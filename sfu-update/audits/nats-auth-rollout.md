@@ -2,6 +2,26 @@
 
 **Companion to** [`nats-acl-audit.md`](./nats-acl-audit.md). The audit identified S-P0-4 (NATS unauthenticated bus) as a blocker for P1 closing. This playbook is the deployment sequence that closes it without dropping any pod.
 
+**Pre-flight verification (already done on `experimental-sfu`):**
+
+The four cells of the (client-creds, server-auth) matrix were tested end-to-end against a local NATS sandbox using the actix-api `nats_connect` helper:
+
+| Cell | Client | Server | Observed | Why it matters |
+| --- | --- | --- | --- | --- |
+| A | no creds | auth | Authorization Violation | Cell A failing is the rollback-gone-wrong shape |
+| B | creds | auth | success | Target post-Phase-C state |
+| **C** | **creds** | **no-auth** | **success** | **Critical: proves Phase B is safe before Phase C** |
+| D | no creds | no-auth | success | Today's baseline |
+
+Reproduce locally with:
+```bash
+bash sfu-update/audits/nats-sandbox-up.sh
+cargo test -p videocall-api --test nats_auth_integration -- --ignored --test-threads=1
+bash sfu-update/audits/nats-sandbox-up.sh down   # when done
+```
+
+All four cells passed (2026-05-15). The integration test is `actix-api/tests/nats_auth_integration.rs`; run it again before each phase rollout if you've touched `nats_connect.rs`.
+
 **Code changes have already landed** on `experimental-sfu`:
 - `actix-api/src/nats_connect.rs` — env-driven helper, reads `NATS_USER`, `NATS_PASSWORD`, `NATS_TLS`, `NATS_TLS_CA`. Falls back to no-auth + plaintext when env unset (back-compat).
 - Four production NATS call sites refactored (`bin/{webtransport,websocket,metrics_server,metrics_server_snapshot}.rs`) to use the helper. Two deprecated test-side call sites also routed through for consistency.
@@ -14,21 +34,21 @@
 
 ## Phase A — create the credential (does nothing on its own)
 
+Runnable script: [`nats-auth-phase-a-create-secret.sh`](./nats-auth-phase-a-create-secret.sh).
+
 ```bash
-# Generate a strong password; record it in a password manager.
-USER="sfu-cluster"
-PASS="$(openssl rand -base64 32 | tr -d '=+/' | head -c 32)"
+# 1. Generate the password (just once; copy to password manager).
+openssl rand -base64 32 | tr -d '=+/' | head -c 32 ; echo
 
-# US East cluster
-kubectl --context us-east -n default create secret generic nats-credentials \
-    --from-literal=user="$USER" \
-    --from-literal=password="$PASS"
-
-# Singapore cluster (same credential — single supercluster)
-kubectl --context singapore -n default create secret generic nats-credentials \
-    --from-literal=user="$USER" \
-    --from-literal=password="$PASS"
+# 2. Apply to BOTH cluster contexts with the SAME credential value
+#    (single NATS supercluster trust domain):
+KUBECTX=do-us-east-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
+    bash sfu-update/audits/nats-auth-phase-a-create-secret.sh
+KUBECTX=do-singapore-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
+    bash sfu-update/audits/nats-auth-phase-a-create-secret.sh
 ```
+
+Use `DRY_RUN=1` to preview the manifest (password is redacted in preview).
 
 At this point: nothing changes. The actix-api pods don't know the Secret exists (they haven't been redeployed). NATS still has `auth.enabled: false`.
 
@@ -36,12 +56,16 @@ At this point: nothing changes. The actix-api pods don't know the Secret exists 
 
 ## Phase B — redeploy the SFU pods to pick up the env (still permissive)
 
+Runnable script: [`nats-auth-phase-b-redeploy-sfu.sh`](./nats-auth-phase-b-redeploy-sfu.sh).
+
 ```bash
-helm --kube-context us-east upgrade rustlemania-webtransport ./helm/rustlemania-webtransport
-helm --kube-context us-east upgrade rustlemania-websocket    ./helm/rustlemania-websocket
-helm --kube-context singapore upgrade rustlemania-webtransport ./helm/rustlemania-webtransport
-helm --kube-context singapore upgrade rustlemania-websocket    ./helm/rustlemania-websocket
+KUBECTX=do-us-east-cluster bash sfu-update/audits/nats-auth-phase-b-redeploy-sfu.sh
+KUBECTX=do-singapore-cluster bash sfu-update/audits/nats-auth-phase-b-redeploy-sfu.sh
 ```
+
+The script also rolls out the new chart values (with the optional `nats-credentials` secretKeyRef + `NATS_TLS` env), waits for the deploy rollout, and tails the pod logs for the `auth=on/off` line so you see the connect posture immediately.
+
+Cell C of the pre-flight matrix proves this phase is safe with the NATS server still permissive.
 
 After this rollout: every actix-api pod attempts to authenticate with the credentials. NATS is still in no-auth mode, so it **accepts** any client (with or without credentials). The pods log `auth=on tls=off` from `nats_connect`.
 
@@ -51,24 +75,17 @@ After this rollout: every actix-api pod attempts to authenticate with the creden
 
 ## Phase C — enable auth on the NATS server
 
-Edit `helm/global/{us-east,singapore}/nats/values.yaml`:
-
-```yaml
-auth:
-  enabled: true
-  users:
-    - user: <USER from Phase A>
-      password: <PASS from Phase A>
-```
-
-(If your nats chart supports env-substitution from a mounted Secret, prefer that over inlining the password into values.yaml. Otherwise the values.yaml goes into a sealed-secrets repo or vault.)
-
-Deploy:
+Runnable script: [`nats-auth-phase-c-enable-nats-auth.sh`](./nats-auth-phase-c-enable-nats-auth.sh).
 
 ```bash
-helm --kube-context us-east   upgrade nats ./helm/global/us-east/nats
-helm --kube-context singapore upgrade nats ./helm/global/singapore/nats
+# BOTH regions, within a few minutes of each other:
+KUBECTX=do-us-east-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
+    bash sfu-update/audits/nats-auth-phase-c-enable-nats-auth.sh
+KUBECTX=do-singapore-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
+    bash sfu-update/audits/nats-auth-phase-c-enable-nats-auth.sh
 ```
+
+The script uses `--set` and `--set-string` to inject the auth block at apply time, keeping the password out of `values.yaml`. Field path is `nats.nats.auth.users[0]` per the nats chart v1.x convention; if your chart version differs, verify with `helm show values nats/nats` and override `CHART_PATH` or edit the script's `AUTH_SETS` array.
 
 Both regions **must** be flipped together (within a few minutes of each other). The cross-region gateway is a NATS-to-NATS supercluster connection; if one side is authenticated and the other isn't, the gateway misbehaves.
 
@@ -78,20 +95,18 @@ Both regions **must** be flipped together (within a few minutes of each other). 
 
 ## Phase D — verify auth is actually enforced
 
-```bash
-# From inside the cluster, without credentials:
-kubectl run nats-probe --rm -it --image=natsio/nats-box:latest -- \
-    nats sub -s nats://nats:4222 '>'
-# Expected: "nats: Authorization Violation" or connection refused.
+Runnable script: [`nats-auth-phase-d-validate.sh`](./nats-auth-phase-d-validate.sh).
 
-# From inside the cluster, WITH credentials:
-kubectl run nats-probe --rm -it --image=natsio/nats-box:latest -- \
-    nats sub -s nats://USER:PASS@nats:4222 '>'
-# Expected: subscribed; no messages flow because nothing is being published
-# to the wildcard from this credential's permitted subjects.
+```bash
+KUBECTX=do-us-east-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
+    bash sfu-update/audits/nats-auth-phase-d-validate.sh
+KUBECTX=do-singapore-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
+    bash sfu-update/audits/nats-auth-phase-d-validate.sh
 ```
 
-If the unauthenticated probe succeeds, Phase C didn't take effect — re-check the values.yaml chart key names match your nats chart's conventions.
+The script runs two probes in each cluster using `kubectl run --rm` against `natsio/nats-box`: (a) connect without creds, expects refusal; (b) connect with creds, expects success. Exits non-zero with a clear `FAIL: expected ...` message if either probe disagrees.
+
+If (a) succeeds (unauthenticated connection accepted), Phase C didn't take effect — re-check the chart key names match your nats chart's conventions and re-run Phase C.
 
 ---
 

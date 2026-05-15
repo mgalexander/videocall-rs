@@ -94,3 +94,43 @@ The audit's recommended remediation order said NATS basic auth + TLS must land b
 - Updated `sfu-update/audits/nats-acl-audit.md` §5 to mark the code side done and point at the rollout doc.
 
 Verification: `cargo check -p videocall-api --tests` clean. `cargo test -p videocall-api --lib nats_connect::` passes both new tests.
+
+## 2026-05-15 NATS auth rollout — pre-flight done, ops scripts authored
+
+Followed up the previous bd-state + NATS-code commits with everything that can be done locally before kubectl/helm action against the real clusters. The end state of the local work:
+
+### Integration matrix verified end-to-end
+
+Stood up two local NATS containers — `sfu-nats-auth` on host port 24222 (basic auth: `sfu-cluster` / `testpass123`) and `sfu-nats-noauth` on 24223 — via `sfu-update/audits/nats-sandbox-up.sh`. Wrote `actix-api/tests/nats_auth_integration.rs` exercising all four cells of (client-creds × server-auth) through the `sec_api::nats_connect` helper:
+
+| Cell | Client | Server | Result |
+| --- | --- | --- | --- |
+| A | no creds | auth | ✓ Authorization Violation (refused) |
+| B | creds | auth | ✓ accepted |
+| **C** | **creds** | **no-auth** | **✓ accepted — Phase B is provably safe before Phase C** |
+| D | no creds | no-auth | ✓ accepted (baseline) |
+
+All four passed (`cargo test -p videocall-api --test nats_auth_integration -- --ignored --test-threads=1`). Tests are `#[ignore]`'d by default; they tcp-probe the sandbox URLs and self-skip if unreachable, so CI without docker is unaffected. Tore the sandbox down after; spin it up again any time before rerolls.
+
+### Runnable phase scripts
+
+`sfu-update/audits/` gained five scripts. The operator runs them once per K8s context (`KUBECTX=do-us-east-cluster` then `KUBECTX=do-singapore-cluster`), no editing required:
+
+- `nats-sandbox-up.sh` — local NATS-with-auth dev loop.
+- `nats-auth-phase-a-create-secret.sh` — creates the `nats-credentials` Secret; supports `DRY_RUN=1` with the password redacted in the preview output.
+- `nats-auth-phase-b-redeploy-sfu.sh` — `helm upgrade` the two SFU charts; waits for rollout and tails pod logs to surface the `auth=on` line from `nats_connect`.
+- `nats-auth-phase-c-enable-nats-auth.sh` — `helm upgrade nats` injecting `auth.enabled=true` + the user/password via `--set` (password stays out of values.yaml); picks the right region chart from `KUBECTX`.
+- `nats-auth-phase-d-validate.sh` — runs two `kubectl run --rm` probes via `natsio/nats-box`: connect without creds (expect refused), connect with creds (expect success); exits non-zero on either disagreement.
+
+### Why this is the right stopping point
+
+`kubectl` and `helm` aren't available from this session, and even if they were, executing Phases A–D against the production clusters falls under the "manually approved" gate per [[feedback-local-only-push]]. The pre-flight work proves the code path works against a real NATS-with-auth, and the scripts make each phase a one-liner per cluster for the operator. The audit doc + rollout doc + scripts together are the handoff package.
+
+**Operator action to actually close S-P0-4:**
+```bash
+openssl rand -base64 32 | tr -d '=+/' | head -c 32 ; echo
+# (record password; both clusters use the same value)
+KUBECTX=do-us-east-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
+    bash sfu-update/audits/nats-auth-phase-a-create-secret.sh
+# repeat per cluster, advance through phases b/c/d
+```
