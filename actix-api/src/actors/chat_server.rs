@@ -17,7 +17,7 @@
  */
 
 use crate::{
-    constants::RECONNECT_GRACE_PERIOD,
+    constants::{MAX_PARTICIPANTS_ENV, MAX_PARTICIPANTS_PER_ROOM, RECONNECT_GRACE_PERIOD},
     messages::{
         server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
@@ -611,6 +611,46 @@ impl Handler<JoinRoom> for ChatServer {
         // "left" from peers' perspective; observers are never announced.
         if is_reconnection || observer {
             self.suppress_join_broadcast.insert(session);
+        }
+
+        // --- Hard admission cap (S-P0-3 in sfu-update/GAP-ANALYSIS.md) ---
+        // Reject non-observer joins when the room is already at capacity.
+        // Observers don't count: they bypass room_members tracking entirely.
+        // Reconnections also pass: the stale row was just removed above, so
+        // the count reflects the post-cleanup state.
+        //
+        // Without this cap, a scripted attacker with one valid JWT can spawn
+        // thousands of sessions in a single room and OOM the pod (each session
+        // = one bounded mpsc + QUIC connection state + N-1 broadcast amplifier
+        // for PARTICIPANT_JOINED). The cap matches the SFU refactor's
+        // webinar-shape design target (200 participants); see PLAN.md §J.
+        if !observer {
+            let cap = std::env::var(MAX_PARTICIPANTS_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(MAX_PARTICIPANTS_PER_ROOM);
+            let current = self
+                .room_members
+                .get(&room)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if current >= cap {
+                warn!(
+                    "JoinRoom rejected: room {} is at capacity ({}/{}) — \
+                     user {} (session {}) denied",
+                    room, current, cap, user_id, session,
+                );
+                // Roll back the suppress_join_broadcast insertion we just did
+                // for the reconnection case, so a later retry (after the room
+                // drains) doesn't silently suppress the legitimate broadcast.
+                if is_reconnection {
+                    self.suppress_join_broadcast.remove(&session);
+                }
+                return MessageResult(Err(format!(
+                    "Room {room} is at capacity ({cap}); please try again later"
+                )
+                .into()));
+            }
         }
 
         let room_clone = room.clone();
@@ -2156,5 +2196,117 @@ mod tests {
                 .copied()
                 .unwrap_or(ConnectionState::Testing))
         }
+    }
+
+    // ==========================================================================
+    // TEST: Hard admission cap rejects joins past the limit (S-P0-3)
+    // ==========================================================================
+    // Locks in the room-capacity check added per sfu-update/GAP-ANALYSIS.md
+    // S-P0-3. Without this cap, a scripted attacker with one valid JWT can
+    // OOM a pod by spawning thousands of sessions in a single room.
+    //
+    // Uses MAX_PARTICIPANTS_ENV to shrink the cap so the test runs quickly.
+    // The env var is set/unset via the `serial` attribute on each test to
+    // avoid races with other tests reading it.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_rejects_past_capacity() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        // Shrink the cap to 3 so the test joins 4 sessions instead of 201.
+        // The handler reads MAX_PARTICIPANTS_ENV at request-time, so setting
+        // it before any JoinRoom is sent is sufficient.
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "3");
+
+        let room = "cap-test-room";
+
+        // Helper: register a dummy session under the given id.
+        async fn register(chat_server: &actix::Addr<ChatServer>, id: u64) {
+            let dummy = DummySession.start();
+            chat_server
+                .send(Connect {
+                    id,
+                    addr: dummy.recipient(),
+                })
+                .await
+                .expect("Connect should succeed");
+        }
+
+        // The first three joins succeed; the fourth is rejected at capacity.
+        for (i, id) in [4001u64, 4002, 4003].iter().enumerate() {
+            register(&chat_server, *id).await;
+            let result = chat_server
+                .send(JoinRoom {
+                    session: *id,
+                    room: room.to_string(),
+                    user_id: format!("user{i}@example.com"),
+                    display_name: format!("user{i}"),
+                    observer: false,
+                })
+                .await
+                .expect("Message delivery should succeed");
+            assert!(
+                result.is_ok(),
+                "Join #{} (session {id}) should succeed, got: {result:?}",
+                i + 1,
+            );
+        }
+
+        register(&chat_server, 4004u64).await;
+        let result = chat_server
+            .send(JoinRoom {
+                session: 4004u64,
+                room: room.to_string(),
+                user_id: "user4@example.com".to_string(),
+                display_name: "user4".to_string(),
+                observer: false,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_err(),
+            "Join past cap should return Err, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("capacity"),
+            "Error should mention capacity, got: {err}"
+        );
+
+        // Observers are not subject to the cap. Register and join a 5th
+        // session as observer — should succeed even though room_members
+        // is already at the (non-observer) cap.
+        register(&chat_server, 4005u64).await;
+        let observer_result = chat_server
+            .send(JoinRoom {
+                session: 4005u64,
+                room: room.to_string(),
+                user_id: "observer@example.com".to_string(),
+                display_name: "observer".to_string(),
+                observer: true,
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(
+            observer_result.is_ok(),
+            "Observer join should bypass the cap, got: {observer_result:?}"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
     }
 }

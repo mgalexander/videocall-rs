@@ -6,8 +6,8 @@
 # it reads sfu-update/.materialize-state.json to map manifest keys to
 # concrete bd ids.
 #
-# This file is the SOURCE OF TRUTH for the DAG. PLAN.md is the prose
-# version; if you change the DAG here, also update PLAN.md.
+# This file is the SOURCE OF TRUTH for the DAG (per ADR-0007). PLAN.md is
+# the long-form prose; if you change the DAG here, also update PLAN.md.
 #
 # Scope: this file currently materialises only the umbrella epic and
 # convoy P0. P1..P6 are deliberately deferred to after the first-bead
@@ -37,6 +37,16 @@ convoys:
       single SFU_MODE feature flag wired into both server binaries.
       No behavioural change yet — SFU_MODE=sfu is a no-op shim.
     tracks: [p0-1, p0-2, p0-3, p0-4, p0-5, p0-6, p0-7, p0-8, p0-9, p0-10, p0-11, p0-12, p0-13, p0-14]
+
+  - key: S0
+    title: "SFU Security Pre-flight (P0-class risks from GAP-ANALYSIS.md)"
+    parent_epic: sfu-epic
+    summary: |
+      Quick-wins and P0-class findings from sfu-update/GAP-ANALYSIS.md.
+      Lands in parallel with P0; must close before P1 opens. Five beads;
+      most are already authored at materialisation time and should be
+      closed immediately (with their landing commit referenced).
+    tracks: [s0-1-admission-cap, s0-2-nats-acl-audit, s0-3-classify-test, s0-4-refinery-push-adr, s0-5-dag-source-adr]
 
 beads:
   - key: p0-1
@@ -202,3 +212,76 @@ beads:
       cargo fmt --check + cargo clippy -p videocall-actix-api -- -D warnings must pass.
     parent_epic: sfu-epic
     blocked_by: [p0-12, p0-13]
+
+  # ===========================================================================
+  # S0 — Security pre-flight (GAP-ANALYSIS.md quick-wins, lands parallel to P0)
+  # ===========================================================================
+  # All five beads are typically authored at materialisation time and closed
+  # immediately with the landing commit referenced. They exist as beads so the
+  # gastown convoy daemon sees S0 close before P1 is allowed to materialise.
+
+  - key: s0-1-admission-cap
+    type: feature
+    title: "Hard admission cap (S-P0-3)"
+    summary: |
+      Add MAX_PARTICIPANTS_PER_ROOM = 200 cap enforcement in
+      actix-api/src/actors/chat_server.rs::JoinRoom (with MAX_PARTICIPANTS_ENV
+      env-var override). Observers bypass the cap. Reconnections cleaned up
+      before the cap check. Unit test in tests module covers all three cases
+      (success at cap-1, rejection at cap, observer-bypass).
+      Reference: sfu-update/GAP-ANALYSIS.md §S-P0-3.
+    parent_epic: sfu-epic
+    blocked_by: []
+
+  - key: s0-2-nats-acl-audit
+    type: chore
+    title: "NATS ACL audit (S-P0-4)"
+    summary: |
+      Audit current NATS deployment (helm/global/{us-east,singapore}/nats)
+      and connection setup (actix-api). Document: auth.enabled=false in
+      both regions, no client TLS, ClusterIP service (intra-cluster only),
+      cross-region NodePort gateway with no auth, no subject ACLs.
+      Recommended remediation order across S0/P6/launch.
+      Deliverable: sfu-update/audits/nats-acl-audit.md.
+    parent_epic: sfu-epic
+    blocked_by: []
+
+  - key: s0-3-classify-test
+    type: task
+    title: "Lock-in: classify_packet drops client-originated server-only PacketTypes"
+    summary: |
+      Harden the existing test at actix-api/src/actors/packet_handler.rs (the
+      CONGESTION drop). Add SERVER_ONLY_PACKET_TYPES list (currently
+      [CONGESTION]; SPEAKER_UPDATE/LAYER_HINT/ADMISSION_DECISION will land in
+      P1) plus a property test that classify_packet returns Dropped for
+      every type in the list, with multiple payload sizes and an
+      attacker-claimed victim session_id. Forces future server-only
+      additions to extend the test list.
+      Reference: sfu-update/GAP-ANALYSIS.md §S-P0-2 (the test that gates
+      against the regression while the full S-P0-2 mitigation lands in P1).
+    parent_epic: sfu-epic
+    blocked_by: []
+
+  - key: s0-4-refinery-push-adr
+    type: decision
+    title: "ADR-0006: Refinery push contract (C-8)"
+    summary: |
+      Decide and document the Refinery's push contract. Decision:
+      convoys default to --merge=local; Refinery merges into the rig's
+      bare repo only, never pushes to the file:// upstream (the user's
+      working clone). User manually fetches from the `rig` remote.
+      Deliverable: sfu-update/adr/0006-refinery-push-contract.md.
+    parent_epic: sfu-epic
+    blocked_by: []
+
+  - key: s0-5-dag-source-adr
+    type: decision
+    title: "ADR-0007: DAG source of truth (C-10)"
+    summary: |
+      Decide and document which artifact is canonical for the bead DAG.
+      Decision: convoy-manifest.yaml is canonical; PLAN.md's "Gastown DAG
+      per Phase" section is long-form documentation. YAML wins on
+      disagreement.
+      Deliverable: sfu-update/adr/0007-dag-source-of-truth.md.
+    parent_epic: sfu-epic
+    blocked_by: []

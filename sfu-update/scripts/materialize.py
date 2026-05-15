@@ -29,8 +29,10 @@ STATE = REPO / "sfu-update" / ".materialize-state.json"
 # Match bd's actual create output: "✓ Created issue: vc-abc — Title".
 # Anchoring on "Created issue:" avoids false matches in auto-import log noise.
 CREATED_ISSUE_RE = re.compile(r"Created issue:\s+([a-z]{1,8}(?:-cv)?-[a-z0-9.]{2,16})")
-# Convoys may print differently; fall back to "Created convoy:".
-CREATED_CONVOY_RE = re.compile(r"Created convoy:?\s+([a-z]{1,8}-cv-[a-z0-9.]{2,16})")
+# Convoys print "Created convoy 🚚 hq-cv-xxxxx" (emoji separator, no colon).
+# Be liberal in what we accept after "Created convoy": optional colon,
+# optional whitespace, optional emoji, then the id.
+CREATED_CONVOY_RE = re.compile(r"Created convoy[:\s]+[^\sa-z0-9]*\s*([a-z]{1,8}-cv-[a-z0-9.]{2,16})")
 
 
 def run(cmd: list[str], check: bool = True) -> str:
@@ -87,7 +89,7 @@ def create_bead(
     if parent_id:
         args += ["--parent", parent_id]
     out = run(args)
-    return extract_id(out, prefix, is_convoy=True)
+    return extract_id(out, prefix, is_convoy=False)
 
 
 def add_blocks_dep(blocker_id: str, blocked_id: str) -> None:
@@ -98,7 +100,7 @@ def add_blocks_dep(blocker_id: str, blocked_id: str) -> None:
 def create_convoy(title: str, tracked_ids: list[str], prefix: str) -> str:
     args = ["gt", "convoy", "create", title] + tracked_ids
     out = run(args)
-    return extract_id(out, prefix)
+    return extract_id(out, prefix, is_convoy=True)
 
 
 def main() -> int:

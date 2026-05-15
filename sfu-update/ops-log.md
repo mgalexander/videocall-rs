@@ -42,3 +42,25 @@ Format: `YYYY-MM-DD HH:MM TZ  ACTOR  EVENT  DETAIL`
 - The most consequential findings (must address): S-P0-1 (routing header forgery enables active-speaker hijack), S-P0-2 (new packet types lack origin discipline — enables redirect/spoof attacks), S-P0-3 (no admission cap until P3 leaves a 7–13 day window where 1000-session DoS is possible), S-P0-4 (NATS subject ACLs not audited).
 - Recommends a new convoy `S0` (security pre-flight) materialised in parallel with P0; the quick-wins section lists five items each ≤1 hour that would substantially harden the experiment before P1 opens.
 - Scheduler remains paused. No new beads materialised from this audit yet — that step waits for overseer review.
+
+## 2026-05-15 S0 convoy (security pre-flight quick-wins)
+
+Five quick-wins from GAP-ANALYSIS.md authored + materialised as convoy `S0`.
+
+- `sfu-update/adr/0006-refinery-push-contract.md` — convoys default to `--merge=local`; Refinery does not push to the file:// upstream. User manually fetches from the `rig` remote.
+- `sfu-update/adr/0007-dag-source-of-truth.md` — `convoy-manifest.yaml` is canonical; PLAN.md "Gastown DAG per Phase" section is long-form documentation.
+- `sfu-update/audits/nats-acl-audit.md` — NATS has `auth.enabled: false` in both regions, no client TLS, ClusterIP service, NodePort cross-region gateway also unauthenticated, no subject ACLs. Remediation order: enable basic auth + TLS before P1 closes; private LB for cross-region before P6 closes; subject ACLs before public launch.
+- `actix-api/src/constants.rs` — added `MAX_PARTICIPANTS_PER_ROOM = 200` + `MAX_PARTICIPANTS_ENV` env-override constant.
+- `actix-api/src/actors/chat_server.rs` — `JoinRoom` handler rejects 201st non-observer joiner with `Err("Room ... is at capacity")`; observers and reconnections bypass the cap correctly. Test `test_join_room_rejects_past_capacity` exercises success at cap-1, rejection at cap, and observer-bypass.
+- `actix-api/src/actors/packet_handler.rs` — added explicit `SERVER_ONLY_PACKET_TYPES` list (currently `[CONGESTION]`; SPEAKER_UPDATE/LAYER_HINT/ADMISSION_DECISION will land in P1) plus property test `test_classify_all_server_only_packet_types_as_dropped`. Each future addition must extend the list, which forces the test to enrol it.
+
+Materialise quirks captured in `[[reference-gastown-quirks]]`:
+- `create_bead` was calling `extract_id(..., is_convoy=True)` (swapped) — fixed.
+- Convoy create output uses `Created convoy 🚚 hq-cv-…` (emoji separator, no colon) — regex generalised.
+
+Convoys after S0:
+- `hq-cv-i4w2x` (P0, status: open, blocking S0+P1 via waits-for)
+- `hq-cv-k4cb1` (S0, status: open, original from `gt convoy create`)
+- `hq-cv-dkhtr` (S0, status: staged_ready, from `gt convoy stage`; will be launched once overseer ack's)
+
+Compile + clippy: `cargo check -p videocall-api --tests` clean. `cargo clippy -- -D warnings` fails on pre-existing `videocall-types/src/validation.rs:79,93` (uninlined-format-args lint), not introduced by S0 changes.

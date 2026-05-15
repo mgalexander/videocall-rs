@@ -314,8 +314,42 @@ mod tests {
         assert!(!should_use_datagram(&bytes));
     }
 
+    // -------------------------------------------------------------------------
+    // SECURITY PROPERTY: server-only packet types must be dropped when sent
+    // by a client.
+    //
+    // A `PacketType` is "server-only" when it carries a control signal that
+    // the *server* is the authority on — emitting it from a client either
+    // bypasses a security control (e.g. CONGESTION → forced encoder
+    // step-down on a victim) or impersonates the server in ways that mislead
+    // peers. The SFU refactor adds more such types (SPEAKER_UPDATE,
+    // LAYER_HINT, ADMISSION_DECISION); each must be added to
+    // `SERVER_ONLY_PACKET_TYPES` below as it lands, and the test below
+    // enforces classify_packet() drops it. See sfu-update/GAP-ANALYSIS.md
+    // S-P0-2 (packet direction discipline).
+    //
+    // The original threat (from the existing CONGESTION case) is documented
+    // in classify_packet() above: "A malicious client could craft a
+    // CONGESTION packet with a victim's session_id to force them to degrade
+    // video quality."
+    //
+    // Adding a new server-only PacketType WITHOUT extending this list is a
+    // security regression. The list is intentionally explicit (not a "wildcard
+    // catch") so reviewers see the addition.
+    const SERVER_ONLY_PACKET_TYPES: &[PacketType] = &[
+        PacketType::CONGESTION,
+        // SFU refactor additions land here as their PacketTypes are added
+        // to packet_wrapper.proto:
+        //   - PacketType::SPEAKER_UPDATE,
+        //   - PacketType::LAYER_HINT,
+        //   - PacketType::ADMISSION_DECISION,
+        // Each addition must also extend classify_packet() to return
+        // PacketKind::Dropped for that type.
+    ];
+
     #[test]
     fn test_classify_congestion_packet_as_dropped() {
+        // Preserve the original property check for the legacy case.
         let wrapper = PacketWrapper {
             packet_type: PacketType::CONGESTION.into(),
             data: vec![1, 2, 3],
@@ -323,6 +357,34 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
+    fn test_classify_all_server_only_packet_types_as_dropped() {
+        // Property test: every PacketType listed in SERVER_ONLY_PACKET_TYPES
+        // must be dropped by classify_packet, regardless of payload content.
+        // When a new server-only PacketType is added to packet_wrapper.proto,
+        // adding it to SERVER_ONLY_PACKET_TYPES enrolls it in this test
+        // automatically. classify_packet() must also be extended to actually
+        // drop it.
+        for &server_type in SERVER_ONLY_PACKET_TYPES {
+            for payload in [vec![], vec![0u8; 3], vec![0u8; 64], vec![0u8; 1500]] {
+                let wrapper = PacketWrapper {
+                    packet_type: server_type.into(),
+                    data: payload.clone(),
+                    session_id: 12345, // attacker-claimed victim session
+                    ..Default::default()
+                };
+                let bytes = wrapper.write_to_bytes().unwrap();
+                assert_eq!(
+                    classify_packet(&bytes),
+                    PacketKind::Dropped,
+                    "server-only PacketType {server_type:?} with {}B payload \
+                     must be dropped when sent from a client",
+                    payload.len(),
+                );
+            }
+        }
     }
 
     #[test]

@@ -72,3 +72,23 @@ pub const KEYFRAME_REQUEST_MAX_PER_SEC: u32 = 2;
 
 /// Time window (in milliseconds) for KEYFRAME_REQUEST rate limiting.
 pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// Room admission control
+// ---------------------------------------------------------------------------
+
+/// Hard cap on the number of non-observer participants in a single room.
+///
+/// Set to match the SFU refactor's webinar-shape design target (see
+/// `sfu-update/PLAN.md` §"Capacity Model"). Joining the (N+1)st participant
+/// is rejected with an error so the client can decline gracefully.
+///
+/// Observers (read-only sessions joining via the waiting room) are NOT counted
+/// against this cap — their join path bypasses `room_members` tracking.
+///
+/// Tunable at deploy time via the `MAX_PARTICIPANTS_PER_ROOM` env var (read by
+/// `JoinRoom` handler at runtime; default applies if unset).
+pub const MAX_PARTICIPANTS_PER_ROOM: usize = 200;
+
+/// Env var name for overriding [`MAX_PARTICIPANTS_PER_ROOM`].
+pub const MAX_PARTICIPANTS_ENV: &str = "MAX_PARTICIPANTS_PER_ROOM";
