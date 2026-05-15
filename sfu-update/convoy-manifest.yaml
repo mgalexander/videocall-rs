@@ -1,0 +1,204 @@
+# sfu-update/convoy-manifest.yaml
+#
+# Machine-readable representation of the SFU refactor DAG for gastown.
+# Consumed by sfu-update/scripts/materialize.py to create beads, parent
+# links, and blocking dependencies. Re-running the script is idempotent;
+# it reads sfu-update/.materialize-state.json to map manifest keys to
+# concrete bd ids.
+#
+# This file is the SOURCE OF TRUTH for the DAG. PLAN.md is the prose
+# version; if you change the DAG here, also update PLAN.md.
+#
+# Scope: this file currently materialises only the umbrella epic and
+# convoy P0. P1..P6 are deliberately deferred to after the first-bead
+# proof loop closes — they will be added incrementally to keep the
+# system observable.
+
+prefix: vc                          # bead-id prefix the rig will use
+
+epics:
+  - key: sfu-epic
+    type: epic
+    title: "SFU refactor of videocall-rs (200-participant webinar)"
+    summary: |
+      Umbrella tracking issue for the SFU refactor on the experimental-sfu
+      branch. See sfu-update/PLAN.md for the full plan. Webinar-first
+      (<=10 active video senders, ~190 listeners), WebTransport primary,
+      VP9 SVC, SFrame-style routing header, hybrid speaker selection,
+      room-affinity routing. Six phases (P0..P6); only P0 is materialised
+      initially.
+
+convoys:
+  - key: P0
+    title: "SFU Phase 0: Decision substrate & feature flag"
+    parent_epic: sfu-epic
+    summary: |
+      Land the RFC umbrella, ADR skeletons, planning artifacts, and a
+      single SFU_MODE feature flag wired into both server binaries.
+      No behavioural change yet — SFU_MODE=sfu is a no-op shim.
+    tracks: [p0-1, p0-2, p0-3, p0-4, p0-5, p0-6, p0-7, p0-8, p0-9, p0-10, p0-11, p0-12, p0-13, p0-14]
+
+beads:
+  - key: p0-1
+    type: chore
+    title: "Scaffold sfu-update/ tree (README, ADR skeletons, placeholder docs)"
+    summary: |
+      Round out /mnt/llms/videocall/sfu-update/ created during bootstrap.
+      Specifically:
+        - Verify/create sfu-update/{README.md, PLAN.md, ops-log.md} (already authored during bootstrap).
+        - Create skeleton sfu-update/capacity-model.md citing PLAN.md §J.
+        - Create skeleton sfu-update/packet-diagrams.md (empty sections for each new packet type).
+        - Create skeleton sfu-update/test-matrix.md (rows: codec/browser/shape).
+        - Create skeleton sfu-update/adr/{0001-routing-header-out-of-encryption,0002-active-speaker-detection,0003-hybrid-subscription-model,0004-outbound-priority-queue,0005-room-affinity-routing}.md using the standard Context/Decision/Consequences/Status template — leave Decision/Consequences sections empty for now.
+      Commit on experimental-sfu with message: "chore(sfu): scaffold sfu-update planning tree".
+    parent_epic: sfu-epic
+    blocked_by: []
+
+  - key: p0-2
+    type: task
+    title: "Author /rfc/rfc-2-sfu-architecture.md umbrella RFC"
+    summary: |
+      Author the umbrella RFC at /rfc/rfc-2-sfu-architecture.md following
+      the convention of the existing /rfc/rfc-1-q3-q4-2023-planning.md.
+      The RFC summarises the SFU refactor and links to each ADR under
+      /sfu-update/adr/. See PLAN.md for content; this is essentially a
+      curated extract of PLAN.md Sections "Context", "Locked Decisions",
+      and "Phased Implementation".
+    parent_epic: sfu-epic
+    blocked_by: [p0-1]
+
+  - key: p0-3
+    type: decision
+    title: "ADR-0001: routing-header-out-of-encryption (SFrame-style)"
+    summary: |
+      Decision: media payload remains encrypted (E2EE preserved), but
+      MediaPacket gains an unencrypted RoutingHeader carrying
+      is_keyframe, temporal_layer_id, spatial_layer_id, audio_level,
+      is_speaking, frame_marker, picture_id. Server reads header only;
+      payload stays opaque. See PLAN.md §A.E2EE-posture and
+      §C "New Wire Surface".
+      Body should follow Context / Decision / Consequences / Status
+      template. Mark status: accepted.
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-4
+    type: decision
+    title: "ADR-0002: active-speaker-detection (EWMA on audio_level)"
+    summary: |
+      Decision: server scores each sender's audio_level via EWMA (alpha=0.3),
+      detects top-N=4 speakers every 200ms with entry/exit hysteresis,
+      publishes SpeakerUpdate to room.{room}.system. See PLAN.md §E.
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-5
+    type: decision
+    title: "ADR-0003: hybrid-subscription-model"
+    summary: |
+      Decision: hybrid speaker selection — server picks default
+      active-speaker set; client overrides via SubscriptionUpdate
+      with pinned_sessions + visibility slots. See PLAN.md §F.
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-6
+    type: decision
+    title: "ADR-0004: outbound-priority-queue"
+    summary: |
+      Decision: replace mpsc(256) FIFO with 5-class PrioritySender
+      (P0 control, P1 audio, P2 keyframe+base-T0, P3 video p-frames,
+      P4 enhancement+screen), strict priority + 8-packet fairness quantum.
+      Class-aware CongestionTracker thresholds. See PLAN.md §H.
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-7
+    type: decision
+    title: "ADR-0005: room-affinity-routing (hybrid)"
+    summary: |
+      Decision: consistent-hash room_id -> pod ordinal via jump_hash.
+      Owner pod redirects mismatched joiners via ADMISSION_DECISION.
+      Spillover via NATS when soft cap or CPU exceeded. Migrate to
+      StatefulSet for stable hostnames. See PLAN.md §I.
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-8
+    type: task
+    title: "Fill out sfu-update/capacity-model.md"
+    summary: |
+      Expand the back-of-envelope from PLAN.md §J: per-pod inbound,
+      per-pod outbound, NATS bandwidth, mpsc backlog, burst behavior,
+      break points for webinar shape vs conference shape. Include the
+      audio-forward-all vs mixdown decision matrix (Open Risk #1).
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-9
+    type: task
+    title: "Fill out sfu-update/packet-diagrams.md"
+    summary: |
+      Sequence diagrams (mermaid or ascii) for the new packets:
+      RoutingHeader on MediaPacket, SubscriptionUpdate, SpeakerUpdate,
+      LAYER_HINT, ADMISSION_DECISION, CAPABILITY_ANNOUNCE.
+      Include client_capabilities advertisement on CONNECTION.
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-10
+    type: task
+    title: "Fill out sfu-update/test-matrix.md"
+    summary: |
+      Coverage matrix: rows = (codec, browser, shape) tuples.
+      Codecs: VP9-L1T3 (initial), VP9-L3T3_KEY (later).
+      Browsers: Chromium M111+, Safari 18.2 (WebTransport ships in 18.2).
+      Shapes: 1:1, small group (<=6), webinar (~200), pathological
+      (one slow receiver).
+    parent_epic: sfu-epic
+    blocked_by: [p0-1, p0-2]
+
+  - key: p0-11
+    type: feature
+    title: "Add actix-api/src/sfu/{mod.rs, config.rs} and SFU_MODE env parsing"
+    summary: |
+      Create the new sfu/ module root under actix-api/src/. Define
+      pub enum SfuMode { Legacy, Sfu } and pub struct SfuConfig { mode:
+      SfuMode } in config.rs. Parse SFU_MODE env var (default Legacy).
+      No behavior yet — this is just the module skeleton + config plumbing.
+      Must compile clean; no unused-warnings.
+    parent_epic: sfu-epic
+    blocked_by: [p0-1]
+
+  - key: p0-12
+    type: feature
+    title: "Wire SFU_MODE into bin/webtransport_server.rs"
+    summary: |
+      Read SfuConfig at boot in actix-api/src/bin/webtransport_server.rs.
+      Log the active mode at INFO. SfuMode::Sfu is a no-op shim that
+      falls through to the legacy path; just log "sfu mode active
+      (no-op shim)" so it's observable. Do NOT touch chat_server.rs
+      forwarding behaviour yet.
+    parent_epic: sfu-epic
+    blocked_by: [p0-11]
+
+  - key: p0-13
+    type: feature
+    title: "Wire SFU_MODE into bin/websocket_server.rs"
+    summary: |
+      Same as p0-12 but for actix-api/src/bin/websocket_server.rs.
+    parent_epic: sfu-epic
+    blocked_by: [p0-11]
+
+  - key: p0-14
+    type: task
+    title: "Unit test asserting SFU_MODE plumbing on both binaries"
+    summary: |
+      Add a #[cfg(test)] in actix-api/src/sfu/config.rs verifying:
+        - SfuConfig::from_env() with SFU_MODE unset -> SfuMode::Legacy.
+        - SFU_MODE=legacy -> SfuMode::Legacy.
+        - SFU_MODE=sfu -> SfuMode::Sfu.
+        - SFU_MODE=invalid -> Result::Err (or fallback to Legacy with warn — pick one, document the choice).
+      cargo fmt --check + cargo clippy -p videocall-actix-api -- -D warnings must pass.
+    parent_epic: sfu-epic
+    blocked_by: [p0-12, p0-13]
