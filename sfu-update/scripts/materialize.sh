@@ -11,5 +11,9 @@
 # State (key -> bd id mapping) lives at sfu-update/.materialize-state.json.
 set -euo pipefail
 
-cd "$(dirname "$0")/../.."
-exec python3 sfu-update/scripts/materialize.py "$@"
+# bd resolves its database by walking up from cwd to find .beads/.
+# The rig's beads live at /gt/videocall/.beads/, NOT at /mnt/llms/videocall/.beads/,
+# so we run from the rig path. The manifest is referenced by absolute path
+# inside materialize.py, so the cwd doesn't affect manifest discovery.
+cd /gt/videocall
+exec python3 /mnt/llms/videocall/sfu-update/scripts/materialize.py "$@"

@@ -77,3 +77,6 @@ e2e/node_modules/**
 
 # gastown polecat worktrees
 .worktrees/
+
+# gastown materialise state (bead-id map; per-environment)
+sfu-update/.materialize-state.json

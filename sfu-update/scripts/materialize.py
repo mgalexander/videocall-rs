@@ -26,7 +26,11 @@ REPO = Path("/mnt/llms/videocall")
 MANIFEST = REPO / "sfu-update" / "convoy-manifest.yaml"
 STATE = REPO / "sfu-update" / ".materialize-state.json"
 
-ID_RE = re.compile(r"\b([a-z]{1,8}(?:-cv)?-[a-z0-9]{4,8})\b")
+# Match bd's actual create output: "✓ Created issue: vc-abc — Title".
+# Anchoring on "Created issue:" avoids false matches in auto-import log noise.
+CREATED_ISSUE_RE = re.compile(r"Created issue:\s+([a-z]{1,8}(?:-cv)?-[a-z0-9.]{2,16})")
+# Convoys may print differently; fall back to "Created convoy:".
+CREATED_CONVOY_RE = re.compile(r"Created convoy:?\s+([a-z]{1,8}-cv-[a-z0-9.]{2,16})")
 
 
 def run(cmd: list[str], check: bool = True) -> str:
@@ -48,14 +52,19 @@ def save_state(state: dict) -> None:
     STATE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
-def extract_id(out: str, prefix: str) -> str:
-    """Pull a bead/convoy id like 'vc-abc12' or 'vc-cv-def34' from CLI output."""
-    candidates = [m for m in ID_RE.findall(out) if m.startswith(f"{prefix}-")]
-    if not candidates:
+def extract_id(out: str, prefix: str, *, is_convoy: bool = False) -> str:
+    """Pull a bead/convoy id from bd/gt CLI output anchored on 'Created issue:' / 'Created convoy:'."""
+    regex = CREATED_CONVOY_RE if is_convoy else CREATED_ISSUE_RE
+    m = regex.search(out)
+    if not m:
         raise SystemExit(
             f"could not extract {prefix}-* id from output:\n{out}"
         )
-    return candidates[0]
+    found = m.group(1)
+    # Convoys live under the town hq prefix (e.g. hq-cv-*), not the rig prefix.
+    if not is_convoy and not found.startswith(f"{prefix}-"):
+        raise SystemExit(f"id {found!r} does not match prefix {prefix!r}; output:\n{out}")
+    return found
 
 
 def create_bead(
@@ -78,7 +87,7 @@ def create_bead(
     if parent_id:
         args += ["--parent", parent_id]
     out = run(args)
-    return extract_id(out, prefix)
+    return extract_id(out, prefix, is_convoy=True)
 
 
 def add_blocks_dep(blocker_id: str, blocked_id: str) -> None:
