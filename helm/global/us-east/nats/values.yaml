@@ -16,8 +16,29 @@ nats:
       memStore:
         enabled: true
         maxSize: 1Gi
+    # Basic auth controls per sfu-update/audits/nats-acl-audit.md S-P0-4.
+    # Flip enabled to true AFTER:
+    #   1. `kubectl create secret generic nats-credentials \
+    #        --from-literal=user=<u> --from-literal=password=<p>`
+    #   2. Both rustlemania-{websocket,webtransport} charts have been
+    #      redeployed with the matching NATS_USER/NATS_PASSWORD env vars
+    #      (already present, optional secretKeyRef — will become required
+    #      once the Secret exists).
+    # The two steps must land BEFORE auth.enabled=true; otherwise existing
+    # pods fail to connect and the room plane goes dark.
     auth:
       enabled: false
+      # Uncomment to enforce auth using the nats-credentials Secret. The
+      # Helm chart resolves the values via 'auth.user' / 'auth.password' or
+      # via 'auth.users' (list-of-objects); pick the format your chart
+      # version supports. Reference (nats-server chart 0.x):
+      # auth:
+      #   enabled: true
+      #   users:
+      #     - user: $NATS_USER
+      #       password: $NATS_PASSWORD
+      # With env substitution from the nats-credentials Secret mounted on
+      # the nats StatefulSet via extraEnvFrom or similar (chart-specific).
     resources:
       limits:
         cpu: 400m

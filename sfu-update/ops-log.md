@@ -64,3 +64,33 @@ Convoys after S0:
 - `hq-cv-dkhtr` (S0, status: staged_ready, from `gt convoy stage`; will be launched once overseer ack's)
 
 Compile + clippy: `cargo check -p videocall-api --tests` clean. `cargo clippy -- -D warnings` fails on pre-existing `videocall-types/src/validation.rs:79,93` (uninlined-format-args lint), not introduced by S0 changes.
+
+## 2026-05-15 bd state permanence + NATS auth/TLS code (S0 follow-ups)
+
+Two GAP-ANALYSIS-driven fixes landed:
+
+### bd state inconsistency (root-cause fix)
+
+`/gt/videocall/.gitignore` blanket-excluded `.beads/`, which (a) made the auto-export's `git add` step fail silently, leaving the JSONL stale, and (b) caused the next bd command's auto-import to revert any uncommitted writes in Dolt. Combined with `dolt.auto-commit=off` (the default), state mutations didn't stick.
+
+Layered fix:
+1. **Removed the blanket `.beads/` line** from `/gt/videocall/.gitignore`. The town repo's intent is that `.beads/` IS tracked at /gt level so JSONL is durable; the inner `/gt/videocall/.beads/.gitignore` already handles the Dolt internals exclusion correctly.
+2. **Set `dolt.auto-commit on`** for the videocall rig (was already inherited from defaults; verified).
+3. **Set `export.interval=1s`** (was 60s) so the timer-based auto-export catches up fast even when synchronous flush is skipped.
+4. **Authored `sfu-update/scripts/bd-sync.sh`** — wraps any bd state-mutating command and runs `bd export --all -o /gt/videocall/.beads/issues.jsonl` synchronously after. Forces `cd /gt/videocall` first so bd's auto-discovery can't resolve a parent `.beads/` and cross-contaminate (we hit exactly that in one iteration — `bd export` from the wrong cwd wrote HQ data into the rig's JSONL; recovered via `bd export` from the correct cwd).
+5. **Updated `sfu-update/scripts/materialize.py`** to do a synchronous export at the end of every run.
+
+Verified: closing the four sticky S0 beads (vc-c4e.20/21/22/23) now lands consistently across Dolt + JSONL + `bd list`.
+
+### NATS auth + TLS (avoid the P1 regression)
+
+The audit's recommended remediation order said NATS basic auth + TLS must land before P1 closes (P1 introduces `audio_level`/`is_speaking` on the same unauthenticated bus). Code side is done; ops side is documented for operator action.
+
+- New `actix-api/src/nats_connect.rs`: a single helper reading `NATS_USER`, `NATS_PASSWORD`, `NATS_TLS`, `NATS_TLS_CA` from env, building `async_nats::ConnectOptions` accordingly. Falls back to no-auth + plaintext when env unset (back-compat). Logs `auth=on/off tls=on/off` at INFO for ops visibility. Unit tests for partial-credentials and CA-missing-file failure paths.
+- Refactored four production NATS call sites: `bin/webtransport_server.rs:47`, `bin/websocket_server.rs:276`, `bin/metrics_server.rs:667`, `bin/metrics_server_snapshot.rs:431`. Also routed two test-side call sites through the helper for consistency.
+- Helm: `helm/rustlemania-{webtransport,websocket}/values.yaml` add `NATS_USER`/`NATS_PASSWORD` env from optional `nats-credentials` Secret + `NATS_TLS`/`NATS_TLS_CA` placeholders.
+- Helm (NATS server): `helm/global/{us-east,singapore}/nats/values.yaml` annotated with the rollout sequence and a commented-out `users:` block. `auth.enabled` still `false` — operator flips it after Secret + pod redeploy.
+- Authored `sfu-update/audits/nats-auth-rollout.md`: six-phase playbook (A: create Secret. B: redeploy SFU pods. C: enable nats auth. D: verify. E: optional TLS. F: subject ACLs post-P1). With rollback steps.
+- Updated `sfu-update/audits/nats-acl-audit.md` §5 to mark the code side done and point at the rollout doc.
+
+Verification: `cargo check -p videocall-api --tests` clean. `cargo test -p videocall-api --lib nats_connect::` passes both new tests.

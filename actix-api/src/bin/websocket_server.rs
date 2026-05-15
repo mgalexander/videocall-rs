@@ -273,10 +273,7 @@ async fn main() -> std::io::Result<()> {
     info!("start");
 
     let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
-    let nats_client = async_nats::ConnectOptions::new()
-        .require_tls(false)
-        .ping_interval(std::time::Duration::from_secs(10))
-        .connect(&nats_url)
+    let nats_client = sec_api::nats_connect::connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
 

@@ -428,7 +428,7 @@ async fn main() -> anyhow::Result<()> {
     let nats_snapshots = snapshots.clone();
     task::spawn(async move {
         info!("Connecting to NATS at {}", nats_url);
-        match async_nats::connect(&nats_url).await {
+        match sec_api::nats_connect::connect(&nats_url).await {
             Ok(nats_client) => {
                 info!("Connected to NATS successfully");
                 if let Err(e) = nats_server_consumer(nats_client, nats_snapshots).await {

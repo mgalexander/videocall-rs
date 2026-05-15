@@ -25,6 +25,7 @@ pub mod lobby;
 pub mod messages;
 pub mod metrics;
 pub mod models;
+pub mod nats_connect;
 pub mod server_diagnostics;
 pub mod session_manager;
 pub mod token_validator;

@@ -146,3 +146,18 @@ Because F-1/F-2 are the root cause and everything else stacks on top:
 ## 4. Bottom line
 
 NATS is the **single most concentrated trust point** in the current architecture, and it currently has zero defense in depth. The SFU refactor doesn't make this worse, but it adds new sensitive fields (`audio_level`, `is_speaking`) that ride the same bus. **Step 1 (enable NATS basic auth) should land as part of S0 — it's a one-day operations change with a strict-net improvement to the threat model.**
+
+---
+
+## 5. Status (2026-05-15 update)
+
+The **code-side** of Step 1 (basic auth) and Step 2 (TLS) has landed in commits on `experimental-sfu`:
+
+- New `actix-api/src/nats_connect.rs` helper reads `NATS_USER`, `NATS_PASSWORD`, `NATS_TLS`, `NATS_TLS_CA` env vars. Falls back to no-auth + plaintext when unset (back-compat with the pre-change cluster).
+- Four production NATS call sites refactored (`bin/{webtransport_server, websocket_server, metrics_server, metrics_server_snapshot}.rs`).
+- `helm/rustlemania-{webtransport,websocket}/values.yaml` — env vars wired from optional `nats-credentials` Secret. Safe to deploy with Secret absent.
+- `helm/global/{us-east,singapore}/nats/values.yaml` — annotated with rollout sequence and example `users:` block; `auth.enabled` still `false` pending operator action.
+
+The **ops-side** rollout is documented in [`nats-auth-rollout.md`](./nats-auth-rollout.md). It is a six-phase, mostly-zero-downtime sequence. Phases A–D close the audit's Step 1 (basic auth). Phase E is optional TLS. Phase F (subject ACLs) is post-P1.
+
+**Until Phases A–D complete, the audit finding remains open** — the bus is still unauthenticated in the running cluster. The code change does not regress security; it merely makes auth *configurable* without code changes. Each helm-side flip is the gate.

@@ -193,6 +193,15 @@ def main() -> int:
         save_state(state)
         print(f"  CREATED convoy {key}  {new_id}  tracks={len(tracked)} beads")
 
+    # bd's auto-export is timer-based (~1s after export.interval was tuned;
+    # default 60s). Without a synchronous flush, state changes written in this
+    # script will not appear in .beads/issues.jsonl before the next bd command
+    # auto-imports the old JSONL and clobbers them. Force a synchronous export
+    # so the JSONL captures everything we just did.
+    jsonl = "/gt/videocall/.beads/issues.jsonl"
+    print("\n== sync export ==")
+    run(["bd", "export", "--all", "-o", jsonl])
+
     print("\n== summary ==")
     print(f"  epics   : {len(state['epics'])}")
     print(f"  beads   : {len(state['beads'])}")

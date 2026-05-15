@@ -419,9 +419,9 @@ mod tests {
         use actix::Actor;
         use std::net::ToSocketAddrs;
 
-        // Connect to NATS
+        // Connect to NATS via shared helper (no auth in test env).
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-        let nats_client = async_nats::connect(&nats_url)
+        let nats_client = crate::nats_connect::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
