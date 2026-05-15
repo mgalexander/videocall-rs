@@ -35,3 +35,10 @@ Format: `YYYY-MM-DD HH:MM TZ  ACTOR  EVENT  DETAIL`
 - Furiosa's first session ran `gt prime --hook`, saw an empty hook (the scheduler sling produced a wisp but never landed the bead on the polecat's hook), and self-deferred with `gt done --status DEFERRED`. Root cause: identity beads weren't created (the `SetAgentState` warnings during pool-init were not "non-fatal" — they meant the polecat identities never landed).
 - Recovery: `gt polecat identity add videocall furiosa` + `gt polecat identity add videocall nux` → created identity beads `vc-videocall-polecat-furiosa` and `vc-videocall-polecat-nux`. Then `gt hook vc-c4e.1 videocall/polecats/furiosa` attached the bead directly. Then `gt session restart videocall/furiosa` cycled furiosa's tmux session. Furiosa primed again, saw the hook, and started actual work (thinking → executing).
 - **Lesson for future phases:** after `gt polecat pool-init`, verify identity beads exist via `gt polecat identity list videocall`. If empty, create them by hand BEFORE slinging.
+
+## 2026-05-15 Pre-execution audit
+
+- Pre-execution gap analysis + adversarial security review filed at `sfu-update/GAP-ANALYSIS.md`. Findings: 4 P0-class security issues, 5 P1, 6 P2, 5 P3, 12 consistency items.
+- The most consequential findings (must address): S-P0-1 (routing header forgery enables active-speaker hijack), S-P0-2 (new packet types lack origin discipline — enables redirect/spoof attacks), S-P0-3 (no admission cap until P3 leaves a 7–13 day window where 1000-session DoS is possible), S-P0-4 (NATS subject ACLs not audited).
+- Recommends a new convoy `S0` (security pre-flight) materialised in parallel with P0; the quick-wins section lists five items each ≤1 hour that would substantially harden the experiment before P1 opens.
+- Scheduler remains paused. No new beads materialised from this audit yet — that step waits for overseer review.

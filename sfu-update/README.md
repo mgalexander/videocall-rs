@@ -5,6 +5,7 @@ Planning artifacts for the SFU refactor of videocall-rs.
 | File | Purpose |
 | --- | --- |
 | [`PLAN.md`](./PLAN.md) | Source-of-truth implementation plan (mirrored from harness plan file). |
+| [`GAP-ANALYSIS.md`](./GAP-ANALYSIS.md) | Pre-execution audit: plan inconsistencies + adversarial security review filed by priority (P0–P3, C). Includes a suggested `S0` security pre-flight convoy. |
 | [`convoy-manifest.yaml`](./convoy-manifest.yaml) | Machine-readable representation of the bead/convoy DAG for gastown. |
 | [`scripts/materialize.sh`](./scripts/materialize.sh) | Idempotent script that walks the manifest and invokes `bd create` / `bd update --add-dep`. |
 | [`ops-log.md`](./ops-log.md) | Running log of bootstrap actions, disk readings, mayor responses. |
