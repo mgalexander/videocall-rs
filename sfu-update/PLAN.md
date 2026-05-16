@@ -642,8 +642,13 @@ For each phase, when the prior phase closes:
 1. `gt convoy stage P{N}` — validates DAG, computes waves, reports staged:warnings or staged:ready.
 2. Review wave output; resolve any warnings (stale deps, missing parents).
 3. `gt convoy launch P{N}` — transitions to open, Wave 1 slung.
-4. Daemon's event-driven feeder picks up close events and dispatches next-ready beads automatically. Stranded scan catches any missed dispatches every 30s.
-5. Convoy auto-closes when all tracked beads close (final wave is the close gate).
+4. **Verify each Wave 1 bead actually landed on its polecat's hook.** `gt sling` / `gt convoy launch` produce the wisp but the wisp frequently fails to land — the polecat primes, sees an empty hook, and self-defers. For each Wave 1 bead, run `gt hook show <rig>/polecats/<polecat>` and confirm the bead id is present. If not, use the wrapper:
+   ```
+   sfu-update/scripts/gt-sling-attached.sh <bead-id> <rig>/<polecat-name>
+   ```
+   which re-hooks the bead and restarts the session. See vco-ow8.8 for the bug history; remove this step once the upstream gastown fix lands.
+5. Daemon's event-driven feeder picks up close events and dispatches next-ready beads automatically. Stranded scan catches any missed dispatches every 30s. The same hook-landing bug affects auto-dispatch — when a polecat from Wave 2+ defers with an empty hook, recover with `gt-sling-attached.sh`.
+6. Convoy auto-closes when all tracked beads close (final wave is the close gate).
 
 If a phase's DAG changes mid-execution (a bead is added/removed), re-run `gt convoy stage P{N}` to re-validate; the daemon handles the re-staged convoy idempotently.
 
