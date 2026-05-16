@@ -1,67 +1,67 @@
 # ADR-0006: Refinery Push Contract (C-8)
 
-- **Status:** Accepted
-- **Date:** 2026-05-15
+- **Status:** Accepted (revised 2026-05-16; supersedes the 2026-05-15 revision of this ADR)
+- **Date:** 2026-05-16 (original 2026-05-15)
 - **Deciders:** overseer (malexander)
-- **Related:** [`SCALE-UP.md`](../SCALE-UP.md), [`FANOUT.md`](../FANOUT.md), [`ops-log.md`](../ops-log.md), [`GAP-ANALYSIS.md`](../GAP-ANALYSIS.md) §C-8.
+- **Related:** [`SCALE-UP.md`](../SCALE-UP.md), [`FANOUT.md`](../FANOUT.md), [`ops-log.md`](../ops-log.md), [`GAP-ANALYSIS.md`](../GAP-ANALYSIS.md) §C-8, bead `vc-c4e.24`.
 
 ## Context
 
-`gt rig add videocall file:///mnt/llms/videocall …` makes the user's working clone (`/mnt/llms/videocall/`) the rig's git upstream. When a polecat finishes work and runs `gt done`, the Refinery merges the polecat's branch into `experimental-sfu` inside the rig's bare repo at `/gt/videocall/.repo.git/` — and then attempts to push the merged result back to the upstream (`/mnt/llms/videocall/`).
+`gt rig add videocall file:///mnt/llms/videocall …` makes the user's working clone (`/mnt/llms/videocall/`) the rig's git upstream. When a polecat finishes work and runs `gt done`, the Refinery merges the polecat's branch into `experimental-sfu` inside the rig's bare repo at `/gt/videocall/.repo.git/` and then pushes the merged result back to the upstream (`/mnt/llms/videocall/`).
 
-This push is refused by git's default `receive.denyCurrentBranch` because the upstream is a non-bare clone with `experimental-sfu` currently checked out. Observed during P0 Wave 1 (bootstrap): merge queue entry `vc-wisp-kzk` sat in status `ready` indefinitely because the Refinery could not push.
+`/mnt/llms/videocall/` has `receive.denyCurrentBranch=updateInstead` set (verified 2026-05-16 with `git config -l`; configured by `gt rig add` during bootstrap, see ops-log 2026-05-15). With `updateInstead`, git accepts a push to the currently checked-out branch *as long as the working tree and index are clean*; the push fast-forwards the branch ref AND updates the working tree in lockstep. The Refinery's normal `git push <upstream> experimental-sfu` therefore succeeds, and HEAD of `/mnt/llms/videocall/` advances automatically.
 
-The user's standing rule (see [[feedback-local-only-push]]): *"keeping the work local in worktrees until merged and manually approved to push."* Two interpretations:
-1. The Refinery's "push to upstream" *is* a push that needs approval.
-2. The Refinery's push is internal to the local environment and only `git push origin` to GitHub is the gated step.
+This was the actual behaviour observed during P0 Wave 1 (bootstrap) once the first push was attempted with a clean working tree, and again during the `videocall_ops` Track 2 launch on 2026-05-16 when obsidian's `vco-ow8.1` commit landed at HEAD of `/mnt/llms/videocall/` on `experimental-sfu` automatically.
 
-The wording is ambiguous, but the spirit — review polecat work before it lands in the user's clone — favors interpretation 1.
+The user's standing rule (see [[feedback-local-only-push]]): *"keeping the work local in worktrees until merged and manually approved to push."* The rule's intent is to gate **pushes that leave the local environment** (i.e. `git push origin` to GitHub). The Refinery's push from the rig's bare repo to the user's local clone is a *local* operation — both endpoints live on the same machine, under the same `file://` mount, and the user can review the result before any GitHub push. The 2026-05-15 revision of this ADR over-read the rule and tried to insert a manual `git fetch rig` step between Refinery and the user's clone. The user's subsequent direction — "let obsidian's work move forward without pause" during the 2026-05-16 Track 2 launch — confirmed that auto-advance is desired, and that the manual review gate lives at `git push origin`, not at the rig-to-clone hop.
 
 ## Decision
 
-**Convoys default to `--merge=local`. The Refinery does NOT push to the upstream (`/mnt/llms/videocall/`). The user manually fetches and merges from the rig.**
+**The Refinery pushes merged work to the upstream (`/mnt/llms/videocall/`). The manual approval gate is `git push origin` (to GitHub), not `git fetch rig`.**
 
 Concretely:
 
-1. **Convoy materialisation default.** Every convoy created via `gt convoy create` / `gt convoy stage` / `materialize.py` uses merge strategy `local`. This is set on the convoy's metadata; the auto-convoy created by `gt sling` for single-issue dispatch also defaults to `local`.
-2. **Refinery behaviour.** The Refinery still merges polecat branches into `experimental-sfu` inside the rig's bare repo (`/gt/videocall/.repo.git/`) when CI gates pass. It then **stops**. No upstream push attempted.
-3. **User sync path.** The user's local clone (`/mnt/llms/videocall/`) has a `rig` remote pointing at `/mnt/llms/gas-town/town/videocall/.repo.git/` (added during bootstrap). To pull polecat-landed work:
-   ```bash
-   git fetch rig
-   git diff experimental-sfu rig/experimental-sfu     # review
-   git merge --ff-only rig/experimental-sfu           # land if FF
-   ```
-   This is the manual approval gate.
-4. **Auto-mode classifier reinforcement.** The Claude Code auto-mode classifier already blocks attempts to FF-merge polecat branches into the user's clone (observed during bootstrap). That behaviour is correct and consistent with this ADR.
-5. **GitHub remote push (`origin`).** Untouched by this ADR. `git push origin experimental-sfu` requires explicit per-push approval from the overseer, no exceptions.
+1. **Refinery behaviour.** When a polecat closes via `gt done` and the Refinery merges its branch into `experimental-sfu` inside the rig's bare repo (`/gt/videocall/.repo.git/`), the Refinery then performs `git push <upstream> experimental-sfu` against the configured `file://` upstream. With `receive.denyCurrentBranch=updateInstead` set on the upstream, this advances both the branch ref and the working tree of `/mnt/llms/videocall/` (provided that working tree is clean — see Operational hygiene below).
+2. **Configuration.** Every rig added via `gt rig add` against a non-bare local upstream **must** have `receive.denyCurrentBranch=updateInstead` set on that upstream. `gt rig add` already does this at rig-creation time (verified for both `videocall` and `videocall_ops` rigs). If you ever stand up a rig and the Refinery's push is being rejected with `refusing to update checked out branch`, this is the setting to fix.
+3. **Convoy materialisation.** Convoys may use either `--merge=local` or `--merge=mr` (the gt default). The merge-mode choice no longer changes the push contract; either way the Refinery pushes to upstream after the local merge step. Existing convoys keep whatever merge mode they were created with.
+4. **GitHub remote push (`origin`) — the actual gate.** Untouched by this ADR and unchanged in spirit. `git push origin experimental-sfu` (or any branch to the GitHub remote) requires explicit per-push approval from the overseer, no exceptions. This is the only push that leaves the local environment and is therefore the only one subject to the manual-approval rule. The Claude Code auto-mode classifier is configured to block `git push origin` without confirmation; that behaviour is correct and load-bearing.
+5. **Per-phase review path.** If pre-merge review of a polecat's work is desired before it advances `experimental-sfu` on the user's clone, the review happens against the polecat's branch in the rig's bare repo (`rig-ops/polecat/<name>/<bead>@…` or the equivalent ref), NOT by intercepting the rig-to-clone push. This keeps the convoy daemon unblocked while preserving the user's ability to inspect work in flight.
 
 ## Consequences
 
 **Pro:**
-- The Refinery can never silently land polecat work into the user's clone, eliminating the bootstrap-observed wedge.
-- The "local-only, manually approved" contract is enforceable in code (convoy default) and in habit (the manual `git fetch rig` step).
-- No need to configure `receive.denyCurrentBranch updateInstead` in the user's clone (which would weaken the gate by auto-applying changes when the working tree is clean).
+- Matches observed system behaviour — no surprise gap between contract and reality.
+- The convoy daemon advances without per-phase human gating, which was the user's explicit direction during the 2026-05-16 Track 2 launch.
+- The manual-approval rule is concentrated at the one place that matters (the GitHub `origin` push), which is easier to enforce and easier to audit.
+- No need for the user to run `git fetch rig && git merge --ff-only rig/experimental-sfu` after every phase. The 2026-05-15 revision's main "Con" (easy to forget) is eliminated.
 
 **Con:**
-- Users must remember to `git fetch rig && git merge --ff-only rig/experimental-sfu` after each phase close. Easy to forget. Mitigation: SCALE-UP.md's "Convoy launch protocol" gains a step "fetch + merge from rig before materialising the next phase."
-- Wave-to-wave dependencies inside a phase still work fine because polecats clone from `/gt/videocall/.repo.git`, not from `/mnt/llms/videocall`. So polecat N+1 sees polecat N's commit immediately after Refinery merges.
-- Cross-phase: P1 polecats see P0 polecats' work in the rig's bare repo, **not** in the user's clone. This is fine as long as the materialiser-script-generated beads reference paths and file states from the rig perspective, not from the user's clone.
+- The user's local clone's `experimental-sfu` advances without per-push review on their machine. Mitigation: pre-merge review can be done against the polecat's branch in the rig bare repo; post-merge review is `git log experimental-sfu` on the user's clone before any `git push origin`.
+- If the user has uncommitted changes in `/mnt/llms/videocall/`, the Refinery's push will be **refused** by `updateInstead` (this is the safety net built into the setting). The push attempt becomes a wedge until the working tree is clean. See Operational hygiene.
+- A misbehaving polecat could land bad work on the user's clone before the user notices. Mitigation: Refinery's CI gates are the primary line of defence; the user's `git push origin` review is the secondary one. If a polecat lands bad code on `experimental-sfu`, it stays in `/mnt/llms/videocall/` but never reaches GitHub without explicit approval.
+
+## Operational hygiene
+
+- Keep `/mnt/llms/videocall/` working tree **clean** when convoys are running. Stash or commit local edits before launching a wave. If `updateInstead` rejects a push because the index isn't clean, the symptom is a stalled MR in the Refinery queue.
+- If a Refinery push wedges, check `git status` on `/mnt/llms/videocall/` first; the most likely cause is a dirty working tree on the upstream.
+- Verify `receive.denyCurrentBranch=updateInstead` on any new rig's upstream after `gt rig add` finishes. One-liner: `git -C <upstream> config receive.denyCurrentBranch` should print `updateInstead`.
 
 ## Implementation
 
-- [ ] (Documentation) `SCALE-UP.md` gains a "Convoy launch protocol" subsection mentioning the `git fetch rig` step. *(done in S0)*
-- [ ] (Manifest) `convoy-manifest.yaml` documents the merge strategy default near the top.
-- [ ] (Default) Add `default_merge: local` field to the manifest schema; have `materialize.py` set this on convoy creation when `gt convoy create` supports a flag (TBD — check `gt convoy create --help`).
-- [ ] (Convoy P0 retro) The existing P0 convoy `hq-cv-i4w2x` was launched with the default (merge=mr). Update it via `gt convoy set` (or recreate) to use `merge=local`. Not blocking; the merge queue entry is harmless.
+- [x] `gt rig add` already configures `receive.denyCurrentBranch=updateInstead` on the upstream at rig-creation time (verified for `videocall` and `videocall_ops` 2026-05-16).
+- [x] Refinery's push-to-upstream behaviour matches this ADR (observed during videocall_ops Track 2 launch, 2026-05-16, with obsidian's vco-ow8.1).
+- [ ] (Documentation) Update `PLAN.md` "Standing guardrails" to clarify that the local-only-push rule applies to `git push origin` (GitHub), not the rig-to-clone hop. *(done alongside this ADR revision)*
+- [ ] (Documentation) Update `PLAN.md` step B7's "Refinery merges into `experimental-sfu` locally; **no push**" line to reflect the auto-push contract. *(done alongside this ADR revision)*
+- [ ] (Documentation) `convoy-manifest.yaml`'s `s0-4-refinery-push-adr` summary still describes the old contract. Either rewrite that summary or leave it as a frozen historical record of what the bead's *original* deliverable said; this ADR (the deliverable file itself) is the authoritative current contract. *(left frozen as historical record, since the bead is closed)*
 
 ## Rejected alternatives
 
-**Alternative A: `git config receive.denyCurrentBranch updateInstead` on the user's clone.** Pro: Refinery can push without rejection, working tree updates automatically. Con: weakens the manual-approval gate; the user's clone changes without their action. **Rejected** as too automatic.
+**Alternative A: "Manual-fetch" model — set `receive.denyCurrentBranch=refuse` on the user's clone; user runs `git fetch rig && git merge --ff-only rig/experimental-sfu` after each phase.** Pro: explicit per-phase review gate on the user's local branch. Con: the user has been happy with auto-merge during multi-phase convoy runs; adds a step that's easy to forget; doesn't actually buy more safety than reviewing before `git push origin`, since both endpoints are local. **Rejected** as ceremony without commensurate benefit. (This was the 2026-05-15 revision's Decision; superseded here.)
 
-**Alternative B: Make the rig's upstream a separate bare repo (e.g., `/mnt/llms/videocall.git`) and let the user pull from there.** Pro: clean separation; Refinery can push freely; the user's working clone is unaffected. Con: adds a third clone (user's working clone + rig's bare + new exchange bare); operational complexity. **Rejected** as overkill.
+**Alternative B: Make the rig's upstream a separate bare repo (e.g., `/mnt/llms/videocall.git`) and let the user pull from there.** Pro: clean separation; Refinery can push freely; the user's working clone is unaffected. Con: adds a third clone (user's working clone + rig's bare + new exchange bare); operational complexity; deviates from the `gt rig add` convention used by every other rig in the town. **Rejected** as over-engineering for a single-user local setup.
 
-**Alternative C: Refinery pushes to a `pending/experimental-sfu` branch on the user's clone, leaves `experimental-sfu` untouched.** Pro: review happens by `git diff experimental-sfu..pending/experimental-sfu`. Con: requires custom Refinery behaviour; the `rig` remote already does this naturally without code changes. **Rejected** as redundant with Alternative B's logic, but using a different mechanism.
+**Alternative C: Refinery pushes to a `pending/experimental-sfu` branch on the user's clone, leaves `experimental-sfu` untouched.** Pro: review happens by `git diff experimental-sfu..pending/experimental-sfu`. Con: requires custom Refinery behaviour; the user's actual need is post-merge review before GitHub push, which is satisfied by reading `git log experimental-sfu` directly. **Rejected** as solving the wrong problem.
 
 ## Status
 
-Accepted 2026-05-15. Applies to all convoys from S0 forward.
+Accepted (revised) 2026-05-16. Applies to all convoys from this point forward. The 2026-05-15 revision (which mandated manual `git fetch rig`) is **superseded** but preserved in git history; do not resurrect the manual-fetch contract without a new ADR.

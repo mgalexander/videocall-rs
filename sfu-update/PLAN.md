@@ -31,7 +31,7 @@ The full DAG is meant to run under gastown's daemon, not be driven step-by-step 
 
 ### Standing guardrails (in force for every bootstrap step and the SFU phases)
 - **Disk:** before any container restart or bead launch, run `df -h /` and `docker system df`. Soft alert at 80%, halt at 85% — escalate to user, don't continue.
-- **Local-only:** no `git push` without explicit user approval (one approval per push). Polecat work happens in **git worktrees** rooted under `/mnt/llms/videocall/.worktrees/` (or rig convention). Merges land on `experimental-sfu` locally first; promotion to remote `main` is gated on user say-so.
+- **Local-only:** no `git push origin` (to GitHub) without explicit user approval, one approval per push. Polecat work happens in **git worktrees** under the rig convention; the Refinery merges polecat branches into `experimental-sfu` in the rig's bare repo and pushes onward to the user's local clone (`/mnt/llms/videocall/`) via `receive.denyCurrentBranch=updateInstead` — that rig-to-clone push is a local operation and is NOT subject to the manual-approval rule. The gate is the GitHub `origin` push only. See [ADR-0006](adr/0006-refinery-push-contract.md).
 - **Container caution:** `gastown-sandbox` has been up ~2 days hosting `lps-` and `imap-` rigs. Don't restart it unless the mount situation requires it; prefer hot-mount or already-present paths.
 
 ### B0 — Verify sandbox + mount situation (read-only)
@@ -82,7 +82,7 @@ This is the proof loop. Things to observe and log to `ops-log.md`:
 - Polecat creates worktree under `/mnt/llms/videocall/.worktrees/p0-1-<polecat-id>/`.
 - Polecat performs p0-1's scope: scaffold `sfu-update/` README + adr/ subtree + capacity-model.md/packet-diagrams.md/test-matrix.md skeletons. (Note: the polecat is *expanding* on what I already wrote — placeholder files become real files.)
 - Polecat commits to the worktree, opens a merge request through the Refinery.
-- Refinery merges into `experimental-sfu` locally; **no push**.
+- Refinery merges into `experimental-sfu` in the rig's bare repo, then pushes to the user's local clone via `updateInstead` (no GitHub push). See [ADR-0006](adr/0006-refinery-push-contract.md).
 - Polecat closes p0-1 via `bd update p0-1 --status done`.
 - Daemon's event-driven feeder detects the close and slings Wave 2 (p0-2, p0-11). Stop here — confirm Wave 2 dispatch is observed, then **pause**.
 

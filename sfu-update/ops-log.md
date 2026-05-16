@@ -187,3 +187,19 @@ Sling chain to obsidian was the same dance as the prior bootstrap:
 - Verified: obsidian's pane shows `gt prime --hook` succeeded, bead now `HOOKED` with `Assignee: videocall_ops/polecats/obsidian`, Claude is thinking.
 
 This is the validation that the cross-rig pattern works end-to-end. Subsequent ops beads (Wave 2: vco-ow8.2 + vco-ow8.3) will auto-dispatch via the daemon's event-driven feeder when vco-ow8.1 closes. The polecat pool size is 1, so Wave 2's two beads will serialize on obsidian unless we grow the pool — a non-blocking concern for the demo.
+
+## 2026-05-16 ADR-0006 revised (push contract reconciled with reality) — vc-c4e.24
+
+Observation during Track 2 launch: obsidian's vco-ow8.1 commit landed at HEAD of `/mnt/llms/videocall/` on `experimental-sfu` automatically after Refinery merge. Investigation: `git -C /mnt/llms/videocall config receive.denycurrentbranch` returns `updateInstead` — configured by `gt rig add` at rig-creation time for both `videocall` and `videocall_ops` rigs. The Refinery's normal push pattern therefore advances both the upstream branch ref AND the user's working tree in lockstep (provided the working tree is clean).
+
+This contradicted ADR-0006 as written (2026-05-15 revision), which mandated `--merge=local` convoys and manual `git fetch rig && git merge --ff-only rig/experimental-sfu` after each phase.
+
+Decision (overseer): adopt the observed auto-merge behaviour. The user explicitly directed obsidian's work to move forward without pause; the manual-approval rule's intent applies to `git push origin` (GitHub) only, not to the local rig-to-clone hop.
+
+Changes landed in this commit:
+- `sfu-update/adr/0006-refinery-push-contract.md` rewritten. Status now "Accepted (revised 2026-05-16); supersedes the 2026-05-15 revision". Decision flipped: Refinery pushes to upstream via `updateInstead`; gate moves to `git push origin`. The 2026-05-15 "manual-fetch" model is preserved as Rejected Alternative A.
+- `sfu-update/PLAN.md` "Standing guardrails" Local-only line clarified — applies to `git push origin` only.
+- `sfu-update/PLAN.md` step B7 push-behaviour line updated to match the auto-push contract.
+- `convoy-manifest.yaml` left untouched (the s0-4 bead's summary describes the original deliverable; the ADR itself is now authoritative).
+
+Operational hygiene captured in the new ADR: keep the user's clone's working tree clean while convoys are running, else `updateInstead` will refuse the push and wedge the Refinery's queue. First failure-mode check on a stalled MR is now `git status` on `/mnt/llms/videocall/`.
