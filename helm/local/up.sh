@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 #
-# helm/local/up.sh — v2 local k3d cluster bringup for the videocall stack.
+# helm/local/up.sh — v3 local k3d cluster bringup for the videocall stack.
 #
-# Scope (v2):
+# Scope (v3):
 #   1. Create the k3d cluster (idempotent).
 #   2. Install ingress-nginx (NodePort) into namespace ingress-nginx.
 #   3. Install cert-manager (with CRDs) into namespace cert-manager.
 #   4. Apply a self-signed ClusterIssuer (`local-selfsigned`) for
 #      *.videocall.local certs.
-#   5. Create `nats-credentials` + `postgres-credentials` Secrets from
-#      helm/local/.env (auto-bootstrapped from .env.example if missing).
+#   5. Create `nats-credentials` + `postgres-credentials` + `jwt-secret`
+#      Secrets from helm/local/.env (auto-bootstrapped from .env.example
+#      if missing).
 #   6. Install NATS via helm/global/local/nats (single replica, auth on).
 #   7. Install postgres via helm/postgres + values-local.yaml.
+#   8. Build + push + k3d-import meeting-api and SFU images from
+#      Dockerfile.meeting-api / Dockerfile.actix (tags: :dev).
+#   9. Apply the WebTransport TLS Certificate (cert-manager) and wait
+#      for the resulting Secret to be Ready.
+#  10. helm install meeting-api + rustlemania-{websocket,webtransport}
+#      with their values-local.yaml overlays.
+#  11. Apply the local-only /healthz Ingress for the WebTransport pod.
 #
-# Out of scope (later beads): meeting-api, SFU, ingresses for app services.
+# Out of scope (later beads): real DNS / external-DNS, dioxus-ui deploy.
 # See helm/local/README.md.
 #
 # Idempotent: re-running is a no-op. Uses `helm upgrade --install` and
@@ -34,10 +42,13 @@ NODE_READY_TIMEOUT="${NODE_READY_TIMEOUT:-120}"
 # How long (seconds) to wait for deployments (ingress-nginx, cert-manager).
 DEPLOY_READY_TIMEOUT="${DEPLOY_READY_TIMEOUT:-180}"
 
-# Resolve the helm/ directory relative to this script so the script can be
-# invoked from any cwd.
+# Resolve the helm/ directory and repo root relative to this script so
+# the script can be invoked from any cwd. REPO_ROOT is the docker build
+# context for the meeting-api and SFU images (their Dockerfiles live at
+# the repo root and `COPY . /app` the whole tree).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${HELM_DIR}/.." && pwd)"
 
 LOG_PREFIX="[up.sh]"
 
@@ -77,11 +88,22 @@ if k3d cluster list "${CLUSTER_NAME}" >/dev/null 2>&1; then
     log "cluster '${CLUSTER_NAME}' already up — skipping create"
 else
     log "creating k3d cluster '${CLUSTER_NAME}' (1 server + 2 agents, registry on localhost:${REGISTRY_PORT}, traefik disabled)"
+    # Port maps publish the ingress-nginx NodePorts (30080/30443 — see
+    # helm/ingress-nginx/values-local.yaml) onto the host so the
+    # /etc/hosts → 127.0.0.1 → cluster path works end-to-end. Without
+    # these, `curl https://transport.videocall.local/healthz` would
+    # only reach the ingress from inside a pod.
+    #
+    # Existing clusters created before this change do NOT get the port
+    # maps retroactively — recreate with helm/local/down.sh + up.sh to
+    # pick them up.
     k3d cluster create "${CLUSTER_NAME}" \
         --servers 1 \
         --agents 2 \
         --registry-create "${REGISTRY_NAME}:0.0.0.0:${REGISTRY_PORT}" \
         --k3s-arg "--disable=traefik@server:0" \
+        --port "30080:30080@loadbalancer" \
+        --port "30443:30443@loadbalancer" \
         --wait
     log "cluster '${CLUSTER_NAME}' created"
 fi
@@ -211,6 +233,7 @@ set -a; . "${ENV_FILE}"; set +a
 : "${POSTGRES_USER:?POSTGRES_USER not set in helm/local/.env}"
 : "${POSTGRES_DB:?POSTGRES_DB not set in helm/local/.env}"
 : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set in helm/local/.env}"
+: "${JWT_SECRET:?JWT_SECRET not set in helm/local/.env (add it; see .env.example)}"
 
 apply_secret() {
     # apply_secret <name> <namespace> <key1=val1> [<key2=val2> ...]
@@ -242,6 +265,14 @@ log "applying postgres-credentials Secret to namespace 'default'"
 apply_secret postgres-credentials default \
     "postgres-password=${POSTGRES_PASSWORD}" \
     "password=${POSTGRES_PASSWORD}"
+
+log "applying jwt-secret Secret to namespace 'default'"
+# Consumed by meeting-api (signs room access tokens) and
+# rustlemania-{websocket,webtransport} (verify them). The default
+# values.yaml on all three charts references this Secret name with
+# key `secret`.
+apply_secret jwt-secret default \
+    "secret=${JWT_SECRET}"
 
 # ----- Phase: NATS ------------------------------------------------------------
 log "installing NATS via helm/global/local/nats"
@@ -279,6 +310,118 @@ log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the postgres StatefulSet to beco
 # The bitnami chart names the primary StatefulSet `<release>-postgresql`.
 kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/postgres-postgresql \
     --timeout="${DEPLOY_READY_TIMEOUT}s"
+
+# ----- Phase: build + push + k3d-import app images ----------------------------
+#
+# Two images, both built from the repo-root Dockerfiles with the whole
+# tree as build context. Tags are :dev — explicit, not :latest, so the
+# in-cluster image reference is stable and registry caches don't serve
+# stale builds.
+#
+# `docker push` makes the image available via the registry running at
+# localhost:5000 (k3d-managed container `videocall-local-registry`).
+# `k3d image import` side-loads the image directly into every k3s node,
+# which is the fast path for warm-restart workflows — the kubelets
+# never need to talk to the registry.
+LOCAL_REGISTRY="localhost:${REGISTRY_PORT}"
+MEETING_API_IMAGE="${LOCAL_REGISTRY}/videocall-meeting-api:dev"
+MEDIA_SERVER_IMAGE="${LOCAL_REGISTRY}/videocall-media-server:dev"
+
+# Build metadata baked into the image labels (matches the convention in
+# the production CI: GIT_SHA / GIT_BRANCH / BUILD_TIMESTAMP).
+GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GIT_BRANCH="$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+build_push_import() {
+    # build_push_import <image-tag> <dockerfile-relpath>
+    local tag="$1" dockerfile="$2"
+    log "building ${tag} from ${dockerfile} (context: ${REPO_ROOT})"
+    docker build \
+        --tag "${tag}" \
+        --file "${REPO_ROOT}/${dockerfile}" \
+        --build-arg "GIT_SHA=${GIT_SHA}" \
+        --build-arg "GIT_BRANCH=${GIT_BRANCH}" \
+        --build-arg "BUILD_TIMESTAMP=${BUILD_TIMESTAMP}" \
+        "${REPO_ROOT}"
+    log "pushing ${tag} to local registry"
+    docker push "${tag}"
+    log "k3d image import ${tag} -> cluster '${CLUSTER_NAME}'"
+    k3d image import "${tag}" --cluster "${CLUSTER_NAME}"
+}
+
+build_push_import "${MEETING_API_IMAGE}" "Dockerfile.meeting-api"
+build_push_import "${MEDIA_SERVER_IMAGE}" "Dockerfile.actix"
+
+# ----- Phase: WebTransport TLS Certificate ------------------------------------
+#
+# The webtransport pod reads its TLS material from a Secret mounted at
+# /certs (see helm/rustlemania-webtransport/values-local.yaml,
+# tlsSecret: transport-videocall-local-tls). Provision it via
+# cert-manager BEFORE the helm install so the pod starts with the
+# Secret in place.
+log "applying WebTransport TLS Certificate (cert-manager)"
+kubectl --context "${KUBECONTEXT}" apply \
+    -f "${SCRIPT_DIR}/manifests/webtransport-certificate.yaml"
+
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for Certificate/transport-videocall-local to be Ready"
+kubectl --context "${KUBECONTEXT}" -n default wait \
+    --for=condition=Ready \
+    --timeout="${DEPLOY_READY_TIMEOUT}s" \
+    certificate/transport-videocall-local
+
+# ----- Phase: meeting-api -----------------------------------------------------
+# Compose the postgres URL from helm/local/.env and stash it in the
+# `meeting-api-db` Secret (key: url). values-local.yaml references this
+# via secretKeyRef, so the helm install carries no credential material
+# on the command line and the env list order is no longer load-bearing.
+log "applying meeting-api-db Secret to namespace 'default'"
+DB_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-postgresql:5432/${POSTGRES_DB}?sslmode=disable"
+apply_secret meeting-api-db default \
+    "url=${DB_URL}"
+
+log "installing meeting-api via helm/meeting-api (values-local overlay)"
+helm --kube-context "${KUBECONTEXT}" upgrade --install meeting-api \
+    "${HELM_DIR}/meeting-api" \
+    --namespace default \
+    --values "${HELM_DIR}/meeting-api/values-local.yaml"
+
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the meeting-api Deployment to roll out"
+kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/meeting-api \
+    --timeout="${DEPLOY_READY_TIMEOUT}s"
+
+# ----- Phase: rustlemania-websocket -------------------------------------------
+log "installing rustlemania-websocket via helm/rustlemania-websocket (values-local overlay)"
+helm --kube-context "${KUBECONTEXT}" upgrade --install rustlemania-websocket \
+    "${HELM_DIR}/rustlemania-websocket" \
+    --namespace default \
+    --values "${HELM_DIR}/rustlemania-websocket/values-local.yaml"
+
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-websocket Deployment to roll out"
+kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/rustlemania-websocket \
+    --timeout="${DEPLOY_READY_TIMEOUT}s"
+
+# ----- Phase: rustlemania-webtransport ----------------------------------------
+log "installing rustlemania-webtransport via helm/rustlemania-webtransport (values-local overlay)"
+helm --kube-context "${KUBECONTEXT}" upgrade --install rustlemania-webtransport \
+    "${HELM_DIR}/rustlemania-webtransport" \
+    --namespace default \
+    --values "${HELM_DIR}/rustlemania-webtransport/values-local.yaml"
+
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-webtransport Deployment to roll out"
+kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/rustlemania-webtransport \
+    --timeout="${DEPLOY_READY_TIMEOUT}s"
+
+# ----- Phase: WebTransport /healthz Ingress -----------------------------------
+#
+# The webtransport chart's `loadbalancer.yaml` template hardcodes
+# `type: LoadBalancer` (no service.type knob), so under k3d (klipper LB
+# disabled) the LB sits Pending. The Service still has a ClusterIP and
+# endpoints though, so we route /healthz through the nginx Ingress
+# controller at transport.videocall.local:30443.
+log "applying WebTransport /healthz Ingress (transport.videocall.local)"
+kubectl --context "${KUBECONTEXT}" apply \
+    -f "${SCRIPT_DIR}/manifests/webtransport-health-ingress.yaml"
 
 # ----- Emit machine-readable handles for downstream scripts -------------------
 log "cluster ready"

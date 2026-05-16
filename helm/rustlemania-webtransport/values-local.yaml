@@ -1,0 +1,89 @@
+# Local k3d overlay for helm/rustlemania-webtransport.
+#
+# Differences from helm/rustlemania-webtransport/values.yaml (production):
+#   - image points at the local k3d registry (localhost:5000) with the
+#     :dev tag built by helm/local/up.sh from Dockerfile.actix.
+#   - pullPolicy: IfNotPresent (k3d image import side-load).
+#   - tlsSecret references a local secret name; cert-manager provisions
+#     it via the Certificate resource at
+#     helm/local/manifests/webtransport-certificate.yaml (applied by
+#     helm/local/up.sh against the `local-selfsigned` ClusterIssuer).
+#   - loadBalancerAnnotations is zeroed: the chart's loadbalancer.yaml
+#     hardcodes `type: LoadBalancer` (no service.type knob), so we
+#     can't switch to NodePort from values alone. The LB will sit
+#     Pending under k3d (klipper LB is disabled in up.sh's cluster
+#     spec). That's fine for the local inner-loop: the QUIC port is
+#     not exposed externally; the `/healthz` health endpoint is
+#     reached via a separate Ingress manifest
+#     (helm/local/manifests/webtransport-health-ingress.yaml) at
+#     transport.videocall.local.
+#   - env: UI_ENDPOINT/UI host references trimmed for local; NATS
+#     wiring identical to production.
+
+image:
+  repository: localhost:5000/videocall-media-server
+  pullPolicy: IfNotPresent
+  tag: dev
+
+# Cert-manager provisions this Secret from
+# helm/local/manifests/webtransport-certificate.yaml. The Deployment
+# mounts /certs from this Secret (optional: true in the chart, so a
+# missing Secret still lets the pod start, though the QUIC listener
+# will fail until the cert is in place).
+tlsSecret: transport-videocall-local-tls
+
+command: ['webtransport_server']
+args: []
+
+env:
+  - name: RUST_LOG
+    value: debug,quinn=warn
+  - name: NATS_URL
+    value: nats:4222
+  - name: LISTEN_URL
+    value: 0.0.0.0:443
+  - name: HEALTH_LISTEN_URL
+    value: 0.0.0.0:444
+  - name: CERT_PATH
+    value: /certs/tls.crt
+  - name: KEY_PATH
+    value: /certs/tls.key
+  - name: TOKIO_WORKER_THREADS
+    value: "1"
+  - name: TOKIO_BLOCKING_THREADS
+    value: "2"
+  - name: JWT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: jwt-secret
+        key: secret
+  - name: NATS_USER
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: user
+        optional: true
+  - name: NATS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: password
+        optional: true
+  - name: NATS_TLS
+    value: "false"
+  - name: NATS_TLS_CA
+    value: ""
+
+# Drop the DigitalOcean LB annotations from the production values.yaml.
+# Helm merges maps deeply, so we have to null each key explicitly — an
+# empty map ({}) would leave the production keys intact.
+loadBalancerAnnotations:
+  external-dns.alpha.kubernetes.io/hostname: null
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: null
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: null
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: null
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: null
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: null
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: null
+  service.beta.kubernetes.io/do-loadbalancer-size-unit: null
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: null

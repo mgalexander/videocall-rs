@@ -30,7 +30,7 @@ The local cluster is a [`k3d`](https://k3d.io) cluster named
   (see below), to match production
 - Kubeconfig context: **`k3d-videocall-local`**
 
-## What `up.sh` installs (v1)
+## What `up.sh` installs (v3)
 
 After cluster bringup, `up.sh` deploys the cluster-wide platform layer:
 
@@ -68,6 +68,49 @@ After cluster bringup, `up.sh` deploys the cluster-wide platform layer:
    with the local overlay `helm/postgres/values-local.yaml`. Standalone,
    ephemeral storage (no PVC), credentials sourced from the
    `postgres-credentials` Secret.
+7. **App images** — `Dockerfile.meeting-api` and `Dockerfile.actix` are
+   built at the repo root, tagged `:dev`, pushed to the local registry
+   (`localhost:5000`), and side-loaded into the cluster via `k3d image
+   import`. Tags are explicit (no `:latest`) so warm-restart workflows
+   pick up the exact image the developer just built.
+8. **`jwt-secret`** (namespace `default`) — created from `JWT_SECRET`
+   in `helm/local/.env`. Consumed by meeting-api (signs room access
+   tokens) and the SFU pods (verify them). Same Secret name/key as
+   production.
+9. **`transport-videocall-local` Certificate** — cert-manager issues
+   the TLS material for the WebTransport QUIC listener (mounted at
+   `/certs` in the pod). Backed by the `local-selfsigned` ClusterIssuer.
+   Applied from `helm/local/manifests/webtransport-certificate.yaml`.
+10. **meeting-api + rustlemania-{websocket,webtransport}** — installed
+    from their respective Helm charts with each chart's
+    `values-local.yaml` overlay. The overlays point `image.repository`
+    at the local registry, set `pullPolicy: IfNotPresent`, and target
+    `*.videocall.local` hostnames with the `local-selfsigned`
+    ClusterIssuer (`cert-manager.io/cluster-issuer` annotation — NOT
+    `cert-manager.io/issuer`).
+11. **WebTransport `/healthz` Ingress** — applied from
+    `helm/local/manifests/webtransport-health-ingress.yaml`. Routes
+    `https://transport.videocall.local/healthz` through nginx to the
+    chart's `-lb` Service on TCP/444. Local-only — production hits
+    the same endpoint via the DigitalOcean LB on the same port.
+
+## `/etc/hosts` requirement
+
+The cluster's ingress controller publishes HTTPS on host port `30443`
+(see `helm/ingress-nginx/values-local.yaml` for the NodePort and the
+`--port 30443:30443@loadbalancer` mapping in `up.sh`'s k3d cluster
+create). To reach the app hostnames from your browser/curl, add a
+single line to `/etc/hosts`:
+
+```
+127.0.0.1 api.videocall.local ws.videocall.local transport.videocall.local
+```
+
+`validate-app.sh` and a curl from the host both use port `30443`
+(e.g. `https://transport.videocall.local:30443/healthz`). If you want
+to drop the `:30443` for browser convenience, run a privileged
+reverse proxy that forwards 443 → 30443 — out of scope for `up.sh`,
+which deliberately avoids requiring `sudo`.
 
 ## Conventions for subsequent scripts
 
@@ -128,6 +171,10 @@ kubectl --context k3d-videocall-local get pods -n default
 # Verify NATS auth is actually enforced (probes with + without creds).
 ./helm/local/validate-nats.sh
 
+# Verify the meeting-api + SFU install: /healthz=200 on the WebTransport
+# ingress AND each app's logs show `auth=on` from nats_connect.
+./helm/local/validate-app.sh
+
 # Hibernate: stop the node containers but keep cluster state on disk.
 # Use this to free CPU/RAM between coding sessions without losing installed
 # components or images you've pushed to the local registry.
@@ -164,17 +211,24 @@ any are missing. It does **not** auto-install — that's an operator decision.
 
 ## Shipped so far
 
-- `up.sh` v2 — cluster bringup + `ingress-nginx` (NodePort overlay) +
+- `up.sh` v3 — cluster bringup + `ingress-nginx` (NodePort overlay) +
   `cert-manager` + self-signed `ClusterIssuer` + NATS (with auth) +
-  postgres (`vco-ow8.1`, `vco-ow8.3`, `vco-ow8.4`)
+  postgres + `meeting-api` + SFU pods (websocket + webtransport) with
+  local image builds, `jwt-secret`, and the WebTransport `/healthz`
+  ingress (`vco-ow8.1`, `vco-ow8.3`, `vco-ow8.4`, `vco-ow8.5`)
 - `down.sh` / `pause.sh` / `resume.sh` — cluster lifecycle (`vco-ow8.2`)
 - `validate-nats.sh` — local equivalent of
   `sfu-update/audits/nats-auth-phase-d-validate.sh` (`vco-ow8.4`)
+- `validate-app.sh` — `/healthz=200` + per-app `auth=on` check
+  (`vco-ow8.5`)
+- `helm/{meeting-api,rustlemania-websocket,rustlemania-webtransport}/`
+  each gained a `values-local.yaml` overlay (`vco-ow8.5`)
+- `helm/local/manifests/` — local-only `Certificate` for the
+  WebTransport TLS Secret and an `Ingress` for the WebTransport
+  `/healthz` health endpoint (`vco-ow8.5`)
 
 ## Out of scope for now
 
-The following ship in later beads (`vco-ow8.5`, ...):
-
-- `meeting-api` deploy (`vco-ow8.5`)
-- SFU pod deploy (`vco-ow8.5`)
 - Real DNS / external-DNS wiring
+- `dioxus-ui` deploy
+- Privileged 443 → 30443 reverse proxy (drops the `:30443` from URLs)
