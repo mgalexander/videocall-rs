@@ -12,6 +12,16 @@
 # populates `postgres-password` and `password` from the same Postgres
 # password value in .env so a single rotation point is enough for local.
 postgresql:
+  # The bitnami postgresql 12.5.7 chart pins to
+  # `bitnami/postgresql:15.3.0-debian-11-r7`, which Bitnami unpublished as
+  # part of their 2025 image-policy change (old tags moved to the
+  # `bitnamilegacy/` namespace; only `latest` stays on `bitnami/`).
+  # Pulling the chart's default tag returns 404 from Docker Hub. Pin to
+  # the same tag in the legacy namespace so behaviour stays identical.
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/postgresql
+    tag: 15.3.0-debian-11-r7
   auth:
     existingSecret: postgres-credentials
     username: rustlemania
