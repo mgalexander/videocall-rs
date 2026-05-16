@@ -364,3 +364,90 @@ beads:
       Commit message: `feat(ops): helm/postgres on official postgres:16-alpine (vco-9)`.
     parent_epic: ops-epic
     blocked_by: []
+
+  - key: vco-10-postgres-redeploy
+    type: task
+    title: "Redeploy postgres on the local cluster (drop bitnamilegacy stopgap, install rewritten chart)"
+    summary: |
+      The chart rewrite (vco-9-postgres-chart-rewrite, commit 642d4ba)
+      is on disk but NOT yet deployed to the running k3d cluster. The
+      cluster's `postgres` Helm release is still on the bitnamilegacy
+      stopgap (commit 7791bac, bitnamilegacy/postgresql:15.3.0-debian-11-r7).
+      This bead does the swap.
+
+      ## Timing — wait for a natural pause
+
+      DO NOT pick this bead up immediately. It involves a ~60s data-
+      plane interruption (postgres drops, meeting-api loses its DB
+      connection, both come back). Per sfu-update/PLAN.md "Postgres
+      redeploy timing", run when BOTH:
+
+        1. No polecat is currently HOOKED to a bead that touches
+           meeting-api or postgres. Doc/proto/UI beads are fine.
+        2. No active "phase validation" run is in flight (i.e. the ops
+           rig isn't mid-Track-3 against a closed dev phase).
+
+      The cleanest trigger is: all ops + dev polecats simultaneously
+      idle (hooks empty across both rigs). That's the green light.
+
+      ## Procedure (run from /mnt/llms/videocall on the host)
+
+      ```bash
+      # 1. Confirm working tree clean (Refinery's updateInstead push
+      #    contract requires it — see ADR-0006 revised 2026-05-16):
+      git -C /mnt/llms/videocall status --short
+
+      # 2. Uninstall the bitnamilegacy Helm release (drops the old
+      #    StatefulSet + pod):
+      helm --kube-context k3d-videocall-local uninstall postgres -n default
+
+      # 3. Re-run up.sh; cluster + ingress + cert-manager + NATS skip
+      #    (idempotent); only the postgres install actually runs:
+      bash helm/local/up.sh
+
+      # 4. Verify:
+      kubectl --context k3d-videocall-local get pods -n default
+      kubectl --context k3d-videocall-local exec -it postgres-postgresql-0 \
+          -n default -- psql -U rustlemania -d rustlemania -c '\dt'
+      kubectl --context k3d-videocall-local logs -n default \
+          deploy/meeting-api --tail=30 | grep -iE "connection|database"
+      ```
+
+      Expected outcomes:
+        - `postgres-postgresql-0` pod Ready within 60s, image is now
+          `docker.io/postgres:16-alpine` (not bitnamilegacy/*).
+        - `psql` connects with the `rustlemania` user; `\dt` returns
+          a prompt (db reachable, auth works).
+        - meeting-api pod flaps once during the swap, then reconnects;
+          `kubectl logs` shows no lingering DATABASE_URL errors.
+
+      ## Watch-for / known sharp edges
+
+      - If `helm uninstall` hangs: usually a StatefulSet PVC finalizer.
+        But persistence is OFF in values-local.yaml, so there's no PVC.
+        Escape hatch: `kubectl delete statefulset postgres-postgresql
+        -n default --force`.
+      - meeting-api's `meeting-api-db` Secret is unchanged (host, port,
+        credentials all identical). The pod just needs DNS re-resolve.
+      - If the working tree is dirty when this runs and another polecat
+        lands work mid-redeploy, the Refinery's `updateInstead` push
+        will be rejected and stack up in the merge queue. Recovery:
+        clean the tree, then `gt mq retry` (or wait for daemon retry).
+
+      ## Owning rig
+
+      `videocall_ops`. Sling via `sfu-update/scripts/gt-sling-attached.sh`
+      to whichever ops polecat is idle when the pause window opens.
+
+      ## Out of scope
+
+      Schema migrations, data migrations, pg_dump/restore. Local
+      persistence is OFF, so there's no data to preserve. For production
+      a `pg_dump` → re-install → `pg_restore` would be needed; that's a
+      separate consideration when we model a real production rig with
+      `persistence.enabled=true`.
+
+      Commit message on close: `chore(ops): redeploy postgres on local
+      cluster with official postgres:16-alpine chart (vco-10)`.
+    parent_epic: ops-epic
+    blocked_by: [vco-9-postgres-chart-rewrite]
