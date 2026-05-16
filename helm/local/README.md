@@ -65,16 +65,31 @@ nodes themselves (which is the fast path for restart-in-place workflows).
 
 ## Usage
 
+The full lifecycle is four scripts, all idempotent (re-running them is safe):
+
 ```bash
-# Bring up the cluster. Idempotent — safe to re-run.
+# Bring up the cluster. Creates k3d cluster + local registry.
 ./helm/local/up.sh
 
 # Verify nodes are healthy.
 kubectl --context k3d-videocall-local get nodes
+
+# Hibernate: stop the node containers but keep cluster state on disk.
+# Use this to free CPU/RAM between coding sessions without losing installed
+# components or images you've pushed to the local registry.
+./helm/local/pause.sh
+
+# Wake the cluster back up. Same final stdout shape as up.sh, so anything
+# that consumes up.sh's KUBECONTEXT=/REGISTRY= lines can consume resume.sh too.
+./helm/local/resume.sh
+
+# Full teardown. Deletes the cluster and the local registry container.
+# Next `up.sh` starts from a clean slate.
+./helm/local/down.sh
 ```
 
-`up.sh` prints two machine-readable lines at the end for downstream scripts
-to grep:
+`up.sh` and `resume.sh` both print two machine-readable lines at the end for
+downstream scripts to grep:
 
 ```
 KUBECONTEXT=k3d-videocall-local
@@ -91,16 +106,18 @@ any are missing. It does **not** auto-install — that's an operator decision.
 - `k3d`  — install via `brew install k3d` (macOS) or
   `curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash`
 
+## Shipped so far
+
+- `up.sh` — cluster bringup (`vco-ow8.1`)
+- `down.sh` / `pause.sh` / `resume.sh` — cluster lifecycle (`vco-ow8.2`)
+
 ## Out of scope for v0
 
-This bead (`vco-ow8.1`) is **cluster bringup only**. The following ship in
-later beads (`vco-ow8.2`, `vco-ow8.3`, `vco-ow8.4`, ...):
+The following ship in later beads (`vco-ow8.3`, `vco-ow8.4`, ...):
 
-- `down.sh` / `pause.sh` cluster lifecycle (`vco-ow8.2`)
 - `ingress-nginx` install (`vco-ow8.3`)
 - `cert-manager` install (`vco-ow8.3`)
 - NATS install (`vco-ow8.4`)
 - postgres install (`vco-ow8.4`)
 - `meeting-api` deploy
 - SFU pod deploy
-- `down.sh` / `pause.sh` lifecycle scripts
