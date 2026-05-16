@@ -184,6 +184,14 @@ kubectl --context k3d-videocall-local get pods -n default
 # that consumes up.sh's KUBECONTEXT=/REGISTRY= lines can consume resume.sh too.
 ./helm/local/resume.sh
 
+# Fast inner-loop refresh after a Rust source change: rebuild the affected
+# images, push + k3d-import them, `helm upgrade` the affected releases with
+# a unique per-run tag (so pods actually roll), wait for rollout, and tail
+# logs for ~5s to surface immediate errors. Assumes up.sh has already run.
+./helm/local/redeploy.sh                       # all three (meeting-api + both SFUs)
+./helm/local/redeploy.sh meeting-api           # just meeting-api
+./helm/local/redeploy.sh websocket webtransport  # both SFU releases, single media-server build
+
 # Full teardown. Deletes the cluster and the local registry container.
 # Next `up.sh` starts from a clean slate.
 ./helm/local/down.sh
@@ -217,6 +225,9 @@ any are missing. It does **not** auto-install — that's an operator decision.
   local image builds, `jwt-secret`, and the WebTransport `/healthz`
   ingress (`vco-ow8.1`, `vco-ow8.3`, `vco-ow8.4`, `vco-ow8.5`)
 - `down.sh` / `pause.sh` / `resume.sh` — cluster lifecycle (`vco-ow8.2`)
+- `redeploy.sh` — fast inner-loop image + helm refresh (rebuild changed
+  Rust crates, push + k3d-import, `helm upgrade` with a unique per-run
+  tag, wait for rollout, tail logs ~5s) (`vco-ow8.6`)
 - `validate-nats.sh` — local equivalent of
   `sfu-update/audits/nats-auth-phase-d-validate.sh` (`vco-ow8.4`)
 - `validate-app.sh` — `/healthz=200` + per-app `auth=on` check
