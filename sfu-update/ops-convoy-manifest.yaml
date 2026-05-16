@@ -1,0 +1,188 @@
+# sfu-update/ops-convoy-manifest.yaml
+#
+# Machine-readable DAG for the videocall_ops gastown rig (prefix vco-).
+# Sibling of convoy-manifest.yaml (the dev-rig manifest), per the plan's
+# "Operating model: overseer + dev rig + ops rig" section.
+#
+# Consumed by sfu-update/scripts/materialize-ops.sh, which invokes
+# materialize.py with overridden --manifest / --state / --jsonl args.
+# State (key → bd id mapping) lives at sfu-update/.materialize-state.ops.json.
+#
+# Scope of this manifest: ONLY ops-side work. Code beads live in
+# convoy-manifest.yaml. The two rigs share the same upstream branch
+# (experimental-sfu) but materialise into separate Dolt databases
+# (/gt/videocall/.beads/ vs /gt/videocall_ops/.beads/).
+#
+# Currently materialises: ops umbrella epic + Track 2 (local K8s stack)
+# initial beads. Later phases (per-phase ops validation in Track 3) are
+# added incrementally as each dev phase closes.
+
+prefix: vco
+
+epics:
+  - key: ops-epic
+    type: epic
+    title: "videocall_ops: local K8s stack lifecycle + per-phase validation"
+    summary: |
+      Umbrella tracking issue for the videocall_ops rig. Owns the local
+      k3d cluster bringup/down/redeploy lifecycle, per-phase deployment
+      and integration validation of dev-rig artifacts, and serves as
+      the template for "standing up a totally new small production rig"
+      per the user's stated rationale (sfu-update/PLAN.md "Operating
+      model: overseer + dev rig + ops rig"). Persistent: keeps running
+      while the videocall rig is parked between phases.
+
+      Cross-rig handoff per "Phase sequencing (race avoidance)" in the
+      plan: dev rig closes phase → ops rig deploys + validates → ops
+      mails dev rig "go" → next phase opens.
+
+convoys:
+  - key: T2-local-k8s
+    title: "Track 2 — Local K8s stack (k3d-based) for the SFU"
+    parent_epic: ops-epic
+    summary: |
+      Stand up a small, production-like Kubernetes cluster on this host
+      via k3d, deploy the SFU stack via the existing helm/ charts (with
+      local overlays), and produce the bringup/teardown/redeploy scripts
+      that are reusable for future fresh production clusters.
+    tracks: [vco-1, vco-2, vco-3, vco-4, vco-5, vco-6, vco-7]
+
+beads:
+  - key: vco-1
+    type: feature
+    title: "Author helm/local/up.sh v0 — create k3d cluster with kubectl context"
+    summary: |
+      Author the first piece of the local K8s lifecycle: a focused
+      `helm/local/up.sh` (v0) that does ONLY the cluster bringup.
+      Scope:
+
+        - Verify k3d is installed (binary on PATH); if not, log a clear
+          install hint (`brew install k3d` / curl-install URL) and exit
+          non-zero. Don't auto-install — that's an operator decision.
+        - Create a k3d cluster named "videocall-local" with 1 control
+          plane + 2 worker nodes. Use the local image registry feature
+          (`--registry-create videocall-local-registry:0.0.0.0:5000`)
+          so subsequent beads can `docker push localhost:5000/...` and
+          `k3d image import` for fast inner-loop redeploys.
+        - Disable k3d's bundled traefik ingress (we'll install our own
+          ingress-nginx via helm in a later bead): `--k3s-arg
+          "--disable=traefik@server:0"`.
+        - Wait for `kubectl get nodes` to return 3 Ready nodes.
+        - Print the kubeconfig context name (e.g. `k3d-videocall-local`)
+          so subsequent scripts can target it via KUBECONTEXT.
+        - Idempotent: if the cluster already exists, log "already up"
+          and exit 0.
+
+      ALSO author a minimal `helm/local/README.md` documenting the
+      cluster shape and the convention for the rest of the local stack
+      (later beads land ingress, cert-manager, NATS, postgres,
+      meeting-api, SFU pods). Reference back to sfu-update/PLAN.md
+      "Local deployment stack" for the full scope.
+
+      Out of scope: deploying any application services. That's vco-2+.
+
+      Commit on experimental-sfu via the Refinery's normal merge queue.
+      Commit message: `feat(ops): helm/local/up.sh v0 — k3d cluster bringup`.
+    parent_epic: ops-epic
+    blocked_by: []
+
+  - key: vco-2
+    type: feature
+    title: "Author helm/local/down.sh + pause.sh"
+    summary: |
+      Companion teardown + hibernate scripts:
+        - down.sh: `k3d cluster delete videocall-local`. Removes the
+          local registry too. Idempotent (no-op if cluster absent).
+        - pause.sh: `k3d cluster stop videocall-local`. Keeps state,
+          stops compute. Companion `resume.sh` (or `up.sh --resume`)
+          if not already covered by vco-1's idempotency.
+      Smoke-test up → pause → up-resume → down end-to-end.
+    parent_epic: ops-epic
+    blocked_by: [vco-1]
+
+  - key: vco-3
+    type: feature
+    title: "Install ingress-nginx + cert-manager into the local cluster"
+    summary: |
+      Extend `helm/local/up.sh` (v1) to deploy:
+        - ingress-nginx via the existing `helm/ingress-nginx/` chart
+          with a `values-local.yaml` overlay (NodePort or hostPort, not
+          LoadBalancer — k3d's loadbalancer is shoddy).
+        - cert-manager via `helm/cert-manager/`.
+        - A self-signed ClusterIssuer via `helm/cert-manager-issuer/`
+          for local `*.videocall.local` certificates.
+
+      Validation: `kubectl get pods -n ingress-nginx` shows Ready;
+      `kubectl get clusterissuer` shows the issuer Ready.
+    parent_epic: ops-epic
+    blocked_by: [vco-1]
+
+  - key: vco-4
+    type: feature
+    title: "Install NATS (with auth) + postgres into the local cluster"
+    summary: |
+      Author `helm/global/local/nats/` (sibling of us-east/singapore),
+      single-replica, auth enabled from day one with a dev credential
+      from `helm/local/.env.example` (real Secret created by up.sh from
+      that template, NOT committed). Install via helm.
+
+      Install postgres via the existing `helm/postgres/` chart with a
+      values-local.yaml overlay (single-node, ephemeral storage).
+
+      Validation: `kubectl exec nats-0 -- nats sub --server=... '>'`
+      with creds works, without creds is refused (mirrors the auth
+      matrix from docker/docker-compose.nats-dev.yaml against a real
+      K8s NATS).
+    parent_epic: ops-epic
+    blocked_by: [vco-1, vco-3]
+
+  - key: vco-5
+    type: feature
+    title: "Deploy meeting-api + SFU pods (webtransport + websocket) locally"
+    summary: |
+      Build local container images from the videocall codebase
+      (`Dockerfile.actix`, `Dockerfile.meeting-api`), push to the k3d
+      registry, helm install meeting-api + rustlemania-{webtransport,
+      websocket} with values-local.yaml overlays. Wire the nats-credentials
+      Secret per sfu-update/audits/nats-auth-rollout.md Phase A pattern.
+
+      Validation: `curl https://transport.videocall.local/healthz`
+      (after /etc/hosts entry); SFU pod logs show "Connected to NATS
+      at ... auth=on".
+    parent_epic: ops-epic
+    blocked_by: [vco-4]
+
+  - key: vco-6
+    type: feature
+    title: "Author helm/local/redeploy.sh — fast inner-loop image+helm refresh"
+    summary: |
+      Author redeploy.sh that:
+        - Rebuilds container images for changed Rust crates (incremental
+          cargo build inside the dev image).
+        - Pushes to the k3d local registry.
+        - `k3d image import` to nodes (faster than registry pull for
+          small clusters).
+        - `helm upgrade` the SFU charts.
+        - Waits for rollout to complete.
+        - Tails pod logs for ~5s to surface immediate errors.
+
+      Used after each dev-rig phase merges to experimental-sfu, per the
+      Track 3 ops-validation cadence.
+    parent_epic: ops-epic
+    blocked_by: [vco-5]
+
+  - key: vco-7
+    type: task
+    title: "End-to-end validation + 'new production rig template' doc"
+    summary: |
+      End-to-end smoke: bring cluster up, deploy full stack, run the
+      nats-auth-phase-d-validate.sh probe against KUBECTX=k3d-videocall-local,
+      teardown.
+
+      Expand helm/local/README.md into the "totally new small production
+      rig template" per the user's stated goal (sfu-update/PLAN.md
+      "Local deployment stack"): document each value override point with
+      a note like "for prod, set <X> to <Y>". Future fresh prod
+      deployments follow this README + a small overrides file.
+    parent_epic: ops-epic
+    blocked_by: [vco-1, vco-2, vco-3, vco-4, vco-5, vco-6]

@@ -80,3 +80,4 @@ e2e/node_modules/**
 
 # gastown materialise state (bead-id map; per-environment)
 sfu-update/.materialize-state.json
+sfu-update/.materialize-state.ops.json

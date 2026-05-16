@@ -11,9 +11,12 @@
 # State (key -> bd id mapping) lives at sfu-update/.materialize-state.json.
 set -euo pipefail
 
-# bd resolves its database by walking up from cwd to find .beads/.
-# The rig's beads live at /gt/videocall/.beads/, NOT at /mnt/llms/videocall/.beads/,
-# so we run from the rig path. The manifest is referenced by absolute path
-# inside materialize.py, so the cwd doesn't affect manifest discovery.
+# bd resolves its database by walking up from cwd to find .beads/. The
+# rig's beads live at /gt/videocall/.beads/, so we cd there before
+# invoking the Python script. The script accepts --manifest / --state /
+# --jsonl args; default values target the videocall rig.
+#
+# To run the same script against the videocall_ops rig, use
+# sfu-update/scripts/materialize-ops.sh (sibling wrapper).
 cd /gt/videocall
 exec python3 /mnt/llms/videocall/sfu-update/scripts/materialize.py "$@"

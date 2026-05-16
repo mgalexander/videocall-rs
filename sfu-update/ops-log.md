@@ -166,3 +166,24 @@ State after bootstrap:
 - Disk: 70% (unchanged).
 
 Tracks 2 + 3 are now unblocked at the rig-existence level. Next decision: whether to materialise their beads in the videocall rig's `convoy-manifest.yaml` or in a new ops-rig manifest (likely the latter, but defer until first Track 2 bead is needed).
+
+## 2026-05-15 Track 2 launched — first ops-rig bead slung
+
+Followed option 2 from the prior session: separate ops manifest, separate state file, ops rig drives.
+
+- **Generalised `sfu-update/scripts/materialize.py`** to accept `--manifest`, `--state`, `--jsonl` CLI args (defaults preserve videocall rig behaviour). Regression-tested against videocall rig: `bash sfu-update/scripts/materialize.sh` reports 19 beads, 22 edges, 3 convoys, all `EXISTS`. Clean.
+- **New `sfu-update/scripts/materialize-ops.sh`** sibling wrapper. `cd /gt/videocall_ops` before invoking the script with the ops-rig paths, so bd's auto-discovery resolves the ops `.beads/` (not the dev one — we hit cross-rig contamination during videocall bootstrap when this wasn't done; bd-sync.sh has the same protection).
+- **New `sfu-update/ops-convoy-manifest.yaml`** — 1 epic, 1 convoy (`T2-local-k8s`), 7 beads (`vco-1` through `vco-7`) walking the local-K8s stack bringup incrementally: k3d cluster only → down/pause → ingress+cert-manager → NATS+postgres → meeting-api+SFU pods → redeploy script → e2e validation + production-template doc. 12 blocking edges.
+- **New `sfu-update/.materialize-state.ops.json`** (gitignored) — separate state file. Plus `.gitignore` updated to exclude it.
+- Materialised cleanly: bead IDs `vco-ow8.{1..7}`, convoy id `hq-cv-fb3cb`.
+- Staged via `gt convoy stage hq-cv-fb3cb` → produced new staged convoy `hq-cv-qxyfx` with 6 waves, max parallelism 2.
+- Launched via `gt convoy launch hq-cv-qxyfx` → Wave 1 (vco-ow8.1) dispatched.
+
+Sling chain to obsidian was the same dance as the prior bootstrap:
+- `gt sling vco-ow8.1 videocall_ops/obsidian` rejected: `'videocall_ops/obsidian' is not a known rig` (identity-bead list quirk).
+- `gt sling vco-ow8.1 videocall_ops` reported `Bead vco-ow8.1 is already scheduled (context: vco-wisp-bag), no-op` — the convoy launch had created the wisp.
+- Polecat session showed obsidian as `working` but `gt hook` returned empty — wisp didn't land on the hook (same bug as last time).
+- Recovery: `gt hook vco-ow8.1 videocall_ops/polecats/obsidian` to attach, then `gt session restart videocall_ops/obsidian` to cycle the tmux session.
+- Verified: obsidian's pane shows `gt prime --hook` succeeded, bead now `HOOKED` with `Assignee: videocall_ops/polecats/obsidian`, Claude is thinking.
+
+This is the validation that the cross-rig pattern works end-to-end. Subsequent ops beads (Wave 2: vco-ow8.2 + vco-ow8.3) will auto-dispatch via the daemon's event-driven feeder when vco-ow8.1 closes. The polecat pool size is 1, so Wave 2's two beads will serialize on obsidian unless we grow the pool — a non-blocking concern for the demo.

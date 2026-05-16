@@ -20,11 +20,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import argparse
+
 import yaml
 
 REPO = Path("/mnt/llms/videocall")
-MANIFEST = REPO / "sfu-update" / "convoy-manifest.yaml"
-STATE = REPO / "sfu-update" / ".materialize-state.json"
+# Defaults match the videocall (dev) rig. Override via CLI args
+# (--manifest / --state) when running for videocall_ops (or any future rig).
+DEFAULT_MANIFEST = REPO / "sfu-update" / "convoy-manifest.yaml"
+DEFAULT_STATE = REPO / "sfu-update" / ".materialize-state.json"
 
 # Match bd's actual create output: "✓ Created issue: vc-abc — Title".
 # Anchoring on "Created issue:" avoids false matches in auto-import log noise.
@@ -44,14 +48,14 @@ def run(cmd: list[str], check: bool = True) -> str:
     return out.strip()
 
 
-def load_state() -> dict:
-    if STATE.exists():
-        return json.loads(STATE.read_text())
+def load_state(state_path: Path) -> dict:
+    if state_path.exists():
+        return json.loads(state_path.read_text())
     return {"epics": {}, "beads": {}, "convoys": {}, "edges": []}
 
 
-def save_state(state: dict) -> None:
-    STATE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+def save_state(state: dict, state_path: Path) -> None:
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 def extract_id(out: str, prefix: str, *, is_convoy: bool = False) -> str:
@@ -104,12 +108,39 @@ def create_convoy(title: str, tracked_ids: list[str], prefix: str) -> str:
 
 
 def main() -> int:
-    if not MANIFEST.exists():
-        raise SystemExit(f"manifest not found: {MANIFEST}")
-    manifest = yaml.safe_load(MANIFEST.read_text())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=DEFAULT_MANIFEST,
+        help=f"YAML DAG manifest (default: {DEFAULT_MANIFEST})",
+    )
+    parser.add_argument(
+        "--state",
+        type=Path,
+        default=DEFAULT_STATE,
+        help=f"JSON state file mapping manifest keys → bd ids (default: {DEFAULT_STATE})",
+    )
+    parser.add_argument(
+        "--jsonl",
+        type=Path,
+        default=Path("/gt/videocall/.beads/issues.jsonl"),
+        help="Path to the rig's issues.jsonl for synchronous export at end of run "
+        "(default: /gt/videocall/.beads/issues.jsonl; override for videocall_ops to "
+        "/gt/videocall_ops/.beads/issues.jsonl)",
+    )
+    args = parser.parse_args()
+
+    manifest_path = args.manifest
+    state_path = args.state
+    jsonl_path = args.jsonl
+
+    if not manifest_path.exists():
+        raise SystemExit(f"manifest not found: {manifest_path}")
+    manifest = yaml.safe_load(manifest_path.read_text())
     prefix = manifest.get("prefix", "vc")
 
-    state = load_state()
+    state = load_state(state_path)
     state.setdefault("epics", {})
     state.setdefault("beads", {})
     state.setdefault("convoys", {})
@@ -130,7 +161,7 @@ def main() -> int:
             prefix=prefix,
         )
         state["epics"][key] = new_id
-        save_state(state)
+        save_state(state, state_path)
         print(f"  CREATED {key}  {new_id}")
 
     # 2. Beads.
@@ -150,7 +181,7 @@ def main() -> int:
             prefix=prefix,
         )
         state["beads"][key] = new_id
-        save_state(state)
+        save_state(state, state_path)
         print(f"  CREATED {key}  {new_id}")
 
     # 3. blocked_by edges.
@@ -174,7 +205,7 @@ def main() -> int:
             add_blocks_dep(blocker_id, blocked_id)
             edge_set.add(edge)
             state["edges"] = sorted(list(edge_set))
-            save_state(state)
+            save_state(state, state_path)
             print(f"  ADDED   {blocker_key}({blocker_id}) -blocks-> {blocked_key}({blocked_id})")
 
     # 4. Convoys, each tracking its declared beads.
@@ -190,7 +221,7 @@ def main() -> int:
             continue
         new_id = create_convoy(convoy["title"], tracked, prefix)
         state["convoys"][key] = new_id
-        save_state(state)
+        save_state(state, state_path)
         print(f"  CREATED convoy {key}  {new_id}  tracks={len(tracked)} beads")
 
     # bd's auto-export is timer-based (~1s after export.interval was tuned;
@@ -198,16 +229,17 @@ def main() -> int:
     # script will not appear in .beads/issues.jsonl before the next bd command
     # auto-imports the old JSONL and clobbers them. Force a synchronous export
     # so the JSONL captures everything we just did.
-    jsonl = "/gt/videocall/.beads/issues.jsonl"
     print("\n== sync export ==")
-    run(["bd", "export", "--all", "-o", jsonl])
+    run(["bd", "export", "--all", "-o", str(jsonl_path)])
 
     print("\n== summary ==")
-    print(f"  epics   : {len(state['epics'])}")
-    print(f"  beads   : {len(state['beads'])}")
-    print(f"  convoys : {len(state['convoys'])}")
-    print(f"  edges   : {len(state['edges'])}")
-    print(f"  state   : {STATE}")
+    print(f"  epics    : {len(state['epics'])}")
+    print(f"  beads    : {len(state['beads'])}")
+    print(f"  convoys  : {len(state['convoys'])}")
+    print(f"  edges    : {len(state['edges'])}")
+    print(f"  manifest : {manifest_path}")
+    print(f"  state    : {state_path}")
+    print(f"  jsonl    : {jsonl_path}")
     return 0
 
 
