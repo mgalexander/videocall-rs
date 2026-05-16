@@ -134,3 +134,15 @@ KUBECTX=do-us-east-cluster NATS_USER=sfu-cluster NATS_PASSWORD='<paste>' \
     bash sfu-update/audits/nats-auth-phase-a-create-secret.sh
 # repeat per cluster, advance through phases b/c/d
 ```
+
+## 2026-05-15 Track 1: dev sandbox moved into project's docker/ convention
+
+Followed the operating model's "no host-bare docker fixtures" rule by replacing the ad-hoc `docker run nats:2.10 ...` invocations with a compose file inside the project tree.
+
+- `docker/docker-compose.nats-dev.yaml` (new): two services, `sfu-nats-auth` (basic auth on host port 24222) + `sfu-nats-noauth` (host port 24223). Sibling of `docker-compose.integration.yaml` / `e2e.yaml`. Same image (`nats:2.10-alpine`) and inline `command:` flags as the existing convention.
+- `sfu-update/audits/nats-sandbox-up.sh`: rewritten as a thin wrapper around `docker compose -f docker/docker-compose.nats-dev.yaml`. Same up/down/status interface as before, so docs/scripts pointing at it still work.
+- `docker/README.nats-dev.md` (new): end-to-end usage doc including the 4-cell matrix table, manual nats-box probes, dev-credential warning, and instructions for connecting other compose stacks.
+
+Verification: brought the sandbox up via the wrapper, ran the auth integration matrix, all four cells passed (Cell A refused, B/C/D accepted), tore down cleanly. Network is `docker_default` (compose project `docker`) — auto-named by compose-file location.
+
+This closes Track 1 of the operating-model deliverables. Track 2 (local k3d cluster + helm stack) and Track 3 (per-phase ops validation) are blocked on `videocall-ops` rig creation, which is a one-time human bootstrap step per the plan.
