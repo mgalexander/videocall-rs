@@ -145,4 +145,24 @@ Followed the operating model's "no host-bare docker fixtures" rule by replacing 
 
 Verification: brought the sandbox up via the wrapper, ran the auth integration matrix, all four cells passed (Cell A refused, B/C/D accepted), tore down cleanly. Network is `docker_default` (compose project `docker`) — auto-named by compose-file location.
 
-This closes Track 1 of the operating-model deliverables. Track 2 (local k3d cluster + helm stack) and Track 3 (per-phase ops validation) are blocked on `videocall-ops` rig creation, which is a one-time human bootstrap step per the plan.
+This closes Track 1 of the operating-model deliverables. Track 2 (local k3d cluster + helm stack) and Track 3 (per-phase ops validation) are blocked on `videocall_ops` rig creation, which is a one-time human bootstrap step per the plan.
+
+## 2026-05-15 videocall_ops rig created (one-time bootstrap)
+
+Stood up the ops rig per the plan's chicken-and-egg exception (creating a rig modifies shared gastown state — `routes.jsonl` + `mayor/rigs.json` — that polecats can't touch).
+
+- `gt rig add videocall_ops file:///mnt/llms/videocall --prefix vco --branch experimental-sfu` — initially tried `videocall-ops` (hyphen); rejected with `rig name contains invalid characters; hyphens, dots, spaces, and path separators are not allowed`. Underscores are required (matches the `labs_imap_server` / `labs_pim_server` convention). Plan updated to use `videocall_ops` everywhere.
+- Rig structure: `/gt/videocall_ops/{refinery,mayor,polecats,witness,crew,.beads,.repo.git}/`. Same bare-clone-from-upstream pattern as the videocall rig. Name pool theme: `minerals` (auto-assigned for cross-rig uniqueness).
+- `bd bootstrap` from `/gt/videocall_ops` — imported 1 issue (the rig identity bead) from `issues.jsonl`. Set `export.interval=1s` to match the videocall rig.
+- Patched `/gt/videocall_ops/.gitignore` preemptively to remove the blanket `.beads/` line (same fix as videocall rig — prevents the bd state-revert bug). Inner `.beads/.gitignore` handles Dolt internals.
+- `gt rig start videocall_ops` — witness + refinery started.
+- `gt polecat pool-init videocall_ops --size 1` — created polecat `obsidian` (theme: minerals). Hit the same identity-bead retry bug as last time (`SetAgentState attempt N failed: issue not found`). Recovered via `gt polecat identity add videocall_ops obsidian`.
+
+State after bootstrap:
+- `routes.jsonl` line appended: `{"prefix":"vco-","path":"videocall_ops"}`.
+- `gt rig list`: 🟢 videocall_ops, witness + refinery both running.
+- `gt polecat list videocall_ops`: 1 polecat (obsidian, idle).
+- Witness + refinery Claude sessions visible in `ps auxf` (PIDs 3060133, 3061863).
+- Disk: 70% (unchanged).
+
+Tracks 2 + 3 are now unblocked at the rig-existence level. Next decision: whether to materialise their beads in the videocall rig's `convoy-manifest.yaml` or in a new ops-rig manifest (likely the latter, but defer until first Track 2 bead is needed).
