@@ -451,3 +451,84 @@ beads:
       cluster with official postgres:16-alpine chart (vco-10)`.
     parent_epic: ops-epic
     blocked_by: [vco-9-postgres-chart-rewrite]
+
+  - key: f0-polecat-cluster-access
+    type: feature
+    title: "Give polecat sandboxes a path to reach the local k3d cluster"
+    summary: |
+      Discovered during vco-ow8.10 (postgres redeploy). Polecat sandboxes
+      inside `gastown-sandbox` have NO way to reach the local k3d cluster
+      on the host:
+
+        - No docker socket mounted (cannot run `docker exec` or
+          `k3d kubeconfig` to bootstrap a context).
+        - No kubeconfig in the sandbox filesystem (host's
+          `~/.kube/config` isn't mounted in).
+        - No `kubectl` / `helm` / `k3d` binaries in the sandbox image
+          (we installed them at `~/.local/bin` on the host only).
+
+      obsidian correctly identified she could not execute the bead's
+      `helm uninstall` + `bash up.sh` + `kubectl exec`/`logs` steps
+      and closed vco-ow8.10 as "no-changes: host-only operation",
+      filing escalation hq-wisp-uf9hl. The overseer then ran the
+      redeploy on the host.
+
+      This is a model-level gap for Track 3 of the plan:
+      "Per-phase ops validation" (sfu-update/PLAN.md → "Concrete
+      next deliverables → Track 3"). Every per-phase ops-validation
+      step that deploys against the local cluster currently hits this
+      wall and the overseer has to step in. The dev/ops agent split
+      breaks down at the kubectl boundary.
+
+      ## Options
+
+      A. **Mount docker socket + kubeconfig into the polecat sandbox.**
+         Simplest fix. Edit `/mnt/llms/gas-town/docker-compose.override.yml`
+         to add:
+
+             volumes:
+               - /var/run/docker.sock:/var/run/docker.sock:ro
+               - /home/malexander/.kube:/home/agent/.kube:ro
+               - /home/malexander/.local/bin/k3d:/usr/local/bin/k3d:ro
+               - /home/malexander/.local/bin/kubectl:/usr/local/bin/kubectl:ro
+               - /home/malexander/.local/bin/helm:/usr/local/bin/helm:ro
+
+         Trade-off: any polecat (current or future) gets root-on-host
+         via docker socket. Acceptable for solo dev; absolutely not for
+         multi-user / production.
+
+      B. **Stand up a kind/k3d cluster INSIDE the gastown-sandbox
+         container** (DinD or rootless variant) so polecats reach it
+         locally without escaping. Heavier; needs Docker-in-Docker
+         setup plus binary installs in the sandbox image.
+
+      C. **A "deploy proxy" pattern.** Polecat writes deploy intent
+         to a known path (e.g. an `apply.yaml` artifact + a tiny
+         marker file); a host-side cron/watcher reconciles it. Highest
+         isolation, most operational surface.
+
+      D. **Keep the status quo:** Track 3 cluster-touching work is
+         overseer-only by policy. Document the gap. Don't change
+         polecat sandboxes.
+
+      ## Recommendation
+
+      Start with **D** (codify the boundary) for the experimental-sfu
+      phase. Revisit **A** when the project graduates to a multi-rig
+      hosting model where >1 polecat needs cluster access on the same
+      shared sandbox. **B** and **C** are over-engineered for a
+      single-developer local stack.
+
+      ## Acceptance for D
+
+      - This bead's outcome is a short ADR (e.g.
+        `sfu-update/adr/0008-polecat-cluster-access-boundary.md`)
+        documenting: (a) the gap, (b) the chosen boundary (overseer
+        runs cluster-touching ops; polecats run code authoring + chart
+        rewrite), (c) when to revisit. Mark Status: Accepted.
+      - sfu-update/PLAN.md "Track 3" gets a one-line note pointing at
+        the ADR.
+      - obsidian's escalation hq-wisp-uf9hl gets closed with a link
+        to the ADR.
+    parent_epic: ops-epic
+    blocked_by: []
