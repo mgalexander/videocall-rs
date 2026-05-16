@@ -258,10 +258,13 @@ apply_secret nats-credentials default \
     "password=${NATS_PASSWORD}"
 
 log "applying postgres-credentials Secret to namespace 'default'"
-# The bitnami postgresql 12.5.7 chart expects both `postgres-password` (for
-# the superuser) and `password` (for the non-root `auth.username`) in the
-# existingSecret. We populate both from the single dev password since the
-# local stack only has one human-facing role.
+# The rewritten helm/postgres chart (rustlemania-postgres 1.1.0, self-
+# contained postgres:16-alpine — no bitnami subchart) reads
+# POSTGRES_PASSWORD from the existingSecret using key `password` (the
+# default for `auth.secretKeys.userPasswordKey`). We additionally populate
+# `postgres-password` with the same value for forward compatibility with
+# any production-style consumer that reads the superuser key — the local
+# stack only has one human-facing role, so one rotation point is enough.
 apply_secret postgres-credentials default \
     "postgres-password=${POSTGRES_PASSWORD}" \
     "password=${POSTGRES_PASSWORD}"
@@ -296,18 +299,18 @@ kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/nats \
 # ----- Phase: postgres --------------------------------------------------------
 log "installing postgres via helm/postgres (values-local overlay)"
 
-log "running 'helm dependency update' for helm/postgres"
-helm dependency update "${HELM_DIR}/postgres" >/dev/null
-
+# rustlemania-postgres 1.1.0 is a thin, self-contained chart (no subcharts);
+# `helm dependency update` is intentionally absent.
 helm --kube-context "${KUBECONTEXT}" upgrade --install postgres \
     "${HELM_DIR}/postgres" \
     --namespace default \
     --values "${HELM_DIR}/postgres/values-local.yaml" \
-    --set "postgresql.auth.username=${POSTGRES_USER}" \
-    --set "postgresql.auth.database=${POSTGRES_DB}"
+    --set "auth.username=${POSTGRES_USER}" \
+    --set "auth.database=${POSTGRES_DB}"
 
 log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the postgres StatefulSet to become ready"
-# The bitnami chart names the primary StatefulSet `<release>-postgresql`.
+# Chart names the StatefulSet `{{ .Release.Name }}-postgresql`, so with
+# release name `postgres` it lands as `postgres-postgresql`.
 kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/postgres-postgresql \
     --timeout="${DEPLOY_READY_TIMEOUT}s"
 

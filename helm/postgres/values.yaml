@@ -1,3 +1,55 @@
-postgresql:
-  auth:
-    existingSecret: rustlemania
+# Production defaults for the rustlemania-postgres chart.
+#
+# This chart is a thin, self-contained wrapper around the upstream
+# docker.io/postgres:16-alpine image — no subcharts, no bitnami. Replaces
+# the previous bitnami/postgresql 12.5.7 dependency that was unpublished
+# from the free tier in 2025.
+#
+# Wire-format constraints (do NOT change without updating EVERY consumer):
+#   - service.name MUST be `postgres-postgresql`. helm/meeting-api/values.yaml
+#     wires DATABASE_URL=postgres://...@postgres-postgresql:5432/...; renaming
+#     the Service breaks meeting-api in local AND production.
+#   - The StatefulSet is named `{{ .Release.Name }}-postgresql`. The local
+#     bootstrap (helm/local/up.sh) installs with release name `postgres`,
+#     yielding `postgres-postgresql` — matched by `kubectl rollout status
+#     statefulset/postgres-postgresql`.
+#   - The chart reads POSTGRES_PASSWORD from the existingSecret using key
+#     `auth.secretKeys.userPasswordKey` (default: `postgres-password`, which
+#     matches the production `rustlemania` Secret managed out-of-band). The
+#     local bootstrap populates both `password` and `postgres-password` from
+#     the same value, so the local install works with the default without
+#     needing an override.
+
+image:
+  repository: docker.io/postgres
+  tag: "16-alpine"
+  pullPolicy: IfNotPresent
+
+auth:
+  # Name of an existing Secret in the release namespace that holds the
+  # postgres password. The chart does NOT create the Secret — it must
+  # exist before `helm install` (managed out-of-band in production;
+  # created by helm/local/up.sh from .env in local).
+  existingSecret: rustlemania
+  database: actix-api-db
+  username: postgres
+  secretKeys:
+    # Key inside `existingSecret` used to set POSTGRES_PASSWORD for the
+    # superuser (the docker.io/postgres image only has one role at initdb
+    # time — POSTGRES_USER — so the two keys below default to the same
+    # value but stay separate for symmetry with multi-role setups.)
+    adminPasswordKey: postgres-password
+    userPasswordKey: postgres-password
+
+service:
+  # MUST stay `postgres-postgresql` — see wire-format constraints above.
+  name: postgres-postgresql
+  port: 5432
+
+persistence:
+  enabled: true
+  size: 10Gi
+  # storageClassName: ""   # omit to use the cluster default StorageClass
+
+# Production sizing is intentionally unset; override per-environment.
+resources: {}

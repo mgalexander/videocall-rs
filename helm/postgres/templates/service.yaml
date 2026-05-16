@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  # Service name is load-bearing: helm/meeting-api references
+  # `postgres-postgresql:5432` in its DATABASE_URL. Do not rename
+  # without updating every consumer.
+  name: {{ .Values.service.name }}
+  labels:
+    {{- include "rustlemania-postgres.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: {{ .Values.service.port }}
+      targetPort: 5432
+      protocol: TCP
+  selector:
+    {{- include "rustlemania-postgres.selectorLabels" . | nindent 4 }}
