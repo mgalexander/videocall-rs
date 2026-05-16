@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
-# helm/local/up.sh — v1 local k3d cluster bringup for the videocall stack.
+# helm/local/up.sh — v2 local k3d cluster bringup for the videocall stack.
 #
-# Scope (v1):
+# Scope (v2):
 #   1. Create the k3d cluster (idempotent).
 #   2. Install ingress-nginx (NodePort) into namespace ingress-nginx.
 #   3. Install cert-manager (with CRDs) into namespace cert-manager.
 #   4. Apply a self-signed ClusterIssuer (`local-selfsigned`) for
 #      *.videocall.local certs.
+#   5. Create `nats-credentials` + `postgres-credentials` Secrets from
+#      helm/local/.env (auto-bootstrapped from .env.example if missing).
+#   6. Install NATS via helm/global/local/nats (single replica, auth on).
+#   7. Install postgres via helm/postgres + values-local.yaml.
 #
-# Out of scope (later beads): NATS, postgres, meeting-api, SFU, ingresses
-# for app services. See helm/local/README.md.
+# Out of scope (later beads): meeting-api, SFU, ingresses for app services.
+# See helm/local/README.md.
 #
 # Idempotent: re-running is a no-op. Uses `helm upgrade --install` and
 # `kubectl apply` throughout. Re-runs against an existing cluster simply
@@ -181,6 +185,100 @@ until kubectl --context "${KUBECONTEXT}" apply \
     log "ClusterIssuer apply failed (attempt ${issuer_attempts}/${max_issuer_attempts}) — webhook likely still warming up; retrying in 3s"
     sleep 3
 done
+
+# ----- Phase: dev credentials (.env + Secrets) --------------------------------
+# helm/local/.env holds the dev credential values for NATS and postgres. If a
+# developer hasn't created one yet, bootstrap from .env.example so up.sh is
+# a one-shot — no surprise "missing file" failures the first time it runs.
+ENV_FILE="${SCRIPT_DIR}/.env"
+ENV_EXAMPLE="${SCRIPT_DIR}/.env.example"
+if [ ! -f "${ENV_FILE}" ]; then
+    if [ -f "${ENV_EXAMPLE}" ]; then
+        log "helm/local/.env not found — copying from .env.example (dev defaults)"
+        cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+    else
+        err "neither helm/local/.env nor helm/local/.env.example exists"
+        exit 1
+    fi
+fi
+
+log "sourcing dev credentials from helm/local/.env"
+# shellcheck disable=SC1090
+set -a; . "${ENV_FILE}"; set +a
+
+: "${NATS_USER:?NATS_USER not set in helm/local/.env}"
+: "${NATS_PASSWORD:?NATS_PASSWORD not set in helm/local/.env}"
+: "${POSTGRES_USER:?POSTGRES_USER not set in helm/local/.env}"
+: "${POSTGRES_DB:?POSTGRES_DB not set in helm/local/.env}"
+: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set in helm/local/.env}"
+
+apply_secret() {
+    # apply_secret <name> <namespace> <key1=val1> [<key2=val2> ...]
+    #
+    # Renders a generic Secret via `kubectl create --dry-run=client -o yaml`
+    # so the values never appear in process listings, then pipes through
+    # `kubectl apply` for idempotency (create-or-update).
+    local name="$1" ns="$2"; shift 2
+    local args=()
+    local kv
+    for kv in "$@"; do
+        args+=( "--from-literal=${kv}" )
+    done
+    kubectl --context "${KUBECONTEXT}" -n "${ns}" create secret generic "${name}" \
+        "${args[@]}" --dry-run=client -o yaml \
+        | kubectl --context "${KUBECONTEXT}" -n "${ns}" apply -f - >/dev/null
+}
+
+log "applying nats-credentials Secret to namespace 'default'"
+apply_secret nats-credentials default \
+    "user=${NATS_USER}" \
+    "password=${NATS_PASSWORD}"
+
+log "applying postgres-credentials Secret to namespace 'default'"
+# The bitnami postgresql 12.5.7 chart expects both `postgres-password` (for
+# the superuser) and `password` (for the non-root `auth.username`) in the
+# existingSecret. We populate both from the single dev password since the
+# local stack only has one human-facing role.
+apply_secret postgres-credentials default \
+    "postgres-password=${POSTGRES_PASSWORD}" \
+    "password=${POSTGRES_PASSWORD}"
+
+# ----- Phase: NATS ------------------------------------------------------------
+log "installing NATS via helm/global/local/nats"
+
+log "running 'helm dependency update' for helm/global/local/nats"
+helm dependency update "${HELM_DIR}/global/local/nats" >/dev/null
+
+# Inject the user/password via --set-string so the credentials stay out of
+# values.yaml. Field path matches the production us-east chart (see
+# sfu-update/audits/nats-auth-phase-c-enable-nats-auth.sh).
+helm --kube-context "${KUBECONTEXT}" upgrade --install nats \
+    "${HELM_DIR}/global/local/nats" \
+    --namespace default \
+    --set-string "nats.nats.auth.users[0].user=${NATS_USER}" \
+    --set-string "nats.nats.auth.users[0].password=${NATS_PASSWORD}"
+
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the NATS StatefulSet to become ready"
+kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/nats \
+    --timeout="${DEPLOY_READY_TIMEOUT}s"
+
+# ----- Phase: postgres --------------------------------------------------------
+log "installing postgres via helm/postgres (values-local overlay)"
+
+log "running 'helm dependency update' for helm/postgres"
+helm dependency update "${HELM_DIR}/postgres" >/dev/null
+
+helm --kube-context "${KUBECONTEXT}" upgrade --install postgres \
+    "${HELM_DIR}/postgres" \
+    --namespace default \
+    --values "${HELM_DIR}/postgres/values-local.yaml" \
+    --set "postgresql.auth.username=${POSTGRES_USER}" \
+    --set "postgresql.auth.database=${POSTGRES_DB}"
+
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the postgres StatefulSet to become ready"
+# The bitnami chart names the primary StatefulSet `<release>-postgresql`.
+kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/postgres-postgresql \
+    --timeout="${DEPLOY_READY_TIMEOUT}s"
 
 # ----- Emit machine-readable handles for downstream scripts -------------------
 log "cluster ready"

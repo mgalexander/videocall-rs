@@ -1,0 +1,56 @@
+# Local NATS configuration for the k3d videocall stack.
+#
+# Differences from the production overlays (helm/global/{us-east,singapore}/nats):
+#   - single replica, no cluster mode (one node is plenty for local dev)
+#   - no cross-region gateway
+#   - jetstream off (the SFU pipeline does not currently use JS)
+#   - auth.enabled: true FROM DAY ONE (the local stack mirrors the
+#     production auth posture from sfu-update/audits/nats-acl-audit.md S-P0-4)
+#
+# auth.user and auth.password are intentionally NOT set here. helm/local/up.sh
+# reads helm/local/.env (a developer-local file derived from
+# helm/local/.env.example) and injects the credentials at install time via
+# --set-string flags. The matching `nats-credentials` Secret is created by
+# up.sh from the same .env values so that app pods can mount it as a
+# secretKeyRef the way they do in production.
+#
+# Field path is `nats.nats.auth.users[0]` per the nats helm chart 0.19.x
+# convention used by the us-east overlay; see
+# sfu-update/audits/nats-auth-phase-c-enable-nats-auth.sh for the production
+# equivalent.
+nats:
+  nats:
+    natsbox:
+      enabled: true
+    cluster:
+      enabled: false
+      replicas: 1
+      noAdvertise: true
+    jetstream:
+      enabled: false
+    auth:
+      enabled: true
+      # users[0].{user,password} are injected by helm/local/up.sh.
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  # No cross-region gateway in the local rig.
+  gateway:
+    enabled: false
+
+# Service configuration — match the production naming so app charts can use
+# the same `nats:4222` resolver style without a local-only override.
+service:
+  name: nats
+  type: ClusterIP
+  ports:
+    client:
+      enabled: true
+      port: 4222
+    monitor:
+      enabled: true
+      port: 8222

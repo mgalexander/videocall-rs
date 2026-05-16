@@ -53,6 +53,21 @@ After cluster bringup, `up.sh` deploys the cluster-wide platform layer:
    the local counterpart to the production Let's Encrypt + DigitalOcean
    DNS `Issuer` in `cert-manager-issuer.yaml` (which is **not** applied
    locally).
+4. **Dev-credentials Secrets** — `nats-credentials` and
+   `postgres-credentials` (namespace `default`), created from
+   `helm/local/.env`. If no `.env` file exists yet, `up.sh` bootstraps it
+   from `helm/local/.env.example` (gitignored so each developer can
+   override credentials without touching the repo).
+5. **NATS** (namespace `default`) — installed from `helm/global/local/nats/`
+   (sibling of `helm/global/us-east/nats/` and `helm/global/singapore/nats/`).
+   Single-replica, no JetStream, no cross-region gateway, **basic auth
+   enabled from day one**. Credentials are injected via `--set-string`
+   from `.env` (kept out of `values.yaml`) and persisted to the
+   `nats-credentials` Secret for app pods to consume.
+6. **postgres** (namespace `default`) — installed from `helm/postgres/`
+   with the local overlay `helm/postgres/values-local.yaml`. Standalone,
+   ephemeral storage (no PVC), credentials sourced from the
+   `postgres-credentials` Secret.
 
 ## Conventions for subsequent scripts
 
@@ -107,6 +122,12 @@ kubectl --context k3d-videocall-local get pods -n cert-manager
 # Verify the self-signed ClusterIssuer is Ready.
 kubectl --context k3d-videocall-local get clusterissuer
 
+# Verify NATS and postgres are Running.
+kubectl --context k3d-videocall-local get pods -n default
+
+# Verify NATS auth is actually enforced (probes with + without creds).
+./helm/local/validate-nats.sh
+
 # Hibernate: stop the node containers but keep cluster state on disk.
 # Use this to free CPU/RAM between coding sessions without losing installed
 # components or images you've pushed to the local registry.
@@ -143,16 +164,17 @@ any are missing. It does **not** auto-install — that's an operator decision.
 
 ## Shipped so far
 
-- `up.sh` v1 — cluster bringup + `ingress-nginx` (NodePort overlay) +
-  `cert-manager` + self-signed `ClusterIssuer` (`vco-ow8.1`, `vco-ow8.3`)
+- `up.sh` v2 — cluster bringup + `ingress-nginx` (NodePort overlay) +
+  `cert-manager` + self-signed `ClusterIssuer` + NATS (with auth) +
+  postgres (`vco-ow8.1`, `vco-ow8.3`, `vco-ow8.4`)
 - `down.sh` / `pause.sh` / `resume.sh` — cluster lifecycle (`vco-ow8.2`)
+- `validate-nats.sh` — local equivalent of
+  `sfu-update/audits/nats-auth-phase-d-validate.sh` (`vco-ow8.4`)
 
 ## Out of scope for now
 
-The following ship in later beads (`vco-ow8.4`, ...):
+The following ship in later beads (`vco-ow8.5`, ...):
 
-- NATS install (`vco-ow8.4`)
-- postgres install (`vco-ow8.4`)
-- `meeting-api` deploy
-- SFU pod deploy
+- `meeting-api` deploy (`vco-ow8.5`)
+- SFU pod deploy (`vco-ow8.5`)
 - Real DNS / external-DNS wiring
