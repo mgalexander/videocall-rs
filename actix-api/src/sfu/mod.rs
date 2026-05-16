@@ -16,19 +16,5 @@
  * conditions.
  */
 
-pub mod actors;
-pub mod auth;
-pub mod client_diagnostics;
-pub mod constants;
-pub mod db;
-pub mod lobby;
-pub mod messages;
-pub mod metrics;
-pub mod models;
-pub mod nats_connect;
-pub mod server_diagnostics;
-pub mod session_manager;
-pub mod sfu;
-pub mod token_validator;
-pub mod version;
-pub mod webtransport;
+pub mod config;
+pub use config::{SfuConfig, SfuMode};

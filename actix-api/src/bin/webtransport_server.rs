@@ -25,6 +25,7 @@ use tracing::{error, info};
 use sec_api::actors::chat_server::ChatServer;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
+use sec_api::sfu::{SfuConfig, SfuMode};
 use sec_api::version;
 use sec_api::webtransport::{self, Certs};
 
@@ -41,6 +42,12 @@ async fn main() {
         .init();
 
     info!("Starting WebTransport server with actor-based session handling");
+
+    let sfu_config = SfuConfig::from_env();
+    info!("sfu mode: {}", sfu_config.mode);
+    if sfu_config.mode == SfuMode::Sfu {
+        info!("sfu mode active (no-op shim)");
+    }
 
     // Connect to NATS. Auth/TLS posture is driven by the NATS_USER /
     // NATS_PASSWORD / NATS_TLS / NATS_TLS_CA env vars; see
