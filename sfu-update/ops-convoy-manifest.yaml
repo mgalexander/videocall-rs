@@ -240,3 +240,127 @@ beads:
       videocall bootstrap and the videocall_ops Track 2 launch.
     parent_epic: ops-epic
     blocked_by: []
+
+  - key: vco-9-postgres-chart-rewrite
+    type: feature
+    title: "Rewrite helm/postgres to thin chart on docker.io/postgres:16-alpine"
+    summary: |
+      Drop the bitnami postgresql 12.5.7 subchart entirely and author a
+      small in-repo chart targeting the official postgres image.
+
+      Why: The bitnami chart pinned to
+      `bitnami/postgresql:15.3.0-debian-11-r7`, which Bitnami unpublished
+      in their 2025 free-tier deprecation (tags moved to `bitnamilegacy/`,
+      no patches). A stopgap override pinning to
+      `bitnamilegacy/postgresql:15.3.0-debian-11-r7` is in place (commit
+      7791bac), but that's a known-stale unsupported image — actively
+      misleading as a "production rig template," which is one of the
+      stated goals of the local stack (sfu-update/PLAN.md "Local
+      deployment stack"). See PLAN.md "Postgres image decision (added
+      2026-05-16)" for the full rationale.
+
+      Target image: `docker.io/postgres:16-alpine`. Permissive license,
+      ~150 MB, weekly security patches, clear production lineage (same
+      image runs inside managed-postgres offerings).
+
+      ## Wire-format constraints THIS REWRITE MUST PRESERVE
+
+      1. Service name `postgres-postgresql` — `helm/meeting-api/values.yaml`
+         line 19-20 wires `DATABASE_URL=postgres://...@postgres-postgresql:5432/...`.
+         Renaming breaks meeting-api in local AND production.
+      2. The `postgres-credentials` Secret has keys `password` and
+         `postgres-password` (created by `helm/local/up.sh` from `.env`,
+         both keys contain the same value). Map `POSTGRES_PASSWORD`
+         env from `secretKeyRef: { name: postgres-credentials, key: password }`.
+      3. `auth.username` and `auth.database` stay configurable via values
+         (local uses `rustlemania`/`rustlemania`; production uses
+         `postgres`/`actix-api-db` per `helm/postgres/values.yaml`).
+      4. Local overlay continues to set `persistence.enabled=false`
+         (ephemeral storage); production overlay would set it true with
+         a PVC.
+
+      ## Files to modify / create / delete
+
+      Modify:
+        - helm/postgres/Chart.yaml: drop the `dependencies:` block
+          referencing bitnami. Keep `apiVersion: v2`, `name`, `version`.
+        - helm/postgres/values.yaml: rewrite for the new chart surface.
+          New shape (suggested):
+            image:
+              repository: docker.io/postgres
+              tag: 16-alpine
+              pullPolicy: IfNotPresent
+            auth:
+              existingSecret: rustlemania  # production secret name
+              database: actix-api-db
+              username: postgres
+              # secretKeys: { adminPasswordKey: postgres-password,
+              #               userPasswordKey: postgres-password }
+            service:
+              name: postgres-postgresql    # MUST stay
+              port: 5432
+            persistence:
+              enabled: true
+              size: 10Gi
+            resources: {}                  # production sizing
+        - helm/postgres/values-local.yaml: drop the bitnamilegacy
+          `postgresql.image.*` override (from commit 7791bac). Restate
+          for the new chart shape:
+            auth:
+              existingSecret: postgres-credentials
+              database: rustlemania
+              username: rustlemania
+            persistence:
+              enabled: false
+            resources:
+              limits: { cpu: 250m, memory: 256Mi }
+              requests: { cpu: 100m, memory: 128Mi }
+
+      Delete:
+        - helm/postgres/Chart.lock (referenced the bitnami dep)
+        - helm/postgres/charts/postgresql-12.5.7.tgz (pulled subchart)
+
+      Create:
+        - helm/postgres/templates/statefulset.yaml — 1 replica
+          StatefulSet named `{{ .Release.Name }}-postgresql`
+          (matches the bitnami naming so the Service can keep the
+          `postgres-postgresql` name without a label-selector mismatch).
+          Container env from existingSecret:
+            POSTGRES_DB:       {{ .Values.auth.database }}
+            POSTGRES_USER:     {{ .Values.auth.username }}
+            POSTGRES_PASSWORD: { valueFrom: { secretKeyRef: { name: .Values.auth.existingSecret, key: password } } }
+            POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+          Mount /var/lib/postgresql/data (PGDATA) via volumeClaimTemplates
+          when persistence.enabled; otherwise emptyDir.
+          Readiness probe: `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB`.
+        - helm/postgres/templates/service.yaml — ClusterIP Service
+          name `{{ .Values.service.name | default "postgres-postgresql" }}`,
+          port 5432 → containerPort 5432, selector matching the StatefulSet.
+
+      ## Verification
+
+      Run from /mnt/llms/videocall on the host (k3d cluster already up
+      per the local bootstrap):
+
+        helm --kube-context k3d-videocall-local uninstall postgres -n default
+        bash helm/local/up.sh
+
+      Expected:
+        - postgres pod Ready within 60s, no ImagePullBackOff.
+        - kubectl exec -it postgres-postgresql-0 -n default -- \
+              psql -U rustlemania -d rustlemania -c '\\dt'
+          returns a prompt (db reachable, user authenticated).
+        - kubectl logs -n default deploy/meeting-api --tail=50
+          shows no DATABASE_URL connection errors.
+        - helm/local/down.sh + bash helm/local/up.sh from a clean state
+          still passes.
+
+      ## Out of scope
+
+      CloudNativePG operator (filed as a future ADR consideration —
+      heavier setup, only pays off when modeling production HA).
+
+      Commit on experimental-sfu via Refinery merge.
+      Commit message: `feat(ops): helm/postgres on official postgres:16-alpine (vco-9)`.
+    parent_epic: ops-epic
+    blocked_by: []
