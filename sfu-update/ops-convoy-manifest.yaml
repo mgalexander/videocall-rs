@@ -186,3 +186,57 @@ beads:
       deployments follow this README + a small overrides file.
     parent_epic: ops-epic
     blocked_by: [vco-1, vco-2, vco-3, vco-4, vco-5, vco-6]
+
+  # ===========================================================================
+  # F0 — Follow-up beads filed during execution (no convoy; pick up when idle)
+  # ===========================================================================
+
+  - key: f0-hook-routing-wrapper
+    type: task
+    title: "Author sling-hook-wrapper to paper over gastown hook-routing bug"
+    summary: |
+      Every time we sling work into a polecat (videocall and
+      videocall_ops alike), the wisp produced by `gt sling` or
+      `gt convoy launch` fails to land on the polecat's hook
+      automatically. The polecat session spawns, primes, sees an empty
+      hook, and self-defers. Every time the recovery is the same dance:
+
+          gt hook <bead> <rig>/polecats/<polecat-name>
+          gt session restart <rig>/<polecat-name>
+
+      Hit three times now: videocall bootstrap (vc-c4e.1), the first
+      ops sling (vco-ow8.1), and Wave 2 auto-dispatch from the daemon
+      (vco-ow8.2 + vco-ow8.3 — both jasper and quartz deferred with
+      empty hooks). The convoy daemon's "event-driven feed" promise
+      doesn't survive contact with the hook attachment step.
+
+      Authoritative fix is upstream in gastown (bug in `gt sling`'s
+      wisp formula, or in how `pool-init` registers polecat identities
+      — the `SetAgentState: issue not found` retry warnings during
+      pool-init are likely related). That's outside this rig's scope.
+
+      This bead authors a LOCAL WRAPPER that papers over the bug for
+      our rigs:
+
+          sfu-update/scripts/gt-sling-attached.sh <bead-id> <rig>/<polecat>
+
+      Does:
+        1. `gt hook <bead-id> <rig>/polecats/<polecat>` — attach.
+        2. `gt session restart <rig>/<polecat>` — cycle so the polecat
+           re-primes and picks up the hook.
+        3. Verify via `gt hook show <rig>/polecats/<polecat>` —
+           non-empty means success.
+        4. If empty after step 3, exit non-zero with a clear message.
+
+      Also: update the convoy launch ritual in sfu-update/PLAN.md
+      "Convoy launch protocol" to recommend `gt-sling-attached.sh`
+      instead of bare `gt sling` until the upstream bug is fixed.
+
+      Optional stretch: a `gt convoy launch-attached <convoy-id>`
+      style wrapper that walks Wave 1 of a convoy and calls the
+      single-bead wrapper for each. Out of scope for the first cut.
+
+      Reference incidents: sfu-update/ops-log.md entries for the
+      videocall bootstrap and the videocall_ops Track 2 launch.
+    parent_epic: ops-epic
+    blocked_by: []

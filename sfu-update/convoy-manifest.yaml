@@ -285,3 +285,57 @@ beads:
       Deliverable: sfu-update/adr/0007-dag-source-of-truth.md.
     parent_epic: sfu-epic
     blocked_by: []
+
+  # ===========================================================================
+  # F0 — Follow-up beads filed during execution (no convoy; pick up when idle)
+  # ===========================================================================
+
+  - key: f0-adr-0006-fix
+    type: task
+    title: "Reconcile ADR-0006 with observed Refinery push behaviour"
+    summary: |
+      ADR-0006 (sfu-update/adr/0006-refinery-push-contract.md) decided
+      that "Refinery merges into the rig's bare repo only, never pushes
+      to the file:// upstream. User syncs via `git fetch rig`."
+
+      Observed behaviour during the videocall_ops Track 2 launch
+      (2026-05-16): obsidian's vco-ow8.1 commit landed at HEAD of
+      /mnt/llms/videocall/ on `experimental-sfu` automatically — the
+      Refinery DID push to upstream. Root cause:
+      `receive.denyCurrentBranch=updateInstead` is set on the
+      /mnt/llms/videocall/ repo (likely configured by `gt rig add` at
+      rig-creation time), which makes git accept pushes to a checked-
+      out branch as long as the working tree is clean. The Refinery's
+      normal push pattern then works.
+
+      Decide which contract is the real one and fix the discrepancy:
+
+      (A) "Manual-fetch" wins — revert the contract to ADR-0006 as
+          written. Set `receive.denyCurrentBranch=refuse` (default) on
+          /mnt/llms/videocall/ to enforce. User manually fetches per
+          phase. Pro: explicit review gate; matches the
+          "local-only, manually approved" intent. Con: extra step per
+          phase; user has been happy with auto-merge so far.
+
+      (B) "Auto-merge to upstream" wins — rewrite ADR-0006 to match
+          observed behaviour. Document that the Refinery pushes to
+          upstream via `updateInstead` and that the review gate is
+          `git push origin` instead of `git fetch rig`. Pro: less
+          ceremony; matches the user's "move forward" intent. Con: no
+          per-phase pre-merge review on the user's local branch.
+
+      Recommend (B). The user explicitly asked for obsidian's work to
+      move forward without pause; pre-merge review can be done via
+      reviewing the polecat's branch (`rig-ops/polecat/<name>/<bead>@…`)
+      if needed, without blocking the convoy daemon.
+
+      Deliverable: rewrite sfu-update/adr/0006-refinery-push-contract.md
+      to reflect the chosen direction. Update sfu-update/PLAN.md
+      "Standing guardrails" if the local-only-push wording needs to
+      shift. Note the consequence: pushes to `origin` (GitHub) still
+      require explicit user approval — that gate is unchanged.
+
+      Reference incident: sfu-update/ops-log.md "2026-05-16 Track 2
+      launched — first ops-rig bead slung" (notes the gap at the end).
+    parent_epic: sfu-epic
+    blocked_by: []
