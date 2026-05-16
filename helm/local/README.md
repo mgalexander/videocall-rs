@@ -18,7 +18,7 @@ The goal is **fast inner-loop iteration**: rebuild a single image, push it to
 the local registry, redeploy a single pod, and reload the browser — without
 touching staging or production.
 
-## Cluster shape (v0)
+## Cluster shape (v1)
 
 The local cluster is a [`k3d`](https://k3d.io) cluster named
 `videocall-local`:
@@ -26,9 +26,33 @@ The local cluster is a [`k3d`](https://k3d.io) cluster named
 - **1 control-plane node + 2 worker nodes** (3 nodes total)
 - **Local image registry** running at `localhost:5000`
   (k3d-managed container `videocall-local-registry`)
-- **Bundled traefik disabled** — we install `ingress-nginx` ourselves in a
-  later bead, to match production
+- **Bundled traefik disabled** — we install `ingress-nginx` ourselves
+  (see below), to match production
 - Kubeconfig context: **`k3d-videocall-local`**
+
+## What `up.sh` installs (v1)
+
+After cluster bringup, `up.sh` deploys the cluster-wide platform layer:
+
+1. **`ingress-nginx`** (namespace `ingress-nginx`) — installed from
+   `helm/ingress-nginx/` with the local overlay
+   `helm/ingress-nginx/values-local.yaml`. Uses **NodePort** for the
+   controller Service (http `30080`, https `30443`) rather than
+   LoadBalancer — k3d's bundled klipper LB has been flaky in our setup, so
+   we side-step it. Production (`helm/global/us-east/ingress-nginx/`) still
+   uses LoadBalancer + DigitalOcean annotations; that overlay is **not**
+   inherited locally.
+2. **`cert-manager`** (namespace `cert-manager`) — installed from
+   `helm/cert-manager/` with CRDs enabled. `up.sh` waits for the
+   `cert-manager`, `cert-manager-webhook`, and `cert-manager-cainjector`
+   deployments to report Available before proceeding (the webhook in
+   particular needs a few seconds to register).
+3. **`local-selfsigned` `ClusterIssuer`** — applied from
+   `helm/cert-manager-issuer/cluster-issuer-local.yaml`. This is a
+   `selfSigned` issuer suitable for `*.videocall.local` dev certs. It is
+   the local counterpart to the production Let's Encrypt + DigitalOcean
+   DNS `Issuer` in `cert-manager-issuer.yaml` (which is **not** applied
+   locally).
 
 ## Conventions for subsequent scripts
 
@@ -68,11 +92,20 @@ nodes themselves (which is the fast path for restart-in-place workflows).
 The full lifecycle is four scripts, all idempotent (re-running them is safe):
 
 ```bash
-# Bring up the cluster. Creates k3d cluster + local registry.
+# Bring up the cluster + platform layer. Idempotent — safe to re-run.
 ./helm/local/up.sh
 
 # Verify nodes are healthy.
 kubectl --context k3d-videocall-local get nodes
+
+# Verify the ingress controller pod is Ready.
+kubectl --context k3d-videocall-local get pods -n ingress-nginx
+
+# Verify cert-manager pods are Ready.
+kubectl --context k3d-videocall-local get pods -n cert-manager
+
+# Verify the self-signed ClusterIssuer is Ready.
+kubectl --context k3d-videocall-local get clusterissuer
 
 # Hibernate: stop the node containers but keep cluster state on disk.
 # Use this to free CPU/RAM between coding sessions without losing installed
@@ -102,22 +135,24 @@ REGISTRY=localhost:5000
 any are missing. It does **not** auto-install — that's an operator decision.
 
 - `docker` — runtime for the k3d nodes and the local registry container
-- `kubectl` — required to verify node readiness
+- `kubectl` — required to verify node readiness and apply the ClusterIssuer
 - `k3d`  — install via `brew install k3d` (macOS) or
   `curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash`
+- `helm` — required to install `ingress-nginx` and `cert-manager`
+  (macOS: `brew install helm`)
 
 ## Shipped so far
 
-- `up.sh` — cluster bringup (`vco-ow8.1`)
+- `up.sh` v1 — cluster bringup + `ingress-nginx` (NodePort overlay) +
+  `cert-manager` + self-signed `ClusterIssuer` (`vco-ow8.1`, `vco-ow8.3`)
 - `down.sh` / `pause.sh` / `resume.sh` — cluster lifecycle (`vco-ow8.2`)
 
-## Out of scope for v0
+## Out of scope for now
 
-The following ship in later beads (`vco-ow8.3`, `vco-ow8.4`, ...):
+The following ship in later beads (`vco-ow8.4`, ...):
 
-- `ingress-nginx` install (`vco-ow8.3`)
-- `cert-manager` install (`vco-ow8.3`)
 - NATS install (`vco-ow8.4`)
 - postgres install (`vco-ow8.4`)
 - `meeting-api` deploy
 - SFU pod deploy
+- Real DNS / external-DNS wiring

@@ -1,0 +1,23 @@
+# Local k3d overlay for ingress-nginx.
+#
+# We deliberately avoid type: LoadBalancer here — k3d's bundled klipper LB has
+# been flaky in our setup. NodePort gives us a deterministic port mapping
+# that k3d already publishes via its `--ports` machinery (or, when not
+# explicitly mapped, is reachable via `kubectl port-forward`/host networking).
+#
+# Production (helm/global/us-east/ingress-nginx/values.yaml) uses LoadBalancer
+# with DigitalOcean annotations; that overlay is NOT inherited here.
+
+ingress-nginx:
+  controller:
+    service:
+      type: NodePort
+      nodePorts:
+        http: 30080
+        https: 30443
+    # Local dev: a single replica is plenty and starts faster.
+    replicaCount: 1
+    # Allow snippet annotations for local experimentation. Off by default
+    # upstream since 4.x; keeping it conservative-but-permissive for dev.
+    admissionWebhooks:
+      enabled: true
