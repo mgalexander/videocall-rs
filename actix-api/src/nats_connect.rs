@@ -151,10 +151,13 @@ pub async fn connect(url: &str) -> Result<Client, NatsConnectError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
 
-    // Env-var tests must serialise to avoid stepping on each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Env-var tests must serialise to avoid stepping on each other. We use
+    // `tokio::sync::Mutex` because the guard is held across `.await` points
+    // (the synchronous env-var reads inside `connect` must observe a stable
+    // env, and the test holds the lock until the future resolves).
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn clear_env() {
         for k in ["NATS_USER", "NATS_PASSWORD", "NATS_TLS", "NATS_TLS_CA"] {
@@ -164,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_credentials_is_an_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         clear_env();
         std::env::set_var("NATS_USER", "alice");
         // password unset on purpose
@@ -181,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn ca_path_missing_file_is_an_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         clear_env();
         std::env::set_var("NATS_TLS", "true");
         std::env::set_var("NATS_TLS_CA", "/nonexistent/ca.pem");
