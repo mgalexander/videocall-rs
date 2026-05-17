@@ -1,0 +1,15 @@
+syntax = "proto3";
+package videocall;
+
+message SubscriptionUpdate {
+  repeated uint64 pinned_sessions = 1;
+  repeated VisibilitySlot slots = 2;
+  uint32 max_video_kbps = 3;
+  bool receive_all_audio = 4;            // v1 default: true
+}
+
+message VisibilitySlot {
+  uint64 session_id = 1;
+  uint32 preferred_spatial = 2;
+  uint32 preferred_temporal = 3;
+}
