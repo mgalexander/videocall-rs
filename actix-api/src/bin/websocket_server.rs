@@ -37,6 +37,7 @@ use sec_api::{
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
+    sfu::{SfuConfig, SfuMode},
     version,
 };
 use tracing::{debug, error, info};
@@ -271,6 +272,12 @@ async fn main() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     info!("start");
+
+    let sfu_config = SfuConfig::from_env();
+    info!("sfu mode: {}", sfu_config.mode);
+    if sfu_config.mode == SfuMode::Sfu {
+        info!("sfu mode active (no-op shim)");
+    }
 
     let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
     let nats_client = sec_api::nats_connect::connect(&nats_url)
