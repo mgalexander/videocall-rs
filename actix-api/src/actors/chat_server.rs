@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
+use videocall_types::protos::media_packet::{MediaPacket, RoutingHeader};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
@@ -822,17 +823,43 @@ fn handle_msg(
     session: SessionId,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
+        // Parse the wrapper once so we can both (a) honor the CONGESTION
+        // self-skip carve-out below and (b) expose the inner MediaPacket /
+        // RoutingHeader to the upcoming Forwarder::decide() call (p2-5).
+        // Parse failures preserve the pre-existing semantics: the wrapper is
+        // treated as non-CONGESTION (so self-addressed unparseable payloads
+        // are still self-skipped) and no routing header is surfaced.
+        let parsed_wrapper = PacketWrapper::parse_from_bytes(&msg.payload).ok();
+
         if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
             // Self-skip prevents echo of our own broadcasts. However,
             // CONGESTION signals published on our subject by a congested
             // receiver must still be delivered — they are not echo.
-            let is_congestion = PacketWrapper::parse_from_bytes(&msg.payload)
+            let is_congestion = parsed_wrapper
+                .as_ref()
                 .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
                 .unwrap_or(false);
             if !is_congestion {
                 return Ok(());
             }
         }
+
+        // Extract the inner MediaPacket + RoutingHeader for MEDIA wrappers so
+        // p2-5 can pass `_routing_header.as_ref()` into Forwarder::decide().
+        // Encrypted-payload parse failures yield `None` and are forwarded
+        // unchanged, matching the inbound classify_and_inspect behavior.
+        let _media_packet: Option<MediaPacket> = parsed_wrapper.as_ref().and_then(|pw| {
+            if pw.packet_type == PacketType::MEDIA.into() {
+                MediaPacket::parse_from_bytes(&pw.data).ok()
+            } else {
+                None
+            }
+        });
+        // p2-5 will pass this to Forwarder::decide().
+        let _routing_header: Option<&RoutingHeader> = _media_packet
+            .as_ref()
+            .and_then(|mp| mp.routing_header.as_ref());
+
         let message = Message {
             msg: msg.payload.to_vec(),
             session,
