@@ -284,13 +284,32 @@ log "running 'helm dependency update' for helm/global/local/nats"
 helm dependency update "${HELM_DIR}/global/local/nats" >/dev/null
 
 # Inject the user/password via --set-string so the credentials stay out of
-# values.yaml. Field path matches the production us-east chart (see
-# sfu-update/audits/nats-auth-phase-c-enable-nats-auth.sh).
+# values.yaml.
+#
+# Field path: the upstream nats helm chart (0.19.x) puts basic-auth users at
+# `auth.basic.users[]` (NOT `auth.users[]`), and `auth` is a TOP-LEVEL key of
+# the subchart — a SIBLING of the chart's own `nats:` block, not a child of
+# it. The wrapper subchart alias is `nats`, so the full path from this
+# wrapper chart's perspective is `nats.auth.basic.users[0].{user,password}`.
+#
+# Earlier versions of this script used `nats.nats.auth.users[0].*`, which is
+# wrong on BOTH counts (extra `nats.` prefix AND missing `.basic`) — the
+# values silently fell on the floor, the rendered nats.conf had no
+# `authorization {}` block, and the server listened unauthenticated. See
+# helm/global/local/nats/values.yaml for the full subchart-path convention
+# writeup, and bead vco-ciu for the audit trail.
+#
+# NOTE: the production phase-c script at
+# sfu-update/audits/nats-auth-phase-c-enable-nats-auth.sh uses the same
+# (wrong) path pattern as the old local code did. It is OUT OF SCOPE for
+# this commit — tracked as bead vco-k2r for a separate fix after the
+# local stack is verified end-to-end. Do NOT copy the path style here
+# back to prod without re-rendering against the prod chart version first.
 helm --kube-context "${KUBECONTEXT}" upgrade --install nats \
     "${HELM_DIR}/global/local/nats" \
     --namespace default \
-    --set-string "nats.nats.auth.users[0].user=${NATS_USER}" \
-    --set-string "nats.nats.auth.users[0].password=${NATS_PASSWORD}"
+    --set-string "nats.auth.basic.users[0].user=${NATS_USER}" \
+    --set-string "nats.auth.basic.users[0].password=${NATS_PASSWORD}"
 
 log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the NATS StatefulSet to become ready"
 kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/nats \
