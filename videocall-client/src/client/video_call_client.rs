@@ -388,6 +388,7 @@ impl VideoCallClient {
                 Vec::new()
             },
             userid: self.options.user_id.clone(),
+            meeting_id: self.options.meeting_id.clone(),
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {

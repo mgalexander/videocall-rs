@@ -36,12 +36,35 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
+
+// -----------------------------------------------------------------------
+// Client capability bitmask (advertised to the SFU on the CONNECTION packet).
+//
+// The SFU uses this to decide what behaviour it can rely on for each receiver
+// (e.g. whether to populate the routing header, whether the client speaks the
+// subscription protocol). New bits MUST be powers of two and MUST NOT be
+// recycled — the wire meaning of each bit is part of the SFU<->client contract.
+// -----------------------------------------------------------------------
+
+/// Client honours the SFU routing header on inbound media (p1-x routing work).
+const CAP_SFU_ROUTING_HEADER: u32 = 1;
+
+/// Client supports SVC (Scalable Video Coding) negotiation. NOT set yet — P4 work.
+#[allow(dead_code)]
+const CAP_SVC: u32 = 2;
+
+/// Client speaks the per-receiver subscription protocol.
+const CAP_SUBSCRIPTION: u32 = 4;
+
+/// Capability bitmask advertised by this client build.
+const CLIENT_CAPABILITIES: u32 = CAP_SFU_ROUTING_HEADER | CAP_SUBSCRIPTION;
 
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
@@ -120,6 +143,10 @@ pub struct ConnectionManagerOptions {
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
     pub userid: String,
+    /// Meeting the user is joining. Included in the CONNECTION packet emitted
+    /// to the SFU on the elected transport so the server can scope routing and
+    /// subscription state to this meeting.
+    pub meeting_id: String,
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
@@ -597,6 +624,29 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Build the CONNECTION packet sent to the SFU on the elected transport.
+    ///
+    /// The packet carries the meeting id and a bitmask of client capabilities
+    /// so the server can decide what behaviour it can rely on for this
+    /// receiver. Sent reliably (stream, not datagram) and emitted on every
+    /// election — initial connect AND each re-election produces a fresh
+    /// transport with no prior server-side context, so the SFU must be
+    /// re-told. Do not gate this behind a "first time" flag.
+    fn build_connection_packet(userid: &str, meeting_id: &str) -> Result<PacketWrapper> {
+        let connection_packet = ConnectionPacket {
+            meeting_id: meeting_id.to_string(),
+            client_capabilities: Some(CLIENT_CAPABILITIES),
+            ..Default::default()
+        };
+
+        Ok(PacketWrapper {
+            packet_type: PacketType::CONNECTION.into(),
+            user_id: userid.as_bytes().to_vec(),
+            data: connection_packet.write_to_bytes()?,
+            ..Default::default()
+        })
+    }
+
     /// Create an RTT probe packet
     fn create_rtt_packet(&self, timestamp: f64) -> Result<PacketWrapper> {
         let media_packet = MediaPacket {
@@ -717,6 +767,26 @@ impl ConnectionManager {
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
                     connection.start_heartbeat(self.options.userid.clone());
                     info!("Started heartbeat on elected connection {}", connection_id);
+
+                    // Emit a one-shot CONNECTION packet on the elected (reliable)
+                    // transport advertising this client's capabilities. The SFU
+                    // uses this to adapt per-receiver forwarding (routing
+                    // header, subscription protocol, etc.).
+                    match Self::build_connection_packet(
+                        &self.options.userid,
+                        &self.options.meeting_id,
+                    ) {
+                        Ok(packet) => {
+                            info!(
+                                "Emitting CONNECTION packet: meeting_id={}, client_capabilities={:#x}",
+                                self.options.meeting_id, CLIENT_CAPABILITIES
+                            );
+                            connection.send_packet(packet);
+                        }
+                        Err(e) => {
+                            error!("Failed to build CONNECTION packet: {e}");
+                        }
+                    }
                 }
 
                 // Store baseline RTT for re-election quality monitoring.
@@ -1801,6 +1871,7 @@ mod tests {
             websocket_urls: vec![],
             webtransport_urls: vec![],
             userid: "test-user".to_string(),
+            meeting_id: "test-meeting".to_string(),
             on_inbound_media: Callback::from(|_: PacketWrapper| {}),
             on_state_changed: Callback::from(|_: ConnectionState| {}),
             peer_monitor: Callback::from(|_: ()| {}),
