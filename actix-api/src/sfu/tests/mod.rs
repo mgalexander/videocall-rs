@@ -16,4 +16,5 @@
  * conditions.
  */
 
+pub mod forwarder_tests;
 pub mod room_state_tests;
