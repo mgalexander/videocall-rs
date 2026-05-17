@@ -32,7 +32,7 @@ use actix::{
 };
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -41,7 +41,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
-use super::packet_handler::parse_and_inspect;
+use super::packet_handler::{parse_and_inspect, ParsedPacket};
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::room_state::RoomState;
@@ -73,10 +73,59 @@ struct PendingDepartureState {
     was_active: bool,
 }
 
+/// Per-room demux state (vc-q0v).
+///
+/// Replaces the pre-vc-q0v *per-session* NATS subscription model. A single
+/// queue-less `subscribe` runs against `room.<room>.*` for the lifetime of the
+/// room. Every inbound message is parsed exactly once via
+/// [`parse_and_inspect`] and fanned out to each receiver in `receivers` via
+/// [`egress_decide_from_parsed`]. Joins update `receivers` under a write lock;
+/// the demux task takes a read lock per inbound message.
+///
+/// When the last receiver leaves, the dispatcher task is aborted and the
+/// `RoomDispatch` entry is removed. This mirrors the lifecycle of
+/// `room_states` / `forwarders` so per-room SFU state and per-room NATS
+/// subscriptions tear down together.
+struct RoomDispatch {
+    /// Live receivers in the room, keyed by `SessionId`. The demux task
+    /// snapshots this map per-message so writes (join/leave) only block
+    /// briefly under a write lock.
+    receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+    /// JoinHandle for the per-room subscription loop. Aborted when the
+    /// room drains so the task exits at its next `.await` and drops its
+    /// `Arc<Forwarder>` reference.
+    ///
+    /// Must be `.abort()`-ed before drop: tokio `JoinHandle` *detaches*
+    /// on drop, it does not cancel. Replacing or removing this field
+    /// without first aborting the prior handle leaks the task.
+    task: JoinHandle<()>,
+}
+
+/// Internal message: posted by the per-room demux task when its
+/// subscription loop exits unexpectedly (initial subscribe failed or
+/// `sub.next()` returned `None` because NATS closed the subscription).
+/// Normal teardown via [`ChatServer::drop_room_receiver`] aborts the task
+/// *before* sending — the handler distinguishes the two cases by checking
+/// whether `room_dispatch` still holds the entry.
+///
+/// Without this signal, a dispatcher dying mid-flight would leave a
+/// `RoomDispatch` entry in `room_dispatch` whose receivers map is still
+/// populated; subsequent joiners would register into that orphan map and
+/// silently receive zero media for the lifetime of the room. The handler
+/// recovers by respawning the dispatcher when receivers are still present.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct RoomDispatcherExited {
+    room: String,
+}
+
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
-    active_subs: HashMap<SessionId, JoinHandle<()>>,
+    /// Sessions that have completed `JoinRoom`. Used solely for the
+    /// duplicate-join short-circuit in the `JoinRoom` handler; the actual
+    /// receiver-side mailbox lives in [`RoomDispatch::receivers`].
+    joined_sessions: HashSet<SessionId>,
     session_manager: SessionManager,
     connection_states: HashMap<SessionId, ConnectionState>,
     /// Track which sessions are in which room, with their user_id and display_name.
@@ -101,26 +150,31 @@ pub struct ChatServer {
     /// running inside the NATS subscriber task can read it concurrently
     /// while p2-6 adds member-table mutations from the actor thread.
     room_states: HashMap<String, Arc<RwLock<RoomState>>>,
-    /// Per-room forwarder, cheaply cloned (via `Arc`) into each spawned
-    /// subscription task so the forwarder outlives the actor handler's stack
+    /// Per-room forwarder, cheaply cloned (via `Arc`) into the per-room
+    /// dispatcher task so the forwarder outlives the actor handler's stack
     /// frame.
     forwarders: HashMap<String, Arc<Forwarder>>,
+    /// Per-room demux state (one NATS subscription per room, fanned out to
+    /// all local receivers). Lazily created on the first `JoinRoom` for a
+    /// room and torn down when the room drains. See [`RoomDispatch`].
+    room_dispatch: HashMap<String, RoomDispatch>,
 }
 
 impl ChatServer {
     pub async fn new(nats_connection: async_nats::client::Client) -> Self {
         ChatServer {
             nats_connection,
-            active_subs: HashMap::new(),
+            joined_sessions: HashSet::new(),
             sessions: HashMap::new(),
             session_manager: SessionManager::new(),
             connection_states: HashMap::new(),
             room_members: HashMap::new(),
             pending_departures: HashMap::new(),
-            suppress_join_broadcast: std::collections::HashSet::new(),
+            suppress_join_broadcast: HashSet::new(),
             sfu_config: SfuConfig::from_env(),
             room_states: HashMap::new(),
             forwarders: HashMap::new(),
+            room_dispatch: HashMap::new(),
         }
     }
 
@@ -132,10 +186,9 @@ impl ChatServer {
         display_name: Option<&str>,
         observer: bool,
     ) {
-        // Remove the subscription task if it exists
-        if let Some(task) = self.active_subs.remove(session_id) {
-            task.abort();
-        }
+        // Drop the session marker. The session's receiver entry in the
+        // per-room demux is removed below (we need the room id for that).
+        self.joined_sessions.remove(session_id);
 
         // Remove from room_members tracking
         if let Some(room_id) = room {
@@ -149,6 +202,12 @@ impl ChatServer {
                 };
                 guard.remove_member(*session_id);
             }
+            // vc-q0v: remove this session from the per-room demux receiver
+            // map. When the room's receiver map empties, abort the
+            // dispatcher task so its `Arc<Forwarder>` reference is dropped
+            // and the per-room subscription closes.
+            self.drop_room_receiver(room_id, session_id);
+
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|(sid, _, _)| sid != session_id);
                 if members.is_empty() {
@@ -243,6 +302,31 @@ impl ChatServer {
     pub fn session_manager(&self) -> &SessionManager {
         &self.session_manager
     }
+
+    /// Remove a session from the per-room demux receiver map (vc-q0v).
+    ///
+    /// If the room's receiver map becomes empty as a result, the dispatcher
+    /// task is aborted and the `RoomDispatch` entry is dropped. Idempotent:
+    /// safe to call when the room or session is already gone.
+    fn drop_room_receiver(&mut self, room_id: &str, session_id: &SessionId) {
+        let now_empty = {
+            let dispatch = match self.room_dispatch.get(room_id) {
+                Some(d) => d,
+                None => return,
+            };
+            let mut guard = match dispatch.receivers.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.remove(session_id);
+            guard.is_empty()
+        };
+        if now_empty {
+            if let Some(dispatch) = self.room_dispatch.remove(room_id) {
+                dispatch.task.abort();
+            }
+        }
+    }
 }
 
 impl Actor for ChatServer {
@@ -298,13 +382,14 @@ impl Handler<Disconnect> for ChatServer {
             return;
         }
 
-        // Remove the NATS subscription task immediately so the old session
-        // stops receiving media. Keep room_members intact for now — they
-        // will be cleaned up either on reconnection or when the grace
-        // period expires.
-        if let Some(task) = self.active_subs.remove(&session) {
-            task.abort();
-        }
+        // vc-q0v: drop this session from the per-room demux receiver map
+        // immediately so the old (dead) recipient stops being targeted for
+        // try_send fan-out. Keep room_members intact for now — they will be
+        // cleaned up either on reconnection or when the grace period
+        // expires. The per-room dispatcher task itself stays alive as long
+        // as any receivers remain (and is aborted when the map empties).
+        self.joined_sessions.remove(&session);
+        self.drop_room_receiver(&room, &session);
 
         // If there is already a pending departure for this (room, user_id),
         // cancel the old timer and replace it. This handles the edge case of
@@ -545,6 +630,93 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
     }
 }
 
+/// Recover from an unexpected per-room dispatcher exit (vc-q0v).
+///
+/// The dispatcher posts [`RoomDispatcherExited`] when its NATS
+/// subscription dies (initial subscribe failed or `sub.next()` returned
+/// `None` mid-flight). Three cases:
+///
+/// 1. **Entry already gone** — normal teardown raced the abort; nothing
+///    to do.
+/// 2. **Entry present, receivers empty** — drain happened concurrently;
+///    drop the entry.
+/// 3. **Entry present, receivers non-empty** — respawn the dispatcher,
+///    *reusing the same receivers map and forwarder*. Sessions stay
+///    connected; they just experience the (NATS-bounded) gap that the
+///    dispatcher was unavailable.
+///
+/// Without this handler, a single dispatcher failure would poison the
+/// whole room: new joiners would insert into the orphaned receivers map
+/// and silently receive zero media for the lifetime of the room. The
+/// pre-vc-q0v per-session model degraded one session per failure; this
+/// recovery preserves the same blast radius at the room level.
+impl Handler<RoomDispatcherExited> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        RoomDispatcherExited { room }: RoomDispatcherExited,
+        ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let Some(existing) = self.room_dispatch.remove(&room) else {
+            // Normal teardown already removed the entry — nothing to do.
+            return;
+        };
+        // `existing.task` is the handle of the task that just sent this
+        // message. It's already finished; calling abort() on a finished
+        // task is a no-op, and dropping the handle detaches harmlessly.
+        let receivers = existing.receivers;
+        let has_receivers = {
+            let g = match receivers.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            !g.is_empty()
+        };
+        if !has_receivers {
+            info!(
+                "Per-room dispatcher exited for room {} with no remaining receivers; \
+                 entry removed",
+                room
+            );
+            return;
+        }
+        // Respawn against the same receivers map and forwarder so live
+        // sessions keep their mailbox identity and the room's SFU state
+        // (members + capabilities) is preserved.
+        let Some(forwarder) = self.forwarders.get(&room).cloned() else {
+            warn!(
+                "Per-room dispatcher exited for room {} but forwarder is gone; \
+                 dropping entry (receivers will be cleaned up on next leave_rooms)",
+                room
+            );
+            return;
+        };
+        let subject = format!("room.{room}.*").replace(' ', "_");
+        let sfu_mode = self.sfu_config.mode;
+        warn!(
+            "Respawning per-room dispatcher for room {} (subscription died with \
+             {} live receivers still attached)",
+            room,
+            receivers
+                .read()
+                .map(|g| g.len())
+                .unwrap_or_else(|p| p.into_inner().len()),
+        );
+        let task = spawn_room_dispatcher(
+            self.nats_connection.clone(),
+            room.clone(),
+            subject,
+            sfu_mode,
+            forwarder,
+            receivers.clone(),
+            ctx.address(),
+        );
+        self.room_dispatch
+            .insert(room, RoomDispatch { receivers, task });
+    }
+}
+
 impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
@@ -626,7 +798,7 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Err("Cannot use reserved system user ID".into()));
         }
 
-        if self.active_subs.contains_key(&session) {
+        if self.joined_sessions.contains(&session) {
             return MessageResult(Ok(()));
         }
 
@@ -713,7 +885,10 @@ impl Handler<JoinRoom> for ChatServer {
         let nc = self.nats_connection.clone();
 
         let session_str = session.to_string();
-        let (subject, queue) = build_subject_and_queue(&room, &session_str);
+        // vc-q0v: only the subject string is needed — the per-room demux
+        // uses a plain `subscribe` rather than `queue_subscribe`. The queue
+        // group was a per-session artifact of the pre-vc-q0v fan-out model.
+        let (subject, _queue) = build_subject_and_queue(&room, &session_str);
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
@@ -769,13 +944,54 @@ impl Handler<JoinRoom> for ChatServer {
         }
         let sfu_mode = self.sfu_config.mode;
 
-        // Clone the recipient so we can send existing member info directly to the new joiner
+        // --- vc-q0v: per-room parse-once demux ----------------------------
+        // Ensure the per-room dispatcher exists (the first joiner spawns it)
+        // and register this session's recipient in the room's receiver map.
+        // The dispatcher subscribes ONCE to `room.<room>.*`, parses each
+        // inbound NATS message exactly once, and fans the parsed result out
+        // to every entry in `receivers` via `egress_decide_from_parsed`.
+        // This eliminates the N× parse cost of the pre-vc-q0v per-session
+        // subscription model.
+        //
+        // The `subject` built above is the per-room wildcard subject; the
+        // queue group was a per-session artifact that the new dispatcher
+        // does not need (one `subscribe` per pod per room).
+        let receivers_for_room = match self.room_dispatch.entry(room.clone()) {
+            std::collections::hash_map::Entry::Occupied(occ) => occ.get().receivers.clone(),
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                let receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>> =
+                    Arc::new(RwLock::new(HashMap::new()));
+                let task = spawn_room_dispatcher(
+                    self.nats_connection.clone(),
+                    room.clone(),
+                    subject.clone(),
+                    sfu_mode,
+                    forwarder.clone(),
+                    receivers.clone(),
+                    ctx.address(),
+                );
+                let recvs = receivers.clone();
+                vac.insert(RoomDispatch { receivers, task });
+                recvs
+            }
+        };
+        {
+            let mut w = match receivers_for_room.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Insert (or replace) — reconnects share the same SessionId
+            // semantics as the prior per-session model: the latest
+            // recipient wins.
+            w.insert(session, session_recipient.clone());
+        }
+        self.joined_sessions.insert(session);
+
+        // Clone the recipient so we can send existing member info directly
+        // to the new joiner from the one-shot post-join task below.
         let new_joiner_recipient = session_recipient.clone();
 
-        let nc2 = self.nats_connection.clone();
-        let session_clone = session;
-
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
             // wt_chat_session) in their started() method, which blocks with
             // ctx.wait() before this JoinRoom handler runs. We do NOT call it
@@ -856,33 +1072,126 @@ impl Handler<JoinRoom> for ChatServer {
                     );
                 }
             }
-
-            match nc2.queue_subscribe(subject, queue).await {
-                Ok(mut sub) => {
-                    let handler = handle_msg(
-                        session_recipient.clone(),
-                        room_clone.clone(),
-                        session_clone,
-                        sfu_mode,
-                        forwarder,
-                    );
-                    while let Some(msg) = sub.next().await {
-                        if let Err(e) = handler(msg) {
-                            error!("Error handling message: {}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("{}", e)
-                }
-            }
         });
-
-        self.active_subs.insert(session, handle);
 
         MessageResult(Ok(()))
     }
+}
+
+/// Spawn the per-room demux subscription task (vc-q0v).
+///
+/// One task per room. Subscribes once to `room.<room>.*`, parses each
+/// inbound NATS message exactly once via [`parse_and_inspect`], and fans
+/// the parsed result out to every receiver in `receivers` by calling
+/// [`egress_decide_from_parsed`]. The pre-vc-q0v model ran one
+/// `queue_subscribe` per session and re-parsed each wrapper N times for an
+/// N-participant room; this consolidation eliminates the (N-1) redundant
+/// parses per published packet.
+///
+/// The task exits on three conditions:
+///   1. **Normal drain** — [`ChatServer::drop_room_receiver`] aborts the
+///      `JoinHandle` once the receivers map empties.
+///   2. **Initial subscribe failed** — `nc.subscribe` returned `Err`.
+///   3. **Subscription closed mid-flight** — `sub.next()` returned `None`
+///      (NATS server closed the subscription, lame-duck shutdown, etc.).
+///
+/// In cases (2) and (3) the task sends [`RoomDispatcherExited`] back to
+/// the actor so the entry is cleaned up (or the dispatcher respawned if
+/// receivers are still present). Without this signal the room would be
+/// silently dead — receivers in the map but no parser feeding them. In
+/// case (1) the abort drops the message channel before the send can race,
+/// which is fine: the handler checks whether the entry is still present
+/// and exits if not.
+fn spawn_room_dispatcher(
+    nc: async_nats::client::Client,
+    room: String,
+    subject: String,
+    sfu_mode: SfuMode,
+    forwarder: Arc<Forwarder>,
+    receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+    chat_server: actix::Addr<ChatServer>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut sub = match nc.subscribe(subject.clone()).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    "Per-room demux failed to subscribe to {} (room {}): {} — \
+                     notifying actor for cleanup/respawn",
+                    subject, room, e
+                );
+                // try_send is fine here: if the actor mailbox is full or
+                // the actor is gone, recovery on the next JoinRoom for
+                // this room will spawn a fresh dispatcher (the entry is
+                // keyed on room, not on this task instance).
+                let _ = chat_server.try_send(RoomDispatcherExited { room });
+                return;
+            }
+        };
+        info!(
+            "Per-room demux subscribed to {} (room {}, mode {:?})",
+            subject, room, sfu_mode
+        );
+        while let Some(msg) = sub.next().await {
+            // Parse ONCE per inbound message — the whole point of vc-q0v.
+            // `msg.payload` is `bytes::Bytes`; deref to `&[u8]` for the
+            // parser. The decision call below takes the `&Bytes` so it
+            // can `clone()` a refcount bump per forwarded receiver.
+            let parsed = parse_and_inspect(&msg.payload[..]);
+            let subject_str: &str = msg.subject.as_ref();
+
+            // Snapshot the recipients under the read lock, then drop it
+            // before fan-out. Recipient<_> is Clone (Arc-backed inside
+            // actix), so per-message cloning is cheap; this keeps the
+            // join/leave write path from being blocked for the full
+            // fan-out (which calls try_send N times).
+            let snapshot: Vec<(SessionId, Recipient<Message>)> = {
+                let guard = match receivers.read() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.iter().map(|(sid, r)| (*sid, r.clone())).collect()
+            };
+
+            for (rsid, recipient) in snapshot {
+                if let Some(bytes) = egress_decide_from_parsed(
+                    sfu_mode,
+                    &forwarder,
+                    rsid,
+                    &room,
+                    subject_str,
+                    &msg.payload,
+                    parsed.as_ref(),
+                ) {
+                    if let Err(e) = recipient.try_send(Message {
+                        msg: bytes,
+                        session: rsid,
+                    }) {
+                        warn!(
+                            "Dropping inbound message for session {}: {} \
+                             (mailbox full — subscription continues)",
+                            rsid, e
+                        );
+                    }
+                }
+            }
+        }
+        // `sub.next()` returned None — the subscription is closed. This is
+        // unexpected during normal operation (async-nats is supposed to
+        // transparently re-attach subscriptions across reconnects). Surface
+        // loudly and ask the actor to either respawn (receivers still
+        // present) or drop the entry (room already drained). A normal
+        // drain reaches this point via `.abort()` before the next `.await`,
+        // so this log specifically marks abnormal exits — though `.abort()`
+        // can race past the await, in which case the actor sees a stale
+        // RoomDispatcherExited and a no-op cleanup, which is harmless.
+        warn!(
+            "Per-room demux subscription closed unexpectedly for room {} — \
+             notifying actor for cleanup/respawn",
+            room
+        );
+        let _ = chat_server.try_send(RoomDispatcherExited { room });
+    })
 }
 
 async fn send_meeting_info(
@@ -901,16 +1210,16 @@ async fn send_meeting_info(
     }
 }
 
-/// Pure egress decision: given a receiver and an on-wire NATS payload, decide
-/// what bytes (if any) should be delivered to the receiver's session actor.
+/// Parse-and-decide helper for tests.
 ///
-/// Returns `Some(bytes)` when the receiver should be sent `bytes`, or `None`
-/// when nothing should be sent.
-///
-/// This is the *pure* core of [`handle_msg`]'s closure body — the same
-/// function is exercised by the legacy-vs-SFU golden-trace parity tests
-/// (`sfu::tests::forwarder_parity_tests`), so production fan-out and the
-/// parity assertion are by construction the *same code path*.
+/// Production fan-out runs through [`spawn_room_dispatcher`] +
+/// [`egress_decide_from_parsed`], which parses each inbound NATS message
+/// exactly once per room (vc-q0v). This wrapper parses on every call and
+/// is retained for test consumers — `sfu::tests::forwarder_parity_tests`
+/// (legacy-vs-SFU golden-trace parity), `sfu::tests::parse_once_tests`
+/// (the parse-per-receiver reference oracle), and the `#[cfg(test)]`
+/// `handle_msg` helper. None of these need to amortize parsing across N
+/// receivers, so they exercise the per-receiver decision path directly.
 ///
 /// Semantics preserved bit-for-bit from the pre-extraction closure:
 ///
@@ -924,6 +1233,7 @@ async fn send_meeting_info(
 ///    CRITICAL comment inline) and parse failures fall through to a tolerant
 ///    "forward as-is" — matching legacy so we never black-hole unparseable
 ///    payloads.
+#[cfg(test)]
 pub(crate) fn egress_decide_bytes(
     sfu_mode: SfuMode,
     forwarder: &Forwarder,
@@ -932,23 +1242,45 @@ pub(crate) fn egress_decide_bytes(
     subject: &str,
     payload: &bytes::Bytes,
 ) -> Option<bytes::Bytes> {
-    // Parse the wrapper + inner MediaPacket once via the shared egress
-    // parser. This is the egress sibling of `classify_and_inspect`; it
-    // deliberately does NOT apply the client-CONGESTION drop (that is an
-    // ingress-only security check — see the CRITICAL carve-out below and
-    // the rustdoc on `parse_and_inspect`). Parse failures preserve the
-    // pre-existing semantics: the wrapper is treated as non-CONGESTION
-    // (so self-addressed unparseable payloads are still self-skipped)
-    // and no routing header is surfaced.
     let parsed = parse_and_inspect(&payload[..]);
+    egress_decide_from_parsed(
+        sfu_mode,
+        forwarder,
+        receiver_session,
+        room,
+        subject,
+        payload,
+        parsed.as_ref(),
+    )
+}
 
+/// Per-receiver egress decision, given a *pre-parsed* wrapper.
+///
+/// The per-room demux task (see [`spawn_room_dispatcher`]) calls
+/// [`parse_and_inspect`] once per inbound NATS message and then invokes this
+/// function once per receiver. This avoids the O(N) parse fan-out that the
+/// pre-vc-q0v per-session subscription model incurred (~6k extra parses/s
+/// per active 30 fps sender per pod with a 200-participant room).
+///
+/// Semantics are identical to [`egress_decide_bytes`]; the only difference
+/// is who owns the parse. `parsed` is `None` when the wrapper failed to
+/// parse — preserving the pre-existing tolerant "forward as-is" behavior on
+/// the SFU path so we never black-hole encrypted-or-unparseable payloads.
+pub(crate) fn egress_decide_from_parsed(
+    sfu_mode: SfuMode,
+    forwarder: &Forwarder,
+    receiver_session: SessionId,
+    room: &str,
+    subject: &str,
+    payload: &bytes::Bytes,
+    parsed: Option<&ParsedPacket>,
+) -> Option<bytes::Bytes> {
     let self_subject = format!("room.{room}.{receiver_session}").replace(' ', "_");
     if subject == self_subject.as_str() {
         // Self-skip prevents echo of our own broadcasts. However,
         // CONGESTION signals published on our subject by a congested
         // receiver must still be delivered — they are not echo.
         let is_congestion = parsed
-            .as_ref()
             .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
         if !is_congestion {
@@ -966,13 +1298,12 @@ pub(crate) fn egress_decide_bytes(
             // etc.) lands in P5 — see PLAN.md Phase 5 priority-queue
             // table.
             let is_congestion = parsed
-                .as_ref()
                 .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
                 .unwrap_or(false);
 
             if is_congestion {
                 Some(payload.clone())
-            } else if let Some(p) = parsed.as_ref() {
+            } else if let Some(p) = parsed {
                 match forwarder.decide(receiver_session, &p.wrapper, p.routing_header()) {
                     // Reuse the original on-wire NATS payload — no per-receiver
                     // re-serialization of an identical PacketWrapper. `Bytes::clone`
@@ -1000,6 +1331,13 @@ pub(crate) fn egress_decide_bytes(
     }
 }
 
+/// Per-receiver subscription handler used by the unit test that exercises
+/// the SFU CONGESTION bypass branch (see
+/// `test_sfu_mode_congestion_bypasses_forwarder`). Production fan-out runs
+/// through [`spawn_room_dispatcher`] and [`egress_decide_from_parsed`]
+/// instead, which parses each inbound NATS message exactly once per room
+/// rather than once per receiver (vc-q0v).
+#[cfg(test)]
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
@@ -1008,10 +1346,6 @@ fn handle_msg(
     forwarder: Arc<Forwarder>,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        // Delegate the actual egress decision to the pure helper. This
-        // ensures the legacy-vs-SFU golden-trace parity tests
-        // (`sfu::tests::forwarder_parity_tests`) exercise the same code
-        // path as production fan-out.
         let subject_str: &str = msg.subject.as_ref();
         if let Some(bytes) = egress_decide_bytes(
             sfu_mode,
@@ -1019,13 +1353,8 @@ fn handle_msg(
             session,
             &room,
             subject_str,
-            // `msg.payload` is `bytes::Bytes` from async-nats; passed by
-            // reference so `egress_decide_bytes` can `clone()` it as a
-            // refcount bump for each forwarded receiver.
             &msg.payload,
         ) {
-            // Inlined send helper keeps the warn! semantics identical across
-            // legacy and SFU code paths.
             if let Err(e) = session_recipient.try_send(Message {
                 msg: bytes,
                 session,
@@ -1257,7 +1586,7 @@ mod tests {
     // TEST: Duplicate join with same session returns Ok
     // ==========================================================================
     // Verifies that a second JoinRoom for the same session_id returns Ok
-    // immediately because the session is already tracked in active_subs.
+    // immediately because the session is already tracked in joined_sessions.
     #[actix_rt::test]
     #[serial]
     async fn test_duplicate_join_same_session_returns_ok() {
@@ -1306,7 +1635,7 @@ mod tests {
         assert!(result1.is_ok(), "First join should succeed");
 
         // Second join attempt with same session - should return Ok
-        // immediately because session is already in active_subs
+        // immediately because session is already in joined_sessions
         let result2 = chat_server
             .send(JoinRoom {
                 session: session_id,
@@ -2398,7 +2727,7 @@ mod tests {
             "Observer JoinRoom should succeed, got: {result:?}"
         );
 
-        // Joining again with same session should return Ok (already in active_subs)
+        // Joining again with same session should return Ok (already in joined_sessions)
         let result2 = chat_server
             .send(JoinRoom {
                 session: session_id,

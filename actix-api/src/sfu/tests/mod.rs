@@ -18,4 +18,5 @@
 
 pub mod forwarder_parity_tests;
 pub mod forwarder_tests;
+pub mod parse_once_tests;
 pub mod room_state_tests;
