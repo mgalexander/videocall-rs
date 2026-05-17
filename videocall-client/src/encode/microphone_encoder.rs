@@ -258,6 +258,8 @@ impl MicrophoneEncoder {
                 }
                 // Reset speaking state and audio level when mic is disabled
                 self.is_speaking.store(false, Ordering::Relaxed);
+                self.audio_level_bits.store(0u32, Ordering::Relaxed);
+                self.routing_is_speaking.store(false, Ordering::Relaxed);
                 self.client.set_speaking(false);
                 self.client.set_audio_level(0.0);
             };
@@ -276,6 +278,8 @@ impl MicrophoneEncoder {
         }
         // Reset speaking state and audio level when encoder stops
         self.is_speaking.store(false, Ordering::Relaxed);
+        self.audio_level_bits.store(0u32, Ordering::Relaxed);
+        self.routing_is_speaking.store(false, Ordering::Relaxed);
         self.client.set_speaking(false);
         self.client.set_audio_level(0.0);
     }
@@ -367,8 +371,7 @@ impl MicrophoneEncoder {
                     // is a coarse hint, not a per-frame measurement.
                     let audio_level =
                         f32::from_bits(audio_level_bits_for_handler.load(Ordering::Relaxed));
-                    let is_speaking_hint =
-                        routing_is_speaking_for_handler.load(Ordering::Relaxed);
+                    let is_speaking_hint = routing_is_speaking_for_handler.load(Ordering::Relaxed);
 
                     let packet: PacketWrapper = transform_audio_chunk(
                         &data,
@@ -631,19 +634,27 @@ impl MicrophoneEncoder {
                         prev_level_clone.set(0.0);
                         client_clone.set_audio_level(0.0);
                     }
+                    // Also reset the routing-header hints so packets emitted
+                    // while the mic is disabled don't carry stale values.
+                    audio_level_bits_for_vad.store(0u32, Ordering::Relaxed);
+                    routing_is_speaking_for_vad.store(false, Ordering::Relaxed);
                     return;
                 }
 
                 let mut array = data_array_for_interval.borrow_mut();
                 analyser.get_float_time_domain_data(&mut array);
 
-                let mut sum = 0.0f32;
-                for sample in array.iter() {
-                    sum += sample * sample;
-                }
-                let rms = (sum / array.len() as f32).sqrt();
+                let rms = compute_audio_level(&array);
 
                 let speaking = rms > vad_threshold;
+
+                // Publish the pre-Opus speaker hints for the outbound
+                // MediaPacket RoutingHeader (bead p1-8). The threshold is
+                // intentionally fixed at SPEAKING_THRESHOLD (not
+                // `vad_threshold`) so the SFU's P3 EWMA scorer can rely on
+                // a stable contract — see ADR-0002.
+                audio_level_bits_for_vad.store(rms.to_bits(), Ordering::Relaxed);
+                routing_is_speaking_for_vad.store(rms > SPEAKING_THRESHOLD, Ordering::Relaxed);
 
                 // Compute normalized intensity using the shared perceptual
                 // curve so the host tile shows a smooth, intensity-driven glow.
@@ -717,6 +728,78 @@ impl MicrophoneEncoder {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod audio_level_tests {
+    //! Host-runnable unit tests for [`compute_audio_level`] and the
+    //! [`SPEAKING_THRESHOLD`] contract (bead p1-8).
+    //!
+    //! These tests intentionally avoid `wasm_bindgen_test` and any
+    //! browser-only dependencies so they execute under
+    //! `cargo test -p videocall-client --lib`.
+    use super::{compute_audio_level, SPEAKING_THRESHOLD};
+
+    #[test]
+    fn all_zero_samples_yield_zero_audio_level() {
+        let samples = vec![0.0f32; 1024];
+        let rms = compute_audio_level(&samples);
+        assert_eq!(rms, 0.0);
+        assert!(
+            !(rms > SPEAKING_THRESHOLD),
+            "silence must not be flagged as speaking"
+        );
+    }
+
+    #[test]
+    fn empty_samples_yield_zero_audio_level() {
+        // Guard rail: the function must not panic on empty input.
+        let rms = compute_audio_level(&[]);
+        assert_eq!(rms, 0.0);
+        assert!(!(rms > SPEAKING_THRESHOLD));
+    }
+
+    #[test]
+    fn mid_amplitude_samples_yield_expected_rms() {
+        // Constant signal at 0.5 → RMS == 0.5 exactly.
+        let samples = vec![0.5f32; 2048];
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.5).abs() < 1e-6, "expected RMS ≈ 0.5, got {rms}");
+        assert!(rms > SPEAKING_THRESHOLD, "0.5 must trip the speaking flag");
+    }
+
+    #[test]
+    fn just_under_speaking_threshold_is_not_speaking() {
+        // Constant 0.04 → RMS ≈ 0.04 < 0.05.
+        let samples = vec![0.04f32; 1024];
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.04).abs() < 1e-6, "expected RMS ≈ 0.04, got {rms}");
+        assert!(
+            !(rms > SPEAKING_THRESHOLD),
+            "0.04 must NOT trip the speaking flag"
+        );
+    }
+
+    #[test]
+    fn just_over_speaking_threshold_is_speaking() {
+        // Constant 0.06 → RMS ≈ 0.06 > 0.05.
+        let samples = vec![0.06f32; 1024];
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.06).abs() < 1e-6, "expected RMS ≈ 0.06, got {rms}");
+        assert!(rms > SPEAKING_THRESHOLD, "0.06 must trip the speaking flag");
+    }
+
+    #[test]
+    fn alternating_polarity_signal_matches_amplitude() {
+        // RMS of a square-wave-like signal at +/- 0.1 is 0.1.
+        let mut samples = Vec::with_capacity(1024);
+        for i in 0..1024 {
+            samples.push(if i % 2 == 0 { 0.1f32 } else { -0.1f32 });
+        }
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.1).abs() < 1e-6, "expected RMS ≈ 0.1, got {rms}");
+        assert!(rms > SPEAKING_THRESHOLD);
     }
 }
 
