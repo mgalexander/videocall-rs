@@ -167,7 +167,9 @@ beads:
         - Tails pod logs for ~5s to surface immediate errors.
 
       Used after each dev-rig phase merges to experimental-sfu, per the
-      Track 3 ops-validation cadence.
+      Track 3 ops-validation cadence. Per ADR-0008, the overseer (not a
+      polecat) invokes this script against k3d-videocall-local — polecats
+      author it, the overseer runs it.
     parent_epic: ops-epic
     blocked_by: [vco-5]
 

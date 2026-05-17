@@ -33,6 +33,7 @@ The full DAG is meant to run under gastown's daemon, not be driven step-by-step 
 - **Disk:** before any container restart or bead launch, run `df -h /` and `docker system df`. Soft alert at 80%, halt at 85% — escalate to user, don't continue.
 - **Local-only:** no `git push origin` (to GitHub) without explicit user approval, one approval per push. Polecat work happens in **git worktrees** under the rig convention; the Refinery merges polecat branches into `experimental-sfu` in the rig's bare repo and pushes onward to the user's local clone (`/mnt/llms/videocall/`) via `receive.denyCurrentBranch=updateInstead` — that rig-to-clone push is a local operation and is NOT subject to the manual-approval rule. The gate is the GitHub `origin` push only. See [ADR-0006](adr/0006-refinery-push-contract.md).
 - **Container caution:** `gastown-sandbox` has been up ~2 days hosting `lps-` and `imap-` rigs. Don't restart it unless the mount situation requires it; prefer hot-mount or already-present paths.
+- **Polecat ↔ local cluster boundary (Track 3):** polecat sandboxes have no path to `k3d-videocall-local` (no docker socket, no kubeconfig, no `kubectl`/`helm`/`k3d` in-image). Cluster-touching ops are overseer-only for the experimental-sfu phase. See [ADR-0008](adr/0008-polecat-cluster-access-boundary.md).
 
 ### B0 — Verify sandbox + mount situation (read-only)
 - `docker ps` confirms `gastown-sandbox` running.

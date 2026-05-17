@@ -203,3 +203,18 @@ Changes landed in this commit:
 - `convoy-manifest.yaml` left untouched (the s0-4 bead's summary describes the original deliverable; the ADR itself is now authoritative).
 
 Operational hygiene captured in the new ADR: keep the user's clone's working tree clean while convoys are running, else `updateInstead` will refuse the push and wedge the Refinery's queue. First failure-mode check on a stalled MR is now `git status` on `/mnt/llms/videocall/`.
+
+## 2026-05-17 ADR-0008 codifies polecat ↔ local-cluster boundary (Track 3) — vco-ow8.11
+
+Followed up vco-ow8.10 (postgres redeploy, closed `no-changes: host-only operation`) with a written boundary policy. Polecat sandboxes have no path to the local k3d cluster (no docker socket, no kubeconfig, no `kubectl`/`helm`/`k3d` binaries in the sandbox image), and the dev/ops agent split breaks down at every kubectl-touching bead in Track 3 (per-phase ops validation).
+
+Decision: Option D — codify the boundary, do not change the sandbox. Cluster-touching ops against `k3d-videocall-local` are **overseer-only** for the experimental-sfu phase; polecats author code, charts, and validation scripts. See `sfu-update/adr/0008-polecat-cluster-access-boundary.md` for the full rationale, the trade-off vs. Options A/B/C, and the "When to revisit" triggers (multi-polecat concurrent cluster access; graduation to a managed cluster; introduction of an ops-specific agent role; rising rate of host-only closures).
+
+Operational impact on Track 3 cadence: dev rig closes phase → overseer runs the phase's `helm/local/redeploy.sh` + validation scripts (authored by polecats) against `k3d-videocall-local` → overseer logs in this file → next dev phase opens. Polecats hitting host-only beads close them `no-changes: host-only operation per ADR-0008` and `gt escalate -s HIGH`.
+
+Changes landed in this commit:
+- `sfu-update/adr/0008-polecat-cluster-access-boundary.md` (new) — Accepted.
+- `sfu-update/ops-convoy-manifest.yaml` — one-line comment near Track 3 reference in vco-6 pointing at ADR-0008.
+- `sfu-update/PLAN.md` "Standing guardrails" — one-line note pointing at ADR-0008 (Track 3 boundary). PLAN.md doesn't have a dedicated "Track 3" section — the Track 1/2/3 terminology lives here in `ops-log.md` and in `ops-convoy-manifest.yaml`.
+
+Note: the bead description references an escalation `hq-wisp-uf9hl` from the vco-ow8.10 closure; the ID didn't resolve via `bd show` / `bd search` at ADR-write time, so no separate close-with-link step was performed. If it surfaces, the link is this ADR.
