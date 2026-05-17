@@ -18,8 +18,6 @@
 
 use std::sync::{Arc, RwLock};
 
-use bytes::Bytes;
-use protobuf::Message;
 use videocall_types::protos::media_packet::RoutingHeader;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -55,9 +53,15 @@ fn packet_type_label(pw: &PacketWrapper) -> &'static str {
 }
 
 /// Decision returned by the [`Forwarder`] for a single (packet, receiver) pair.
+///
+/// The pass-through hot path no longer carries bytes: the caller already
+/// has the on-wire NATS payload in scope and reuses it directly on
+/// `Forward`, avoiding a per-receiver re-serialization of an identical
+/// `PacketWrapper`.
 pub enum ForwardDecision {
-    /// Forward the serialized packet bytes to the receiver.
-    Forward(Bytes),
+    /// Forward to the receiver. The caller is responsible for supplying
+    /// the bytes (typically the original NATS payload — no re-encoding).
+    Forward,
     /// Drop the packet for this receiver.
     Drop,
 }
@@ -66,13 +70,15 @@ pub enum ForwardDecision {
 ///
 /// Holds a shared handle to the authoritative [`RoomState`]. `decide` is
 /// invoked from each receiver's NATS subscription callback and takes a
-/// read lock on the room for the duration of the decision — callers must
-/// keep that work cheap.
+/// read lock on the room only long enough to evaluate policy — callers
+/// must keep that work cheap.
 ///
 /// Wave-3 implements *pass-through* semantics: every packet is forwarded
 /// except for the sender's own echo (self-skip). Real per-receiver
 /// filtering (subscription, allow-set, layer selection) lands in later
-/// phases.
+/// phases. The decision carries no bytes — the call site reuses the
+/// original NATS payload, so the pass-through path performs zero
+/// per-receiver serialization.
 pub struct Forwarder {
     room: Arc<RwLock<RoomState>>,
 }
@@ -86,8 +92,9 @@ impl Forwarder {
     ///
     /// Returns [`ForwardDecision::Drop`] iff the packet's sender is the
     /// receiver itself (self-skip — preserves legacy fanout semantics).
-    /// Otherwise re-serializes the packet and returns
-    /// [`ForwardDecision::Forward`] with the bytes.
+    /// Otherwise returns [`ForwardDecision::Forward`]; the caller is
+    /// expected to write the original on-wire bytes to the receiver — no
+    /// re-encoding occurs in this function.
     pub fn decide(
         &self,
         receiver_sid: SessionId,
@@ -96,11 +103,12 @@ impl Forwarder {
     ) -> ForwardDecision {
         let start = std::time::Instant::now();
 
-        // Hold a read lock for the duration of the decision so future
-        // phases can layer subscription / capability / speaker checks
-        // here without changing the call site. The lock is poison-safe:
-        // a panicked writer leaves the room readable.
-        let decision = {
+        // Tight read-lock scope: only the policy decision (self-skip) and
+        // a room-size gauge refresh happen under the lock. Counters and
+        // the latency histogram are updated *after* the guard is dropped
+        // to keep the critical section as small as possible. The lock is
+        // poison-safe: a panicked writer leaves the room readable.
+        let is_self = {
             let room = match self.room.read() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
@@ -111,24 +119,17 @@ impl Forwarder {
                 .with_label_values(&[room.room_id.as_str()])
                 .set(room.member_count() as f64);
 
-            if packet_wrapper.session_id == receiver_sid {
-                SFU_DROPPED_TOTAL.with_label_values(&["self_skip"]).inc();
-                ForwardDecision::Drop
-            } else {
-                match packet_wrapper.write_to_bytes() {
-                    Ok(bytes) => {
-                        SFU_FORWARDED_TOTAL
-                            .with_label_values(&[packet_type_label(packet_wrapper)])
-                            .inc();
-                        ForwardDecision::Forward(Bytes::from(bytes))
-                    }
-                    // Serialization failure is a defensive branch for a
-                    // well-formed `PacketWrapper` and does not map cleanly
-                    // onto any of the (self_skip / unsubscribed / layer_budget)
-                    // drop reasons, so we deliberately leave it uncounted.
-                    Err(_) => ForwardDecision::Drop,
-                }
-            }
+            packet_wrapper.session_id == receiver_sid
+        };
+
+        let decision = if is_self {
+            SFU_DROPPED_TOTAL.with_label_values(&["self_skip"]).inc();
+            ForwardDecision::Drop
+        } else {
+            SFU_FORWARDED_TOTAL
+                .with_label_values(&[packet_type_label(packet_wrapper)])
+                .inc();
+            ForwardDecision::Forward
         };
 
         let elapsed_us = start.elapsed().as_micros() as f64;

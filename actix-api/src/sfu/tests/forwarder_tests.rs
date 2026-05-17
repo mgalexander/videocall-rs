@@ -21,7 +21,6 @@
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use protobuf::Message;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -47,13 +46,12 @@ fn passthrough_forwards_to_unrelated_receiver() {
     let receiver_sid = 2u64;
     let pw = make_packet(sender_sid);
 
-    match fwd.decide(receiver_sid, &pw, None) {
-        ForwardDecision::Forward(bytes) => {
-            let expected = pw.write_to_bytes().expect("serialize");
-            assert_eq!(bytes.as_ref(), expected.as_slice());
-        }
-        ForwardDecision::Drop => panic!("expected Forward for unrelated receiver"),
-    }
+    // The decision no longer carries bytes — the call site is responsible
+    // for forwarding the original on-wire NATS payload on `Forward`.
+    assert!(matches!(
+        fwd.decide(receiver_sid, &pw, None),
+        ForwardDecision::Forward
+    ));
 }
 
 #[test]
@@ -66,7 +64,7 @@ fn self_skip_drops_when_receiver_is_sender() {
 
     match fwd.decide(sid, &pw, None) {
         ForwardDecision::Drop => {}
-        ForwardDecision::Forward(_) => panic!("expected Drop for self-skip"),
+        ForwardDecision::Forward => panic!("expected Drop for self-skip"),
     }
 }
 
@@ -88,7 +86,7 @@ fn concurrent_decide_calls_against_shared_room() {
             let pw = make_packet(receiver_sid.wrapping_add(1));
             matches!(
                 fwd.decide(receiver_sid, &pw, None),
-                ForwardDecision::Forward(_)
+                ForwardDecision::Forward
             )
         }));
     }
@@ -113,7 +111,7 @@ fn metrics_forward_counter_increments_on_forward() {
     let latency_before = SFU_DECIDE_LATENCY_US.get_sample_count();
 
     match fwd.decide(receiver_sid, &pw, None) {
-        ForwardDecision::Forward(_) => {}
+        ForwardDecision::Forward => {}
         ForwardDecision::Drop => panic!("expected Forward for unrelated receiver"),
     }
 
@@ -142,7 +140,7 @@ fn metrics_drop_counter_increments_on_self_skip() {
 
     match fwd.decide(sid, &pw, None) {
         ForwardDecision::Drop => {}
-        ForwardDecision::Forward(_) => panic!("expected Drop for self-skip"),
+        ForwardDecision::Forward => panic!("expected Drop for self-skip"),
     }
 
     let after = SFU_DROPPED_TOTAL.with_label_values(&["self_skip"]).get();

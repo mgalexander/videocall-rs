@@ -940,7 +940,9 @@ fn handle_msg(
                     send(msg.payload.to_vec());
                 } else if let Some(pw) = parsed_wrapper.as_ref() {
                     match forwarder.decide(session, pw, routing_header) {
-                        ForwardDecision::Forward(bytes) => send(bytes.to_vec()),
+                        // Reuse the original on-wire NATS payload — no per-receiver
+                        // re-serialization of an identical PacketWrapper.
+                        ForwardDecision::Forward => send(msg.payload.to_vec()),
                         ForwardDecision::Drop => {
                             // p2-7 will increment a dropped-packet counter here.
                             return Ok(());
