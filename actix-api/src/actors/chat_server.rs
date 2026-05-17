@@ -629,11 +629,7 @@ impl Handler<JoinRoom> for ChatServer {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(MAX_PARTICIPANTS_PER_ROOM);
-            let current = self
-                .room_members
-                .get(&room)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let current = self.room_members.get(&room).map(|m| m.len()).unwrap_or(0);
             if current >= cap {
                 warn!(
                     "JoinRoom rejected: room {} is at capacity ({}/{}) — \
