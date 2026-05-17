@@ -2,4 +2,10 @@ syntax = "proto3";
 
 message ConnectionPacket {
   string meeting_id = 1;
+
+  // CAPABILITY BITS:
+  //   SFU_ROUTING_HEADER = 1   // emits MediaPacket.routing_header
+  //   SVC                = 2   // can encode/decode SVC layered bitstreams
+  //   SUBSCRIPTION       = 4   // can emit SubscriptionUpdate
+  optional uint32 client_capabilities = 2;
 }
