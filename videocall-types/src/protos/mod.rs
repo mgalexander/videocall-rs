@@ -9,3 +9,5 @@ pub mod meeting_packet;
 pub mod packet_wrapper;
 pub mod rsa_packet;
 pub mod server_connection_packet;
+pub mod speaker_update_packet;
+pub mod subscription_packet;

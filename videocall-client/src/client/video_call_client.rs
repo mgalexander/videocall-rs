@@ -1379,6 +1379,36 @@ impl Inner {
                     );
                 }
             }
+            Ok(PacketType::SUBSCRIPTION_UPDATE) => {
+                debug!(
+                    "Received SUBSCRIPTION_UPDATE packet from {} -- handler not yet implemented (wave 3)",
+                    String::from_utf8_lossy(&response.user_id)
+                );
+            }
+            Ok(PacketType::SPEAKER_UPDATE) => {
+                debug!(
+                    "Received SPEAKER_UPDATE packet from {} -- handler not yet implemented (wave 3)",
+                    String::from_utf8_lossy(&response.user_id)
+                );
+            }
+            Ok(PacketType::LAYER_HINT) => {
+                debug!(
+                    "Received LAYER_HINT packet from {} -- handler not yet implemented (wave 3)",
+                    String::from_utf8_lossy(&response.user_id)
+                );
+            }
+            Ok(PacketType::ADMISSION_DECISION) => {
+                debug!(
+                    "Received ADMISSION_DECISION packet from {} -- handler not yet implemented (wave 3)",
+                    String::from_utf8_lossy(&response.user_id)
+                );
+            }
+            Ok(PacketType::CAPABILITY_ANNOUNCE) => {
+                debug!(
+                    "Received CAPABILITY_ANNOUNCE packet from {} -- handler not yet implemented (wave 3)",
+                    String::from_utf8_lossy(&response.user_id)
+                );
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

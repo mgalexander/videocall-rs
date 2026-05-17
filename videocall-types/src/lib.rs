@@ -84,6 +84,21 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::CONGESTION => {
                 write!(f, "CONGESTION")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::SUBSCRIPTION_UPDATE => {
+                write!(f, "SUBSCRIPTION_UPDATE")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::SPEAKER_UPDATE => {
+                write!(f, "SPEAKER_UPDATE")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::LAYER_HINT => {
+                write!(f, "LAYER_HINT")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::ADMISSION_DECISION => {
+                write!(f, "ADMISSION_DECISION")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::CAPABILITY_ANNOUNCE => {
+                write!(f, "CAPABILITY_ANNOUNCE")
+            }
         }
     }
 }
