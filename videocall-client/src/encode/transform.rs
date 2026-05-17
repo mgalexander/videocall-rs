@@ -23,10 +23,10 @@ use js_sys::Uint8Array;
 use protobuf::Message;
 use std::rc::Rc;
 use videocall_types::protos::{
-    media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
+    media_packet::{media_packet::MediaType, MediaPacket, RoutingHeader, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
-use web_sys::EncodedVideoChunk;
+use web_sys::{EncodedVideoChunk, EncodedVideoChunkType};
 
 pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
     // Convert &mut [u8] to a Uint8Array
@@ -44,6 +44,25 @@ pub fn transform_video_chunk(
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
         log::error!("Error copying video chunk: {e:?}");
     }
+    // frame_marker bitfield constants — see ADR-0001.
+    const START_OF_FRAME: u32 = 1;
+    const END_OF_FRAME: u32 = 2;
+    const REFERENCES_T0: u32 = 4;
+    let is_keyframe = chunk.type_() == EncodedVideoChunkType::Key;
+    // Each WebCodecs chunk is one complete frame; in L1T1 delta frames always reference T0.
+    let frame_marker = if is_keyframe {
+        START_OF_FRAME | END_OF_FRAME
+    } else {
+        START_OF_FRAME | END_OF_FRAME | REFERENCES_T0
+    };
+    let routing_header = RoutingHeader {
+        is_keyframe,
+        temporal_layer_id: 0,
+        spatial_layer_id: 0,
+        frame_marker,
+        picture_id: sequence,
+        ..Default::default()
+    };
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
@@ -56,6 +75,7 @@ pub fn transform_video_chunk(
             ..Default::default()
         })
         .into(),
+        routing_header: Some(routing_header).into(),
         ..Default::default()
     };
     if let Some(duration0) = chunk.duration() {
