@@ -33,6 +33,7 @@ use actix::{
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
@@ -42,6 +43,9 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
 use super::session_logic::{ConnectionState, SessionId};
+use crate::sfu::forwarder::{ForwardDecision, Forwarder};
+use crate::sfu::room_state::RoomState;
+use crate::sfu::{SfuConfig, SfuMode};
 
 /// Internal message sent via `notify_later` after the reconnection grace period
 /// expires. If the user has not reconnected by the time this message is handled,
@@ -87,6 +91,20 @@ pub struct ChatServer {
     /// This is used for reconnection sessions: the user never "left" from peers'
     /// perspective, so announcing a "join" would be misleading.
     suppress_join_broadcast: std::collections::HashSet<SessionId>,
+    /// SFU runtime configuration, snapshotted from `SFU_MODE` at actor
+    /// construction. The startup binaries log the mode separately; reading
+    /// the env again here is intentional so the actor owns its own copy.
+    sfu_config: SfuConfig,
+    /// Per-room authoritative SFU state. Lazily inserted in `JoinRoom` and
+    /// removed in the same code paths that clean up `room_members`. Wrapped
+    /// in `Arc<RwLock<_>>` so the per-receiver `Forwarder::decide` calls
+    /// running inside the NATS subscriber task can read it concurrently
+    /// while p2-6 adds member-table mutations from the actor thread.
+    room_states: HashMap<String, Arc<RwLock<RoomState>>>,
+    /// Per-room forwarder, cheaply cloned (via `Arc`) into each spawned
+    /// subscription task so the forwarder outlives the actor handler's stack
+    /// frame.
+    forwarders: HashMap<String, Arc<Forwarder>>,
 }
 
 impl ChatServer {
@@ -100,6 +118,9 @@ impl ChatServer {
             room_members: HashMap::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: std::collections::HashSet::new(),
+            sfu_config: SfuConfig::from_env(),
+            room_states: HashMap::new(),
+            forwarders: HashMap::new(),
         }
     }
 
@@ -122,6 +143,10 @@ impl ChatServer {
                 members.retain(|(sid, _, _)| sid != session_id);
                 if members.is_empty() {
                     self.room_members.remove(room_id);
+                    // Mirror room_members lifecycle for SFU state so p2-6 can
+                    // build member tracking on top without re-thinking cleanup.
+                    self.forwarders.remove(room_id);
+                    self.room_states.remove(room_id);
                 }
             }
         }
@@ -471,6 +496,9 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                     members.retain(|(sid, _, _)| *sid != session);
                     if members.is_empty() {
                         self.room_members.remove(&room);
+                        // Mirror room_members lifecycle for SFU state.
+                        self.forwarders.remove(&room);
+                        self.room_states.remove(&room);
                     }
                 }
                 return;
@@ -687,6 +715,22 @@ impl Handler<JoinRoom> for ChatServer {
             ));
         }
 
+        // Lazily materialize per-room SFU state. p2-5 intentionally does NOT
+        // call `insert_member` here — member-table tracking lands in p2-6.
+        // The empty RoomState is still valid for the Forwarder: self-skip is
+        // keyed on `packet_wrapper.session_id`, not on the member table.
+        let room_state = self
+            .room_states
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(RoomState::new(room.clone()))))
+            .clone();
+        let forwarder = self
+            .forwarders
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(Forwarder::new(room_state)))
+            .clone();
+        let sfu_mode = self.sfu_config.mode;
+
         // Clone the recipient so we can send existing member info directly to the new joiner
         let new_joiner_recipient = session_recipient.clone();
 
@@ -777,13 +821,15 @@ impl Handler<JoinRoom> for ChatServer {
 
             match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
+                    let handler = handle_msg(
+                        session_recipient.clone(),
+                        room_clone.clone(),
+                        session_clone,
+                        sfu_mode,
+                        forwarder,
+                    );
                     while let Some(msg) = sub.next().await {
-                        if let Err(e) = handle_msg(
-                            session_recipient.clone(),
-                            room_clone.clone(),
-                            session_clone,
-                        )(msg)
-                        {
+                        if let Err(e) = handler(msg) {
                             error!("Error handling message: {}", e);
                             break;
                         }
@@ -821,12 +867,14 @@ fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
     session: SessionId,
+    sfu_mode: SfuMode,
+    forwarder: Arc<Forwarder>,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         // Parse the wrapper once so we can both (a) honor the CONGESTION
         // self-skip carve-out below and (b) expose the inner MediaPacket /
-        // RoutingHeader to the upcoming Forwarder::decide() call (p2-5).
-        // Parse failures preserve the pre-existing semantics: the wrapper is
+        // RoutingHeader to the Forwarder::decide() call (p2-5). Parse
+        // failures preserve the pre-existing semantics: the wrapper is
         // treated as non-CONGESTION (so self-addressed unparseable payloads
         // are still self-skipped) and no routing header is surfaced.
         let parsed_wrapper = PacketWrapper::parse_from_bytes(&msg.payload).ok();
@@ -845,32 +893,71 @@ fn handle_msg(
         }
 
         // Extract the inner MediaPacket + RoutingHeader for MEDIA wrappers so
-        // p2-5 can pass `_routing_header.as_ref()` into Forwarder::decide().
-        // Encrypted-payload parse failures yield `None` and are forwarded
-        // unchanged, matching the inbound classify_and_inspect behavior.
-        let _media_packet: Option<MediaPacket> = parsed_wrapper.as_ref().and_then(|pw| {
+        // we can pass `routing_header` into Forwarder::decide(). Encrypted /
+        // unparseable payloads yield `None` and the SFU branch falls back to
+        // forwarding bytes as-is (see below), matching the inbound
+        // classify_and_inspect behavior.
+        let media_packet: Option<MediaPacket> = parsed_wrapper.as_ref().and_then(|pw| {
             if pw.packet_type == PacketType::MEDIA.into() {
                 MediaPacket::parse_from_bytes(&pw.data).ok()
             } else {
                 None
             }
         });
-        // p2-5 will pass this to Forwarder::decide().
-        let _routing_header: Option<&RoutingHeader> = _media_packet
+        let routing_header: Option<&RoutingHeader> = media_packet
             .as_ref()
             .and_then(|mp| mp.routing_header.as_ref());
 
-        let message = Message {
-            msg: msg.payload.to_vec(),
-            session,
+        // Inlined send helper keeps the warn! semantics identical across
+        // legacy and SFU code paths.
+        let send = |bytes: Vec<u8>| {
+            if let Err(e) = session_recipient.try_send(Message {
+                msg: bytes,
+                session,
+            }) {
+                warn!(
+                    "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
+                    session, e
+                );
+            }
         };
 
-        if let Err(e) = session_recipient.try_send(message) {
-            warn!(
-                "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
-                session, e
-            );
+        match sfu_mode {
+            SfuMode::Sfu => {
+                // CRITICAL carve-out — preserve legacy broadcast semantics
+                // for CONGESTION. Without this, the forwarder's per-receiver
+                // filter could drop CONGESTION packets that all peers MUST
+                // receive so they can back off. The full priority-class
+                // carve-out (HEARTBEAT, RTT, SESSION_ASSIGNED, MEETING_*,
+                // etc.) lands in P5 — see PLAN.md Phase 5 priority-queue
+                // table.
+                let is_congestion = parsed_wrapper
+                    .as_ref()
+                    .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
+                    .unwrap_or(false);
+
+                if is_congestion {
+                    send(msg.payload.to_vec());
+                } else if let Some(pw) = parsed_wrapper.as_ref() {
+                    match forwarder.decide(session, pw, routing_header) {
+                        ForwardDecision::Forward(bytes) => send(bytes.to_vec()),
+                        ForwardDecision::Drop => {
+                            // p2-7 will increment a dropped-packet counter here.
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    // Parse failure — match the pre-existing tolerant
+                    // behavior: forward bytes as-is so we don't black-hole
+                    // encrypted-or-unparseable payloads on the SFU path.
+                    send(msg.payload.to_vec());
+                }
+            }
+            SfuMode::Legacy => {
+                send(msg.payload.to_vec());
+            }
         }
+
         Ok(())
     }
 }
