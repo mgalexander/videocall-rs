@@ -17,47 +17,21 @@
  */
 
 use super::super::wrappers::EncodedVideoChunkTypeWrapper;
+use super::routing::build_routing_header_from_chunk;
 use crate::constants::get_video_codec;
 use crate::crypto::aes::Aes128State;
 use js_sys::Uint8Array;
 use protobuf::Message;
 use std::rc::Rc;
 use videocall_types::protos::{
-    media_packet::{media_packet::MediaType, MediaPacket, RoutingHeader, VideoMetadata},
+    media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
-use web_sys::{EncodedVideoChunk, EncodedVideoChunkType};
+use web_sys::EncodedVideoChunk;
 
 pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
     // Convert &mut [u8] to a Uint8Array
     unsafe { Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) }
-}
-
-// frame_marker bitfield constants — see ADR-0001.
-const START_OF_FRAME: u32 = 1;
-const END_OF_FRAME: u32 = 2;
-const REFERENCES_T0: u32 = 4;
-
-/// Build a `RoutingHeader` for a single WebCodecs `EncodedVideoChunk`.
-///
-/// Each WebCodecs chunk is one complete frame, so `START_OF_FRAME | END_OF_FRAME`
-/// is always set. In L1T1 (single temporal layer) delta frames always reference T0.
-/// Both camera and screen-share paths share these semantics today.
-fn build_routing_header_from_chunk(chunk: &EncodedVideoChunk, sequence: u64) -> RoutingHeader {
-    let is_keyframe = chunk.type_() == EncodedVideoChunkType::Key;
-    let frame_marker = if is_keyframe {
-        START_OF_FRAME | END_OF_FRAME
-    } else {
-        START_OF_FRAME | END_OF_FRAME | REFERENCES_T0
-    };
-    RoutingHeader {
-        is_keyframe,
-        temporal_layer_id: 0,
-        spatial_layer_id: 0,
-        frame_marker,
-        picture_id: sequence,
-        ..Default::default()
-    }
 }
 
 pub fn transform_video_chunk(
