@@ -9,7 +9,8 @@
 #      created by helm/local/up.sh publishes 30443 → host:30443).
 #   2. kubectl logs for one pod each of meeting-api, rustlemania-
 #      websocket, rustlemania-webtransport — grep for the
-#      `auth=on` line emitted by actix-api's nats_connect helper.
+#      `auth="on"` line emitted by actix-api's nats_connect helper
+#      (tracing emits string field values quoted).
 #
 # Usage:
 #   ./helm/local/validate-app.sh
@@ -82,10 +83,13 @@ log "probe '/healthz' OK (HTTP 200)"
 # ----- Probe 2: NATS auth=on in each app's logs -------------------------------
 #
 # actix-api's nats_connect helper logs a line shaped like:
-#     connecting to NATS at <url> auth=on tls=off
-# when NATS_USER/NATS_PASSWORD env are populated (per the vco-ow8.5
+#     connecting to NATS nats_url=<url> auth="on" tls="off"
+# (tracing's structured-field emission quotes string values) when
+# NATS_USER/NATS_PASSWORD env are populated (per the vco-ow8.5
 # wiring + sfu-update/audits/nats-acl-audit.md). Grep the most recent
-# pod logs for that line on each of the three apps.
+# pod logs for that line on each of the three apps. The regex below
+# tolerates both the quoted form (current) and an unquoted form, so
+# the validator survives future tracing-format changes.
 #
 # Rollout timing across the three apps is not synchronized: a freshly
 # rolled pod may not have logged the NATS connect line yet when we
@@ -100,7 +104,7 @@ check_auth_on() {
     local label="$1" selector="$2"
     local pod="" out="" last_out=""
     local attempt=0
-    log "checking ${label} for 'auth=on' (up to $(( AUTH_ON_MAX_ATTEMPTS * AUTH_ON_SLEEP_SECS ))s)"
+    log "checking ${label} for 'auth=\"on\"' (up to $(( AUTH_ON_MAX_ATTEMPTS * AUTH_ON_SLEEP_SECS ))s)"
     while [ "${attempt}" -lt "${AUTH_ON_MAX_ATTEMPTS}" ]; do
         attempt=$(( attempt + 1 ))
         # Re-resolve the pod name every iteration in case a rollout
@@ -116,14 +120,14 @@ check_auth_on() {
         out=$(kubectl --context "${KUBECONTEXT}" -n "${NAMESPACE}" logs "${pod}" --tail=200 2>&1)
         set -e
         last_out="${out}"
-        if echo "${out}" | grep -q 'auth=on'; then
+        if echo "${out}" | grep -qE 'auth="?on"?'; then
             log "${pod}: auth=on"
             return 0
         fi
-        log "  attempt ${attempt}/${AUTH_ON_MAX_ATTEMPTS}: ${label} pod ${pod} has no 'auth=on' yet; retrying in ${AUTH_ON_SLEEP_SECS}s"
+        log "  attempt ${attempt}/${AUTH_ON_MAX_ATTEMPTS}: ${label} pod ${pod} has no 'auth=\"on\"' yet; retrying in ${AUTH_ON_SLEEP_SECS}s"
         sleep "${AUTH_ON_SLEEP_SECS}"
     done
-    err "FAIL: ${label} did not log 'auth=on' within $(( AUTH_ON_MAX_ATTEMPTS * AUTH_ON_SLEEP_SECS ))s (last pod: ${pod:-<none>})"
+    err "FAIL: ${label} did not log 'auth=\"on\"' within $(( AUTH_ON_MAX_ATTEMPTS * AUTH_ON_SLEEP_SECS ))s (last pod: ${pod:-<none>})"
     err "last 5 log lines:"
     echo "${last_out}" | tail -5 | sed "s/^/${LOG_PREFIX}   /" >&2
     return 1
