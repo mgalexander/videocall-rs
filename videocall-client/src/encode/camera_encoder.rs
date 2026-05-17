@@ -26,6 +26,7 @@ use log::error;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +106,14 @@ pub struct CameraEncoder {
     /// Shared audio tier FEC flag. Written by the camera encoder's quality
     /// manager alongside `shared_audio_tier_bitrate`.
     shared_audio_tier_fec: Rc<AtomicBool>,
+    /// Monotonic counter used as the `picture_id` / `sequence` for every
+    /// encoded video chunk. Hoisted onto the struct (rather than living as a
+    /// closure-local in `start()`) so it survives encoder restarts triggered
+    /// by camera switches, `set_enabled(false→true)`, and stop/start cycles.
+    /// ADR-0001 and P4 SVC invariants require monotonic `picture_id`
+    /// correlation across restarts; resetting to 0 would create gaps that
+    /// receivers interpret as a fault.
+    picture_id_counter: Rc<AtomicU64>,
 }
 
 impl CameraEncoder {
@@ -146,6 +155,7 @@ impl CameraEncoder {
                 default_audio_tier.bitrate_kbps * 1000,
             )),
             shared_audio_tier_fec: Rc::new(AtomicBool::new(default_audio_tier.enable_fec)),
+            picture_id_counter: Rc::new(AtomicU64::new(0)),
         }
     }
 
@@ -332,9 +342,13 @@ impl CameraEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
+        // Clone the hoisted picture_id counter into the encoder output closure.
+        // The counter lives on `CameraEncoder` so it survives encoder restarts
+        // (camera switch, enable/disable toggle, stop/start) — see ADR-0001
+        // and the P4 SVC invariants for why monotonic `picture_id` matters.
+        let picture_id_counter = self.picture_id_counter.clone();
         let video_output_handler = {
             let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
-            let mut sequence_number = 0;
             let mut last_chunk_time = window().performance().unwrap().now();
             let mut chunks_in_last_second = 0;
 
@@ -358,6 +372,13 @@ impl CameraEncoder {
                     buffer.resize(byte_length, 0);
                 }
 
+                // `fetch_add` returns the value BEFORE the increment, matching
+                // the prior semantics of `transform_video_chunk(... sequence_number ...);
+                // sequence_number += 1;`. Relaxed ordering is sufficient: there
+                // is exactly one writer (this closure) and the counter is a
+                // monotonic ticker with no cross-thread synchronization need.
+                let sequence_number = picture_id_counter.fetch_add(1, Ordering::Relaxed);
+
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,
@@ -366,7 +387,6 @@ impl CameraEncoder {
                     aes.clone(),
                 );
                 client.send_media_packet(packet);
-                sequence_number += 1;
             })
         };
         let device_id = if let Some(vid) = &self.state.selected {
