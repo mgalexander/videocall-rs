@@ -25,6 +25,12 @@ image:
 env:
   - name: RUST_LOG
     value: info
+  # Disable tracing-subscriber's ANSI colorization. kubectl logs streams
+  # raw bytes; color escapes only get in the way of grep/log aggregators
+  # (and previously broke helm/local/validate-app.sh's `auth="on"` match
+  # — bead vco-gek). NO_COLOR=1 is the de-facto cross-tooling standard.
+  - name: NO_COLOR
+    value: "1"
   - name: LISTEN_ADDR
     value: "0.0.0.0:8081"
   # DATABASE_URL is sourced from the meeting-api-db Secret. helm/local/up.sh

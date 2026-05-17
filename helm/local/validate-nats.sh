@@ -90,6 +90,12 @@ probe() {
         env "PROBE_URL=${url}" sh -c 'NATS_TIMEOUT=2s timeout 4 nats --server="$PROBE_URL" sub --count=1 "validate.>" 2>&1')
     rc=$?
     set -e
+    # Strip ANSI color escapes from natscli output before display + grep.
+    # The natscli today emits plain output in this code path, but some
+    # versions colorize error messages — color codes between letters of
+    # "authorization" would silently defeat the keyword grep below.
+    # Mirror the same defense applied in validate-app.sh (bead vco-gek).
+    out=$(printf '%s' "${out}" | sed 's/\x1b\[[0-9;]*m//g')
     echo "${out}" | head -3 | sed "s/^/${LOG_PREFIX}   /"
 
     case "${expect}" in

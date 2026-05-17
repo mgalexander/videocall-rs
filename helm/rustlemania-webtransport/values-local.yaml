@@ -42,6 +42,11 @@ args: []
 env:
   - name: RUST_LOG
     value: debug,quinn=warn
+  # Disable tracing-subscriber ANSI colorization (see meeting-api
+  # values-local.yaml header / bead vco-gek). kubectl logs streams the
+  # raw bytes; color escapes broke validate-app.sh's auth="on" match.
+  - name: NO_COLOR
+    value: "1"
   - name: NATS_URL
     value: nats:4222
   - name: LISTEN_URL

@@ -91,6 +91,15 @@ log "probe '/healthz' OK (HTTP 200)"
 # tolerates both the quoted form (current) and an unquoted form, so
 # the validator survives future tracing-format changes.
 #
+# We also strip ANSI color escapes before grepping. The local overlays
+# set NO_COLOR=1 on the app pods (see helm/{meeting-api,rustlemania-*}/
+# values-local.yaml) so tracing-subscriber emits plain bytes, but the
+# strip is a cheap backstop in case the validator is ever pointed at
+# an overlay that doesn't disable colors (e.g. production us-east).
+# Without it, kubectl-logs bytes interleave \x1b[Nm sequences between
+# field name and quoted value (`auth\x1b[0m\x1b[2m=\x1b[0m\x1b[3m"on"\x1b[0m`),
+# which defeats any literal pattern. Bead vco-gek for the original break.
+#
 # Rollout timing across the three apps is not synchronized: a freshly
 # rolled pod may not have logged the NATS connect line yet when we
 # probe. Retry up to AUTH_ON_MAX_ATTEMPTS × AUTH_ON_SLEEP_SECS seconds
@@ -120,7 +129,11 @@ check_auth_on() {
         out=$(kubectl --context "${KUBECONTEXT}" -n "${NAMESPACE}" logs "${pod}" --tail=200 2>&1)
         set -e
         last_out="${out}"
-        if echo "${out}" | grep -qE 'auth="?on"?'; then
+        # Strip ANSI color escapes (\x1b[...m) before matching — see the
+        # header comment for this section. The sed pattern uses POSIX
+        # bracket-expression escape semantics that GNU sed and BusyBox sed
+        # both support; the inputs are bounded (kubectl logs --tail=200).
+        if echo "${out}" | sed 's/\x1b\[[0-9;]*m//g' | grep -qE 'auth="?on"?'; then
             log "${pod}: auth=on"
             return 0
         fi

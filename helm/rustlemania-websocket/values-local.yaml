@@ -21,6 +21,11 @@ image:
 env:
   - name: RUST_LOG
     value: info
+  # Disable tracing-subscriber ANSI colorization (see meeting-api
+  # values-local.yaml header / bead vco-gek). kubectl logs streams the
+  # raw bytes; color escapes broke validate-app.sh's auth="on" match.
+  - name: NO_COLOR
+    value: "1"
   - name: ACTIX_PORT
     value: "8080"
   - name: UI_ENDPOINT
