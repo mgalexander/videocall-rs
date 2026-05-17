@@ -123,6 +123,100 @@ NAME="${TARGET##*/}"
 HOOK_ADDR="${RIG}/polecats/${NAME}"   # form gt hook expects
 SESSION_ADDR="${RIG}/${NAME}"          # form gt session restart expects
 
+# ----- Pre-flight: enforce rig invariants ------------------------------------
+#
+# Repeatedly observed wedge: a polecat ends up checked out on the base branch
+# (experimental-sfu) instead of its own polecat/<name>/<bead> branch. The
+# polecat then auto-saves WIP, which advances the bare repo's base-branch
+# ref. Subsequent Refinery pushes from OTHER polecats then fail non-FF
+# because the bare repo's view of the base branch has diverged from upstream.
+#
+# Incident log: nux-on-experimental-sfu, recurring ~every few cycles even
+# AFTER vco-49p added per-sling fresh-branch checkout for the TARGET polecat.
+# vco-49p doesn't backfill polecats that were already in a bad state.
+#
+# This pre-flight is INTENTIONALLY conservative (per overseer direction to
+# "add an extra validation check even if it is slower in the near term"):
+#   1. For every polecat worktree in the rig (not just the sling target),
+#      check whether it's on the base branch. If yes, detach it, parking
+#      the orphaned commit under refs/heads/parked/auto-<name>-<sha7>.
+#   2. After any fix, re-sync the bare repo's base-branch ref to
+#      origin/<base-branch> so the next Refinery push goes clean.
+#
+# Cost: one `git branch --show-current` per polecat in the rig + a fetch +
+# an update-ref if any fix was needed. <1 second in practice.
+#
+# If pre-flight CANNOT fix the state (e.g., a polecat has uncommitted dirty
+# work that we'd lose by detaching), it aborts the sling with a clear error
+# and tells the operator what to inspect. We do NOT silently overwrite work.
+preflight_rig_invariants() {
+    local rig="$1"
+    local base="$2"
+    local town_root="${GT_TOWN_ROOT:-/gt}"
+    local pdir="${town_root}/${rig}/polecats"
+    local bare="${town_root}/${rig}/.repo.git"
+
+    if [[ ! -d "$bare" ]]; then
+        return 0
+    fi
+
+    local fixed=0
+    if [[ -d "$pdir" ]]; then
+        for pwt in "$pdir"/*/"$rig"; do
+            [[ -d "$pwt" ]] || continue
+            local cur
+            cur=$(git -C "$pwt" branch --show-current 2>/dev/null || echo "")
+            if [[ "$cur" == "$base" ]]; then
+                local pname
+                pname=$(basename "$(dirname "$pwt")")
+
+                # Refuse if the worktree has uncommitted tracked changes —
+                # we'd lose them on the detach. Operator must resolve.
+                if ! git -C "$pwt" diff --quiet \
+                   || ! git -C "$pwt" diff --cached --quiet; then
+                    echo "preflight: ABORT — polecat ${pname} is on ${base} AND has uncommitted tracked changes." >&2
+                    echo "           Inspect: git -C ${pwt} status" >&2
+                    echo "           Resolve manually (commit/stash/discard), then re-run the sling." >&2
+                    exit 1
+                fi
+
+                local head_sha
+                head_sha=$(git -C "$pwt" rev-parse HEAD 2>/dev/null || echo "")
+                echo "preflight: polecat ${pname} is on ${base}; detaching (head was ${head_sha:0:7})" >&2
+
+                # Park the orphaned head under refs/heads/parked/ so nothing
+                # is unreachable. Best-effort; if the ref already exists or
+                # update-ref fails, we still detach the worktree.
+                if [[ -n "$head_sha" ]]; then
+                    git -C "$bare" update-ref "refs/heads/parked/auto-${pname}-${head_sha:0:7}" "$head_sha" 2>/dev/null || true
+                fi
+
+                git -C "$pwt" checkout --detach HEAD >&2 || {
+                    echo "preflight: failed to detach polecat ${pname} from ${base}; aborting" >&2
+                    exit 1
+                }
+                fixed=1
+            fi
+        done
+    fi
+
+    # After any fix, re-sync bare-repo base ref to upstream so the next push
+    # goes clean. Safe to run unconditionally if we fixed anything; skips
+    # otherwise.
+    if (( fixed )); then
+        echo "preflight: re-syncing bare repo ${bare}'s ${base} → origin/${base}" >&2
+        git -C "$bare" fetch origin --no-tags --quiet 2>/dev/null || {
+            echo "preflight: WARN — could not fetch origin; bare-repo ${base} ref may still be stale" >&2
+        }
+        if git -C "$bare" rev-parse "refs/remotes/origin/${base}" >/dev/null 2>&1; then
+            git -C "$bare" update-ref "refs/heads/${base}" "refs/remotes/origin/${base}" 2>/dev/null || true
+            echo "preflight: bare repo ${base} now at $(git -C "$bare" log --oneline -1 "$base")" >&2
+        fi
+    fi
+}
+
+preflight_rig_invariants "$RIG" "$BASE_BRANCH"
+
 # Validate the polecat worktree *before* mutating the hook. If the worktree
 # is dirty (or missing), we abort early — that way an aborted sling never
 # leaves the hook reassigned with no matching session restart.
@@ -192,6 +286,29 @@ if ! grep -qF "$BEAD" <<<"$HOOK_OUT"; then
     echo "                     gt hook $BEAD $HOOK_ADDR" >&2
     echo "                     gt session restart $SESSION_ADDR" >&2
     exit 1
+fi
+
+# ----- Post-flight invariant check -------------------------------------------
+#
+# Verify the target polecat's worktree did not silently end up back on the
+# base branch (which would be the failure mode the pre-flight catches at
+# the START of the NEXT sling — but by then a WIP auto-save may have
+# already advanced the bare-repo ref). Catching it here, immediately after
+# the session restart, gives the operator a chance to recover before any
+# damage is done.
+if (( SWITCH_BRANCH )); then
+    POST_BRANCH=$(git -C "$WORKTREE" branch --show-current 2>/dev/null || echo "")
+    if [[ "$POST_BRANCH" == "$BASE_BRANCH" ]]; then
+        echo "gt-sling-attached: POST-FLIGHT FAILED — polecat worktree is on '$BASE_BRANCH' after sling" >&2
+        echo "                   (expected '$NEW_BRANCH'). gt session restart may have reset it." >&2
+        echo "                   recover manually: git -C $WORKTREE checkout -B $NEW_BRANCH origin/$BASE_BRANCH" >&2
+        exit 1
+    fi
+    if [[ "$POST_BRANCH" != "$NEW_BRANCH" ]]; then
+        echo "gt-sling-attached: POST-FLIGHT WARN — polecat worktree is on '$POST_BRANCH'" >&2
+        echo "                   (expected '$NEW_BRANCH'). Continuing — branch isn't $BASE_BRANCH so" >&2
+        echo "                   the wedge risk is contained, but verify the polecat session." >&2
+    fi
 fi
 
 echo "✓ $BEAD attached to $HOOK_ADDR and session restarted" >&2
