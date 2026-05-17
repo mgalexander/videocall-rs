@@ -12,6 +12,11 @@ message PacketWrapper {
     MEETING = 7;
     SESSION_ASSIGNED = 8;
     CONGESTION = 9;
+    SUBSCRIPTION_UPDATE = 10;
+    SPEAKER_UPDATE = 11;
+    LAYER_HINT = 12;
+    ADMISSION_DECISION = 13;
+    CAPABILITY_ANNOUNCE = 14;
   }
   
   PacketType packet_type = 1;
