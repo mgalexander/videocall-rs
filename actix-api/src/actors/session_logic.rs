@@ -352,6 +352,11 @@ impl SessionLogic {
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
             observer: self.observer,
+            // CONNECTION packets arrive after JoinRoom in the current
+            // protocol, so the server has no client_capabilities to thread
+            // here yet. p2-6 defaults to 0; capability-aware decisions in
+            // later phases will update RoomState out of band.
+            capabilities: 0,
         }
     }
 

@@ -139,12 +139,21 @@ impl ChatServer {
 
         // Remove from room_members tracking
         if let Some(room_id) = room {
+            // p2-6: drop the SFU member entry first. We do this before the
+            // room_members emptiness check below because the room_states
+            // map entry may itself be removed in the same pass.
+            if let Some(state) = self.room_states.get(room_id) {
+                let mut guard = match state.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.remove_member(*session_id);
+            }
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|(sid, _, _)| sid != session_id);
                 if members.is_empty() {
                     self.room_members.remove(room_id);
-                    // Mirror room_members lifecycle for SFU state so p2-6 can
-                    // build member tracking on top without re-thinking cleanup.
+                    // Mirror room_members lifecycle for SFU state.
                     self.forwarders.remove(room_id);
                     self.room_states.remove(room_id);
                 }
@@ -491,6 +500,15 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                      skipping PARTICIPANT_LEFT (session was never activated)",
                     user_id, session, room
                 );
+                // p2-6: drop the SFU member entry before the room_states
+                // map entry may be evicted below.
+                if let Some(state) = self.room_states.get(&room) {
+                    let mut guard = match state.write() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.remove_member(session);
+                }
                 // Still clean up room_members for the old session.
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|(sid, _, _)| *sid != session);
@@ -597,6 +615,7 @@ impl Handler<JoinRoom> for ChatServer {
             user_id,
             display_name,
             observer,
+            capabilities,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -623,6 +642,16 @@ impl Handler<JoinRoom> for ChatServer {
             // Clean up stale room_members entry from the old session
             if let Some(members) = self.room_members.get_mut(&room) {
                 members.retain(|(sid, _, _)| *sid != pending.old_session);
+            }
+            // Mirror the cleanup on the SFU member table — the old SID is
+            // gone (subscription was already aborted in Disconnect) and a
+            // new SID will be inserted below.
+            if let Some(state) = self.room_states.get(&room) {
+                let mut guard = match state.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.remove_member(pending.old_session);
             }
 
             info!(
@@ -715,10 +744,9 @@ impl Handler<JoinRoom> for ChatServer {
             ));
         }
 
-        // Lazily materialize per-room SFU state. p2-5 intentionally does NOT
-        // call `insert_member` here — member-table tracking lands in p2-6.
-        // The empty RoomState is still valid for the Forwarder: self-skip is
-        // keyed on `packet_wrapper.session_id`, not on the member table.
+        // Lazily materialize per-room SFU state and register this session
+        // in the member table (p2-6). `insert_member` overwrites prior
+        // entries with matching `session_id`, mirroring reconnect semantics.
         let room_state = self
             .room_states
             .entry(room.clone())
@@ -727,8 +755,18 @@ impl Handler<JoinRoom> for ChatServer {
         let forwarder = self
             .forwarders
             .entry(room.clone())
-            .or_insert_with(|| Arc::new(Forwarder::new(room_state)))
+            .or_insert_with(|| Arc::new(Forwarder::new(room_state.clone())))
             .clone();
+        {
+            // Poison-safe write: a panicked previous writer leaves the
+            // table mutable. Capabilities default to 0 today; later phases
+            // will refresh the entry from CONNECTION packets out of band.
+            let mut guard = match room_state.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert_member(session, capabilities);
+        }
         let sfu_mode = self.sfu_config.mode;
 
         // Clone the recipient so we can send existing member info directly to the new joiner
@@ -957,6 +995,42 @@ fn handle_msg(
 }
 
 // ==========================================================================
+// Test-only query: snapshot a room's SFU member table.
+// ==========================================================================
+// Returns `None` if the room has no SFU state. Otherwise returns a vector of
+// `(session_id, capabilities)` pairs sorted by session_id for determinism.
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "Option<Vec<(SessionId, u32)>>")]
+struct SnapshotRoomMembers {
+    room: String,
+}
+
+#[cfg(test)]
+impl Handler<SnapshotRoomMembers> for ChatServer {
+    type Result = Option<Vec<(SessionId, u32)>>;
+
+    fn handle(
+        &mut self,
+        SnapshotRoomMembers { room }: SnapshotRoomMembers,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let state = self.room_states.get(&room)?;
+        let guard = match state.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut entries: Vec<(SessionId, u32)> = guard
+            .members
+            .values()
+            .map(|m| (m.session_id, m.capabilities))
+            .collect();
+        entries.sort_by_key(|(sid, _)| *sid);
+        Some(entries)
+    }
+}
+
+// ==========================================================================
 // Unit Tests for ChatServer
 // ==========================================================================
 #[cfg(test)]
@@ -1025,6 +1099,7 @@ mod tests {
                 user_id: SYSTEM_USER_ID.to_string(),
                 display_name: SYSTEM_USER_ID.to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1084,6 +1159,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1115,6 +1191,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1174,6 +1251,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1189,6 +1267,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1556,6 +1635,7 @@ mod tests {
                 user_id: "alice@example.com".to_string(),
                 display_name: "alice@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1664,6 +1744,7 @@ mod tests {
                 user_id: "observer-user@example.com".to_string(),
                 display_name: "observer-user@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1758,6 +1839,7 @@ mod tests {
                 user_id: "real-user@example.com".to_string(),
                 display_name: "real-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1858,6 +1940,7 @@ mod tests {
                 user_id: "testing-user@example.com".to_string(),
                 display_name: "testing-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1922,6 +2005,7 @@ mod tests {
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2028,6 +2112,7 @@ mod tests {
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2135,6 +2220,7 @@ mod tests {
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2255,6 +2341,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2272,6 +2359,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2359,6 +2447,7 @@ mod tests {
                     user_id: format!("user{i}@example.com"),
                     display_name: format!("user{i}"),
                     observer: false,
+                    capabilities: 0,
                 })
                 .await
                 .expect("Message delivery should succeed");
@@ -2377,6 +2466,7 @@ mod tests {
                 user_id: "user4@example.com".to_string(),
                 display_name: "user4".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2402,6 +2492,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2534,6 +2625,98 @@ mod tests {
         assert_eq!(
             received.session_id, sender_sid,
             "forwarded packet must preserve the sender SID"
+        );
+    }
+
+    // ==========================================================================
+    // TEST (p2-6): JoinRoom/Leave drive RoomState.members + capabilities
+    // ==========================================================================
+    // Two sessions join the same room with distinct capabilities; the SFU
+    // member table must reflect both entries. One session leaves; the table
+    // must shrink to one entry while preserving the other's capabilities.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_leave_drives_room_state_members() {
+        use crate::sfu::room_state::{CAP_SFU_ROUTING_HEADER, CAP_SUBSCRIPTION, CAP_SVC};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy_a = DummySession.start();
+        let dummy_b = DummySession.start();
+        let sid_a: SessionId = 30001;
+        let sid_b: SessionId = 30002;
+        let caps_a = CAP_SFU_ROUTING_HEADER | CAP_SVC;
+        let caps_b = CAP_SUBSCRIPTION;
+        let room = "test-room-p2-6".to_string();
+
+        for (sid, addr) in [(sid_a, dummy_a.recipient()), (sid_b, dummy_b.recipient())] {
+            chat_server
+                .send(Connect { id: sid, addr })
+                .await
+                .expect("Connect should succeed");
+        }
+
+        for (sid, caps, user) in [
+            (sid_a, caps_a, "alice@example.com"),
+            (sid_b, caps_b, "bob@example.com"),
+        ] {
+            let res = chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.clone(),
+                    user_id: user.to_string(),
+                    display_name: user.to_string(),
+                    observer: false,
+                    capabilities: caps,
+                })
+                .await
+                .expect("Message delivery should succeed");
+            assert!(res.is_ok(), "JoinRoom should succeed for {user}: {res:?}");
+        }
+
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .expect("Snapshot delivery should succeed")
+            .expect("Room should exist after JoinRoom");
+        assert_eq!(
+            snapshot,
+            vec![(sid_a, caps_a), (sid_b, caps_b)],
+            "Both sessions must appear with their declared capabilities"
+        );
+
+        chat_server
+            .send(Leave {
+                session: sid_a,
+                room: room.clone(),
+                user_id: "alice@example.com".to_string(),
+            })
+            .await
+            .expect("Leave delivery should succeed");
+
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .expect("Snapshot delivery should succeed")
+            .expect("Room should still exist after one leave");
+        assert_eq!(
+            snapshot,
+            vec![(sid_b, caps_b)],
+            "After Leave(sid_a), only sid_b remains with its capabilities"
         );
     }
 }

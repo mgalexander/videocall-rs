@@ -44,6 +44,11 @@ pub struct JoinRoom {
     /// When true, this is an observer session (waiting room) and should NOT
     /// trigger PARTICIPANT_JOINED notifications.
     pub observer: bool,
+    /// SFU capability bitmask declared by the client's `CONNECTION` packet.
+    /// Defaults to `0` for legacy clients or when the JoinRoom is built
+    /// before any CONNECTION packet has been observed (the common case
+    /// today; CONNECTION currently arrives after JoinRoom).
+    pub capabilities: u32,
 }
 
 #[derive(ActixMessage)]
