@@ -154,7 +154,7 @@ if (( SWITCH_BRANCH )); then
     # suffix makes each sling produce a distinct ref so re-slinging the same
     # bead doesn't collide with a previous branch the Refinery has already
     # consumed.
-    SUFFIX="mp$(tr -dc 'a-z0-9' </dev/urandom | head -c6)"
+    SUFFIX="mp$(head -c100 /dev/urandom | tr -dc 'a-z0-9' | head -c6)"
     NEW_BRANCH="polecat/${NAME}/${BEAD}@${SUFFIX}"
 fi
 
