@@ -644,8 +644,7 @@ impl Handler<JoinRoom> for ChatServer {
                 }
                 return MessageResult(Err(format!(
                     "Room {room} is at capacity ({cap}); please try again later"
-                )
-                .into()));
+                )));
             }
         }
 
