@@ -235,6 +235,23 @@ set -a; . "${ENV_FILE}"; set +a
 : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set in helm/local/.env}"
 : "${JWT_SECRET:?JWT_SECRET not set in helm/local/.env (add it; see .env.example)}"
 
+# Compute a checksum of the NATS credentials so the meeting-api +
+# rustlemania-{websocket,webtransport} Deployments roll their pods
+# whenever NATS_USER or NATS_PASSWORD change.
+#
+# Why: the env vars are wired via secretKeyRef into the external
+# `nats-credentials` Secret. Kubernetes resolves secretKeyRef at pod
+# start, but changes to a Secret's content do NOT trigger a rollout on
+# their own — `helm upgrade --install` is a no-op when the rendered
+# Deployment spec is unchanged, so old pods keep running with stale
+# (or empty) creds. Stamping this hash into podAnnotations forces a
+# spec diff (and therefore a rollout) iff the credentials actually
+# changed; steady-state re-runs of up.sh remain no-ops.
+#
+# Annotation key mirrors the bitnami/upstream `checksum/<secret-name>`
+# convention. See bead vco-757 for the original integration gap.
+NATS_CRED_CHECKSUM=$(printf '%s|%s' "${NATS_USER}" "${NATS_PASSWORD}" | sha256sum | awk '{print $1}')
+
 apply_secret() {
     # apply_secret <name> <namespace> <key1=val1> [<key2=val2> ...]
     #
@@ -406,7 +423,8 @@ log "installing meeting-api via helm/meeting-api (values-local overlay)"
 helm --kube-context "${KUBECONTEXT}" upgrade --install meeting-api \
     "${HELM_DIR}/meeting-api" \
     --namespace default \
-    --values "${HELM_DIR}/meeting-api/values-local.yaml"
+    --values "${HELM_DIR}/meeting-api/values-local.yaml" \
+    --set "podAnnotations.checksum/nats-credentials=${NATS_CRED_CHECKSUM}"
 
 log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the meeting-api Deployment to roll out"
 kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/meeting-api \
@@ -417,7 +435,8 @@ log "installing rustlemania-websocket via helm/rustlemania-websocket (values-loc
 helm --kube-context "${KUBECONTEXT}" upgrade --install rustlemania-websocket \
     "${HELM_DIR}/rustlemania-websocket" \
     --namespace default \
-    --values "${HELM_DIR}/rustlemania-websocket/values-local.yaml"
+    --values "${HELM_DIR}/rustlemania-websocket/values-local.yaml" \
+    --set "podAnnotations.checksum/nats-credentials=${NATS_CRED_CHECKSUM}"
 
 log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-websocket Deployment to roll out"
 kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/rustlemania-websocket \
@@ -428,7 +447,8 @@ log "installing rustlemania-webtransport via helm/rustlemania-webtransport (valu
 helm --kube-context "${KUBECONTEXT}" upgrade --install rustlemania-webtransport \
     "${HELM_DIR}/rustlemania-webtransport" \
     --namespace default \
-    --values "${HELM_DIR}/rustlemania-webtransport/values-local.yaml"
+    --values "${HELM_DIR}/rustlemania-webtransport/values-local.yaml" \
+    --set "podAnnotations.checksum/nats-credentials=${NATS_CRED_CHECKSUM}"
 
 log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-webtransport Deployment to roll out"
 kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/rustlemania-webtransport \

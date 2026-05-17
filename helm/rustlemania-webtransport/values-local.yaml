@@ -17,8 +17,12 @@
 #     reached via a separate Ingress manifest
 #     (helm/local/manifests/webtransport-health-ingress.yaml) at
 #     transport.videocall.local.
-#   - env: UI_ENDPOINT/UI host references trimmed for local; NATS
-#     wiring identical to production.
+#   - env: UI_ENDPOINT/UI host references trimmed for local. NATS
+#     wiring differs from production: NATS_USER/PASSWORD secretKeyRef
+#     is NOT marked optional here because the local NATS server always
+#     has auth enabled (see helm/global/local/nats/values.yaml). A
+#     missing nats-credentials Secret must hard-fail the pod start,
+#     not silently fall through to empty creds. See bead vco-757.
 
 image:
   repository: localhost:5000/videocall-media-server
@@ -57,18 +61,18 @@ env:
       secretKeyRef:
         name: jwt-secret
         key: secret
+  # NATS_USER/PASSWORD: NOT optional in the local overlay — the local
+  # NATS server always runs with auth enabled. See header comment.
   - name: NATS_USER
     valueFrom:
       secretKeyRef:
         name: nats-credentials
         key: user
-        optional: true
   - name: NATS_PASSWORD
     valueFrom:
       secretKeyRef:
         name: nats-credentials
         key: password
-        optional: true
   - name: NATS_TLS
     value: "false"
   - name: NATS_TLS_CA

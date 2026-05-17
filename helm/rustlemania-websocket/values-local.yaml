@@ -6,8 +6,11 @@
 #   - pullPolicy: IfNotPresent because images are side-loaded via
 #     `k3d image import`.
 #   - env block overridden in full to point UI_ENDPOINT at the local UI
-#     host. NATS_USER/PASSWORD wiring is identical to the production
-#     overlay (optional secretKeyRef into nats-credentials).
+#     host. NATS_USER/PASSWORD are wired via secretKeyRef into
+#     nats-credentials WITHOUT `optional: true` (unlike production) —
+#     the local NATS server always has auth enabled, so a missing
+#     Secret must be a hard pod-start failure, not silent no-auth.
+#     See bead vco-757.
 #   - ingress targets ws.videocall.local with local-selfsigned.
 
 image:
@@ -31,18 +34,18 @@ env:
       secretKeyRef:
         name: jwt-secret
         key: secret
+  # NATS_USER/PASSWORD: NOT optional in the local overlay — the local
+  # NATS server always runs with auth enabled. See header comment.
   - name: NATS_USER
     valueFrom:
       secretKeyRef:
         name: nats-credentials
         key: user
-        optional: true
   - name: NATS_PASSWORD
     valueFrom:
       secretKeyRef:
         name: nats-credentials
         key: password
-        optional: true
   - name: NATS_TLS
     value: "false"
   - name: NATS_TLS_CA

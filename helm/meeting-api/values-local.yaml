@@ -92,8 +92,16 @@ env:
     value: "https://app.videocall.local"
   - name: SERVICE_VERSION_URLS
     value: ""
-  # NATS basic auth — same Secret as the SFU charts, optional for
-  # back-compat (env vars resolve empty -> actix-api uses no-auth).
+  # NATS basic auth — same Secret as the SFU charts. The local stack
+  # always runs with `nats.auth.enabled: true` (see
+  # helm/global/local/nats/values.yaml), so secretKeyRef is NOT marked
+  # optional here: missing creds must be a hard pod-start failure, not
+  # silent fall-through to no-auth (which is what bit us in bead vco-757
+  # — pods started before the Secret had user/password keys, env vars
+  # resolved empty, and the pods then ran indefinitely against an
+  # auth-enforcing NATS, logging `authorization violation` every reconnect).
+  # The production values.yaml keeps `optional: true` for back-compat
+  # with the us-east/singapore overlays which still have auth disabled.
   - name: NATS_URL
     value: nats:4222
   - name: NATS_USER
@@ -101,13 +109,11 @@ env:
       secretKeyRef:
         name: nats-credentials
         key: user
-        optional: true
   - name: NATS_PASSWORD
     valueFrom:
       secretKeyRef:
         name: nats-credentials
         key: password
-        optional: true
   - name: NATS_TLS
     value: "false"
   - name: NATS_TLS_CA
