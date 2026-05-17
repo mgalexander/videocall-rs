@@ -44,9 +44,10 @@ set -a; . "${ENV_FILE}"; set +a
 
 # Resolve the natsbox pod the chart installs alongside the server.
 NATSBOX_POD=$(kubectl --context "${KUBECONTEXT}" -n "${NAMESPACE}" \
-    get pods -l app.kubernetes.io/name=nats-box -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    get pods -l app=nats-box -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 if [ -z "${NATSBOX_POD}" ]; then
-    err "no nats-box pod found in namespace '${NAMESPACE}' — chart's natsbox.enabled may be off"
+    err "no pod matched selector 'app=nats-box' in namespace '${NAMESPACE}'."
+    err "Check: kubectl get pods -n ${NAMESPACE} --show-labels"
     exit 1
 fi
 log "using nats-box pod: ${NATSBOX_POD}"
