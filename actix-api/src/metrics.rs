@@ -20,7 +20,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_gauge_vec, register_histogram, Counter, GaugeVec, Histogram,
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    Counter, CounterVec, Gauge, GaugeVec, Histogram,
 };
 
 lazy_static! {
@@ -295,4 +296,65 @@ lazy_static! {
         &["protocol", "customer_email", "meeting_id", "server_instance", "region"]
     )
     .expect("Failed to create server_reconnections_total metric");
+
+    // ===== SFU FORWARDER METRICS (p2-7) =====
+    //
+    // These metrics intentionally do NOT carry the `videocall_` prefix used by
+    // the legacy/client metrics above; they are scoped to the SFU forwarder and
+    // are exposed via the same Prometheus default registry (no endpoint
+    // changes required).
+
+    /// Total packets forwarded by `Forwarder::decide`, labeled by packet type.
+    pub static ref SFU_FORWARDED_TOTAL: CounterVec = register_counter_vec!(
+        "sfu_forwarded_total",
+        "Total packets forwarded by the SFU forwarder, labeled by packet type",
+        &["packet_type"]
+    )
+    .expect("Failed to create sfu_forwarded_total metric");
+
+    /// Total packets dropped by `Forwarder::decide`, labeled by reason.
+    ///
+    /// Known label values (registered eagerly so they appear at 0 in
+    /// `/metrics` even before any drop occurs):
+    ///   - `self_skip`     — sender == receiver (wave-3 / current)
+    ///   - `unsubscribed`  — placeholder, wired in P3
+    ///   - `layer_budget`  — placeholder, wired in P4
+    pub static ref SFU_DROPPED_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_dropped_total",
+            "Total packets dropped by the SFU forwarder, labeled by reason",
+            &["reason"]
+        )
+        .expect("Failed to create sfu_dropped_total metric");
+        // Touch each known label value at zero so it is visible in /metrics
+        // before the first real increment in later phases.
+        cv.with_label_values(&["self_skip"]).inc_by(0.0);
+        cv.with_label_values(&["unsubscribed"]).inc_by(0.0);
+        cv.with_label_values(&["layer_budget"]).inc_by(0.0);
+        cv
+    };
+
+    /// Current number of members in each SFU room, labeled by room id.
+    /// Refreshed on every `Forwarder::decide` invocation.
+    pub static ref SFU_ROOM_SIZE: GaugeVec = register_gauge_vec!(
+        "sfu_room_size",
+        "Current number of members in the SFU room",
+        &["room_id"]
+    )
+    .expect("Failed to create sfu_room_size metric");
+
+    /// Speaker changes per minute. Declared in p2-7; wired in P3.
+    pub static ref SFU_SPEAKER_CHANGES_PER_MIN: Gauge = register_gauge!(
+        "sfu_speaker_changes_per_min",
+        "Speaker changes per minute (declared in p2-7; populated in P3)"
+    )
+    .expect("Failed to create sfu_speaker_changes_per_min metric");
+
+    /// Wall-clock duration of `Forwarder::decide` in microseconds.
+    pub static ref SFU_DECIDE_LATENCY_US: Histogram = register_histogram!(
+        "sfu_decide_latency_us",
+        "Wall-clock duration of Forwarder::decide in microseconds",
+        vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0]
+    )
+    .expect("Failed to create sfu_decide_latency_us metric");
 }
