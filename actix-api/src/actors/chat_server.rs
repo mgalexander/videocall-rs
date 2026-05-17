@@ -901,6 +901,104 @@ async fn send_meeting_info(
     }
 }
 
+/// Pure egress decision: given a receiver and an on-wire NATS payload, decide
+/// what bytes (if any) should be delivered to the receiver's session actor.
+///
+/// Returns `Some(bytes)` when the receiver should be sent `bytes`, or `None`
+/// when nothing should be sent.
+///
+/// This is the *pure* core of [`handle_msg`]'s closure body — the same
+/// function is exercised by the legacy-vs-SFU golden-trace parity tests
+/// (`sfu::tests::forwarder_parity_tests`), so production fan-out and the
+/// parity assertion are by construction the *same code path*.
+///
+/// Semantics preserved bit-for-bit from the pre-extraction closure:
+///
+/// 1. **Self-skip with CONGESTION carve-out.** If `subject` is the receiver's
+///    own publish subject, the message is dropped *unless* the parsed wrapper
+///    is a `CONGESTION` packet (server-published back-off signal that all
+///    peers must still receive).
+/// 2. **Legacy mode** delivers every non-self-skipped payload byte-for-byte.
+/// 3. **SFU mode** runs the forwarder's per-receiver `decide`. The
+///    server-published CONGESTION class is carve-out-broadcast (see the
+///    CRITICAL comment inline) and parse failures fall through to a tolerant
+///    "forward as-is" — matching legacy so we never black-hole unparseable
+///    payloads.
+pub(crate) fn egress_decide_bytes(
+    sfu_mode: SfuMode,
+    forwarder: &Forwarder,
+    receiver_session: SessionId,
+    room: &str,
+    subject: &str,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    // Parse the wrapper + inner MediaPacket once via the shared egress
+    // parser. This is the egress sibling of `classify_and_inspect`; it
+    // deliberately does NOT apply the client-CONGESTION drop (that is an
+    // ingress-only security check — see the CRITICAL carve-out below and
+    // the rustdoc on `parse_and_inspect`). Parse failures preserve the
+    // pre-existing semantics: the wrapper is treated as non-CONGESTION
+    // (so self-addressed unparseable payloads are still self-skipped)
+    // and no routing header is surfaced.
+    let parsed = parse_and_inspect(payload);
+
+    let self_subject = format!("room.{room}.{receiver_session}").replace(' ', "_");
+    if subject == self_subject.as_str() {
+        // Self-skip prevents echo of our own broadcasts. However,
+        // CONGESTION signals published on our subject by a congested
+        // receiver must still be delivered — they are not echo.
+        let is_congestion = parsed
+            .as_ref()
+            .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
+            .unwrap_or(false);
+        if !is_congestion {
+            return None;
+        }
+    }
+
+    match sfu_mode {
+        SfuMode::Sfu => {
+            // CRITICAL carve-out — preserve legacy broadcast semantics
+            // for CONGESTION. Without this, the forwarder's per-receiver
+            // filter could drop CONGESTION packets that all peers MUST
+            // receive so they can back off. The full priority-class
+            // carve-out (HEARTBEAT, RTT, SESSION_ASSIGNED, MEETING_*,
+            // etc.) lands in P5 — see PLAN.md Phase 5 priority-queue
+            // table.
+            let is_congestion = parsed
+                .as_ref()
+                .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
+                .unwrap_or(false);
+
+            if is_congestion {
+                Some(payload.to_vec())
+            } else if let Some(p) = parsed.as_ref() {
+                match forwarder.decide(receiver_session, &p.wrapper, p.routing_header()) {
+                    // Reuse the original on-wire NATS payload — no per-receiver
+                    // re-serialization of an identical PacketWrapper.
+                    ForwardDecision::Forward => Some(payload.to_vec()),
+                    ForwardDecision::Drop => {
+                        // p2-7 will increment a dropped-packet counter here.
+                        None
+                    }
+                }
+            } else {
+                // Parse failure — match the pre-existing tolerant
+                // behavior: forward bytes as-is so we don't black-hole
+                // encrypted-or-unparseable payloads on the SFU path.
+                // Note: the mode-independent self-echo skip above
+                // already dropped any self-addressed unparseable
+                // payloads before we got here, so SFU and legacy
+                // diverge only on *non-self-addressed* unparseable
+                // payloads — which don't occur in practice (only
+                // senders mint these, and they hit the self-skip).
+                Some(payload.to_vec())
+            }
+        }
+        SfuMode::Legacy => Some(payload.to_vec()),
+    }
+}
+
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
@@ -909,32 +1007,21 @@ fn handle_msg(
     forwarder: Arc<Forwarder>,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        // Parse the wrapper + inner MediaPacket once via the shared egress
-        // parser. This is the egress sibling of `classify_and_inspect`; it
-        // deliberately does NOT apply the client-CONGESTION drop (that is an
-        // ingress-only security check — see the CRITICAL carve-out below and
-        // the rustdoc on `parse_and_inspect`). Parse failures preserve the
-        // pre-existing semantics: the wrapper is treated as non-CONGESTION
-        // (so self-addressed unparseable payloads are still self-skipped)
-        // and no routing header is surfaced.
-        let parsed = parse_and_inspect(&msg.payload);
-
-        if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
-            // Self-skip prevents echo of our own broadcasts. However,
-            // CONGESTION signals published on our subject by a congested
-            // receiver must still be delivered — they are not echo.
-            let is_congestion = parsed
-                .as_ref()
-                .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
-                .unwrap_or(false);
-            if !is_congestion {
-                return Ok(());
-            }
-        }
-
-        // Inlined send helper keeps the warn! semantics identical across
-        // legacy and SFU code paths.
-        let send = |bytes: Vec<u8>| {
+        // Delegate the actual egress decision to the pure helper. This
+        // ensures the legacy-vs-SFU golden-trace parity tests
+        // (`sfu::tests::forwarder_parity_tests`) exercise the same code
+        // path as production fan-out.
+        let subject_str: &str = msg.subject.as_ref();
+        if let Some(bytes) = egress_decide_bytes(
+            sfu_mode,
+            &forwarder,
+            session,
+            &room,
+            subject_str,
+            &msg.payload,
+        ) {
+            // Inlined send helper keeps the warn! semantics identical across
+            // legacy and SFU code paths.
             if let Err(e) = session_recipient.try_send(Message {
                 msg: bytes,
                 session,
@@ -943,50 +1030,6 @@ fn handle_msg(
                     "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
                     session, e
                 );
-            }
-        };
-
-        match sfu_mode {
-            SfuMode::Sfu => {
-                // CRITICAL carve-out — preserve legacy broadcast semantics
-                // for CONGESTION. Without this, the forwarder's per-receiver
-                // filter could drop CONGESTION packets that all peers MUST
-                // receive so they can back off. The full priority-class
-                // carve-out (HEARTBEAT, RTT, SESSION_ASSIGNED, MEETING_*,
-                // etc.) lands in P5 — see PLAN.md Phase 5 priority-queue
-                // table.
-                let is_congestion = parsed
-                    .as_ref()
-                    .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
-                    .unwrap_or(false);
-
-                if is_congestion {
-                    send(msg.payload.to_vec());
-                } else if let Some(p) = parsed.as_ref() {
-                    match forwarder.decide(session, &p.wrapper, p.routing_header()) {
-                        // Reuse the original on-wire NATS payload — no per-receiver
-                        // re-serialization of an identical PacketWrapper.
-                        ForwardDecision::Forward => send(msg.payload.to_vec()),
-                        ForwardDecision::Drop => {
-                            // p2-7 will increment a dropped-packet counter here.
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    // Parse failure — match the pre-existing tolerant
-                    // behavior: forward bytes as-is so we don't black-hole
-                    // encrypted-or-unparseable payloads on the SFU path.
-                    // Note: the mode-independent self-echo skip at the top
-                    // of this closure already dropped any self-addressed
-                    // unparseable payloads before we got here, so SFU and
-                    // legacy diverge only on *non-self-addressed*
-                    // unparseable payloads — which don't occur in practice
-                    // (only senders mint these, and they hit the self-skip).
-                    send(msg.payload.to_vec());
-                }
-            }
-            SfuMode::Legacy => {
-                send(msg.payload.to_vec());
             }
         }
 
