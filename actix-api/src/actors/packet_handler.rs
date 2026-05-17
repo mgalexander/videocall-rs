@@ -22,6 +22,7 @@
 //! used by both `WsChatSession` and `WtChatSession`.
 
 use protobuf::Message as ProtobufMessage;
+use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -45,22 +46,42 @@ pub enum PacketKind {
     KeyframeRequest,
 }
 
-/// Classify a packet based on its contents.
+/// Result of classifying an inbound packet, with optional parsed inner
+/// payloads useful for observability without forcing the caller to re-parse.
 ///
-/// Parses the `PacketWrapper` exactly once and uses the `packet_type` field
-/// to classify the packet. For MEDIA packets, the inner `MediaPacket` is
-/// parsed at most once to distinguish RTT and KEYFRAME_REQUEST from regular
-/// media data.
+/// `media_packet` is populated for any MEDIA `PacketWrapper` whose inner
+/// `MediaPacket` parsed successfully (encrypted-payload parse failures yield
+/// `None` and still classify as [`PacketKind::Data`]).
 ///
-/// # Arguments
-/// * `data` - Raw packet bytes
+/// `connection_packet` is populated for any successfully parsed inner
+/// `ConnectionPacket` carried by a CONNECTION `PacketWrapper`. CONNECTION
+/// packets currently classify as [`PacketKind::Data`] (i.e. they are still
+/// forwarded unchanged); this field exists purely so the caller can log the
+/// advertised `client_capabilities` once per connection.
+pub struct ClassifiedPacket {
+    pub kind: PacketKind,
+    pub media_packet: Option<MediaPacket>,
+    pub connection_packet: Option<ConnectionPacket>,
+}
+
+/// Classify a packet and surface any inner payload that was already parsed
+/// in the process, so callers can read fields like `routing_header` or
+/// `client_capabilities` without re-parsing the bytes.
 ///
-/// # Returns
-/// The classification of the packet
-pub fn classify_packet(data: &[u8]) -> PacketKind {
+/// This is the production entry point used by `SessionLogic::handle_inbound`.
+/// `classify_packet` is preserved as a thin wrapper that drops the extra
+/// fields, used by the existing security property tests.
+pub fn classify_and_inspect(data: &[u8]) -> ClassifiedPacket {
     let packet_wrapper = match PacketWrapper::parse_from_bytes(data) {
         Ok(pw) => pw,
-        Err(_) => return PacketKind::Data, // unparseable, treat as opaque data
+        Err(_) => {
+            // Unparseable, treat as opaque data.
+            return ClassifiedPacket {
+                kind: PacketKind::Data,
+                media_packet: None,
+                connection_packet: None,
+            };
+        }
     };
 
     // Drop client-originated CONGESTION packets.
@@ -68,7 +89,11 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
     // never from clients. A malicious client could craft a CONGESTION packet with
     // a victim's session_id to force them to degrade video quality.
     if packet_wrapper.packet_type == PacketType::CONGESTION.into() {
-        return PacketKind::Dropped;
+        return ClassifiedPacket {
+            kind: PacketKind::Dropped,
+            media_packet: None,
+            connection_packet: None,
+        };
     }
 
     // Check if it's a MEDIA packet (RTT, keyframe request, or regular media).
@@ -76,23 +101,70 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
         // Try to parse inner MediaPacket to distinguish control sub-types.
         // For encrypted payloads this parse will fail, correctly falling
         // through to PacketKind::Data.
-        if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-            if media_packet.media_type == MediaType::RTT.into() {
-                return PacketKind::Rtt;
+        let media_packet = MediaPacket::parse_from_bytes(&packet_wrapper.data).ok();
+        let kind = match &media_packet {
+            Some(mp) if mp.media_type == MediaType::RTT.into() => PacketKind::Rtt,
+            Some(mp) if mp.media_type == MediaType::KEYFRAME_REQUEST.into() => {
+                PacketKind::KeyframeRequest
             }
-            if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
-                return PacketKind::KeyframeRequest;
-            }
-        }
-        return PacketKind::Data;
+            _ => PacketKind::Data,
+        };
+        return ClassifiedPacket {
+            kind,
+            media_packet,
+            connection_packet: None,
+        };
     }
 
     // Check health packet.
     if packet_wrapper.packet_type == PacketType::HEALTH.into() {
-        return PacketKind::Health;
+        return ClassifiedPacket {
+            kind: PacketKind::Health,
+            media_packet: None,
+            connection_packet: None,
+        };
     }
 
-    PacketKind::Data
+    // Check CONNECTION packet. CONNECTION packets are still forwarded as
+    // opaque Data so peers receive the join notification; we just attempt
+    // to parse the inner ConnectionPacket to expose `client_capabilities`
+    // for observability. A parse failure is benign — classification still
+    // falls through to PacketKind::Data.
+    if packet_wrapper.packet_type == PacketType::CONNECTION.into() {
+        let connection_packet = ConnectionPacket::parse_from_bytes(&packet_wrapper.data).ok();
+        return ClassifiedPacket {
+            kind: PacketKind::Data,
+            media_packet: None,
+            connection_packet,
+        };
+    }
+
+    ClassifiedPacket {
+        kind: PacketKind::Data,
+        media_packet: None,
+        connection_packet: None,
+    }
+}
+
+/// Classify a packet based on its contents.
+///
+/// Parses the `PacketWrapper` exactly once and uses the `packet_type` field
+/// to classify the packet. For MEDIA packets, the inner `MediaPacket` is
+/// parsed at most once to distinguish RTT and KEYFRAME_REQUEST from regular
+/// media data.
+///
+/// This is a thin wrapper around [`classify_and_inspect`] that discards the
+/// parsed inner payloads. Production code uses [`classify_and_inspect`]
+/// directly so the inner `MediaPacket` / `ConnectionPacket` can be logged
+/// without re-parsing.
+///
+/// # Arguments
+/// * `data` - Raw packet bytes
+///
+/// # Returns
+/// The classification of the packet
+pub fn classify_packet(data: &[u8]) -> PacketKind {
+    classify_and_inspect(data).kind
 }
 
 /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -508,6 +580,76 @@ mod tests {
         let mut limiter = KeyframeRequestLimiter::new();
         assert!(limiter.allow());
         assert!(limiter.allow());
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_and_inspect: surfaces parsed inner payloads for observability
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_inspect_media_packet_with_routing_header() {
+        use videocall_types::protos::media_packet::RoutingHeader;
+
+        let routing_header = RoutingHeader {
+            is_keyframe: true,
+            temporal_layer_id: 2,
+            spatial_layer_id: 1,
+            audio_level: 0.75,
+            is_speaking: true,
+            ..Default::default()
+        };
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            routing_header: ::protobuf::MessageField::some(routing_header),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let classified = classify_and_inspect(&bytes);
+        assert_eq!(classified.kind, PacketKind::Data);
+        let mp = classified
+            .media_packet
+            .expect("MediaPacket should be surfaced for MEDIA wrappers");
+        let rh = mp
+            .routing_header
+            .as_ref()
+            .expect("routing_header should be present");
+        assert!(rh.is_keyframe);
+        assert_eq!(rh.temporal_layer_id, 2);
+        assert_eq!(rh.spatial_layer_id, 1);
+        assert!((rh.audio_level - 0.75).abs() < f32::EPSILON);
+        assert!(rh.is_speaking);
+        assert!(classified.connection_packet.is_none());
+    }
+
+    #[test]
+    fn test_inspect_connection_packet_with_capabilities() {
+        let conn = ConnectionPacket {
+            meeting_id: "room-42".to_string(),
+            client_capabilities: Some(5),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::CONNECTION.into(),
+            data: conn.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let classified = classify_and_inspect(&bytes);
+        // CONNECTION packets must still be forwarded as Data so peers see them.
+        assert_eq!(classified.kind, PacketKind::Data);
+        let cp = classified
+            .connection_packet
+            .expect("ConnectionPacket should be surfaced for CONNECTION wrappers");
+        assert_eq!(cp.meeting_id, "room-42");
+        assert_eq!(cp.client_capabilities, Some(5));
+        assert!(classified.media_packet.is_none());
     }
 
     #[test]

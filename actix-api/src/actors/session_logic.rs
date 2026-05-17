@@ -23,7 +23,9 @@
 //! adapters while all business logic lives here.
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::packet_handler::{classify_packet, KeyframeRequestLimiter, PacketKind};
+use crate::actors::packet_handler::{
+    classify_and_inspect, ClassifiedPacket, KeyframeRequestLimiter, PacketKind,
+};
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
@@ -41,6 +43,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
+use videocall_types::protos::connection_packet::ConnectionPacket;
+use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -173,6 +177,71 @@ impl CongestionTracker {
             None
         }
     }
+}
+
+// =========================================================================
+// Observability helpers (logging only, no behavior change)
+// =========================================================================
+
+/// Emit a DEBUG log with the inner `RoutingHeader` fields, if present.
+///
+/// This is intentionally gated on `tracing::enabled!(Level::DEBUG)` so that in
+/// production (where DEBUG is typically disabled) the function is effectively
+/// a no-op — no field reads, no formatting, no allocation. Recall that this
+/// fires on every inbound media packet (~30 fps per sender × N participants),
+/// so any work performed here must be conditional on DEBUG actually being on.
+///
+/// The inner `MediaPacket` itself is parsed by `classify_and_inspect`, so we
+/// reuse the existing parse rather than re-parsing here.
+#[inline]
+fn log_routing_header_if_enabled(media_packet: Option<&MediaPacket>, session_id: u64) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let Some(mp) = media_packet else {
+        return;
+    };
+    let Some(rh) = mp.routing_header.as_ref() else {
+        return;
+    };
+    debug!(
+        sender = session_id,
+        is_keyframe = rh.is_keyframe,
+        temporal = rh.temporal_layer_id,
+        spatial = rh.spatial_layer_id,
+        audio_level = rh.audio_level,
+        is_speaking = rh.is_speaking,
+        "received routing header"
+    );
+}
+
+/// Emit an INFO log advertising the client's declared SFU capabilities, if
+/// any. Called once per CONNECTION packet (i.e. roughly once per session at
+/// join time), so INFO is appropriate.
+///
+/// `client_capabilities` is a bitfield (see `connection_packet.proto`):
+///   SFU_ROUTING_HEADER = 1, SVC = 2, SUBSCRIPTION = 4.
+#[inline]
+fn log_client_capabilities_if_present(
+    connection_packet: Option<&ConnectionPacket>,
+    session_id: u64,
+    user_id: &str,
+) {
+    let Some(cp) = connection_packet else {
+        return;
+    };
+    let Some(caps) = cp.client_capabilities else {
+        return;
+    };
+    if caps == 0 {
+        return;
+    }
+    info!(
+        capabilities = caps,
+        session = session_id,
+        user = %user_id,
+        "client connected with SFU capabilities"
+    );
 }
 
 /// Shared session logic, transport-agnostic.
@@ -353,8 +422,23 @@ impl SessionLogic {
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_received(self.id, data.len() as u64);
 
-        // Classify and handle
-        match classify_packet(data) {
+        // Classify and inspect once. The inspector surfaces the inner
+        // MediaPacket / ConnectionPacket so we can read RoutingHeader and
+        // client_capabilities without re-parsing the bytes.
+        let ClassifiedPacket {
+            kind,
+            media_packet,
+            connection_packet,
+        } = classify_and_inspect(data);
+
+        // Observability: log RoutingHeader (DEBUG, per packet) and
+        // client_capabilities (INFO, one-shot per CONNECTION packet).
+        // Both helpers are no-ops when the corresponding tracing level is
+        // disabled, so they cost nothing on the hot path in production.
+        log_routing_header_if_enabled(media_packet.as_ref(), self.id);
+        log_client_capabilities_if_present(connection_packet.as_ref(), self.id, &self.user_id);
+
+        match kind {
             PacketKind::Dropped => {
                 debug!(
                     "Dropping disallowed packet from session {} (user {})",
