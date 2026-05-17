@@ -127,9 +127,14 @@ probe() {
             # message that never arrived). NATS_TIMEOUT=2s here only
             # bounds the CONNECT phase; after a successful connect
             # natscli blocks on the subscription, so the outer `timeout`
-            # is what we land on. Treat 124 as success. Other non-zero
+            # is what we land on. Treat 124 as success. We also accept
+            # 143 (128+15, SIGTERM): when `timeout` signals the child,
+            # some natscli versions install a SIGTERM handler that exits
+            # via the signal rather than letting `timeout` escalate to
+            # the rc=124 path. Both rc=124 and rc=143 mean "the
+            # connection was healthy at the 4s deadline". Other non-zero
             # codes indicate the connection was rejected.
-            if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 124 ]; then
+            if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 124 ] && [ "${rc}" -ne 143 ]; then
                 err "FAIL: probe '${label}' expected success but nats sub exited ${rc}"
                 return 1
             fi
