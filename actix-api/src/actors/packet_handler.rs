@@ -24,7 +24,7 @@
 use protobuf::Message as ProtobufMessage;
 use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::{MediaPacket, RoutingHeader};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -165,6 +165,78 @@ pub fn classify_and_inspect(data: &[u8]) -> ClassifiedPacket {
 /// The classification of the packet
 pub fn classify_packet(data: &[u8]) -> PacketKind {
     classify_and_inspect(data).kind
+}
+
+/// Parsed `PacketWrapper` plus (optionally) its inner `MediaPacket`, surfaced
+/// for the egress fan-out path in `ChatServer::handle_msg`.
+///
+/// Unlike [`ClassifiedPacket`], this struct does NOT carry a [`PacketKind`]
+/// and the parser does NOT apply the client-CONGESTION drop. That drop is an
+/// *ingress-only* security check enforced by [`classify_and_inspect`]: it
+/// prevents a malicious client from spoofing a peer's congestion signal. By
+/// the time a packet reaches egress fan-out (a per-receiver NATS subscription
+/// closure), it has already passed the ingress filter — and the server itself
+/// publishes CONGESTION packets on the participant's own subject so peers can
+/// back off. Re-dropping CONGESTION at egress would black-hole those
+/// legitimate server-published signals. See the CRITICAL carve-out in
+/// `chat_server::handle_msg` (around the `SfuMode::Sfu` match arm) for the
+/// matching policy on the receive side.
+pub struct ParsedPacket {
+    /// The outer wrapper as parsed from the wire.
+    pub wrapper: PacketWrapper,
+    /// Inner [`MediaPacket`], populated for MEDIA wrappers whose payload
+    /// parsed successfully. Encrypted MediaPacket payloads correctly yield
+    /// `None` here without affecting `wrapper`, so callers can still inspect
+    /// the wrapper's packet type / session id.
+    pub media_packet: Option<MediaPacket>,
+}
+
+impl ParsedPacket {
+    /// Convenience accessor for the routing header, if present.
+    ///
+    /// Returns `None` for non-MEDIA wrappers, MEDIA wrappers whose inner
+    /// payload failed to parse (e.g. encrypted), and MEDIA wrappers whose
+    /// `MediaPacket` simply does not set a routing header.
+    pub fn routing_header(&self) -> Option<&RoutingHeader> {
+        self.media_packet
+            .as_ref()
+            .and_then(|mp| mp.routing_header.as_ref())
+    }
+}
+
+/// Parse a packet for egress fan-out, surfacing the inner `MediaPacket` once
+/// so per-receiver closures don't re-parse.
+///
+/// This is the egress counterpart to [`classify_and_inspect`]. It deliberately
+/// performs *less* work:
+///
+/// - No [`PacketKind`] classification — egress fan-out does not need to
+///   distinguish RTT / HEALTH / KEYFRAME_REQUEST from regular data.
+/// - No inner `ConnectionPacket` parse — egress does not read
+///   `client_capabilities`.
+/// - **No client-CONGESTION drop.** The CONGESTION-as-Dropped rule in
+///   [`classify_and_inspect`] is an ingress-only security check that prevents
+///   clients from spoofing peer congestion. At egress, the server's
+///   `CongestionTracker` legitimately publishes CONGESTION on a session's own
+///   subject so peers can degrade quality; dropping those here would defeat
+///   the feature. See the `is_congestion` carve-out in
+///   `chat_server::handle_msg` for the matching receive-side policy.
+///
+/// Returns `None` only when the outer `PacketWrapper` itself fails to parse.
+/// Encrypted MediaPacket payloads return `Some` with `media_packet: None`.
+pub fn parse_and_inspect(data: &[u8]) -> Option<ParsedPacket> {
+    let wrapper = PacketWrapper::parse_from_bytes(data).ok()?;
+    let media_packet = if wrapper.packet_type == PacketType::MEDIA.into() {
+        // Encrypted payloads parse-fail here and correctly yield `None`
+        // without affecting the wrapper.
+        MediaPacket::parse_from_bytes(&wrapper.data).ok()
+    } else {
+        None
+    };
+    Some(ParsedPacket {
+        wrapper,
+        media_packet,
+    })
 }
 
 /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -650,6 +722,132 @@ mod tests {
         assert_eq!(cp.meeting_id, "room-42");
         assert_eq!(cp.client_capabilities, Some(5));
         assert!(classified.media_packet.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_and_inspect: egress-side parser, NO client-CONGESTION drop
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_and_inspect_returns_none_for_garbage() {
+        assert!(parse_and_inspect(&[1, 2, 3, 4, 5]).is_none());
+    }
+
+    #[test]
+    fn test_parse_and_inspect_returns_none_for_empty() {
+        // An empty input *is* a valid empty PacketWrapper for protobuf, so we
+        // still get Some — but `wrapper.packet_type` defaults to RELIABLE
+        // (the proto default), and `media_packet` is None. Document that
+        // here: `None` only occurs for truly malformed wire bytes, not for
+        // empty input.
+        let parsed = parse_and_inspect(&[]);
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap().media_packet.is_none());
+    }
+
+    #[test]
+    fn test_parse_and_inspect_non_media_wrapper_has_no_media_packet() {
+        for pt in [PacketType::HEALTH, PacketType::AES_KEY] {
+            let wrapper = PacketWrapper {
+                packet_type: pt.into(),
+                data: vec![1, 2, 3],
+                ..Default::default()
+            };
+            let bytes = wrapper.write_to_bytes().unwrap();
+            let parsed = parse_and_inspect(&bytes).expect("wrapper parses");
+            assert_eq!(parsed.wrapper.packet_type, pt.into());
+            assert!(parsed.media_packet.is_none());
+            assert!(parsed.routing_header().is_none());
+        }
+    }
+
+    #[test]
+    fn test_parse_and_inspect_media_with_routing_header() {
+        use videocall_types::protos::media_packet::RoutingHeader;
+
+        let routing_header = RoutingHeader {
+            is_keyframe: true,
+            temporal_layer_id: 2,
+            spatial_layer_id: 1,
+            audio_level: 0.5,
+            is_speaking: true,
+            ..Default::default()
+        };
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            routing_header: ::protobuf::MessageField::some(routing_header),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let parsed = parse_and_inspect(&bytes).expect("wrapper parses");
+        assert_eq!(parsed.wrapper.packet_type, PacketType::MEDIA.into());
+        let mp = parsed
+            .media_packet
+            .as_ref()
+            .expect("inner MediaPacket parses");
+        assert_eq!(mp.media_type, MediaType::VIDEO.into());
+        let rh = parsed
+            .routing_header()
+            .expect("routing_header surfaced via accessor");
+        assert!(rh.is_keyframe);
+        assert_eq!(rh.temporal_layer_id, 2);
+        assert_eq!(rh.spatial_layer_id, 1);
+        assert!((rh.audio_level - 0.5).abs() < f32::EPSILON);
+        assert!(rh.is_speaking);
+    }
+
+    #[test]
+    fn test_parse_and_inspect_media_with_unparseable_inner_payload() {
+        // Encrypted-payload analog: outer MEDIA wrapper parses, inner bytes
+        // are not a valid MediaPacket. The wrapper must still surface;
+        // `media_packet` is None; `routing_header()` is None.
+        //
+        // We construct unparseable inner bytes by using a leading byte that
+        // is not a valid protobuf tag for MediaPacket fields (0xff repeated).
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: vec![0xff, 0xff, 0xff, 0xff],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        let parsed = parse_and_inspect(&bytes).expect("outer wrapper parses");
+        assert_eq!(parsed.wrapper.packet_type, PacketType::MEDIA.into());
+        assert!(
+            parsed.media_packet.is_none(),
+            "encrypted/unparseable inner payload must yield media_packet: None"
+        );
+        assert!(parsed.routing_header().is_none());
+    }
+
+    #[test]
+    fn test_parse_and_inspect_congestion_is_not_dropped() {
+        // CRITICAL contract: at egress, CONGESTION must reach receivers.
+        // The CONGESTION-as-Dropped rule in classify_and_inspect is an
+        // *ingress-only* security check — it stops a client from spoofing a
+        // peer's congestion signal. The server's CongestionTracker
+        // legitimately publishes CONGESTION on a session's own subject so
+        // peers can back off. parse_and_inspect runs at egress and MUST NOT
+        // apply the client-CONGESTION drop, or those server-published
+        // signals would never reach the wire.
+        //
+        // See `chat_server::handle_msg` for the matching CONGESTION
+        // carve-out on the receive side.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::CONGESTION.into(),
+            data: vec![1, 2, 3],
+            session_id: 99,
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        let parsed = parse_and_inspect(&bytes).expect("wrapper parses");
+        assert_eq!(parsed.wrapper.packet_type, PacketType::CONGESTION.into());
+        assert!(parsed.media_packet.is_none());
     }
 
     #[test]

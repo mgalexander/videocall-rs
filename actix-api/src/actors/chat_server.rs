@@ -37,11 +37,11 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
-use videocall_types::protos::media_packet::{MediaPacket, RoutingHeader};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
+use super::packet_handler::parse_and_inspect;
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::room_state::RoomState;
@@ -871,42 +871,28 @@ fn handle_msg(
     forwarder: Arc<Forwarder>,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        // Parse the wrapper once so we can both (a) honor the CONGESTION
-        // self-skip carve-out below and (b) expose the inner MediaPacket /
-        // RoutingHeader to the Forwarder::decide() call (p2-5). Parse
-        // failures preserve the pre-existing semantics: the wrapper is
-        // treated as non-CONGESTION (so self-addressed unparseable payloads
-        // are still self-skipped) and no routing header is surfaced.
-        let parsed_wrapper = PacketWrapper::parse_from_bytes(&msg.payload).ok();
+        // Parse the wrapper + inner MediaPacket once via the shared egress
+        // parser. This is the egress sibling of `classify_and_inspect`; it
+        // deliberately does NOT apply the client-CONGESTION drop (that is an
+        // ingress-only security check — see the CRITICAL carve-out below and
+        // the rustdoc on `parse_and_inspect`). Parse failures preserve the
+        // pre-existing semantics: the wrapper is treated as non-CONGESTION
+        // (so self-addressed unparseable payloads are still self-skipped)
+        // and no routing header is surfaced.
+        let parsed = parse_and_inspect(&msg.payload);
 
         if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
             // Self-skip prevents echo of our own broadcasts. However,
             // CONGESTION signals published on our subject by a congested
             // receiver must still be delivered — they are not echo.
-            let is_congestion = parsed_wrapper
+            let is_congestion = parsed
                 .as_ref()
-                .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
+                .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
                 .unwrap_or(false);
             if !is_congestion {
                 return Ok(());
             }
         }
-
-        // Extract the inner MediaPacket + RoutingHeader for MEDIA wrappers so
-        // we can pass `routing_header` into Forwarder::decide(). Encrypted /
-        // unparseable payloads yield `None` and the SFU branch falls back to
-        // forwarding bytes as-is (see below), matching the inbound
-        // classify_and_inspect behavior.
-        let media_packet: Option<MediaPacket> = parsed_wrapper.as_ref().and_then(|pw| {
-            if pw.packet_type == PacketType::MEDIA.into() {
-                MediaPacket::parse_from_bytes(&pw.data).ok()
-            } else {
-                None
-            }
-        });
-        let routing_header: Option<&RoutingHeader> = media_packet
-            .as_ref()
-            .and_then(|mp| mp.routing_header.as_ref());
 
         // Inlined send helper keeps the warn! semantics identical across
         // legacy and SFU code paths.
@@ -931,15 +917,15 @@ fn handle_msg(
                 // carve-out (HEARTBEAT, RTT, SESSION_ASSIGNED, MEETING_*,
                 // etc.) lands in P5 — see PLAN.md Phase 5 priority-queue
                 // table.
-                let is_congestion = parsed_wrapper
+                let is_congestion = parsed
                     .as_ref()
-                    .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
+                    .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
                     .unwrap_or(false);
 
                 if is_congestion {
                     send(msg.payload.to_vec());
-                } else if let Some(pw) = parsed_wrapper.as_ref() {
-                    match forwarder.decide(session, pw, routing_header) {
+                } else if let Some(p) = parsed.as_ref() {
+                    match forwarder.decide(session, &p.wrapper, p.routing_header()) {
                         // Reuse the original on-wire NATS payload — no per-receiver
                         // re-serialization of an identical PacketWrapper.
                         ForwardDecision::Forward => send(msg.payload.to_vec()),
