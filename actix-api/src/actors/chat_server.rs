@@ -950,6 +950,12 @@ fn handle_msg(
                     // Parse failure — match the pre-existing tolerant
                     // behavior: forward bytes as-is so we don't black-hole
                     // encrypted-or-unparseable payloads on the SFU path.
+                    // Note: the mode-independent self-echo skip at the top
+                    // of this closure already dropped any self-addressed
+                    // unparseable payloads before we got here, so SFU and
+                    // legacy diverge only on *non-self-addressed*
+                    // unparseable payloads — which don't occur in practice
+                    // (only senders mint these, and they hit the self-skip).
                     send(msg.payload.to_vec());
                 }
             }
@@ -2417,5 +2423,129 @@ mod tests {
         );
 
         std::env::remove_var(MAX_PARTICIPANTS_ENV);
+    }
+
+    // ==========================================================================
+    // TEST (p2-5): CONGESTION packets bypass Forwarder::decide in SFU mode
+    // ==========================================================================
+    // Verifies the CRITICAL carve-out in `handle_msg`: in SfuMode::Sfu, a
+    // CONGESTION packet must always be forwarded as-is regardless of what the
+    // forwarder would decide. The forwarder is built on top of an empty
+    // RoomState (p2-5 does not call insert_member — that's p2-6).
+    //
+    // To prove the bypass actually runs, we set `pw.session_id ==
+    // receiver_sid`. If the CONGESTION bypass branch were removed, the code
+    // would fall through to `Forwarder::decide`, whose self-skip filter
+    // (keyed on `packet_wrapper.session_id == receiver_sid`) would return
+    // `Drop` and no message would be captured — failing the assertion.
+    // Equal SIDs therefore make the test sensitive to the very branch it is
+    // intended to lock in.
+    //
+    // Exercised by constructing a synthetic async_nats::Message and invoking
+    // the `handle_msg` closure directly — no NATS round-trip required.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_sfu_mode_congestion_bypasses_forwarder() {
+        use crate::sfu::forwarder::Forwarder;
+        use crate::sfu::room_state::RoomState;
+        use crate::sfu::SfuMode;
+        use std::sync::{Arc, Mutex, RwLock};
+        use tokio::time::{sleep, Duration};
+
+        // Capturing receiver — records every Message it gets.
+        struct CapturingSession {
+            captured: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.captured.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let receiver = CapturingSession {
+            captured: captured.clone(),
+        }
+        .start();
+        let recipient = receiver.recipient();
+
+        let room = "p2-5-test-room".to_string();
+        // sender_sid == receiver_sid is deliberate: if the CONGESTION bypass
+        // were removed, Forwarder::decide would self-skip-drop this packet
+        // (its only filter today keys on packet_wrapper.session_id ==
+        // receiver_sid), so the assertion below would fail. Equal SIDs make
+        // this test sensitive to the bypass branch actually running.
+        let receiver_sid: SessionId = 7001;
+        let sender_sid: SessionId = 7001;
+
+        // Build the SFU side: empty RoomState + Forwarder over it.
+        let room_state = Arc::new(RwLock::new(RoomState::new(room.clone())));
+        let forwarder = Arc::new(Forwarder::new(room_state));
+
+        let handler = handle_msg(
+            recipient,
+            room.clone(),
+            receiver_sid,
+            SfuMode::Sfu,
+            forwarder,
+        );
+
+        // Build a CONGESTION PacketWrapper from the SAME session as the
+        // receiver (see SID comment above). The top-of-handle_msg self-echo
+        // skip carves out CONGESTION explicitly, so it reaches the SFU
+        // branch; the SFU branch's bypass is then the only thing standing
+        // between this packet and the assertion.
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::CONGESTION.into();
+        pw.session_id = sender_sid;
+        pw.user_id = b"test-user@example.com".to_vec();
+        pw.data = b"congestion-payload".to_vec();
+        let payload_bytes = pw.write_to_bytes().expect("serialize CONGESTION wrapper");
+        let payload_len = payload_bytes.len();
+
+        // Publish on the receiver's OWN subject. With sender_sid ==
+        // receiver_sid, the top-level self-echo skip would drop this if
+        // CONGESTION weren't carved out, and the SFU branch's bypass is the
+        // only path that delivers it without consulting the forwarder.
+        let subject_str = format!("room.{room}.{receiver_sid}").replace(' ', "_");
+        let msg = async_nats::Message {
+            subject: subject_str.into(),
+            reply: None,
+            payload: bytes::Bytes::from(payload_bytes),
+            headers: None,
+            status: None,
+            description: None,
+            length: payload_len,
+        };
+
+        handler(msg).expect("handle_msg should succeed");
+
+        // The CapturingSession runs on the same actix runtime; give it one
+        // scheduler tick to drain its mailbox.
+        sleep(Duration::from_millis(50)).await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            1,
+            "CONGESTION packet must be forwarded (bypass), got {} messages",
+            got.len()
+        );
+        // The CONGESTION bypass forwards the original payload verbatim.
+        let received = PacketWrapper::parse_from_bytes(&got[0])
+            .expect("captured payload must be a valid PacketWrapper");
+        assert_eq!(
+            received.packet_type,
+            PacketType::CONGESTION.into(),
+            "forwarded packet must remain CONGESTION"
+        );
+        assert_eq!(
+            received.session_id, sender_sid,
+            "forwarded packet must preserve the sender SID"
+        );
     }
 }
