@@ -847,7 +847,7 @@ impl Handler<JoinRoom> for ChatServer {
                     existing_uid, existing_display_name, user_id_clone
                 );
                 if let Err(e) = new_joiner_recipient.try_send(Message {
-                    msg: existing_bytes,
+                    msg: bytes::Bytes::from(existing_bytes),
                     session: *existing_sid,
                 }) {
                     warn!(
@@ -930,8 +930,8 @@ pub(crate) fn egress_decide_bytes(
     receiver_session: SessionId,
     room: &str,
     subject: &str,
-    payload: &[u8],
-) -> Option<Vec<u8>> {
+    payload: &bytes::Bytes,
+) -> Option<bytes::Bytes> {
     // Parse the wrapper + inner MediaPacket once via the shared egress
     // parser. This is the egress sibling of `classify_and_inspect`; it
     // deliberately does NOT apply the client-CONGESTION drop (that is an
@@ -940,7 +940,7 @@ pub(crate) fn egress_decide_bytes(
     // pre-existing semantics: the wrapper is treated as non-CONGESTION
     // (so self-addressed unparseable payloads are still self-skipped)
     // and no routing header is surfaced.
-    let parsed = parse_and_inspect(payload);
+    let parsed = parse_and_inspect(&payload[..]);
 
     let self_subject = format!("room.{room}.{receiver_session}").replace(' ', "_");
     if subject == self_subject.as_str() {
@@ -971,12 +971,13 @@ pub(crate) fn egress_decide_bytes(
                 .unwrap_or(false);
 
             if is_congestion {
-                Some(payload.to_vec())
+                Some(payload.clone())
             } else if let Some(p) = parsed.as_ref() {
                 match forwarder.decide(receiver_session, &p.wrapper, p.routing_header()) {
                     // Reuse the original on-wire NATS payload — no per-receiver
-                    // re-serialization of an identical PacketWrapper.
-                    ForwardDecision::Forward => Some(payload.to_vec()),
+                    // re-serialization of an identical PacketWrapper. `Bytes::clone`
+                    // is a refcount bump, so every receiver shares one allocation.
+                    ForwardDecision::Forward => Some(payload.clone()),
                     ForwardDecision::Drop => {
                         // p2-7 will increment a dropped-packet counter here.
                         None
@@ -992,10 +993,10 @@ pub(crate) fn egress_decide_bytes(
                 // diverge only on *non-self-addressed* unparseable
                 // payloads — which don't occur in practice (only
                 // senders mint these, and they hit the self-skip).
-                Some(payload.to_vec())
+                Some(payload.clone())
             }
         }
-        SfuMode::Legacy => Some(payload.to_vec()),
+        SfuMode::Legacy => Some(payload.clone()),
     }
 }
 
@@ -1018,6 +1019,9 @@ fn handle_msg(
             session,
             &room,
             subject_str,
+            // `msg.payload` is `bytes::Bytes` from async-nats; passed by
+            // reference so `egress_decide_bytes` can `clone()` it as a
+            // refcount bump for each forwarded receiver.
             &msg.payload,
         ) {
             // Inlined send helper keeps the warn! semantics identical across
@@ -1642,10 +1646,10 @@ mod tests {
 
         let chat_server = ChatServer::new(nats_client).await.start();
 
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
 
         struct CapturingSession {
-            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
         }
         impl Actor for CapturingSession {
             type Context = actix::Context<Self>;
@@ -2576,7 +2580,7 @@ mod tests {
 
         // Capturing receiver — records every Message it gets.
         struct CapturingSession {
-            captured: Arc<Mutex<Vec<Vec<u8>>>>,
+            captured: Arc<Mutex<Vec<bytes::Bytes>>>,
         }
         impl Actor for CapturingSession {
             type Context = actix::Context<Self>;
@@ -2588,7 +2592,7 @@ mod tests {
             }
         }
 
-        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
         let receiver = CapturingSession {
             captured: captured.clone(),
         }

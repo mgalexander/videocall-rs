@@ -35,6 +35,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use bytes::Bytes;
 use protobuf::Message as ProtobufMessage;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -56,7 +57,7 @@ const TEST_ROOM: &str = "parity-room";
 /// Build a serialized MEDIA `PacketWrapper` whose sender session id is
 /// `sender_sid`. The inner `MediaPacket` carries deterministic body bytes
 /// drawn from `seed` so each packet in a stream is distinguishable.
-fn build_media_payload(sender_sid: SessionId, seed: u8) -> Vec<u8> {
+fn build_media_payload(sender_sid: SessionId, seed: u8) -> Bytes {
     let media = MediaPacket {
         media_type: MediaType::VIDEO.into(),
         // Deterministic body so byte-equality assertions are meaningful.
@@ -72,14 +73,14 @@ fn build_media_payload(sender_sid: SessionId, seed: u8) -> Vec<u8> {
         data: media.write_to_bytes().expect("encode MediaPacket"),
         ..Default::default()
     };
-    wrapper.write_to_bytes().expect("encode PacketWrapper")
+    Bytes::from(wrapper.write_to_bytes().expect("encode PacketWrapper"))
 }
 
 /// Build a serialized CONGESTION `PacketWrapper` purportedly addressed to
 /// `target_sid` (the receiver who is being told to back off). At egress, the
 /// CONGESTION carve-out broadcasts these to *all* receivers in the room — see
 /// the CRITICAL comment in `egress_decide_bytes`.
-fn build_congestion_payload(target_sid: SessionId, seed: u8) -> Vec<u8> {
+fn build_congestion_payload(target_sid: SessionId, seed: u8) -> Bytes {
     let wrapper = PacketWrapper {
         packet_type: PacketType::CONGESTION.into(),
         // `session_id` on a CONGESTION packet is the session being told to
@@ -88,7 +89,7 @@ fn build_congestion_payload(target_sid: SessionId, seed: u8) -> Vec<u8> {
         data: vec![seed; 8],
         ..Default::default()
     };
-    wrapper.write_to_bytes().expect("encode PacketWrapper")
+    Bytes::from(wrapper.write_to_bytes().expect("encode PacketWrapper"))
 }
 
 /// Mirror chat_server's NATS subject formatting:
@@ -120,18 +121,18 @@ struct Event {
     /// subject (`room.{room}.{publisher}`) in this codebase, so this drives
     /// both the subject used for fan-out and the self-skip decision.
     publisher: SessionId,
-    payload: Vec<u8>,
+    payload: Bytes,
 }
 
 /// Run the egress decision for every (event, receiver) pair under `mode` and
-/// return a map from `receiver_sid` → ordered list of byte-vectors delivered.
+/// return a map from `receiver_sid` → ordered list of byte-blobs delivered.
 fn collect_fanout(
     mode: SfuMode,
     forwarder: &Forwarder,
     receivers: &[SessionId],
     stream: &[Event],
-) -> std::collections::BTreeMap<SessionId, Vec<Vec<u8>>> {
-    let mut out: std::collections::BTreeMap<SessionId, Vec<Vec<u8>>> =
+) -> std::collections::BTreeMap<SessionId, Vec<Bytes>> {
+    let mut out: std::collections::BTreeMap<SessionId, Vec<Bytes>> =
         receivers.iter().map(|&sid| (sid, Vec::new())).collect();
     for ev in stream {
         let subj = publish_subject(ev.publisher);

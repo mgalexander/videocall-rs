@@ -495,8 +495,10 @@ impl SessionLogic {
 
     /// Handle an outbound message from ChatServer (to be sent to client).
     ///
-    /// Returns the bytes to send and tracks metrics.
-    pub fn handle_outbound(&self, msg: &Message) -> Vec<u8> {
+    /// Returns the bytes to send and tracks metrics. Cloning `Bytes` is a
+    /// refcount bump, so the SFU fan-out path delivers the same allocation
+    /// to every receiver.
+    pub fn handle_outbound(&self, msg: &Message) -> bytes::Bytes {
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
         msg.msg.clone()

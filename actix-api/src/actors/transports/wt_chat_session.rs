@@ -175,11 +175,11 @@ impl WtChatSession {
     /// The `is_media` hint is pre-computed by the caller from an already-parsed
     /// `PacketWrapper`, avoiding a redundant protobuf parse on every outbound
     /// packet.
-    fn send_auto(&self, data: Vec<u8>, is_media: bool) -> WtSendResult {
+    fn send_auto(&self, data: Bytes, is_media: bool) -> WtSendResult {
         let outbound = if !is_media && data.len() <= DATAGRAM_MAX_SIZE {
-            WtOutbound::Datagram(data.into())
+            WtOutbound::Datagram(data)
         } else {
-            WtOutbound::UniStream(data.into())
+            WtOutbound::UniStream(data)
         };
 
         match self.outbound_tx.try_send(outbound) {
