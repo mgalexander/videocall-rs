@@ -948,8 +948,11 @@ impl Handler<ClientMessage> for ChatServer {
                 if packet_wrapper.packet_type == PacketType::MEDIA.into() {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
                         if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
-                            let empty_members: Vec<(SessionId, String, String)> = Vec::new();
-                            let members = self.room_members.get(&room).unwrap_or(&empty_members);
+                            let members: &[(SessionId, String, String)] = self
+                                .room_members
+                                .get(&room)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]);
                             // Read the cached selection under a read lock and
                             // clone so we don't hold the lock across the
                             // synchronous helper call. The helper itself is
