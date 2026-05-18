@@ -257,11 +257,18 @@ impl PeerDecode for VideoPeerDecoder {
                 }
             };
 
+            let temporal_layer_id = packet
+                .routing_header
+                .as_ref()
+                .map(|rh| rh.temporal_layer_id.min(u8::MAX as u32) as u8)
+                .unwrap_or(0);
+
             let video_frame = CodecVideoFrame {
                 sequence_number: video_metadata.sequence,
                 timestamp: packet.timestamp,
                 frame_type: self.get_frame_type(packet),
                 codec: frame_codec,
+                temporal_layer_id,
                 data: packet.data.clone(),
             };
 

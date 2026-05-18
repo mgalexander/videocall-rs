@@ -206,6 +206,8 @@ fn main() -> Result<()> {
                 } else {
                     FrameType::DeltaFrame
                 },
+                codec: Default::default(),
+                temporal_layer_id: 0,
                 data: frame.data.to_vec(),
                 timestamp: current_time_ms as f64,
             };
@@ -230,6 +232,8 @@ fn main() -> Result<()> {
             } else {
                 FrameType::DeltaFrame
             },
+            codec: Default::default(),
+            temporal_layer_id: 0,
             data: frame.data.to_vec(),
             timestamp: current_time_ms as f64,
         };

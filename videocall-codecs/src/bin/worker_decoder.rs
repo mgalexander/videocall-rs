@@ -338,6 +338,7 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
                 sequence_number: frame.sequence_number(),
                 frame_type: frame.frame.frame_type,
                 codec: frame.frame.codec,
+                temporal_layer_id: frame.frame.temporal_layer_id,
                 data: frame.frame.data.clone(),
                 timestamp: frame.frame.timestamp,
             };
