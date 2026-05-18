@@ -299,6 +299,15 @@ impl SpeakerTick {
         TickHandle { join }
     }
 
+    /// Drive a single deterministic scoring pass at the supplied virtual
+    /// `now`. Test-only seam so unit tests can exercise hysteresis windows
+    /// without scheduling a real interval loop. Wraps the private
+    /// [`Self::tick_once`] over `self`'s shared state.
+    #[cfg(test)]
+    pub(crate) async fn drive_tick_for_test(&self, now: Instant) {
+        Self::tick_once(&self.scorer, &self.state, &self.tx, now).await;
+    }
+
     /// One scoring pass. Extracted so tests can drive ticks deterministically
     /// by supplying a synthetic `now`.
     async fn tick_once(
