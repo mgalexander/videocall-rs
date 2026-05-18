@@ -389,6 +389,27 @@ impl ConnectionManager {
         self.start_election()
     }
 
+    /// Cleanup invoked when `apply_admission_redirect` returns `Err` from the
+    /// REDIRECT-handler's spawned task: log the error, clear the suppression
+    /// marker (so a stale `Reconnecting` doesn't outlive a terminal failure),
+    /// and notify the UI with a terminal `ConnectionState::Failed`.
+    ///
+    /// Extracted as an associated fn so unit tests can drive the exact same
+    /// body the production failure-branch runs (vc-76h).
+    fn on_redirect_apply_failed(
+        reconnection_phase: &Rc<RefCell<ReconnectionPhase>>,
+        on_state_changed: &Callback<ConnectionState>,
+        redirect_to: &str,
+        err: &anyhow::Error,
+    ) {
+        error!("apply_admission_redirect failed: {err}");
+        *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
+        on_state_changed.emit(ConnectionState::Failed {
+            error: format!("Redirect apply failed: {err}"),
+            last_known_server: Some(redirect_to.to_string()),
+        });
+    }
+
     /// Apply an `ADMISSION_DECISION { status=REDIRECT, redirect_to=<dns> }`
     /// from the server: rewrite the configured URL list so that the matching
     /// transport now points at a single URL whose host is `redirect_to`,
@@ -708,14 +729,17 @@ impl ConnectionManager {
                             };
 
                             if let Err(e) = result {
-                                error!("apply_admission_redirect failed: {e}");
                                 // Clear the suppression marker so it doesn't
-                                // linger past a terminal failure.
-                                *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
-                                on_state_changed.emit(ConnectionState::Failed {
-                                    error: format!("Redirect apply failed: {e}"),
-                                    last_known_server: Some(redirect_to),
-                                });
+                                // linger past a terminal failure, and notify
+                                // the UI. Extracted into a helper so unit
+                                // tests can exercise the exact same body
+                                // (vc-76h).
+                                Self::on_redirect_apply_failed(
+                                    &reconnection_phase,
+                                    &on_state_changed,
+                                    &redirect_to,
+                                    &e,
+                                );
                             }
                         });
 
@@ -3358,6 +3382,175 @@ mod tests {
     }
 
     // ===================================================================
+    // vc-76h: directly drive the Callback returned by
+    // `create_connection_lost_callback` and exercise the failure-cleanup
+    // bookkeeping that the inbound REDIRECT handler relies on.
+    // ===================================================================
+
+    /// Test 1 — Phase-guard short-circuit when already Reconnecting.
+    ///
+    /// Invokes the connection-lost callback while `reconnection_phase` is
+    /// already `Reconnecting { .. }` and asserts that:
+    ///
+    ///   1. `on_state_changed` does NOT receive a fresh
+    ///      `ConnectionState::Reconnecting { server_url: <old> }` frame, and
+    ///   2. The async reconnection loop is NOT launched.
+    ///
+    /// Observability for (2): `run_reconnection_loop` is dispatched through
+    /// `wasm_bindgen_futures::spawn_local` immediately AFTER the
+    /// `on_state_changed.emit(Reconnecting { .. })` call, and both sit on
+    /// the far side of the phase guard. We can't directly observe
+    /// spawned-ness without a wasm runtime, but because the emit and the
+    /// spawn are bracketed by the same guard on the same control-flow path,
+    /// the absence of an emission is a sound proxy for the absence of the
+    /// spawn.
+    ///
+    /// Note: the callback clears `active_connection_id` BEFORE reaching the
+    /// phase guard. We pre-set `active_connection_id` to the connection's
+    /// own id so the active-connection check lets control flow through to
+    /// the phase guard.
+    #[test]
+    fn connection_lost_callback_short_circuits_when_already_reconnecting() {
+        let mut mgr = make_test_manager();
+
+        // Capture every ConnectionState the callback emits.
+        let captured: Rc<RefCell<Vec<ConnectionState>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured_clone = captured.clone();
+        mgr.options.on_state_changed = Callback::from(move |state: ConnectionState| {
+            captured_clone.borrow_mut().push(state);
+        });
+
+        // Pre-set the active connection so the callback gets past the
+        // "non-active connection lost" early-return.
+        let conn_id = "wt_0".to_string();
+        let server_url = "https://old-wt.example.com:9443/lobby".to_string();
+        *mgr.active_connection_id.borrow_mut() = Some(conn_id.clone());
+
+        // Pre-set reconnection_phase to Reconnecting with distinct, easily
+        // identifiable counter values. If the phase guard fails to fire, the
+        // callback would overwrite this with { attempt: 0, next_delay_ms:
+        // RECONNECT_INITIAL_DELAY_MS }.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 7,
+            next_delay_ms: 4321,
+        };
+
+        // Build the callback and fire it.
+        let cb = mgr.create_connection_lost_callback(conn_id.clone(), server_url.clone());
+        cb.emit(JsValue::NULL);
+
+        // Assertion (1): no ConnectionState was emitted at all — the guard
+        // returns before the Reconnecting-frame emit on the happy path.
+        let emitted = captured.borrow();
+        assert!(
+            emitted.is_empty(),
+            "expected no ConnectionState emissions while phase-guard short-circuits, got {emitted:?}",
+        );
+
+        // (2) follows from (1): emit and spawn share the same guard.
+
+        // Side-effect check: the active-connection clear runs BEFORE the
+        // phase guard, so it must have executed.
+        assert!(
+            mgr.active_connection_id.borrow().is_none(),
+            "active_connection_id must be cleared on connection-lost before the phase guard fires",
+        );
+
+        // The pre-existing Reconnecting counters must be untouched (the
+        // happy-path overwrite would have replaced attempt:7 with attempt:0).
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 7,
+                next_delay_ms: 4321,
+            },
+            "phase-guard short-circuit must leave the in-flight Reconnecting counters untouched",
+        );
+    }
+
+    /// Test 2 — Redirect-failure cleanup emits the terminal
+    /// `ConnectionState::Failed { last_known_server: Some(target) }` and
+    /// clears the suppression marker.
+    ///
+    /// The real failure branch lives inside a `spawn_local`-driven task
+    /// launched by the inbound REDIRECT handler, which a non-wasm unit test
+    /// can't drive directly. Instead the cleanup body is extracted into
+    /// `ConnectionManager::on_redirect_apply_failed`; production calls it
+    /// with the live `anyhow::Error` returned by `apply_admission_redirect`,
+    /// and this test calls it with the very same Err — produced by really
+    /// invoking `apply_admission_redirect` twice so its depth guard trips.
+    /// That keeps the test honest: failure trigger AND cleanup body are
+    /// shared with production, not mimicked.
+    #[test]
+    fn redirect_failure_cleanup_emits_failed_state() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+
+        // Pretend a backoff loop was mid-flight; the cleanup helper must
+        // overwrite this to Failed regardless of prior state.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 2,
+            next_delay_ms: 1500,
+        };
+
+        // Capture state emissions.
+        let captured: Rc<RefCell<Vec<ConnectionState>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let on_state_changed: Callback<ConnectionState> =
+            Callback::from(move |state: ConnectionState| {
+                captured_clone.borrow_mut().push(state);
+            });
+
+        // Produce a genuine Err from apply_admission_redirect by applying
+        // two redirects. The second one trips the depth guard and returns
+        // the same anyhow::Error the production spawn_local task inspects.
+        mgr.apply_admission_redirect(
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string(),
+        )
+        .unwrap();
+
+        let redirect_to =
+            "rustlemania-webtransport-7.webtransport-headless.svc.cluster.local".to_string();
+        let err = mgr
+            .apply_admission_redirect(redirect_to.clone())
+            .expect_err("second redirect must fail hard with depth >= 2");
+
+        // Drive the SAME helper production calls. No mirrored body in the
+        // test — if the cleanup ever changes, both sides change together.
+        ConnectionManager::on_redirect_apply_failed(
+            &mgr.reconnection_phase,
+            &on_state_changed,
+            &redirect_to,
+            &err,
+        );
+
+        // Phase moved to Failed (overwriting the in-flight Reconnecting).
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Failed);
+
+        // Exactly one Failed frame, with last_known_server matching the
+        // redirect target and the error message derived from the real Err.
+        let emitted = captured.borrow();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "expected exactly one ConnectionState emission, got {emitted:?}",
+        );
+        match &emitted[0] {
+            ConnectionState::Failed {
+                error,
+                last_known_server,
+            } => {
+                assert_eq!(last_known_server.as_deref(), Some(redirect_to.as_str()));
+                assert!(
+                    error.starts_with("Redirect apply failed:"),
+                    "error message should be prefixed by the cleanup-helper format, got {error:?}",
+                );
+            }
+            other => panic!("expected ConnectionState::Failed, got {other:?}"),
+        }
+    }
+
+    // ===================================================================
     // Integration test notes
     // ===================================================================
     //
@@ -3372,7 +3565,11 @@ mod tests {
     //
     // - `complete_election()` with live connections (selects best, starts heartbeat)
     //
-    // - `create_connection_lost_callback` -> spawns reconnection loop
+    // - `create_connection_lost_callback`'s happy path (the path that ends
+    //   in `spawn_local`). The phase-guard short-circuit branch is covered
+    //   by `connection_lost_callback_short_circuits_when_already_reconnecting`
+    //   above; the spawn_local-driven async reconnection loop itself needs
+    //   the wasm-bindgen-test harness.
     //
     // These should be covered by wasm-bindgen-test integration tests or E2E tests.
 }
