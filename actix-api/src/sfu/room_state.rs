@@ -102,6 +102,17 @@ pub struct RoomState {
     /// Maintained by routing every keyset-changing mutation through
     /// [`Self::rebuild_members_snapshot`].
     members_snapshot: Arc<HashSet<SessionId>>,
+    /// Monotonic counter bumped on every actual keyset change (insert of
+    /// a new sid, removal of an existing sid). Re-inserting an already
+    /// present sid does NOT bump the generation — it preserves the
+    /// `Arc::ptr_eq` "no rebuild on reconnect" contract that
+    /// [`Self::rebuild_members_snapshot`] documents.
+    ///
+    /// Consumed by `SubscriptionStore::resolve_cached` (vc-2cx) to detect
+    /// stale cached `AllowSet`s without comparing the underlying `Arc`
+    /// pointer (which is vulnerable to ABA reuse if a freshly-allocated
+    /// `HashSet` happens to land at the same address as a recycled one).
+    members_generation: u64,
 }
 
 impl RoomState {
@@ -111,6 +122,7 @@ impl RoomState {
             room_id,
             members: HashMap::new(),
             members_snapshot: Arc::new(HashSet::new()),
+            members_generation: 0,
         }
     }
 
@@ -122,9 +134,17 @@ impl RoomState {
     /// readers that already hold a clone continue to observe a consistent
     /// (if slightly stale) snapshot — exactly the contract `decide` relies
     /// on.
+    ///
+    /// Also bumps `members_generation` so downstream caches (e.g.
+    /// `SubscriptionStore::resolve_cached`, vc-2cx) can invalidate
+    /// pre-rebuild entries safely. Callers MUST only invoke this when the
+    /// keyset has actually changed — the existing "no rebuild on
+    /// reconnect" optimisation depends on the generation NOT bumping on
+    /// no-op updates.
     fn rebuild_members_snapshot(&mut self) {
         let snapshot: HashSet<SessionId> = self.members.keys().copied().collect();
         self.members_snapshot = Arc::new(snapshot);
+        self.members_generation = self.members_generation.wrapping_add(1);
     }
 
     /// Lock-free clone of the current members snapshot.
@@ -135,6 +155,18 @@ impl RoomState {
     /// call observed by this thread.
     pub fn members_snapshot(&self) -> Arc<HashSet<SessionId>> {
         Arc::clone(&self.members_snapshot)
+    }
+
+    /// Lock-free clone of the current members snapshot together with the
+    /// generation counter that identifies it.
+    ///
+    /// Hot callers that want to feed a downstream cache (e.g.
+    /// `SubscriptionStore::resolve_cached`) need both halves to be read
+    /// atomically under the same lock acquisition — otherwise a mutation
+    /// between the two reads could pair a fresh snapshot with a stale
+    /// generation (or vice versa) and silently serve a wrong AllowSet.
+    pub fn members_snapshot_with_generation(&self) -> (Arc<HashSet<SessionId>>, u64) {
+        (Arc::clone(&self.members_snapshot), self.members_generation)
     }
 
     /// Insert (or replace) a member with the given capabilities bitmask.
@@ -307,6 +339,30 @@ mod tests {
         let snap = room.members_snapshot();
         assert_eq!(snap.len(), 1);
         assert!(snap.contains(&2));
+    }
+
+    #[test]
+    fn members_generation_bumps_only_on_keyset_change() {
+        let mut room = RoomState::new("r".into());
+        let (_, gen0) = room.members_snapshot_with_generation();
+
+        room.insert_member(1, 0);
+        let (_, gen1) = room.members_snapshot_with_generation();
+        assert_ne!(gen0, gen1, "first insert must bump generation");
+
+        // Reconnect (re-insert same sid) must NOT bump.
+        room.insert_member(1, 7);
+        let (_, gen2) = room.members_snapshot_with_generation();
+        assert_eq!(gen1, gen2, "reconnect must not bump generation");
+
+        // Remove of an absent id must NOT bump.
+        room.remove_member(999);
+        let (_, gen3) = room.members_snapshot_with_generation();
+        assert_eq!(gen2, gen3, "no-op remove must not bump generation");
+
+        room.remove_member(1);
+        let (_, gen4) = room.members_snapshot_with_generation();
+        assert_ne!(gen3, gen4, "remove of present sid must bump generation");
     }
 
     #[test]

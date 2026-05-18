@@ -28,6 +28,9 @@
 //! stable. Forwarder integration lands in p3-5; this module is pure logic.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use dashmap::DashMap;
 
 use videocall_types::protos::subscription_packet::{SubscriptionUpdate, VisibilitySlot};
 
@@ -82,11 +85,35 @@ pub struct ReceiverSubscription {
     pub receive_all_audio: bool,
 }
 
+/// Cached `AllowSet` for one receiver, keyed by the three generation counters
+/// that fully determine its contents (vc-2cx).
+///
+/// On lookup, all three counters must match the live state for the cache to be
+/// safe to serve. A mismatch in ANY counter is a stale entry — we recompute
+/// and overwrite.
+#[derive(Debug, Clone)]
+struct CachedAllow {
+    /// Shared, immutable result. Hot path returns `Arc::clone(&allow)`.
+    allow: Arc<AllowSet>,
+    /// Receiver's per-subscription version when this entry was computed.
+    sub_version: u64,
+    /// Room membership generation when this entry was computed.
+    members_generation: u64,
+    /// Active-speaker set generation when this entry was computed.
+    speakers_generation: u64,
+}
+
 /// Tracks declarative subscription state for every receiver in a room.
 ///
 /// Each [`SubscriptionUpdate`] from a receiver fully replaces its prior state
 /// (declarative semantics). Resolution against the current speaker set + room
 /// membership produces an [`AllowSet`] used by the forwarder.
+///
+/// vc-2cx: the forwarder hot path resolves the same `AllowSet` once per packet
+/// per receiver. Membership / subscription / speaker set all change rarely
+/// relative to packet rate, so we memoise the result in [`Self::cache`] keyed
+/// by `(receiver, sub_version, members_generation, speakers_generation)`.
+/// Hits return an `Arc<AllowSet>` with zero allocations.
 #[derive(Debug, Default)]
 pub struct SubscriptionStore {
     /// Per-receiver subscription state. Declarative: server replaces the prior
@@ -95,6 +122,15 @@ pub struct SubscriptionStore {
     /// Pinned ids that referenced senders not yet in the room. Cleared / promoted
     /// on subsequent `apply_update` calls. Capped at [`PENDING_CAP`] per receiver.
     pending: HashMap<SessionId, Vec<SessionId>>,
+    /// Per-receiver monotonic version, bumped on every `apply_update` and
+    /// removed on `forget`. Receivers that never sent an update have no entry
+    /// and default to 0 — that 0 is a stable cache key for the legacy
+    /// default-fan-out path.
+    sub_version: HashMap<SessionId, u64>,
+    /// Resolved-AllowSet cache, keyed by receiver. Sharded `DashMap` so the
+    /// forwarder can hold the outer `RwLock<SubscriptionStore>` read-only and
+    /// still mutate the cache (one shard lock per write).
+    cache: DashMap<SessionId, CachedAllow>,
 }
 
 impl SubscriptionStore {
@@ -173,6 +209,15 @@ impl SubscriptionStore {
                 receive_all_audio,
             },
         );
+
+        // Bump the per-receiver version and evict the cached entry. The
+        // version bump alone is sufficient for correctness — `resolve_cached`
+        // re-checks all three generations on every lookup — but evicting
+        // here ensures we don't carry a stale entry around indefinitely for
+        // a receiver that has since left the cache hot path.
+        let v = self.sub_version.entry(receiver).or_insert(0);
+        *v = v.wrapping_add(1);
+        self.cache.remove(&receiver);
     }
 
     /// Resolve the receiver's [`AllowSet`] from stored subscription + live state.
@@ -188,6 +233,64 @@ impl SubscriptionStore {
     /// - Audio follows video unless `receive_all_audio` is set, in which case
     ///   audio is the full membership minus the receiver.
     pub fn resolve(
+        &self,
+        receiver: SessionId,
+        current_members: &HashSet<SessionId>,
+        speaker_set: &[SessionId],
+    ) -> AllowSet {
+        self.resolve_inner(receiver, current_members, speaker_set)
+    }
+
+    /// Cached variant of [`Self::resolve`] (vc-2cx).
+    ///
+    /// On a cache hit (per-receiver `sub_version` plus the supplied
+    /// `members_generation` and `speakers_generation` all match the cached
+    /// entry), returns a cloned `Arc<AllowSet>` — zero allocations on the
+    /// hot path.
+    ///
+    /// On a miss (no entry, or any of the three generations differs), the
+    /// `AllowSet` is computed from scratch via [`Self::resolve_inner`],
+    /// wrapped in an `Arc`, inserted, and returned.
+    ///
+    /// `&self`-only: the inner cache is a [`DashMap`], so the caller may
+    /// continue to hold the outer `Arc<RwLock<SubscriptionStore>>` read-only.
+    pub fn resolve_cached(
+        &self,
+        receiver: SessionId,
+        current_members: &Arc<HashSet<SessionId>>,
+        members_generation: u64,
+        speaker_set: &Arc<Vec<SessionId>>,
+        speakers_generation: u64,
+    ) -> Arc<AllowSet> {
+        let sub_version = self.sub_version.get(&receiver).copied().unwrap_or(0);
+
+        // Fast path: lock-free shard read; on a full-match return the Arc clone.
+        if let Some(entry) = self.cache.get(&receiver) {
+            if entry.sub_version == sub_version
+                && entry.members_generation == members_generation
+                && entry.speakers_generation == speakers_generation
+            {
+                return Arc::clone(&entry.allow);
+            }
+        }
+
+        // Miss: compute, store, return.
+        let allow = Arc::new(self.resolve_inner(receiver, current_members, speaker_set));
+        self.cache.insert(
+            receiver,
+            CachedAllow {
+                allow: Arc::clone(&allow),
+                sub_version,
+                members_generation,
+                speakers_generation,
+            },
+        );
+        allow
+    }
+
+    /// Compute a fresh `AllowSet` (no caching). Used by both [`Self::resolve`]
+    /// and the miss path of [`Self::resolve_cached`].
+    fn resolve_inner(
         &self,
         receiver: SessionId,
         current_members: &HashSet<SessionId>,
@@ -294,6 +397,8 @@ impl SubscriptionStore {
     pub fn forget(&mut self, receiver: SessionId) {
         self.per_receiver.remove(&receiver);
         self.pending.remove(&receiver);
+        self.sub_version.remove(&receiver);
+        self.cache.remove(&receiver);
     }
 }
 
@@ -581,5 +686,153 @@ mod tests {
         store.forget(1);
         assert!(!store.per_receiver.contains_key(&1));
         assert!(!store.pending.contains_key(&1));
+    }
+
+    // ---------------- vc-2cx: resolve_cached cache invariants ----------------
+
+    /// Cache hit returns the SAME `Arc` allocation on a repeated call with
+    /// matching generations — zero new allocations on the hot path.
+    #[test]
+    fn resolve_cached_hit_returns_shared_arc() {
+        let mut store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        store.apply_update(1, update(&[2], vec![], false), &room);
+
+        let a = store.resolve_cached(1, &room, 5, &speakers, 7);
+        let b = store.resolve_cached(1, &room, 5, &speakers, 7);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second resolve_cached must return the same Arc (cache hit)"
+        );
+        assert_eq!(a.video.len(), 1);
+        assert!(a.video.contains_key(&2));
+    }
+
+    /// Bumping `sub_version` via `apply_update` invalidates the cache: the
+    /// next `resolve_cached` returns a fresh Arc whose contents reflect the
+    /// new subscription.
+    #[test]
+    fn resolve_cached_invalidates_on_apply_update() {
+        let mut store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+
+        store.apply_update(1, update(&[2], vec![], false), &room);
+        let a = store.resolve_cached(1, &room, 0, &speakers, 0);
+
+        // New subscription: pin 3 instead of 2.
+        store.apply_update(1, update(&[3], vec![], false), &room);
+        let b = store.resolve_cached(1, &room, 0, &speakers, 0);
+
+        assert!(!Arc::ptr_eq(&a, &b), "apply_update must invalidate cache");
+        assert!(a.video.contains_key(&2));
+        assert!(!a.video.contains_key(&3));
+        assert!(b.video.contains_key(&3));
+        assert!(!b.video.contains_key(&2));
+    }
+
+    /// A different `members_generation` must produce a fresh Arc, even if
+    /// the sub state and the speaker generation are unchanged.
+    #[test]
+    fn resolve_cached_invalidates_on_members_generation() {
+        let mut store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        store.apply_update(1, update(&[2], vec![], false), &room);
+
+        let a = store.resolve_cached(1, &room, 1, &speakers, 0);
+        let b = store.resolve_cached(1, &room, 2, &speakers, 0);
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "members_generation change must invalidate cache"
+        );
+    }
+
+    /// A different `speakers_generation` must produce a fresh Arc, even if
+    /// the sub state and members generation are unchanged.
+    #[test]
+    fn resolve_cached_invalidates_on_speakers_generation() {
+        let mut store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        store.apply_update(1, update(&[2], vec![], false), &room);
+
+        let a = store.resolve_cached(1, &room, 0, &speakers, 1);
+        let b = store.resolve_cached(1, &room, 0, &speakers, 2);
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "speakers_generation change must invalidate cache"
+        );
+    }
+
+    /// Legacy default path (receiver never sent an update) is also cached —
+    /// hits return the same Arc.
+    #[test]
+    fn resolve_cached_legacy_default_path_is_cached() {
+        let store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3, 4]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+
+        let a = store.resolve_cached(1, &room, 0, &speakers, 0);
+        let b = store.resolve_cached(1, &room, 0, &speakers, 0);
+        assert!(Arc::ptr_eq(&a, &b), "default-path resolve must cache");
+        // Same legacy semantics: forward everyone (minus self).
+        assert_eq!(a.video.len(), 3);
+    }
+
+    /// `forget` must drop the cached entry so a fresh subscription post-
+    /// forget cannot read a stale value through the cache.
+    #[test]
+    fn forget_evicts_cache_entry() {
+        let mut store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        store.apply_update(1, update(&[2], vec![], false), &room);
+
+        let _ = store.resolve_cached(1, &room, 0, &speakers, 0);
+        assert!(store.cache.contains_key(&1));
+
+        store.forget(1);
+        assert!(!store.cache.contains_key(&1));
+        assert!(!store.sub_version.contains_key(&1));
+    }
+
+    /// `apply_update` on one receiver must NOT evict another receiver's
+    /// cached entry — locks in per-receiver eviction granularity.
+    #[test]
+    fn apply_update_on_other_receiver_preserves_cache() {
+        let mut store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        store.apply_update(1, update(&[2], vec![], false), &room);
+        store.apply_update(2, update(&[3], vec![], false), &room);
+
+        let a = store.resolve_cached(1, &room, 0, &speakers, 0);
+        // Mutating receiver 2 must not invalidate receiver 1's entry.
+        store.apply_update(2, update(&[1], vec![], false), &room);
+        let b = store.resolve_cached(1, &room, 0, &speakers, 0);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "receiver 1's cache must survive receiver 2's apply_update"
+        );
+    }
+
+    /// A lower (older) generation must miss the cache — the invariant is
+    /// equality, not "any prior key", so a hash-based key swap could not
+    /// silently sneak in.
+    #[test]
+    fn resolve_cached_lower_generation_misses() {
+        let mut store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        store.apply_update(1, update(&[2], vec![], false), &room);
+
+        let a = store.resolve_cached(1, &room, 5, &speakers, 0);
+        let b = store.resolve_cached(1, &room, 3, &speakers, 0);
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "lower members_generation must miss (equality, not monotonic-or-greater)"
+        );
     }
 }

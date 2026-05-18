@@ -311,7 +311,14 @@ impl Forwarder {
         // replaces ~20k full `HashSet` rebuilds per second per room.
         // `SubscriptionStore::resolve` continues to accept `&HashSet`, so
         // we deref the `Arc` at the call site.
-        let (members_snapshot, receiver_bw_kbps): (Arc<HashSet<SessionId>>, Option<u32>) = {
+        // vc-2cx: capture `members_generation` alongside the snapshot so
+        // `SubscriptionStore::resolve_cached` can detect stale cached
+        // AllowSets safely (the `Arc` pointer alone is ABA-vulnerable).
+        let (members_snapshot, members_generation, receiver_bw_kbps): (
+            Arc<HashSet<SessionId>>,
+            u64,
+            Option<u32>,
+        ) = {
             let room = match self.room.read() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
@@ -319,13 +326,13 @@ impl Forwarder {
             SFU_ROOM_SIZE
                 .with_label_values(&[room.room_id.as_str()])
                 .set(room.member_count() as f64);
-            let members = room.members_snapshot();
+            let (members, gen) = room.members_snapshot_with_generation();
             let bw = room
                 .members
                 .get(&receiver_sid)
                 .and_then(|m| m.bandwidth_estimate.as_ref())
                 .map(|est| est.estimated_downlink_kbps);
-            (members, bw)
+            (members, gen, bw)
         };
 
         // 1. Self-skip — sender is the receiver itself.
@@ -360,16 +367,22 @@ impl Forwarder {
                         let snap = self.speakers.borrow();
                         (Arc::clone(&snap.top), snap.generation)
                     };
+                    // vc-2cx: cached resolve. Hit returns `Arc::clone` (zero
+                    // allocations); miss recomputes once and stores. The
+                    // outer read lock on `subscriptions` is sufficient — the
+                    // cache itself is a `DashMap` with internal shard locks.
                     let allow = {
                         let store = match self.subscriptions.read() {
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        // `resolve` accepts `&HashSet<SessionId>` and
-                        // `&[SessionId]`; deref coercion peels the
-                        // `Arc` wrappers automatically when the target
-                        // type is fixed.
-                        store.resolve(receiver_sid, &members_snapshot, &speakers_top)
+                        store.resolve_cached(
+                            receiver_sid,
+                            &members_snapshot,
+                            members_generation,
+                            &speakers_top,
+                            speakers_generation,
+                        )
                     };
 
                     let sender_sid = packet_wrapper.session_id;
