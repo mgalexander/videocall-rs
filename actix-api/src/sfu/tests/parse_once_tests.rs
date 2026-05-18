@@ -90,7 +90,7 @@ fn build_forwarder(receivers: &[SessionId]) -> Arc<Forwarder> {
             w.insert_member(sid, 0);
         }
     }
-    Arc::new(Forwarder::new(room))
+    Arc::new(Forwarder::with_room_only(room))
 }
 
 struct Event {

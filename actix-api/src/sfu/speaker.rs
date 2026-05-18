@@ -184,7 +184,12 @@ pub struct ActiveSpeakerSet {
 }
 
 impl ActiveSpeakerSet {
-    fn empty() -> Self {
+    /// Construct the initial empty set (`top = []`, `generation = 0`).
+    ///
+    /// Used by [`SpeakerTick`] for its starting `watch::channel` value and by
+    /// `ChatServer` (p3-5) when materialising a brand-new room before the
+    /// per-room tick has fired even once.
+    pub fn empty() -> Self {
         Self {
             top: Vec::new(),
             generation: 0,

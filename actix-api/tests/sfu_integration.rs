@@ -59,12 +59,13 @@ use sec_api::actors::chat_server::ChatServer;
 use sec_api::actors::session_logic::SessionId;
 use sec_api::messages::server::{ActivateConnection, ClientMessage, Connect, JoinRoom, Packet};
 use sec_api::messages::session::Message;
-use sec_api::metrics::SFU_FORWARDED_TOTAL;
+use sec_api::metrics::{SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL};
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::subscription_packet::SubscriptionUpdate;
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -554,4 +555,156 @@ fn normalize_for_parity(bytes: &[u8]) -> Vec<u8> {
         }
         Err(_) => bytes.to_vec(),
     }
+}
+
+// ===========================================================================
+// p3-5: per-receiver SubscriptionUpdate filtering (acceptance criterion)
+// ===========================================================================
+//
+// Three-client room in SFU mode where B sends `SubscriptionUpdate{pinned:[C]}`
+// before any MEDIA flows. A (never sent an update) keeps the legacy-default
+// fanout; B sees only C's MEDIA; C (also never sent an update) keeps full
+// fanout. The `sfu_dropped_total{reason=unsubscribed}` counter must observe a
+// strictly positive delta covering the A→B MEDIA packets that get filtered.
+
+/// Build a SUBSCRIPTION_UPDATE wrapper carrying `update`. The server's
+/// `ClientMessage` handler intercepts wrappers of this type and applies them
+/// to the per-room `SubscriptionStore` rather than republishing on NATS.
+fn build_subscription_update_payload(
+    sender_sid: SessionId,
+    sender_user: &str,
+    update: SubscriptionUpdate,
+) -> Vec<u8> {
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::SUBSCRIPTION_UPDATE.into(),
+        session_id: sender_sid,
+        user_id: sender_user.as_bytes().to_vec(),
+        data: update.write_to_bytes().expect("encode SubscriptionUpdate"),
+        ..Default::default()
+    };
+    wrapper.write_to_bytes().expect("encode PacketWrapper")
+}
+
+async fn send_subscription_update(
+    chat: &actix::Addr<ChatServer>,
+    sender: &Participant,
+    room: &str,
+    update: SubscriptionUpdate,
+) {
+    let bytes = build_subscription_update_payload(sender.sid, &sender.user, update);
+    chat.send(ClientMessage {
+        session: sender.sid,
+        room: room.to_string(),
+        user: sender.user.clone(),
+        msg: Packet {
+            data: Arc::new(bytes),
+        },
+    })
+    .await
+    .expect("SubscriptionUpdate ClientMessage");
+}
+
+#[actix_rt::test]
+#[serial]
+async fn sfu_subscription_filters_per_receiver() {
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+
+    // SFU mode is required: the per-receiver AllowSet filter only runs on
+    // the SFU path. Legacy is unconditional broadcast.
+    let env = EnvGuard::new();
+    env.set("sfu");
+
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .expect("connect to NATS");
+    let chat = ChatServer::new(nats_client).await.start();
+
+    let room = "p3-5-sub-filter".to_string();
+    // Distinct sid range from the parity test so concurrent runs don't
+    // collide on ChatServer's joined_sessions / session_manager.
+    let a = Participant::new(70_000, "a-sub@example.com");
+    let b = Participant::new(70_001, "b-sub@example.com");
+    let c = Participant::new(70_002, "c-sub@example.com");
+    register_and_join(&chat, &a, &room).await.expect("A join");
+    register_and_join(&chat, &b, &room).await.expect("B join");
+    register_and_join(&chat, &c, &room).await.expect("C join");
+
+    // Snapshot the unsubscribed-drop counter BEFORE any filtering work runs
+    // so we can assert a strict positive delta on the unsubscribed drops we
+    // expect to observe (A → B MEDIA frames).
+    let dropped_before = SFU_DROPPED_TOTAL.with_label_values(&["unsubscribed"]).get();
+
+    // B declares a restrictive subscription pinned to C only. No slots, no
+    // receive_all_audio — B should see C's MEDIA exclusively. The update
+    // must land BEFORE any MEDIA flows so the forwarder consults it from
+    // the very first packet.
+    let mut update = SubscriptionUpdate::new();
+    update.pinned_sessions = vec![c.sid];
+    update.slots = vec![];
+    update.receive_all_audio = false;
+    send_subscription_update(&chat, &b, &room, update).await;
+
+    // Settle: subscription apply is synchronous in the ClientMessage handler,
+    // but room subscriptions still need a moment to attach.
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Each of A, B, C publishes 5 VIDEO MEDIA frames.
+    const BURST: usize = 5;
+    let _sent_a = send_media_burst(&chat, &a, &room, BURST).await;
+    let _sent_b = send_media_burst(&chat, &b, &room, BURST).await;
+    let _sent_c = send_media_burst(&chat, &c, &room, BURST).await;
+
+    sleep(PUBLISH_SETTLE).await;
+
+    let a_media = a.captured_of(PacketType::MEDIA);
+    let b_media = b.captured_of(PacketType::MEDIA);
+    let c_media = c.captured_of(PacketType::MEDIA);
+
+    // A never sent a SubscriptionUpdate → legacy-default AllowSet covers
+    // every other member, so A sees B's 5 + C's 5 frames.
+    assert_eq!(
+        a_media.len(),
+        BURST * 2,
+        "A (no SubscriptionUpdate) must see both other senders' MEDIA: got {}",
+        a_media.len()
+    );
+
+    // B pinned only C → A's MEDIA filtered as unsubscribed, B's own MEDIA
+    // self-skipped, leaving exactly C's 5.
+    assert_eq!(
+        b_media.len(),
+        BURST,
+        "B (pinned=[C]) must see only C's MEDIA: got {}",
+        b_media.len()
+    );
+    for bytes in &b_media {
+        let w = <PacketWrapper as ProtobufMessage>::parse_from_bytes(bytes)
+            .expect("decode delivered wrapper");
+        assert_eq!(
+            w.session_id, c.sid,
+            "B's filtered delivery must originate from C: got sid={}",
+            w.session_id
+        );
+    }
+
+    // C never sent a SubscriptionUpdate → legacy-default AllowSet, sees
+    // both A's 5 and B's 5.
+    assert_eq!(
+        c_media.len(),
+        BURST * 2,
+        "C (no SubscriptionUpdate) must see both other senders' MEDIA: got {}",
+        c_media.len()
+    );
+
+    // The unsubscribed-drop counter must have advanced by at least BURST
+    // (A → B drops). It may advance by more if other in-process tests
+    // happen to overlap on the global registry; the strict-positive bound
+    // is the meaningful guarantee here.
+    let dropped_after = SFU_DROPPED_TOTAL.with_label_values(&["unsubscribed"]).get();
+    let drop_delta = dropped_after - dropped_before;
+    assert!(
+        drop_delta >= BURST as f64,
+        "sfu_dropped_total{{reason=\"unsubscribed\"}} must increment by at least {BURST} \
+         (A→B drops): before={dropped_before} after={dropped_after} delta={drop_delta}"
+    );
 }

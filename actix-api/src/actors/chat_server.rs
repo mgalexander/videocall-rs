@@ -49,7 +49,11 @@ use super::packet_handler::{parse_and_inspect, ParsedPacket};
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::room_state::RoomState;
+use crate::sfu::speaker::ActiveSpeakerSet;
+use crate::sfu::subscription::SubscriptionStore;
 use crate::sfu::{SfuConfig, SfuMode};
+use tokio::sync::watch;
+use videocall_types::protos::subscription_packet::SubscriptionUpdate;
 
 /// Internal message sent via `notify_later` after the reconnection grace period
 /// expires. If the user has not reconnected by the time this message is handled,
@@ -158,6 +162,18 @@ pub struct ChatServer {
     /// dispatcher task so the forwarder outlives the actor handler's stack
     /// frame.
     forwarders: HashMap<String, Arc<Forwarder>>,
+    /// Per-room declarative subscription state (p3-4). Receivers publish
+    /// `SubscriptionUpdate` packets which the `ClientMessage` handler intercepts
+    /// before NATS publish and applies via `SubscriptionStore::apply_update`.
+    /// The forwarder reads this store on every `decide()` to determine which
+    /// senders' MEDIA may be forwarded to each receiver.
+    subscriptions: HashMap<String, Arc<RwLock<SubscriptionStore>>>,
+    /// Per-room active-speaker-set sender. The forwarder reads the set via a
+    /// cloned `watch::Receiver`. Today the sender stays inert (initial empty
+    /// snapshot); the speaker tick from p3-2 is not yet wired in (that's a
+    /// follow-up). Holding the sender keeps the channel open so every
+    /// forwarder's `watch::Receiver::borrow()` returns a valid snapshot.
+    speakers: HashMap<String, watch::Sender<ActiveSpeakerSet>>,
     /// Per-room demux state (one NATS subscription per room, fanned out to
     /// all local receivers). Lazily created on the first `JoinRoom` for a
     /// room and torn down when the room drains. See [`RoomDispatch`].
@@ -178,6 +194,8 @@ impl ChatServer {
             sfu_config: SfuConfig::from_env(),
             room_states: HashMap::new(),
             forwarders: HashMap::new(),
+            subscriptions: HashMap::new(),
+            speakers: HashMap::new(),
             room_dispatch: HashMap::new(),
         }
     }
@@ -212,6 +230,17 @@ impl ChatServer {
             // and the per-room subscription closes.
             self.drop_room_receiver(room_id, session_id);
 
+            // Drop the receiver's declarative subscription state (if any) so
+            // a future session reusing this `SessionId` starts from the
+            // legacy default. Best-effort: missing entries are silently
+            // ignored.
+            if let Some(store) = self.subscriptions.get(room_id) {
+                let mut guard = match store.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.forget(*session_id);
+            }
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|(sid, _, _)| sid != session_id);
                 if members.is_empty() {
@@ -219,6 +248,11 @@ impl ChatServer {
                     // Mirror room_members lifecycle for SFU state.
                     self.forwarders.remove(room_id);
                     self.room_states.remove(room_id);
+                    self.subscriptions.remove(room_id);
+                    // Dropping the watch sender closes the channel; the
+                    // forwarder we just removed is the only holder of the
+                    // matching receiver, so this is a clean teardown.
+                    self.speakers.remove(room_id);
                 }
             }
         }
@@ -305,6 +339,51 @@ impl ChatServer {
     /// Get the session manager (for use by chat_session)
     pub fn session_manager(&self) -> &SessionManager {
         &self.session_manager
+    }
+
+    /// Apply a `SubscriptionUpdate` payload from `receiver` in `room` (p3-5).
+    ///
+    /// Decodes `payload` as a [`SubscriptionUpdate`] and applies it to the
+    /// room's [`SubscriptionStore`] against the current member set. Silently
+    /// returns on:
+    ///   * malformed payloads (parse error)
+    ///   * unknown rooms (no `SubscriptionStore` materialised yet)
+    ///   * missing room state (no member snapshot available)
+    ///
+    /// These are best-effort updates: a malformed packet does not break the
+    /// existing subscription state, and a missing store cannot exist in
+    /// practice because both are materialised together in `JoinRoom`.
+    fn apply_subscription_update(&self, room: &str, receiver: SessionId, payload: &[u8]) {
+        let update = match SubscriptionUpdate::parse_from_bytes(payload) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(
+                    "Dropping malformed SubscriptionUpdate from session {} in room {}: {}",
+                    receiver, room, e
+                );
+                return;
+            }
+        };
+
+        let store = match self.subscriptions.get(room) {
+            Some(s) => s,
+            None => return,
+        };
+        let members: HashSet<SessionId> = match self.room_states.get(room) {
+            Some(state) => {
+                let guard = match state.read() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.members.keys().copied().collect()
+            }
+            None => return,
+        };
+        let mut guard = match store.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.apply_update(receiver, update, &members);
     }
 
     /// Remove a session from the per-room demux receiver map (vc-q0v).
@@ -757,6 +836,15 @@ impl Handler<ClientMessage> for ChatServer {
                 if packet_wrapper.session_id == 0 {
                     packet_wrapper.session_id = session;
                 }
+                // p3-5: SUBSCRIPTION_UPDATE is a server-local control packet —
+                // intercept it before NATS publish, apply it to the per-room
+                // SubscriptionStore so the forwarder picks it up on the next
+                // decide(), and return without broadcasting. Peers do not need
+                // to see other peers' subscription state.
+                if packet_wrapper.packet_type == PacketType::SUBSCRIPTION_UPDATE.into() {
+                    self.apply_subscription_update(&room, session, &packet_wrapper.data);
+                    return;
+                }
                 match packet_wrapper.write_to_bytes() {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -1005,10 +1093,35 @@ impl Handler<JoinRoom> for ChatServer {
             .entry(room.clone())
             .or_insert_with(|| Arc::new(RwLock::new(RoomState::new(room.clone()))))
             .clone();
+        let subscriptions = self
+            .subscriptions
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(SubscriptionStore::new())))
+            .clone();
+        // Materialise the per-room active-speaker-set channel on first join.
+        // The sender is retained on `self.speakers` so the channel stays open
+        // for as long as the room exists; the receiver is cloned into the
+        // forwarder. The p3-2 SpeakerTick is not yet wired into chat_server
+        // (separate bead) — until then the channel stays at the initial empty
+        // snapshot, and resolve() falls back to pinned/slots tiers only.
+        let speakers_rx = self
+            .speakers
+            .entry(room.clone())
+            .or_insert_with(|| {
+                let (tx, _rx) = watch::channel(ActiveSpeakerSet::empty());
+                tx
+            })
+            .subscribe();
         let forwarder = self
             .forwarders
             .entry(room.clone())
-            .or_insert_with(|| Arc::new(Forwarder::new(room_state.clone())))
+            .or_insert_with(|| {
+                Arc::new(Forwarder::new(
+                    room_state.clone(),
+                    subscriptions.clone(),
+                    speakers_rx,
+                ))
+            })
             .clone();
         {
             // Poison-safe write: a panicked previous writer leaves the
@@ -1398,7 +1511,7 @@ pub(crate) fn egress_decide_from_parsed(
             if is_congestion {
                 Some(payload.clone())
             } else if let Some(p) = parsed {
-                match forwarder.decide(receiver_session, &p.wrapper, p.routing_header()) {
+                match forwarder.decide(receiver_session, &p.wrapper, p.media_packet.as_ref()) {
                     // Reuse the original on-wire NATS payload — no per-receiver
                     // re-serialization of an identical PacketWrapper. `Bytes::clone`
                     // is a refcount bump, so every receiver shares one allocation.
@@ -3033,7 +3146,7 @@ mod tests {
 
         // Build the SFU side: empty RoomState + Forwarder over it.
         let room_state = Arc::new(RwLock::new(RoomState::new(room.clone())));
-        let forwarder = Arc::new(Forwarder::new(room_state));
+        let forwarder = Arc::new(Forwarder::with_room_only(room_state));
 
         let handler = handle_msg(
             recipient,
