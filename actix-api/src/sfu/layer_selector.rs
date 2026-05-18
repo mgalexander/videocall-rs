@@ -170,13 +170,36 @@ pub struct CachedSelection {
 /// downgrade path. State is keyed by receiver `SessionId` and must be
 /// reaped via [`Self::prune_stale`] on `LeaveRoom`.
 ///
-/// One [`LayerSelector`] instance backs an entire room and is wrapped in
-/// an `Arc<RwLock<_>>` by the caller. Hot-path consumers
-/// ([`super::forwarder::Forwarder::decide`]) take a read lock to call
-/// [`LayerSelector::last_selection_for`]; recompute-trigger sites
-/// ([`LayerSelector::recompute_for_receiver`],
-/// [`LayerSelector::invalidate_all`]) take a write lock. Configuration
-/// knobs are loaded once at startup from [`super::config::SfuConfig`].
+/// # Concurrency (vc-wls, post-p4-7)
+///
+/// The previous design wrapped the entire selector in
+/// `Arc<RwLock<LayerSelector>>`. That serialised the hot read path in
+/// [`super::forwarder::Forwarder::decide`] against bandwidth-estimate
+/// invalidation — a 1 Hz/receiver write that briefly stalled every
+/// packet decision.
+///
+/// The new layout splits state by access pattern:
+///
+/// * **Hot read** ([`Self::last_selection_for`]) — backed by a
+///   [`DashMap`] keyed by receiver `SessionId`. Reads acquire a single
+///   striped shard lock and clone an `Arc<CachedSelection>`; reads of
+///   distinct receivers never contend. Writes are per-key and never
+///   block readers of other receivers.
+/// * **Slow recompute** ([`Self::recompute_for_receiver`]) — hysteresis
+///   bookkeeping lives behind a [`Mutex`] that only the recompute path
+///   touches. The mutex is held during the greedy selection itself
+///   (this is fine — recompute is the slow path), then the newly
+///   computed [`CachedSelection`] is published into the `DashMap`.
+/// * **Configuration** (`max_video_kbps`, `bandwidth_headroom_pct`) —
+///   immutable after construction. No interior mutability needed.
+///
+/// One [`LayerSelector`] instance backs an entire room and is shared as
+/// `Arc<LayerSelector>` by the caller (no outer `RwLock`). Hot-path
+/// consumers call [`Self::last_selection_for`] (lock-free w.r.t. other
+/// receivers); recompute-trigger sites call
+/// [`Self::recompute_for_receiver`] / [`Self::invalidate_all`].
+/// Configuration knobs are loaded once at startup from
+/// [`super::config::SfuConfig`].
 #[derive(Debug)]
 pub struct LayerSelector {
     /// Hard cap on per-receiver forwarded video bitrate (kbps).
@@ -184,16 +207,24 @@ pub struct LayerSelector {
     /// Fraction of the measured downlink we actually fill (0.0..=1.0).
     pub bandwidth_headroom_pct: f32,
     /// Per-receiver hysteresis state. Populated lazily on first
-    /// `pick_with_hysteresis` call; pruned via `prune_stale`.
-    receiver_state: HashMap<SessionId, ReceiverHysteresis>,
+    /// `pick_with_hysteresis` call; pruned via `prune_stale`. Guarded by
+    /// a single [`Mutex`] — only the slow recompute path acquires it,
+    /// so contention is negligible compared to the per-packet read load
+    /// (which never touches this map).
+    receiver_state: Mutex<HashMap<SessionId, ReceiverHysteresis>>,
     /// Cached selections keyed by receiver `SessionId`. Absence of a
     /// receiver entry means "no decision computed yet — fall back to
     /// pass-through" (the forwarder treats absence as "no layer-drop"
     /// to preserve fan-out for legacy or freshly-joined receivers that
-    /// have not yet reported a bandwidth estimate). Populated by
-    /// [`Self::recompute_for_receiver`], which always runs the
-    /// hysteresis-aware [`Self::pick_with_hysteresis`] before caching.
-    last_selections: HashMap<SessionId, CachedSelection>,
+    /// have not yet reported a bandwidth estimate).
+    ///
+    /// Values are `Arc<CachedSelection>` so the hot read path returns a
+    /// cheap pointer clone instead of cloning the inner `LayerSelection`
+    /// `HashMap`. Each entry is published atomically via
+    /// [`DashMap::insert`] from [`Self::recompute_for_receiver`], which
+    /// runs [`Self::pick_with_hysteresis`] (with the hysteresis state
+    /// already updated under its own mutex) before publishing.
+    last_selections: DashMap<SessionId, Arc<CachedSelection>>,
 }
 
 impl LayerSelector {
@@ -201,16 +232,21 @@ impl LayerSelector {
         Self {
             max_video_kbps: DEFAULT_MAX_VIDEO_KBPS,
             bandwidth_headroom_pct: DEFAULT_BANDWIDTH_HEADROOM_PCT,
-            receiver_state: HashMap::new(),
-            last_selections: HashMap::new(),
+            receiver_state: Mutex::new(HashMap::new()),
+            last_selections: DashMap::new(),
         }
     }
 
     /// Return the cached [`CachedSelection`] for `receiver`, if any. Used
     /// by the forwarder to compare bandwidth/generation against the live
     /// inputs before deciding whether to recompute.
-    pub fn last_selection_for(&self, receiver: SessionId) -> Option<&CachedSelection> {
-        self.last_selections.get(&receiver)
+    ///
+    /// The returned [`Arc`] is a cheap pointer clone — the underlying
+    /// [`CachedSelection`] is immutable for the lifetime of that `Arc`,
+    /// so callers can hold it across other operations without blocking
+    /// recomputes or invalidations on the same key.
+    pub fn last_selection_for(&self, receiver: SessionId) -> Option<Arc<CachedSelection>> {
+        self.last_selections.get(&receiver).map(|r| r.clone())
     }
 
     /// Recompute and cache the layer selection for `receiver`. Called from
@@ -224,7 +260,7 @@ impl LayerSelector {
     /// the 3 s headroom streak + 5 s downgrade cooldown; downgrades are
     /// immediate.
     pub fn recompute_for_receiver(
-        &mut self,
+        &self,
         receiver: SessionId,
         allow_set: &AllowSet,
         speaker_set: &[SessionId],
@@ -245,7 +281,7 @@ impl LayerSelector {
     /// accepts an injected `now`. Production callers should use the
     /// `Instant::now()`-defaulted [`Self::recompute_for_receiver`].
     pub fn recompute_for_receiver_at(
-        &mut self,
+        &self,
         receiver: SessionId,
         allow_set: &AllowSet,
         speaker_set: &[SessionId],
@@ -253,15 +289,31 @@ impl LayerSelector {
         generation: u64,
         now: Instant,
     ) {
-        let selection =
-            self.pick_with_hysteresis(receiver, allow_set, speaker_set, bandwidth_kbps, now);
+        // Pure (stateless) candidate computation FIRST — no locks held.
+        let candidate = self.pick_layers(receiver, allow_set, speaker_set, bandwidth_kbps);
+        let budget = self.effective_budget_kbps(bandwidth_kbps);
+
+        // Hysteresis pass: needs &mut access to per-receiver state.
+        // Critical section is bounded (a single HashMap entry update +
+        // a few comparisons over the candidate `LayerSelection`); no
+        // I/O, no allocation of unbounded size.
+        let selection = {
+            let mut state = match self.receiver_state.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            Self::apply_hysteresis(&mut state, receiver, candidate, budget, now)
+        };
+
+        // Publish atomically — single DashMap insert, per-key shard lock.
+        // Readers of OTHER receivers are never blocked by this write.
         self.last_selections.insert(
             receiver,
-            CachedSelection {
+            Arc::new(CachedSelection {
                 selection,
                 generation,
                 bandwidth_kbps,
-            },
+            }),
         );
     }
 
@@ -271,7 +323,7 @@ impl LayerSelector {
     /// stale-input condition (bandwidth estimate refreshed; AllowSet may
     /// have shifted), not a receiver departure. Receivers that leave the
     /// room are reaped via [`Self::prune_stale`], which clears both.
-    pub fn invalidate_for_receiver(&mut self, receiver: SessionId) {
+    pub fn invalidate_for_receiver(&self, receiver: SessionId) {
         self.last_selections.remove(&receiver);
     }
 
@@ -282,7 +334,7 @@ impl LayerSelector {
     /// upgrade-streak / downgrade-cooldown timers across membership
     /// churn so that a join event doesn't reset everyone's hysteresis.
     /// Per-receiver hysteresis cleanup happens in [`Self::prune_stale`].
-    pub fn invalidate_all(&mut self) {
+    pub fn invalidate_all(&self) {
         self.last_selections.clear();
     }
 
@@ -431,7 +483,7 @@ impl LayerSelector {
     /// sharing requires external synchronization such as
     /// `Arc<Mutex<LayerSelector>>`.
     pub fn pick_with_hysteresis(
-        &mut self,
+        &self,
         receiver_sid: SessionId,
         allow_set: &AllowSet,
         speaker_set: &[SessionId],
@@ -440,11 +492,32 @@ impl LayerSelector {
     ) -> LayerSelection {
         let candidate = self.pick_layers(receiver_sid, allow_set, speaker_set, bandwidth_kbps);
         let budget = self.effective_budget_kbps(bandwidth_kbps);
+        let mut state = match self.receiver_state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::apply_hysteresis(&mut state, receiver_sid, candidate, budget, now)
+    }
 
+    /// Apply hysteresis bookkeeping to a freshly computed `candidate`.
+    ///
+    /// Factored out so that both [`Self::pick_with_hysteresis`] (kept
+    /// for the public API + existing tests) and
+    /// [`Self::recompute_for_receiver_at`] (the new cache-publish path)
+    /// share one source of truth. The caller is responsible for holding
+    /// the `receiver_state` lock; this helper is intentionally not a
+    /// method on `&self` so the `&mut HashMap` borrow stays explicit.
+    fn apply_hysteresis(
+        receiver_state: &mut HashMap<SessionId, ReceiverHysteresis>,
+        receiver_sid: SessionId,
+        candidate: LayerSelection,
+        budget: u32,
+        now: Instant,
+    ) -> LayerSelection {
         // First-ever decision for this receiver: emit and seed state.
-        let Some(state) = self.receiver_state.get(&receiver_sid).cloned() else {
+        let Some(state) = receiver_state.get(&receiver_sid).cloned() else {
             let headroom_ok = has_upgrade_headroom(budget, &candidate);
-            self.receiver_state.insert(
+            receiver_state.insert(
                 receiver_sid,
                 ReceiverHysteresis {
                     last_selection: candidate.clone(),
@@ -464,8 +537,7 @@ impl LayerSelector {
                     (true, None) => Some(now),
                     (false, _) => None,
                 };
-                let entry = self
-                    .receiver_state
+                let entry = receiver_state
                     .get_mut(&receiver_sid)
                     .expect("state existed above");
                 entry.headroom_streak_start = new_streak;
@@ -473,8 +545,7 @@ impl LayerSelector {
             }
             SelectionDelta::Downgrade => {
                 // Immediate. No gates. Reset streak; record downgrade time.
-                let entry = self
-                    .receiver_state
+                let entry = receiver_state
                     .get_mut(&receiver_sid)
                     .expect("state existed above");
                 entry.last_selection = candidate.clone();
@@ -506,8 +577,7 @@ impl LayerSelector {
                 };
 
                 if headroom_ok && streak_satisfied && cooldown_satisfied {
-                    let entry = self
-                        .receiver_state
+                    let entry = receiver_state
                         .get_mut(&receiver_sid)
                         .expect("state existed above");
                     entry.last_selection = candidate.clone();
@@ -516,8 +586,7 @@ impl LayerSelector {
                     entry.headroom_streak_start = None;
                     candidate
                 } else {
-                    let entry = self
-                        .receiver_state
+                    let entry = receiver_state
                         .get_mut(&receiver_sid)
                         .expect("state existed above");
                     entry.headroom_streak_start = new_streak;
@@ -533,8 +602,12 @@ impl LayerSelector {
     /// rejoining receiver doesn't inherit the previous session's
     /// upgrade-streak / cooldown timers or stale cached selection. Safe
     /// to call for receivers that have no state (no-op).
-    pub fn prune_stale(&mut self, receiver_sid: SessionId) {
-        self.receiver_state.remove(&receiver_sid);
+    pub fn prune_stale(&self, receiver_sid: SessionId) {
+        let mut state = match self.receiver_state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.remove(&receiver_sid);
         self.last_selections.remove(&receiver_sid);
     }
 
@@ -879,7 +952,7 @@ mod tests {
     /// return the same selection every time and never re-emit.
     #[test]
     fn hysteresis_steady_state_no_change() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -899,7 +972,7 @@ mod tests {
     /// 2 s at 2000 kbps — not long enough to satisfy the streak gate.
     #[test]
     fn hysteresis_brief_headroom_spike_no_upgrade() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -924,7 +997,7 @@ mod tests {
     /// don't upgrade and that the at-mark call does.
     #[test]
     fn hysteresis_sustained_headroom_triggers_upgrade() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -961,7 +1034,7 @@ mod tests {
     /// Polls every 500 ms across the window for broad coverage.
     #[test]
     fn hysteresis_cooldown_blocks_upgrade() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -1007,7 +1080,7 @@ mod tests {
     /// This catches a regression that flipped `>` to `>=`.
     #[test]
     fn hysteresis_cooldown_boundary_strict() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -1056,7 +1129,7 @@ mod tests {
     /// post-cooldown rebuild from scratch.
     #[test]
     fn hysteresis_upgrade_fires_immediately_after_cooldown() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -1107,7 +1180,7 @@ mod tests {
     /// new streak to satisfy — it cannot ride the previous streak.
     #[test]
     fn hysteresis_back_to_back_upgrade_requires_streak_rebuild() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -1163,7 +1236,7 @@ mod tests {
     /// is recorded (verified by blocking a subsequent upgrade attempt).
     #[test]
     fn hysteresis_immediate_downgrade() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 
@@ -1186,7 +1259,7 @@ mod tests {
     /// fresh candidate immediately, no streak inherited).
     #[test]
     fn hysteresis_prune_clears_state() {
-        let mut sel = LayerSelector::new();
+        let sel = LayerSelector::new();
         let allow = allow_set_with(&[2]);
         let t0 = Instant::now();
 

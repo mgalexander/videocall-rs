@@ -218,7 +218,7 @@ fn build_wired_forwarder(
     // Keep sender alive for the lifetime of the forwarder — borrow() on the
     // receiver would otherwise return the closed-channel sentinel value.
     std::mem::forget(tx);
-    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let layer_selector = Arc::new(LayerSelector::new());
     let fwd = Arc::new(Forwarder::new(room, subs.clone(), rx, layer_selector));
     (fwd, subs)
 }
@@ -490,7 +490,7 @@ fn p4_7_layer_drop_three_receivers_distinct_budgets() {
     }
     let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
     std::mem::forget(tx);
-    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let layer_selector = Arc::new(LayerSelector::new());
     let fwd = Arc::new(Forwarder::new(
         room.clone(),
         subs.clone(),
@@ -618,7 +618,7 @@ fn p4_7_legacy_no_routing_header_forwards() {
     let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
     let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
     std::mem::forget(tx);
-    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let layer_selector = Arc::new(LayerSelector::new());
     let fwd = Arc::new(Forwarder::new(
         room.clone(),
         subs.clone(),
@@ -681,7 +681,7 @@ fn p4_8_base_keyframe_forwards_below_t0_budget() {
     }
     let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
     std::mem::forget(tx);
-    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let layer_selector = Arc::new(LayerSelector::new());
     let fwd = Arc::new(Forwarder::new(
         room.clone(),
         subs.clone(),
@@ -746,7 +746,7 @@ fn p4_8_higher_layer_keyframe_obeys_budget() {
     }
     let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
     std::mem::forget(tx);
-    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let layer_selector = Arc::new(LayerSelector::new());
     let fwd = Arc::new(Forwarder::new(
         room.clone(),
         subs.clone(),

@@ -167,7 +167,15 @@ pub struct Forwarder {
     /// `decide` for VP9 SVC enhancement-layer drops (p4-7); written on
     /// bandwidth-estimate ingest + room membership changes, and lazily
     /// inside `decide` when the active-speaker generation moves forward.
-    layer_selector: Arc<RwLock<LayerSelector>>,
+    ///
+    /// vc-wls: the previous `Arc<RwLock<LayerSelector>>` wrapper was
+    /// removed. The selector's internal hot-read state is now a
+    /// [`dashmap::DashMap`] (per-receiver striped locks); the slow
+    /// recompute path's hysteresis state has its own internal `Mutex`.
+    /// Readers of distinct receivers never contend, and bandwidth-
+    /// estimate invalidation (1 Hz per receiver) no longer stalls the
+    /// 1000 pps `decide` hot path.
+    layer_selector: Arc<LayerSelector>,
     /// p4-9: per-`(receiver, sender)` bounded set of T0 `picture_id`s the
     /// SFU has actually forwarded to this receiver in the recent past.
     /// Consulted on every T1/T2 frame whose `frame_marker & REFERENCES_T0`
@@ -191,7 +199,7 @@ impl Forwarder {
         room: Arc<RwLock<RoomState>>,
         subscriptions: Arc<RwLock<SubscriptionStore>>,
         speakers: watch::Receiver<ActiveSpeakerSet>,
-        layer_selector: Arc<RwLock<LayerSelector>>,
+        layer_selector: Arc<LayerSelector>,
     ) -> Self {
         Self {
             room,
@@ -206,7 +214,7 @@ impl Forwarder {
     /// bandwidth-estimate ingest path in `chat_server` can call
     /// [`LayerSelector::recompute_for_receiver`] without re-plumbing the
     /// handle separately.
-    pub fn layer_selector(&self) -> Arc<RwLock<LayerSelector>> {
+    pub fn layer_selector(&self) -> Arc<LayerSelector> {
         self.layer_selector.clone()
     }
 
@@ -233,7 +241,7 @@ impl Forwarder {
             room,
             subscriptions,
             speakers: rx,
-            layer_selector: Arc::new(RwLock::new(LayerSelector::new())),
+            layer_selector: Arc::new(LayerSelector::new()),
             recent_t0: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -468,9 +476,14 @@ impl Forwarder {
     ///   passed AllowSet" behavior.
     /// * Cached selection's `generation` matches the live speaker
     ///   generation AND `bandwidth_kbps` matches the live estimate →
-    ///   consult the cache directly (single read lock).
-    /// * Otherwise (stale generation / bandwidth) → upgrade to a write
-    ///   lock and recompute via [`crate::sfu::layer_selector::LayerSelector::recompute_for_receiver`].
+    ///   consult the cache directly (lock-free `Arc` clone out of a
+    ///   [`dashmap::DashMap`] shard — never blocks other receivers'
+    ///   reads).
+    /// * Otherwise (stale generation / bandwidth) → call
+    ///   [`crate::sfu::layer_selector::LayerSelector::recompute_for_receiver`]
+    ///   which acquires the hysteresis mutex briefly, runs the greedy
+    ///   selection, then atomically publishes the new `CachedSelection`
+    ///   into the DashMap.
     ///
     /// Returns `true` when the packet should be dropped as exceeding
     /// the receiver's layer budget. Callers are responsible for emitting
@@ -496,39 +509,13 @@ impl Forwarder {
             None => return false,
         };
 
-        // Fast path: cached selection is fresh (same generation + same
-        // bandwidth budget) → single read lock.
-        {
-            let guard = match self.layer_selector.read() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(cached) = guard.last_selection_for(receiver_sid) {
-                if cached.generation == speakers_generation && cached.bandwidth_kbps == bw_kbps {
-                    return match cached
-                        .selection
-                        .forward
-                        .get(&(sender_sid, spatial_layer_id))
-                    {
-                        Some(&max_t) => temporal_layer_id > max_t,
-                        None => true,
-                    };
-                }
-            }
-        }
-
-        // Slow path: cache miss / stale → recompute under a write lock.
-        // The "no cached selection at all" case is treated as a stale
-        // miss here (rather than legacy pass-through) because the
-        // receiver HAS a bandwidth estimate, so we have enough info to
-        // make a proper decision.
-        let mut guard = match self.layer_selector.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Re-check under the write lock — another decide caller may
-        // have just refreshed the cache while we waited.
-        if let Some(cached) = guard.last_selection_for(receiver_sid) {
+        // Fast path: lock-free read of the cached selection. The DashMap
+        // get/clone is a single shard lock that contends only with
+        // writes to THIS receiver's entry (rare — ~1 Hz on bandwidth-
+        // estimate refresh). Other receivers' decide() calls run
+        // entirely concurrently.
+        let cached = self.layer_selector.last_selection_for(receiver_sid);
+        if let Some(cached) = cached.as_ref() {
             if cached.generation == speakers_generation && cached.bandwidth_kbps == bw_kbps {
                 return match cached
                     .selection
@@ -540,14 +527,21 @@ impl Forwarder {
                 };
             }
         }
-        guard.recompute_for_receiver(
+
+        // Slow path: cache miss / stale → recompute and publish atomically.
+        // The "no cached selection at all" case is treated as a stale
+        // miss here (rather than legacy pass-through) because the
+        // receiver HAS a bandwidth estimate, so we have enough info to
+        // make a proper decision.
+        self.layer_selector.recompute_for_receiver(
             receiver_sid,
             allow_set,
             speaker_set,
             bw_kbps,
             speakers_generation,
         );
-        let cached = guard
+        let cached = self
+            .layer_selector
             .last_selection_for(receiver_sid)
             .expect("recompute_for_receiver just inserted the entry");
         match cached

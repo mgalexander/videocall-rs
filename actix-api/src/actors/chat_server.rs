@@ -294,12 +294,10 @@ impl ChatServer {
             // cache is dead work.
             if !room_torn_down {
                 if let Some(fwd) = self.forwarders.get(room_id) {
-                    let ls = fwd.layer_selector();
-                    let mut lg = match ls.write() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    lg.invalidate_all();
+                    // vc-wls: no lock to acquire — interior mutability
+                    // is handled inside the selector (DashMap shard
+                    // locks for `last_selections`, mutex for hysteresis).
+                    fwd.layer_selector().invalidate_all();
                 }
             }
         }
@@ -437,12 +435,8 @@ impl ChatServer {
         // cached layer selection so the next `decide()` call recomputes
         // against the new `AllowSet`.
         if let Some(fwd) = self.forwarders.get(room) {
-            let ls = fwd.layer_selector();
-            let mut lg = match ls.write() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            lg.invalidate_for_receiver(receiver);
+            // vc-wls: lock-free per-key invalidation via DashMap.
+            fwd.layer_selector().invalidate_for_receiver(receiver);
         }
     }
 
@@ -970,13 +964,16 @@ impl Handler<ClientMessage> for ChatServer {
                             // synchronous helper call. The helper itself is
                             // cheap; cloning a typically-tiny `LayerSelection`
                             // keeps the critical section minimal.
+                            // vc-wls: lock-free read of the cached
+                            // selection. `last_selection_for` returns an
+                            // `Arc<CachedSelection>` from a DashMap shard
+                            // lock that contends only with writes to THIS
+                            // receiver's entry. We then clone the inner
+                            // `LayerSelection` (typically tiny) so we
+                            // don't hand a clone-on-write Arc across the
+                            // helper boundary.
                             let cached_selection = self.forwarders.get(&room).and_then(|fwd| {
-                                let ls = fwd.layer_selector();
-                                let guard = match ls.read() {
-                                    Ok(g) => g,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                guard
+                                fwd.layer_selector()
                                     .last_selection_for(session)
                                     .map(|cached| cached.selection.clone())
                             });
@@ -1278,7 +1275,10 @@ impl Handler<JoinRoom> for ChatServer {
                 let speakers_rx = tick.subscribe();
                 let handle = tick.run();
                 self.speaker_ticks.insert(room.clone(), handle);
-                let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+                // vc-wls: bare `Arc<LayerSelector>` — the selector now
+                // owns its own interior locking (DashMap shards for the
+                // hot read cache, a small Mutex for hysteresis state).
+                let layer_selector = Arc::new(LayerSelector::new());
                 let f = Arc::new(Forwarder::new(
                     room_state.clone(),
                     subscriptions.clone(),
@@ -1302,12 +1302,9 @@ impl Handler<JoinRoom> for ChatServer {
         // in the room — the new member's `AllowSet` resolution may now
         // include them as a candidate sender for existing receivers.
         {
-            let ls = forwarder.layer_selector();
-            let mut lg = match ls.write() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            lg.invalidate_all();
+            // vc-wls: lock-free invalidation — see LayerSelector
+            // concurrency notes for the access pattern.
+            forwarder.layer_selector().invalidate_all();
         }
         let sfu_mode = self.sfu_config.mode;
 
@@ -1613,12 +1610,10 @@ fn spawn_room_dispatcher(
                                     // the receiver whose downlink changed
                                     // — they're reporting their OWN
                                     // bandwidth back to the SFU.
-                                    let ls = forwarder.layer_selector();
-                                    let mut lg = match ls.write() {
-                                        Ok(g) => g,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    lg.invalidate_for_receiver(sender_sid);
+                                    // vc-wls: lock-free per-key invalidate.
+                                    forwarder
+                                        .layer_selector()
+                                        .invalidate_for_receiver(sender_sid);
                                 }
                             }
                             Err(e) => {
