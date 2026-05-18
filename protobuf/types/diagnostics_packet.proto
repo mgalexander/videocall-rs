@@ -17,6 +17,30 @@ message DiagnosticsPacket {
   
   // Audio-specific metrics (only populated for audio streams)
   AudioMetrics audio_metrics = 7;
+
+  // Receiver's estimated downlink bandwidth and link state. Consumed by
+  // the SFU LayerSelector (p4-5) to budget per-receiver layer selection.
+  optional BandwidthEstimate bandwidth_estimate = 8;
+}
+
+// Receiver's downlink bandwidth estimate, reported by the client and
+// consumed by the SFU's LayerSelector to budget per-receiver layer
+// selection.
+message BandwidthEstimate {
+  // Receiver's estimated downlink bandwidth in kbps. From the
+  // client's existing congestion/throughput tracking. The SFU
+  // uses 85% of this as the layer budget (15% headroom for ACKs,
+  // protocol overhead, and burst absorption).
+  uint32 estimated_downlink_kbps = 1;
+
+  // Receiver's estimated downlink loss rate, 0..1. Currently
+  // unused by the LayerSelector but reserved for future P4+
+  // refinements (e.g. drop enhancement layers under high loss).
+  float estimated_loss_rate = 2;
+
+  // RTT to the SFU in milliseconds. Used by the LayerSelector
+  // upgrade-watchdog (needs sustained headroom to upgrade).
+  uint32 rtt_ms = 3;
 }
 
 // Video-specific diagnostic metrics
