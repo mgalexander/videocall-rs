@@ -118,10 +118,25 @@ pub struct Peer {
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
-    /// Last seen video sequence number for gap detection.
+    /// Last seen video sequence number for gap detection. Used only on the
+    /// legacy (no-RoutingHeader) non-SVC video path and is preserved for
+    /// backward compatibility with senders that don't emit `RoutingHeader`.
+    /// SVC-aware video uses `last_t0_received_ms` instead — see
+    /// `track_sequence`.
     last_video_seq: Option<u64>,
-    /// Last seen screen sequence number for gap detection.
+    /// Last seen screen sequence number for gap detection. Screen sharing
+    /// is not SVC-encoded (L1T1 only) so the simple increment-by-1 detector
+    /// is correct here.
     last_screen_seq: Option<u64>,
+    /// Wall-clock (ms) of the most recent T0 (base-layer) VIDEO arrival.
+    /// Used for time-based T0-stall detection: when enhancement-layer
+    /// (T1/T2) frames keep arriving but no T0 has landed for longer than
+    /// `KEYFRAME_REQUEST_TIMEOUT_MS`, the receiver concludes that T0
+    /// frames are being lost and arms a KEYFRAME_REQUEST. `None` until
+    /// the first T0 frame is seen (the detector cannot arm before any
+    /// T0 has been observed). Only meaningful on the SVC video path
+    /// (when packets carry a `RoutingHeader`).
+    last_t0_received_ms: Option<u64>,
     /// Timestamp (ms) when a video gap was first detected. `None` if no gap.
     video_gap_detected_at_ms: Option<u64>,
     /// Timestamp (ms) when a screen gap was first detected. `None` if no gap.
@@ -185,6 +200,7 @@ impl Peer {
             has_received_heartbeat: false,
             last_video_seq: None,
             last_screen_seq: None,
+            last_t0_received_ms: None,
             video_gap_detected_at_ms: None,
             screen_gap_detected_at_ms: None,
             last_video_keyframe_request_ms: 0,
@@ -535,20 +551,105 @@ impl Peer {
     /// gaps. Returns `Some(media_type)` if a KEYFRAME_REQUEST should be sent
     /// for this peer, or `None` if no request is needed.
     ///
-    /// Gap detection logic:
-    /// 1. When a gap is detected (seq > last_seq + 1), record the time.
-    /// 2. After `KEYFRAME_REQUEST_TIMEOUT_MS` with the gap still present,
-    ///    return the media type to request a keyframe for.
-    /// 3. Rate-limit to one request per `KEYFRAME_REQUEST_MIN_INTERVAL_MS`.
-    /// 4. When a keyframe arrives (frame_type == "key"), clear the gap state.
+    /// Two detection strategies are used:
+    ///
+    /// 1. **SVC video (packet has a `RoutingHeader`)**: time-based T0-stall
+    ///    detection. T0 (base-layer) arrivals refresh `last_t0_received_ms`
+    ///    and clear any pending gap. T1/T2 (enhancement-layer) arrivals are
+    ///    a liveness signal that the stream is still flowing on the wire,
+    ///    but if more than `KEYFRAME_REQUEST_TIMEOUT_MS` has elapsed since
+    ///    the last T0 while T1/T2 keep arriving, we conclude that T0 frames
+    ///    are being lost (not just dropped by the SFU on a quiet stream)
+    ///    and arm `video_gap_detected_at_ms`. This avoids the bug where the
+    ///    SFU strips T1/T2 per-receiver and the receiver's wire-sequence
+    ///    jumps would otherwise be misread as gaps. We use wall-clock time
+    ///    here rather than picture_id arithmetic because the encoder's
+    ///    current `picture_id` is a global per-frame counter (see
+    ///    `encode/routing.rs::build_routing_header`) — not a per-layer
+    ///    counter — so T0 picture_ids on the wire are not contiguous.
+    ///
+    /// 2. **Legacy video (no `RoutingHeader`) and SCREEN**: original
+    ///    increment-by-1 sequence-gap detection on `video_metadata.sequence`.
+    ///    SCREEN is L1T1 (no SVC, see `encode/transform.rs`) so this is the
+    ///    correct path.
+    ///
+    /// Once `video_gap_detected_at_ms` / `screen_gap_detected_at_ms` is set,
+    /// the standard `KEYFRAME_REQUEST_TIMEOUT_MS` + `KEYFRAME_REQUEST_MIN_INTERVAL_MS`
+    /// rate-limit applies. A keyframe (`frame_type == "key"`) clears the gap
+    /// state and refreshes `last_t0_received_ms` (keyframes are T0 by
+    /// definition).
     fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> Option<MediaType> {
+        let frame_type_str = packet.frame_type.as_str();
+        let now = now_ms();
+
+        // SVC-aware video path: packet carries a RoutingHeader.
+        if media_type == MediaType::VIDEO {
+            if let Some(rh) = packet.routing_header.as_ref() {
+                // Keyframes are always T0 by definition. Treat them as T0
+                // for stall accounting AND clear any armed gap.
+                if frame_type_str == "key" {
+                    self.last_t0_received_ms = Some(now);
+                    self.video_gap_detected_at_ms = None;
+                } else if rh.temporal_layer_id == 0 {
+                    // T0 (base-layer) delta frame arrived. Stream's T0 path
+                    // is healthy: refresh timestamp and clear any pending
+                    // gap. The SFU normally preserves T0 (it only drops
+                    // enhancement layers to fit downlink bandwidth);
+                    // receiving a T0 frame is strong evidence the base
+                    // layer is intact.
+                    self.last_t0_received_ms = Some(now);
+                    self.video_gap_detected_at_ms = None;
+                } else {
+                    // T1/T2 enhancement-layer frame. Use it as a liveness
+                    // signal: if the wire is delivering T1/T2 but T0 has
+                    // been silent for longer than the timeout, that's a
+                    // real T0 loss (not just the SFU stripping enhancement
+                    // layers on a quiet stream).
+                    if let Some(last_t0) = self.last_t0_received_ms {
+                        let since_t0 = now.saturating_sub(last_t0);
+                        if since_t0 >= KEYFRAME_REQUEST_TIMEOUT_MS
+                            && self.video_gap_detected_at_ms.is_none()
+                        {
+                            self.video_gap_detected_at_ms = Some(now);
+                            debug!(
+                                "T0 stall detected for peer {}: {}ms since last T0 while T1/T2 still arriving",
+                                self.session_id, since_t0
+                            );
+                        }
+                    }
+                    // If `last_t0_received_ms` is None we haven't seen a T0
+                    // yet — the detector cannot arm before establishing a
+                    // baseline. Initial-frame recovery is handled by the
+                    // decoder's own keyframe-waiting state machine.
+                }
+
+                // Apply the standard rate-limited dispatch on
+                // `video_gap_detected_at_ms`.
+                if let Some(gap_time) = self.video_gap_detected_at_ms {
+                    let elapsed_since_gap = now.saturating_sub(gap_time);
+                    let elapsed_since_last_req =
+                        now.saturating_sub(self.last_video_keyframe_request_ms);
+                    if elapsed_since_gap >= KEYFRAME_REQUEST_TIMEOUT_MS
+                        && elapsed_since_last_req >= KEYFRAME_REQUEST_MIN_INTERVAL_MS
+                    {
+                        self.last_video_keyframe_request_ms = now;
+                        return Some(MediaType::VIDEO);
+                    }
+                }
+                return None;
+            }
+            // Fall through to the legacy seq-based path below for VIDEO
+            // packets without a RoutingHeader.
+        }
+
+        // Legacy sequence-based path: VIDEO without RoutingHeader, and
+        // SCREEN (which is L1T1 and never carries enhancement layers).
         // Both VIDEO and SCREEN packets use `video_metadata` for sequence
         // tracking. This is correct: `transform_screen_chunk` in
         // `encode/transform.rs` populates `VideoMetadata { sequence, .. }`
-        // for SCREEN packets the same way `transform_video_chunk` does for
-        // VIDEO packets.
-        let (seq, frame_type_str) = if let Some(vm) = packet.video_metadata.as_ref() {
-            (vm.sequence, packet.frame_type.as_str())
+        // for SCREEN packets the same way `transform_video_chunk` does.
+        let seq = if let Some(vm) = packet.video_metadata.as_ref() {
+            vm.sequence
         } else {
             return None;
         };
@@ -566,8 +667,6 @@ impl Peer {
             ),
             _ => return None,
         };
-
-        let now = now_ms();
 
         // If this is a keyframe, clear the gap state -- we recovered.
         if frame_type_str == "key" {
@@ -1271,6 +1370,7 @@ mod tests {
             vad_threshold: None,
             last_video_seq: None,
             last_screen_seq: None,
+            last_t0_received_ms: None,
             video_gap_detected_at_ms: None,
             screen_gap_detected_at_ms: None,
             last_video_keyframe_request_ms: 0,
@@ -2441,6 +2541,301 @@ mod tests {
         };
         let result = peer.track_sequence(MediaType::AUDIO, &pkt);
         assert!(result.is_none(), "AUDIO should not be tracked");
+    }
+
+    // -- SVC temporal-layer-aware gap detection tests ----------------------
+
+    /// Build a VIDEO MediaPacket carrying both `video_metadata.sequence` and
+    /// a `RoutingHeader` with the given temporal layer and picture_id.
+    /// `frame_type` is "delta" unless `is_key` is true. Note: with the
+    /// time-based T0-stall detector, `picture_id` no longer participates in
+    /// gap math — it's set here only because it's a real field of
+    /// `RoutingHeader` and helps test packets resemble production traffic.
+    fn svc_video_packet(
+        sequence: u64,
+        temporal_layer_id: u32,
+        picture_id: u64,
+        is_key: bool,
+    ) -> MediaPacket {
+        use videocall_types::protos::media_packet::{RoutingHeader, VideoMetadata};
+        MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence,
+                ..Default::default()
+            })
+            .into(),
+            routing_header: Some(RoutingHeader {
+                is_keyframe: is_key,
+                temporal_layer_id,
+                spatial_layer_id: 0,
+                picture_id,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: if is_key { "key".into() } else { "delta".into() },
+            ..Default::default()
+        }
+    }
+
+    /// A healthy L1T3 stream — alternating T0/T1/T2 deltas arriving at
+    /// realistic wall-clock times — must not trip the gap detector and
+    /// must not fire a KEYFRAME_REQUEST. Verifies the baseline: SVC
+    /// awareness does not introduce false positives.
+    #[wasm_bindgen_test]
+    fn svc_t0_arrivals_keep_stream_healthy() {
+        let (mut peer, _muted) = make_test_peer(220);
+
+        // Two full GOPs of L1T3: T0, T2, T1, T2, T0, T2, T1, T2.
+        // Wire sequence increments per frame; picture_id same as sequence
+        // (matches current encoder).
+        let layers = [0u32, 2, 1, 2, 0, 2, 1, 2];
+        for (i, &tlid) in layers.iter().enumerate() {
+            let pkt = svc_video_packet(100 + i as u64, tlid, 100 + i as u64, false);
+            let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+            assert!(
+                result.is_none(),
+                "Healthy frame i={i} tlid={tlid} must not request a keyframe"
+            );
+        }
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "Healthy stream must not arm the gap detector"
+        );
+        assert!(
+            peer.last_t0_received_ms.is_some(),
+            "T0 arrivals must refresh last_t0_received_ms"
+        );
+    }
+
+    /// When T0 stops arriving but T1/T2 still flow on the wire for longer
+    /// than KEYFRAME_REQUEST_TIMEOUT_MS, the detector arms and (after the
+    /// rate-limit window) a KEYFRAME_REQUEST fires. This is the real T0
+    /// loss case the SFU layer-drop did NOT cause — the SFU never drops
+    /// T0 — so it indicates network loss of base-layer frames.
+    #[wasm_bindgen_test]
+    fn svc_t1_t2_only_no_t0_for_timeout_triggers_kfr() {
+        let (mut peer, _muted) = make_test_peer(221);
+
+        // Establish baseline: one T0 arrival to arm `last_t0_received_ms`.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        assert!(peer.last_t0_received_ms.is_some());
+        assert!(peer.video_gap_detected_at_ms.is_none());
+
+        // Backdate the last-T0 timestamp to simulate a long T0 silence
+        // while enhancement layers keep arriving.
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+
+        // First T1 arrival past the timeout: the detector should arm,
+        // recording `video_gap_detected_at_ms`. The KFR itself can't fire
+        // yet because the gap was JUST armed (elapsed_since_gap is ~0).
+        let result1 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        assert!(
+            peer.video_gap_detected_at_ms.is_some(),
+            "T0 stall past timeout must arm the gap detector"
+        );
+        assert!(
+            result1.is_none(),
+            "Just-armed gap shouldn't fire KFR on the same call"
+        );
+
+        // Backdate the gap timestamp so elapsed >= KEYFRAME_REQUEST_TIMEOUT_MS,
+        // and clear the rate-limit. Now another T1 arrival should fire.
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms = 0;
+
+        let result2 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 2, 12, false));
+        assert_eq!(
+            result2,
+            Some(MediaType::VIDEO),
+            "T0 stall must fire VIDEO KEYFRAME_REQUEST after timeout"
+        );
+    }
+
+    /// A keyframe arrival clears the armed stall and refreshes
+    /// `last_t0_received_ms` (keyframes are T0 by definition).
+    #[wasm_bindgen_test]
+    fn svc_keyframe_clears_t0_stall() {
+        let (mut peer, _muted) = make_test_peer(222);
+
+        // Arm a stall: one T0 baseline, then backdate and feed T1.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        assert!(
+            peer.video_gap_detected_at_ms.is_some(),
+            "Precondition: stall is armed"
+        );
+        let old_last_t0 = peer.last_t0_received_ms;
+
+        // A keyframe arrives. Since keyframes are T0, the stall must clear
+        // and last_t0_received_ms must be refreshed to ~now.
+        let result = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 0, 12, true));
+        assert!(result.is_none(), "Keyframe arrival must not trigger KFR");
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "Keyframe must clear the armed stall"
+        );
+        assert!(
+            peer.last_t0_received_ms != old_last_t0,
+            "Keyframe must refresh last_t0_received_ms"
+        );
+    }
+
+    /// A plain T0 delta arrival (not a keyframe) also clears the armed stall
+    /// and refreshes `last_t0_received_ms`. T0 arrival is itself proof that
+    /// the base-layer path is healthy again.
+    #[wasm_bindgen_test]
+    fn svc_t0_arrival_clears_t0_stall() {
+        let (mut peer, _muted) = make_test_peer(223);
+
+        // Arm a stall: one T0 baseline, then backdate and feed T1.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        assert!(peer.video_gap_detected_at_ms.is_some());
+        let old_last_t0 = peer.last_t0_received_ms;
+
+        // Plain T0 delta arrives.
+        let result = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 0, 12, false));
+        assert!(result.is_none(), "T0 delta arrival must not trigger KFR");
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "T0 delta arrival must clear the armed stall"
+        );
+        assert!(
+            peer.last_t0_received_ms != old_last_t0,
+            "T0 delta arrival must refresh last_t0_received_ms"
+        );
+    }
+
+    /// After a T0-stall KFR fires, an immediate follow-up T1 arrival must
+    /// NOT fire another KFR — `last_video_keyframe_request_ms` was just set
+    /// and `KEYFRAME_REQUEST_MIN_INTERVAL_MS` has not elapsed. Pins the
+    /// rate-limit invariant on the SVC path.
+    #[wasm_bindgen_test]
+    fn svc_t0_stall_kfr_respects_rate_limit() {
+        let (mut peer, _muted) = make_test_peer(224);
+
+        // Mirror the setup in svc_t1_t2_only_no_t0_for_timeout_triggers_kfr
+        // to drive a KFR fire.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        // Backdate the armed gap so the next call fires.
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms = 0;
+        let result1 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 2, 12, false));
+        assert_eq!(
+            result1,
+            Some(MediaType::VIDEO),
+            "Precondition: first KFR fires"
+        );
+        assert!(
+            peer.last_video_keyframe_request_ms > 0,
+            "Precondition: rate-limit timestamp recorded"
+        );
+
+        // Immediately re-arm the gap timestamp (still past timeout) but
+        // do NOT advance `last_video_keyframe_request_ms`. The rate-limit
+        // alone must now suppress a second fire.
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let result2 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(13, 1, 13, false));
+        assert!(
+            result2.is_none(),
+            "Second KFR within KEYFRAME_REQUEST_MIN_INTERVAL_MS must be rate-limited"
+        );
+    }
+
+    /// Without ever observing a T0 frame, T1/T2 arrivals alone must NOT arm
+    /// the gap detector. Pins the "detector cannot arm before baseline"
+    /// invariant: `last_t0_received_ms` is `None`, so the time-based check
+    /// has no reference point and must take no action.
+    #[wasm_bindgen_test]
+    fn svc_no_baseline_t0_t1_t2_only_no_arming() {
+        let (mut peer, _muted) = make_test_peer(225);
+
+        // Fresh peer: no T0 has ever been seen.
+        assert!(peer.last_t0_received_ms.is_none());
+
+        // Feed five enhancement-layer packets (alternating T1 / T2).
+        let layers = [1u32, 2, 1, 2, 1];
+        for (i, &tlid) in layers.iter().enumerate() {
+            let pkt = svc_video_packet(100 + i as u64, tlid, 100 + i as u64, false);
+            let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+            assert!(
+                result.is_none(),
+                "T1/T2 packet i={i} without a T0 baseline must not return a KFR"
+            );
+        }
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "Detector must not arm before the first T0 establishes a baseline"
+        );
+        assert!(
+            peer.last_t0_received_ms.is_none(),
+            "T1/T2 packets must not populate last_t0_received_ms"
+        );
+    }
+
+    /// Regression guard: a legacy sender that does not populate a
+    /// `RoutingHeader` must continue to use the original
+    /// `video_metadata.sequence`-based gap detection.
+    #[wasm_bindgen_test]
+    fn legacy_no_routing_header_uses_sequence_based_gap_detection() {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let (mut peer, _muted) = make_test_peer(224);
+
+        // No RoutingHeader on these packets — purely the legacy path.
+        let pkt1 = MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence: 1,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".into(),
+            ..Default::default()
+        };
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
+
+        let pkt5 = MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence: 5,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".into(),
+            ..Default::default()
+        };
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt5);
+
+        assert!(
+            peer.video_gap_detected_at_ms.is_some(),
+            "Legacy sender (no RoutingHeader) must still trip seq-based gap detection"
+        );
+
+        // And the KFR still fires after timeout.
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms = 0;
+
+        let pkt6 = MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence: 6,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".into(),
+            ..Default::default()
+        };
+        let result = peer.track_sequence(MediaType::VIDEO, &pkt6);
+        assert_eq!(
+            result,
+            Some(MediaType::VIDEO),
+            "Legacy seq-gap KFR path must remain unchanged"
+        );
     }
 
     // -- Visibility-based skip tests ----------------------------------------
