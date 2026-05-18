@@ -13,12 +13,12 @@ const BROWSER_ARGS = [
 ];
 
 // SFU publishes SpeakerUpdate on a 200ms tick. After flipping mute state we
-// wait long enough for: (a) the next tick on the SFU, (b) the SpeakerUpdate
-// to propagate over the WebTransport/WebSocket link, and (c) the dioxus tile
-// to re-render its glow inline style. 2.5s is conservative for a local stack
-// and matches the budget assumed by the server-side integration test in
-// p3-11.
-const SPEAKER_PROPAGATION_MS = 2500;
+// wait long enough for: (a) the next tick on the SFU, (b) the Heartbeat to
+// reach the SFU, (c) the SpeakerUpdate to propagate over the
+// WebTransport/WebSocket link, and (d) the dioxus tile to re-render its glow
+// inline style. The browser round-trip adds noticeable latency on top of the
+// in-process p3-11 integration test budget, so we use 8s here.
+const SPEAKER_PROPAGATION_MS = 8000;
 
 async function createAuthenticatedContext(
   browser: ReturnType<typeof chromium.launch> extends Promise<infer B> ? B : never,
@@ -149,12 +149,18 @@ async function setMic(page: Page, target: "on" | "off"): Promise<void> {
  * is silent the style contains `border: 1.5px solid transparent` and
  * `box-shadow: none`. When the peer is the active speaker the style contains
  * `border: 1.5px solid rgba(0, 255, 65, ...)` with a non-zero `box-shadow`.
+ *
+ * Callers must ensure the peer tile is already visible (e.g., via the
+ * mutual peer-discovery wait in the test body) — this helper deliberately
+ * keeps a tight 5s visibility check so a missing tile or glow-overlay
+ * surfaces a fast, targeted failure instead of being buried 30s deep
+ * inside a "read style" helper.
  */
 async function readPeerGlowStyle(observerPage: Page): Promise<string> {
   const peerTile = observerPage.locator("#grid-container .canvas-container").first();
-  await expect(peerTile).toBeVisible({ timeout: 30_000 });
+  await expect(peerTile).toBeVisible({ timeout: 5_000 });
   const glowOverlay = peerTile.locator(".glow-overlay");
-  await expect(glowOverlay).toBeVisible({ timeout: 10_000 });
+  await expect(glowOverlay).toBeVisible({ timeout: 5_000 });
   const style = await glowOverlay.getAttribute("style");
   expect(style).toBeTruthy();
   return style ?? "";
@@ -232,6 +238,23 @@ test.describe("SFU speaker rotation reflected in peer tile UI", () => {
       const guestResult = await joinMeetingFromPage(pageB);
       await admitGuestIfNeeded(pageA, pageB, guestResult);
 
+      // Mutual peer-discovery wait (mirrors two-users-meeting.spec.ts:193-201).
+      // Both sides need a remote `.canvas-container` before any glow read is
+      // meaningful. We also gate on the connection LED flipping to
+      // `connected` — the failure mode under environmental misconfiguration
+      // (e.g. WS reaching the wrong host port) is a perpetual "Connecting"
+      // state, and asserting against it here produces a far more
+      // diagnostic failure than a buried 30s tile-visibility timeout.
+      await pageA.waitForTimeout(5000);
+      await expect(pageA.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expect(pageB.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+      await expect(pageA.locator(".connection-led.connected")).toBeVisible({ timeout: 30_000 });
+      await expect(pageB.locator(".connection-led.connected")).toBeVisible({ timeout: 30_000 });
+
       // Both clients land in the grid with their mic off (UI default).
       // Confirm the silent baseline on both observer sides.
       const silentOnB = await readPeerGlowStyle(pageB);
@@ -250,6 +273,10 @@ test.describe("SFU speaker rotation reflected in peer tile UI", () => {
 
       // --- Phase 2: swap. B speaks, A observes B as active speaker.
       await setMic(pageA, "off");
+      // Brief settle so the "stopped speaking" Heartbeat reaches the SFU
+      // before B's mic flips on. Back-to-back toggles can race the SFU's
+      // authoritative speaker pick.
+      await pageA.waitForTimeout(500);
       await setMic(pageB, "on");
       const bSpeakingOnA = await waitForGlowStyle(
         pageA,
