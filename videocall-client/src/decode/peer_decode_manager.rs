@@ -102,6 +102,13 @@ pub struct Peer {
     pub screen_enabled: bool,
     pub is_speaking: bool,
     pub audio_level: f32,
+    /// Whether the SFU has taken authority over this peer's `is_speaking`
+    /// state via a `SpeakerUpdate`. Once `true`, the HEARTBEAT path stops
+    /// writing `is_speaking` (and stops zeroing `audio_level` on the
+    /// not-speaking branch) so the SFU's authoritative decision is not
+    /// clobbered by the peer's local VAD. Defaults to `false` so legacy
+    /// path-only / pre-SFU clients keep using the heartbeat-driven path.
+    pub sfu_speaker_authoritative: bool,
     pub display_name: Option<String>,
     /// Whether this peer's video/screen tiles are currently visible in the
     /// viewport (tracked via IntersectionObserver in the UI layer). When
@@ -170,6 +177,7 @@ impl Peer {
             screen_enabled: false,
             is_speaking: false,
             audio_level: 0.0,
+            sfu_speaker_authoritative: false,
             display_name: None,
             visible: true,
             context_initialized: false,
@@ -450,9 +458,19 @@ impl Peer {
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
-                    self.is_speaking = metadata.is_speaking;
-                    if !metadata.is_speaking {
-                        self.audio_level = 0.0;
+                    // Once the SFU has issued any SpeakerUpdate, it is the
+                    // authoritative writer for `is_speaking`. The peer's
+                    // local VAD (carried in the HEARTBEAT metadata) lags
+                    // the SFU's decision by up to ~1Hz and would otherwise
+                    // clobber the authoritative state and cause UI flicker
+                    // on tile speaker indicators. The other heartbeat
+                    // fields (video/audio/screen enabled) remain peer-
+                    // authoritative regardless.
+                    if !self.sfu_speaker_authoritative {
+                        self.is_speaking = metadata.is_speaking;
+                        if !metadata.is_speaking {
+                            self.audio_level = 0.0;
+                        }
                     }
 
                     // Flush video decoder when video is turned off
@@ -772,6 +790,13 @@ impl PeerDecodeManager {
             .collect();
 
         for (sid, peer) in self.connected_peers.iter_mut() {
+            // Flip the authoritative flag for every connected peer,
+            // including peers that are silent for the entire session and
+            // would therefore never appear in `top_speakers`. After the
+            // first accepted SpeakerUpdate, the SFU owns `is_speaking` for
+            // all peers — the HEARTBEAT path must stop writing it.
+            peer.sfu_speaker_authoritative = true;
+
             let should_speak = speakers.contains(sid);
             if peer.is_speaking != should_speak {
                 peer.is_speaking = should_speak;
@@ -971,6 +996,10 @@ impl PeerDecodeManager {
             );
             peer.display_name = Some(cached_name.clone());
         }
+        // If the SFU has already issued at least one SpeakerUpdate, peers
+        // joining mid-call must inherit the authoritative gate so the
+        // heartbeat path does not write `is_speaking` for them either.
+        peer.sfu_speaker_authoritative = self.speaker_generation > 0;
         self.connected_peers.insert(session_id, peer);
         Ok(())
     }
@@ -1238,6 +1267,7 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            sfu_speaker_authoritative: false,
             vad_threshold: None,
             last_video_seq: None,
             last_screen_seq: None,
@@ -1663,6 +1693,129 @@ mod tests {
             manager.current_speaker_generation(),
             0,
             "generation counter must remain unchanged"
+        );
+    }
+
+    /// Build a HEARTBEAT packet that carries an explicit `is_speaking` flag
+    /// (the standard `heartbeat_packet` helper leaves it at its protobuf
+    /// default of false).
+    fn heartbeat_packet_with_speaking(
+        session_id: u64,
+        video: bool,
+        audio: bool,
+        screen: bool,
+        is_speaking: bool,
+    ) -> Arc<PacketWrapper> {
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: "test@test.com".into(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: video,
+                audio_enabled: audio,
+                screen_enabled: screen,
+                is_speaking,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        wrap(&media, session_id)
+    }
+
+    /// Once the SFU has issued a SpeakerUpdate, the HEARTBEAT path must NOT
+    /// override the SFU's authoritative `is_speaking` decision. This guards
+    /// against UI flicker when the peer's local VAD disagrees with the SFU
+    /// for ~1 heartbeat cycle after a generation flip.
+    #[wasm_bindgen_test]
+    fn heartbeat_after_speaker_update_does_not_override_sfu_decision() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(1001);
+        let (peer_b, _) = make_test_peer(1002);
+        manager.connected_peers.insert(1001, peer_a);
+        manager.connected_peers.insert(1002, peer_b);
+
+        // SFU declares A speaking, B not. This also flips
+        // `sfu_speaker_authoritative = true` on both peers via the real
+        // side effect of `apply_speaker_update`.
+        let u = make_speaker_update(1, &[(1001, true), (1002, false)]);
+        assert!(manager.apply_speaker_update(&u));
+        assert!(manager.get(&1001).unwrap().is_speaking);
+        assert!(!manager.get(&1002).unwrap().is_speaking);
+        assert!(manager.get(&1001).unwrap().sfu_speaker_authoritative);
+        assert!(manager.get(&1002).unwrap().sfu_speaker_authoritative);
+
+        // Heartbeats from each peer disagree with the SFU: A says not
+        // speaking, B says speaking. These must be ignored for is_speaking.
+        let hb_a = heartbeat_packet_with_speaking(1001, true, true, false, false);
+        let hb_b = heartbeat_packet_with_speaking(1002, true, true, false, true);
+
+        // Decode through the manager so we exercise the real Peer::decode
+        // path (which dispatches HEARTBEAT to the gated branch).
+        let _ = manager.decode((*hb_a).clone(), "local@example.com");
+        let _ = manager.decode((*hb_b).clone(), "local@example.com");
+
+        assert!(
+            manager.get(&1001).unwrap().is_speaking,
+            "SFU said A is speaking; heartbeat must not flip it back to false"
+        );
+        assert!(
+            !manager.get(&1002).unwrap().is_speaking,
+            "SFU said B is NOT speaking; heartbeat must not flip it to true"
+        );
+
+        // And video_enabled / audio_enabled writes from the heartbeat
+        // should still propagate (those fields are NOT gated).
+        assert!(manager.get(&1001).unwrap().video_enabled);
+        assert!(manager.get(&1001).unwrap().audio_enabled);
+        assert!(manager.get(&1002).unwrap().video_enabled);
+        assert!(manager.get(&1002).unwrap().audio_enabled);
+    }
+
+    /// Legacy / pre-SFU path: when no SpeakerUpdate has ever been received,
+    /// the HEARTBEAT path must still write `is_speaking`. This guards the
+    /// path-only client (and the moment before the first generation
+    /// arrives) against silent regression.
+    #[wasm_bindgen_test]
+    fn heartbeat_before_any_speaker_update_still_writes_is_speaking() {
+        let (mut peer, _muted) = make_test_peer(1100);
+        assert!(!peer.sfu_speaker_authoritative);
+        assert!(!peer.is_speaking);
+
+        let hb = heartbeat_packet_with_speaking(1100, false, true, false, true);
+        let _ = peer.decode(&hb);
+
+        assert!(
+            peer.is_speaking,
+            "pre-SFU heartbeat with is_speaking=true must flip peer.is_speaking"
+        );
+        // Audio enable should also propagate as before.
+        assert!(peer.audio_enabled);
+    }
+
+    /// Peers joining mid-call (after at least one SpeakerUpdate has been
+    /// applied) must inherit `sfu_speaker_authoritative = true` from
+    /// `add_peer()`, so their first heartbeat does not clobber the SFU's
+    /// state for them either.
+    #[wasm_bindgen_test]
+    fn add_peer_inherits_authoritative_flag_when_generation_nonzero() {
+        let mut manager = PeerDecodeManager::new();
+
+        // First, apply a SpeakerUpdate (with no peers connected — it's
+        // still accepted; manager.speaker_generation advances).
+        let u = make_speaker_update(7, &[]);
+        assert!(manager.apply_speaker_update(&u));
+        assert_eq!(manager.current_speaker_generation(), 7);
+
+        // Now add a brand new peer. NOTE: Peer::new() instantiates real
+        // decoders that require a browser environment, so this test only
+        // succeeds in a wasm-bindgen-test environment.
+        let res = manager.add_peer("late@example.com", 1200, None);
+        assert!(res.is_ok(), "add_peer should succeed: {:?}", res.err());
+
+        let p = manager.get(&1200).expect("peer should exist");
+        assert!(
+            p.sfu_speaker_authoritative,
+            "peer added after a SpeakerUpdate must inherit the authoritative flag"
         );
     }
 
