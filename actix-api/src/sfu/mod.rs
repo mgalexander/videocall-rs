@@ -26,6 +26,7 @@ pub mod layer_selector;
 pub mod priority_queue;
 pub mod room_state;
 pub mod speaker;
+pub mod spillover;
 pub mod subscription;
 
 #[cfg(test)]
