@@ -1,12 +1,13 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "rustlemania.fullname" . }}
   labels:
     {{- include "rustlemania.labels" . | nindent 4 }}
 spec:
+  serviceName: websocket-headless
   {{- if not .Values.autoscaling.enabled }}
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.replicaCount | default 1 }}
   {{- end }}
   selector:
     matchLabels:
@@ -33,6 +34,12 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: STATEFULSET_REPLICAS
+              value: "{{ .Values.replicaCount }}"
             {{- toYaml .Values.env | nindent 12 }}
           ports:
             - name: ws-api
