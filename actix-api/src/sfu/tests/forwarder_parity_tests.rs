@@ -332,3 +332,58 @@ fn mixed_stream_parity() {
     // Receiver 400 is a pure observer (no self-skip): all 12 MEDIA + 2 CONGESTION.
     assert_eq!(counts[&400], 12 + 2);
 }
+
+/// p6-7 / vc-kol follow-up: HEALTH_BEACON is server-internal — published
+/// on `room.{room}.system` by the owner pod and consumed by the spill
+/// controller (p6-8). It must be dropped at the egress decision in BOTH
+/// SFU and Legacy modes; without this, the dispatcher's `room.{room}.*`
+/// subscription would fan the 70 B beacon out to every connected client
+/// every 5 s.
+///
+/// The test publishes a synthetic HEALTH_BEACON on the same per-room
+/// system subject the production beacon uses and asserts zero receivers
+/// see it, in both modes.
+#[test]
+fn health_beacon_dropped_for_all_receivers_in_both_modes() {
+    use videocall_types::protos::health_beacon_packet::HealthBeaconPacket;
+
+    // Build a HEALTH_BEACON wrapper that mirrors what
+    // `build_health_beacon_payload` emits in production.
+    fn build_beacon_payload() -> Bytes {
+        let beacon = HealthBeaconPacket {
+            room_id: TEST_ROOM.to_string(),
+            participant_count: 4,
+            cpu_load: 0.25,
+            reported_at_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::HEALTH_BEACON.into(),
+            // session_id is 0 / SYSTEM-shaped — production uses
+            // `SYSTEM_USER_ID` for `user_id` and leaves session_id unset.
+            session_id: 0,
+            user_id: b"system".to_vec(),
+            data: beacon.write_to_bytes().expect("encode HealthBeaconPacket"),
+            ..Default::default()
+        };
+        Bytes::from(wrapper.write_to_bytes().expect("encode PacketWrapper"))
+    }
+
+    let receivers: Vec<SessionId> = vec![1, 2, 3];
+    let payload = build_beacon_payload();
+    // The beacon publishes on the per-room system subject — NOT on any
+    // sender's `room.{room}.{sid}` subject. Use the same format the
+    // production publisher emits (post-normalisation).
+    let system_subject = format!("room.{}.system", TEST_ROOM.replace(' ', "_"));
+
+    for mode in [SfuMode::Legacy, SfuMode::Sfu] {
+        let fwd = build_forwarder(&receivers);
+        for &rsid in &receivers {
+            let out = egress_decide_bytes(mode, &fwd, rsid, TEST_ROOM, &system_subject, &payload);
+            assert!(
+                out.is_none(),
+                "HEALTH_BEACON must NOT be delivered to receiver {rsid} in mode {mode:?}",
+            );
+        }
+    }
+}

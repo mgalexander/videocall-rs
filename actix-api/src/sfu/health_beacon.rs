@@ -40,7 +40,7 @@
 //!   `speaker_ticks` map.
 
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protobuf::Message as ProtoMessage;
@@ -138,14 +138,34 @@ pub fn linux_cpu_load_estimate() -> f32 {
 
 /// Count the online CPUs from `/proc/cpuinfo`. Returns 1 if unavailable so
 /// downstream division never divides by zero.
+///
+/// Cached in a process-wide [`OnceLock`]: the CPU count does not change at
+/// runtime on the pods we deploy to, and parsing `/proc/cpuinfo` line-by-line
+/// on every beacon tick is wasted I/O at the per-room cadence (200 owned
+/// rooms × 1 tick / 5 s = 40 reads/s before caching).
 fn num_online_cpus() -> usize {
-    match std::fs::read_to_string("/proc/cpuinfo") {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::fs::read_to_string("/proc/cpuinfo") {
         Ok(s) => {
             let n = s.lines().filter(|l| l.starts_with("processor")).count();
             n.max(1)
         }
         Err(_) => 1,
-    }
+    })
+}
+
+/// Format the NATS subject for the per-room system topic.
+///
+/// Matches the normalisation applied at every other publish/subscribe site
+/// in `chat_server.rs` (search for `replace(' ', "_")`): NATS subjects may
+/// not contain whitespace, so room ids that contain spaces must have them
+/// rewritten before the subject is constructed. Without this, beacons
+/// published from a room id like `"foo bar"` would land on the literal
+/// subject `room.foo bar.system`, which the spill controller's
+/// `room.*.system` subscription cannot match in the same way the rest of
+/// the codebase has been written to expect.
+pub(crate) fn system_subject(room_id: &str) -> String {
+    format!("room.{}.system", room_id.replace(' ', "_"))
 }
 
 /// Build the wire payload for a single beacon tick.
@@ -303,7 +323,9 @@ pub fn spawn_health_beacon_loop_with_interval(
         // at `t = interval`, not `t = 0`. Matches the SpeakerTick pattern
         // and gives joiners a moment to register before being counted.
         ticker.tick().await;
-        let subject = format!("room.{}.system", room_id);
+        // Whitespace-safe subject — matches every other `room.{room}.system`
+        // publish/subscribe site in `chat_server.rs` (vc-kol follow-up).
+        let subject = system_subject(&room_id);
         loop {
             ticker.tick().await;
             if !owner_check.is_owner(&room_id) {
@@ -653,5 +675,65 @@ mod tests {
     fn linux_cpu_load_estimate_in_range() {
         let v = linux_cpu_load_estimate();
         assert!((0.0..=1.0).contains(&v), "got {v}");
+    }
+
+    /// `system_subject` rewrites whitespace in the room id so the published
+    /// subject is wire-legal and matches the rest of the codebase's
+    /// `room.{room}.system` convention.
+    ///
+    /// vc-kol follow-up: every other site that builds the system subject in
+    /// `chat_server.rs` calls `.replace(' ', "_")` before formatting; the
+    /// beacon publisher must do the same so the spill controller (p6-8) sees
+    /// beacons for rooms whose ids contain spaces.
+    #[test]
+    fn system_subject_replaces_spaces_with_underscores() {
+        assert_eq!(system_subject("foo bar"), "room.foo_bar.system");
+        // Multiple spaces are all rewritten.
+        assert_eq!(system_subject("a b c"), "room.a_b_c.system");
+        // Rooms without spaces are unchanged.
+        assert_eq!(system_subject("plain-room"), "room.plain-room.system");
+    }
+
+    /// End-to-end: a room id with a space publishes its beacon on the
+    /// normalised subject (matches `chat_server.rs`'s convention).
+    ///
+    /// Without the `.replace(' ', "_")` fix, the beacon loop would publish
+    /// to `room.foo bar.system` (subject contains a space), which is both
+    /// invalid as a NATS subject and would never match the spill
+    /// controller's subscription pattern.
+    #[tokio::test(start_paused = true)]
+    async fn beacon_publishes_on_normalised_subject() {
+        let room_id = "foo bar".to_string();
+        let room_state = Arc::new(RwLock::new(RoomState::new(room_id.clone())));
+        {
+            let mut g = room_state.write().unwrap();
+            g.insert_member(1, 0);
+        }
+        let publisher = Arc::new(FakePublisher::new());
+        let handle = spawn_health_beacon_loop_with_interval(
+            room_id,
+            room_state,
+            Arc::new(AlwaysOwner),
+            Arc::new(FixedCpu(0.0)),
+            publisher.clone(),
+            Duration::from_millis(50),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let published = publisher.drain();
+        assert!(
+            !published.is_empty(),
+            "expected at least one beacon after first interval"
+        );
+        let (subject, _payload) = &published[0];
+        assert_eq!(
+            subject, "room.foo_bar.system",
+            "subject must normalise the space in 'foo bar' to 'foo_bar'"
+        );
+
+        drop(handle);
     }
 }

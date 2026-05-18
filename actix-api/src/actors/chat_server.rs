@@ -1818,6 +1818,25 @@ pub(crate) fn egress_decide_from_parsed(
     payload: &bytes::Bytes,
     parsed: Option<&ParsedPacket>,
 ) -> Option<bytes::Bytes> {
+    // p6-7 / vc-kol follow-up: HEALTH_BEACON is server-internal. It is
+    // published on `room.{room}.system` by the owner pod for the spill
+    // controller (p6-8) to consume, and is never relevant to any client.
+    // Without this drop, the dispatcher's wildcard subscription
+    // (`room.{room}.*`) would fan the ~70 B beacon out to every connected
+    // receiver every 5 s — ~8 KB/min/client of pure overhead on mobile.
+    //
+    // Mode-independent and earliest-possible: applied before self-skip
+    // so we never echo a beacon, applied in both SFU and Legacy modes
+    // because the beacon has no place on either client path. The client-
+    // side handler (`videocall-client/src/client/video_call_client.rs`)
+    // also ignores it as defense-in-depth, but the drop MUST happen here
+    // on the server so we don't burn the bytes on the wire.
+    if let Some(p) = parsed {
+        if p.wrapper.packet_type == PacketType::HEALTH_BEACON.into() {
+            return None;
+        }
+    }
+
     let self_subject = format!("room.{room}.{receiver_session}").replace(' ', "_");
     if subject == self_subject.as_str() {
         // Self-skip prevents echo of our own broadcasts. However,
