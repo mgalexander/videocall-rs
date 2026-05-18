@@ -47,6 +47,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::protos::speaker_update_packet::SpeakerUpdate;
 use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_ID;
 use wasm_bindgen::JsValue;
@@ -1479,10 +1480,31 @@ impl Inner {
                 );
             }
             Ok(PacketType::SPEAKER_UPDATE) => {
-                debug!(
-                    "Received SPEAKER_UPDATE packet from {} -- handler not yet implemented (wave 3)",
-                    String::from_utf8_lossy(&response.user_id)
-                );
+                match SpeakerUpdate::parse_from_bytes(&response.data) {
+                    Ok(update) => {
+                        let applied = self.peer_decode_manager.apply_speaker_update(&update);
+                        if applied {
+                            debug!(
+                                "Applied SpeakerUpdate gen={} ({} entries) from {}",
+                                update.generation,
+                                update.top_speakers.len(),
+                                String::from_utf8_lossy(&response.user_id),
+                            );
+                        } else {
+                            debug!(
+                                "Ignored SpeakerUpdate gen={} from {} (stale or invalid)",
+                                update.generation,
+                                String::from_utf8_lossy(&response.user_id),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to parse SpeakerUpdate from {}: {e}",
+                            String::from_utf8_lossy(&response.user_id),
+                        );
+                    }
+                }
             }
             Ok(PacketType::LAYER_HINT) => {
                 debug!(

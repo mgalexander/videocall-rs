@@ -36,6 +36,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::speaker_update_packet::SpeakerUpdate;
 use videocall_types::Callback;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -651,6 +652,11 @@ pub struct PeerDecodeManager {
     send_packet: Option<Callback<PacketWrapper>>,
     /// The local user_id, needed to construct outgoing KEYFRAME_REQUEST packets.
     local_user_id: String,
+    /// Highest `SpeakerUpdate.generation` accepted so far. Used to drop
+    /// out-of-order / stale updates from the server (datagram delivery can
+    /// reorder packets). `0` means "no update has been applied yet" and is
+    /// also treated as an invalid generation when found on incoming packets.
+    speaker_generation: u64,
 }
 
 impl Default for PeerDecodeManager {
@@ -672,6 +678,7 @@ impl PeerDecodeManager {
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            speaker_generation: 0,
         }
     }
 
@@ -687,6 +694,7 @@ impl PeerDecodeManager {
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            speaker_generation: 0,
         }
     }
 
@@ -723,6 +731,64 @@ impl PeerDecodeManager {
 
     pub fn sorted_keys(&self) -> &Vec<u64> {
         self.connected_peers.ordered_keys()
+    }
+
+    /// Apply a `SpeakerUpdate` from the SFU.
+    ///
+    /// Updates each connected peer's `is_speaking` flag based on the speaker
+    /// list. A generation counter is used to drop stale / out-of-order
+    /// packets (datagrams may reorder). Returns `true` when the update was
+    /// accepted and applied, `false` when it was rejected (older or equal
+    /// generation, or invalid generation `0`).
+    ///
+    /// Note: `audio_level` is zeroed only for peers transitioning to
+    /// not-speaking. When a peer is marked speaking by this update, the
+    /// existing `audio_level` (sourced from the HEARTBEAT path) is left
+    /// untouched. This mirrors the behaviour in the HEARTBEAT handler.
+    pub fn apply_speaker_update(&mut self, update: &SpeakerUpdate) -> bool {
+        // Generation 0 is reserved/unset on the wire. Reject it outright so
+        // server bugs do not silently clobber existing state.
+        if update.generation == 0 {
+            debug!("Dropping SpeakerUpdate with generation == 0 (invalid)");
+            return false;
+        }
+        // Drop strictly older or duplicate generations. The first valid
+        // packet (gen >= 1) passes since `speaker_generation` starts at 0.
+        if update.generation <= self.speaker_generation {
+            debug!(
+                "Dropping out-of-order SpeakerUpdate: incoming gen={} <= current gen={}",
+                update.generation, self.speaker_generation
+            );
+            return false;
+        }
+        self.speaker_generation = update.generation;
+
+        // Build a set of session ids that should be marked speaking.
+        let speakers: std::collections::HashSet<u64> = update
+            .top_speakers
+            .iter()
+            .filter(|e| e.is_speaking)
+            .map(|e| e.session_id)
+            .collect();
+
+        for (sid, peer) in self.connected_peers.iter_mut() {
+            let should_speak = speakers.contains(sid);
+            if peer.is_speaking != should_speak {
+                peer.is_speaking = should_speak;
+                if !should_speak {
+                    // Mirror the HEARTBEAT handler: zero audio level on the
+                    // not-speaking transition so the UI bar deflates.
+                    peer.audio_level = 0.0;
+                }
+            }
+        }
+        true
+    }
+
+    /// Test-only accessor for the current speaker generation counter.
+    #[cfg(test)]
+    pub fn current_speaker_generation(&self) -> u64 {
+        self.speaker_generation
     }
 
     pub fn get(&self, key: &u64) -> Option<&Peer> {
@@ -1414,6 +1480,189 @@ mod tests {
             (peer.audio_level - 0.0).abs() < f32::EPSILON,
             "audio_level should be reset to 0.0 when heartbeat says not speaking, got {}",
             peer.audio_level
+        );
+    }
+
+    // -- SpeakerUpdate tests ----------------------------------------------
+
+    /// Build a `SpeakerUpdate` with the given generation and speaker list.
+    fn make_speaker_update(generation: u64, speakers: &[(u64, bool)]) -> SpeakerUpdate {
+        use videocall_types::protos::speaker_update_packet::SpeakerEntry;
+        let mut update = SpeakerUpdate::new();
+        update.generation = generation;
+        update.top_speakers = speakers
+            .iter()
+            .map(|(sid, speaking)| {
+                let mut e = SpeakerEntry::new();
+                e.session_id = *sid;
+                e.is_speaking = *speaking;
+                e.score = if *speaking { 1.0 } else { 0.0 };
+                e
+            })
+            .collect();
+        update
+    }
+
+    /// Ascending generations should each be applied and reflected in
+    /// `peer.is_speaking`.
+    #[wasm_bindgen_test]
+    fn speaker_update_ascending_generations_advance_state() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(1);
+        let (peer_b, _) = make_test_peer(2);
+        manager.connected_peers.insert(1, peer_a);
+        manager.connected_peers.insert(2, peer_b);
+
+        // gen 1: peer 1 speaking, peer 2 not.
+        let u1 = make_speaker_update(1, &[(1, true), (2, false)]);
+        assert!(manager.apply_speaker_update(&u1));
+        assert!(manager.get(&1).unwrap().is_speaking);
+        assert!(!manager.get(&2).unwrap().is_speaking);
+
+        // gen 2: flip — peer 2 speaking, peer 1 not.
+        let u2 = make_speaker_update(2, &[(1, false), (2, true)]);
+        assert!(manager.apply_speaker_update(&u2));
+        assert!(!manager.get(&1).unwrap().is_speaking);
+        assert!(manager.get(&2).unwrap().is_speaking);
+
+        assert_eq!(manager.current_speaker_generation(), 2);
+    }
+
+    /// An older generation arriving after a newer one must be dropped.
+    #[wasm_bindgen_test]
+    fn speaker_update_out_of_order_packet_dropped() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(10);
+        manager.connected_peers.insert(10, peer_a);
+
+        // Establish gen 5 first.
+        let u5 = make_speaker_update(5, &[(10, true)]);
+        assert!(manager.apply_speaker_update(&u5));
+        assert!(manager.get(&10).unwrap().is_speaking);
+        assert_eq!(manager.current_speaker_generation(), 5);
+
+        // Late-arriving gen 3 with peer not speaking — must be rejected.
+        let u3 = make_speaker_update(3, &[(10, false)]);
+        assert!(
+            !manager.apply_speaker_update(&u3),
+            "older generation must be dropped"
+        );
+        assert!(
+            manager.get(&10).unwrap().is_speaking,
+            "is_speaking must NOT change when stale update is dropped"
+        );
+        assert_eq!(manager.current_speaker_generation(), 5);
+    }
+
+    /// A duplicate generation (equal to the stored one) must also be dropped.
+    #[wasm_bindgen_test]
+    fn speaker_update_equal_generation_dropped() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(20);
+        let (peer_b, _) = make_test_peer(21);
+        manager.connected_peers.insert(20, peer_a);
+        manager.connected_peers.insert(21, peer_b);
+
+        // First gen 2: peer 20 is speaking.
+        let u2a = make_speaker_update(2, &[(20, true), (21, false)]);
+        assert!(manager.apply_speaker_update(&u2a));
+        assert!(manager.get(&20).unwrap().is_speaking);
+        assert!(!manager.get(&21).unwrap().is_speaking);
+
+        // Second gen 2 with different speakers: must be rejected.
+        let u2b = make_speaker_update(2, &[(20, false), (21, true)]);
+        assert!(
+            !manager.apply_speaker_update(&u2b),
+            "duplicate generation must be dropped"
+        );
+        // State preserved from the first call.
+        assert!(manager.get(&20).unwrap().is_speaking);
+        assert!(!manager.get(&21).unwrap().is_speaking);
+    }
+
+    /// Peers absent from `top_speakers` (or present with is_speaking=false)
+    /// should be marked not speaking, and their `audio_level` zeroed.
+    #[wasm_bindgen_test]
+    fn speaker_update_absent_peers_marked_not_speaking_and_audio_zeroed() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Two peers, both currently speaking with a non-zero audio level.
+        let (mut peer_a, _) = make_test_peer(30);
+        peer_a.is_speaking = true;
+        peer_a.audio_level = 0.42;
+        let (mut peer_b, _) = make_test_peer(31);
+        peer_b.is_speaking = true;
+        peer_b.audio_level = 0.66;
+        manager.connected_peers.insert(30, peer_a);
+        manager.connected_peers.insert(31, peer_b);
+
+        // gen 1 names only peer 30 as speaking; peer 31 is explicitly
+        // listed as not speaking. peer 30 audio_level must stay untouched
+        // (still speaking); peer 31 audio_level must drop to 0.
+        let u = make_speaker_update(1, &[(30, true), (31, false)]);
+        assert!(manager.apply_speaker_update(&u));
+
+        let p30 = manager.get(&30).unwrap();
+        assert!(p30.is_speaking, "peer 30 should remain speaking");
+        assert!(
+            (p30.audio_level - 0.42).abs() < f32::EPSILON,
+            "peer 30 audio_level should NOT be zeroed while speaking"
+        );
+
+        let p31 = manager.get(&31).unwrap();
+        assert!(
+            !p31.is_speaking,
+            "peer 31 should transition to not speaking"
+        );
+        assert!(
+            (p31.audio_level - 0.0).abs() < f32::EPSILON,
+            "peer 31 audio_level must be reset to 0 on transition"
+        );
+    }
+
+    /// Peers omitted entirely from the speaker list should also be marked
+    /// not speaking and have audio_level zeroed.
+    #[wasm_bindgen_test]
+    fn speaker_update_omitted_peer_marked_not_speaking() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer_a, _) = make_test_peer(40);
+        peer_a.is_speaking = true;
+        peer_a.audio_level = 0.9;
+        manager.connected_peers.insert(40, peer_a);
+
+        // No entries for peer 40 at all — it should be cleared.
+        let u = make_speaker_update(1, &[]);
+        assert!(manager.apply_speaker_update(&u));
+
+        let p = manager.get(&40).unwrap();
+        assert!(!p.is_speaking, "omitted peer should be marked not speaking");
+        assert!(
+            (p.audio_level - 0.0).abs() < f32::EPSILON,
+            "audio_level should be zeroed on transition to not speaking"
+        );
+    }
+
+    /// Generation 0 is reserved/unset and must be rejected unconditionally.
+    #[wasm_bindgen_test]
+    fn speaker_update_generation_zero_rejected() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer_a, _) = make_test_peer(50);
+        peer_a.is_speaking = false;
+        manager.connected_peers.insert(50, peer_a);
+
+        let u = make_speaker_update(0, &[(50, true)]);
+        assert!(
+            !manager.apply_speaker_update(&u),
+            "generation 0 must be rejected"
+        );
+        assert!(
+            !manager.get(&50).unwrap().is_speaking,
+            "rejected update must not change state"
+        );
+        assert_eq!(
+            manager.current_speaker_generation(),
+            0,
+            "generation counter must remain unchanged"
         );
     }
 
