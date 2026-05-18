@@ -33,7 +33,18 @@
 //!
 //! Hysteresis (upgrade watchdog + downgrade cooldown) lands in p4-6 — see
 //! [`LayerSelector::pick_with_hysteresis`].
-//! Forwarder consumption of the [`LayerSelection`] lands in p4-7.
+//!
+//! p4-7 wires the [`LayerSelector`] into the [`super::forwarder::Forwarder`]:
+//! the selector now caches the most-recent [`LayerSelection`] per receiver
+//! (keyed by the active-speaker generation + bandwidth budget that produced
+//! it) so the hot decide path can look up the result with a single read lock
+//! instead of recomputing for every packet. The cache is updated via
+//! [`LayerSelector::recompute_for_receiver`] (which goes through
+//! [`LayerSelector::pick_with_hysteresis`], so the cached selection already
+//! reflects hysteresis), invalidated on join/leave via
+//! [`LayerSelector::invalidate_all`], and lazily refreshed in
+//! [`super::forwarder::Forwarder::decide`] whenever the speaker generation
+//! moves forward.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -132,15 +143,38 @@ enum SelectionDelta {
     Downgrade,
 }
 
+/// Cached [`LayerSelection`] for a single receiver plus the inputs that
+/// produced it. The cache is invalidated by comparing the live
+/// `ActiveSpeakerSet::generation` and the receiver's current
+/// `bandwidth_kbps`; a mismatch on either signals stale state and
+/// triggers a fresh [`LayerSelector::recompute_for_receiver`] call (which
+/// in turn runs the hysteresis-aware [`LayerSelector::pick_with_hysteresis`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedSelection {
+    pub selection: LayerSelection,
+    /// Speaker-set generation the cached selection was computed against.
+    pub generation: u64,
+    /// Receiver bandwidth budget (kbps) the cached selection used.
+    pub bandwidth_kbps: u32,
+}
+
 /// Configurable greedy two-pass layer selector with per-receiver
-/// upgrade/downgrade hysteresis.
+/// upgrade/downgrade hysteresis and a per-receiver result cache.
 ///
 /// `pick_layers` itself remains stateless. `pick_with_hysteresis` layers
 /// on per-receiver memory: an upgrade watchdog (≥20% headroom held for
 /// ≥3 s, plus a 5 s cooldown after any downgrade) and an immediate
 /// downgrade path. State is keyed by receiver `SessionId` and must be
 /// reaped via [`Self::prune_stale`] on `LeaveRoom`.
-#[derive(Debug, Clone)]
+///
+/// One [`LayerSelector`] instance backs an entire room and is wrapped in
+/// an `Arc<RwLock<_>>` by the caller. Hot-path consumers
+/// ([`super::forwarder::Forwarder::decide`]) take a read lock to call
+/// [`LayerSelector::last_selection_for`]; recompute-trigger sites
+/// ([`LayerSelector::recompute_for_receiver`],
+/// [`LayerSelector::invalidate_all`]) take a write lock. Configuration
+/// knobs are loaded once at startup from [`super::config::SfuConfig`].
+#[derive(Debug)]
 pub struct LayerSelector {
     /// Hard cap on per-receiver forwarded video bitrate (kbps).
     pub max_video_kbps: u32,
@@ -149,6 +183,14 @@ pub struct LayerSelector {
     /// Per-receiver hysteresis state. Populated lazily on first
     /// `pick_with_hysteresis` call; pruned via `prune_stale`.
     receiver_state: HashMap<SessionId, ReceiverHysteresis>,
+    /// Cached selections keyed by receiver `SessionId`. Absence of a
+    /// receiver entry means "no decision computed yet — fall back to
+    /// pass-through" (the forwarder treats absence as "no layer-drop"
+    /// to preserve fan-out for legacy or freshly-joined receivers that
+    /// have not yet reported a bandwidth estimate). Populated by
+    /// [`Self::recompute_for_receiver`], which always runs the
+    /// hysteresis-aware [`Self::pick_with_hysteresis`] before caching.
+    last_selections: HashMap<SessionId, CachedSelection>,
 }
 
 impl LayerSelector {
@@ -157,7 +199,88 @@ impl LayerSelector {
             max_video_kbps: DEFAULT_MAX_VIDEO_KBPS,
             bandwidth_headroom_pct: DEFAULT_BANDWIDTH_HEADROOM_PCT,
             receiver_state: HashMap::new(),
+            last_selections: HashMap::new(),
         }
+    }
+
+    /// Return the cached [`CachedSelection`] for `receiver`, if any. Used
+    /// by the forwarder to compare bandwidth/generation against the live
+    /// inputs before deciding whether to recompute.
+    pub fn last_selection_for(&self, receiver: SessionId) -> Option<&CachedSelection> {
+        self.last_selections.get(&receiver)
+    }
+
+    /// Recompute and cache the layer selection for `receiver`. Called from
+    /// the bandwidth-ingest path (every `DiagnosticsPacket.bandwidth_estimate`
+    /// arrival) and from the forwarder's lazy refresh when the
+    /// speaker-generation moves forward.
+    ///
+    /// Runs the hysteresis-aware [`Self::pick_with_hysteresis`] (not the
+    /// raw [`Self::pick_layers`]) so the cached selection reflects the
+    /// production-public layer-selection policy: upgrades are gated by
+    /// the 3 s headroom streak + 5 s downgrade cooldown; downgrades are
+    /// immediate.
+    pub fn recompute_for_receiver(
+        &mut self,
+        receiver: SessionId,
+        allow_set: &AllowSet,
+        speaker_set: &[SessionId],
+        bandwidth_kbps: u32,
+        generation: u64,
+    ) {
+        self.recompute_for_receiver_at(
+            receiver,
+            allow_set,
+            speaker_set,
+            bandwidth_kbps,
+            generation,
+            Instant::now(),
+        );
+    }
+
+    /// Test-friendly variant of [`Self::recompute_for_receiver`] that
+    /// accepts an injected `now`. Production callers should use the
+    /// `Instant::now()`-defaulted [`Self::recompute_for_receiver`].
+    pub fn recompute_for_receiver_at(
+        &mut self,
+        receiver: SessionId,
+        allow_set: &AllowSet,
+        speaker_set: &[SessionId],
+        bandwidth_kbps: u32,
+        generation: u64,
+        now: Instant,
+    ) {
+        let selection =
+            self.pick_with_hysteresis(receiver, allow_set, speaker_set, bandwidth_kbps, now);
+        self.last_selections.insert(
+            receiver,
+            CachedSelection {
+                selection,
+                generation,
+                bandwidth_kbps,
+            },
+        );
+    }
+
+    /// Drop the cached selection for `receiver`. No-op if absent.
+    ///
+    /// Does **not** drop hysteresis state — invalidation reflects a
+    /// stale-input condition (bandwidth estimate refreshed; AllowSet may
+    /// have shifted), not a receiver departure. Receivers that leave the
+    /// room are reaped via [`Self::prune_stale`], which clears both.
+    pub fn invalidate_for_receiver(&mut self, receiver: SessionId) {
+        self.last_selections.remove(&receiver);
+    }
+
+    /// Drop every cached selection. Called on room-membership changes
+    /// (join/leave) — the `AllowSet` inputs that fed the previous
+    /// selections may now reference stale members. Hysteresis state is
+    /// intentionally retained: surviving receivers should keep their
+    /// upgrade-streak / downgrade-cooldown timers across membership
+    /// churn so that a join event doesn't reset everyone's hysteresis.
+    /// Per-receiver hysteresis cleanup happens in [`Self::prune_stale`].
+    pub fn invalidate_all(&mut self) {
+        self.last_selections.clear();
     }
 
     /// Greedy two-pass layer selection for a single receiver.
@@ -401,14 +524,15 @@ impl LayerSelector {
         }
     }
 
-    /// Drop any hysteresis state for `receiver_sid`.
+    /// Drop any hysteresis state *and* cached selection for `receiver_sid`.
     ///
     /// Intended to be called from the room's `LeaveRoom` handling so a
     /// rejoining receiver doesn't inherit the previous session's
-    /// upgrade-streak / cooldown timers. Safe to call for receivers that
-    /// have no state (no-op).
+    /// upgrade-streak / cooldown timers or stale cached selection. Safe
+    /// to call for receivers that have no state (no-op).
     pub fn prune_stale(&mut self, receiver_sid: SessionId) {
         self.receiver_state.remove(&receiver_sid);
+        self.last_selections.remove(&receiver_sid);
     }
 
     /// Effective bitrate budget for this pick:

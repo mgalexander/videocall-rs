@@ -30,6 +30,7 @@ use crate::actors::session_logic::SessionId;
 use crate::metrics::{
     SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL, SFU_ROOM_SIZE,
 };
+use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::ActiveSpeakerSet;
 use crate::sfu::subscription::SubscriptionStore;
@@ -99,6 +100,11 @@ pub struct Forwarder {
     room: Arc<RwLock<RoomState>>,
     subscriptions: Arc<RwLock<SubscriptionStore>>,
     speakers: watch::Receiver<ActiveSpeakerSet>,
+    /// Per-room [`LayerSelector`] with a per-receiver cache. Read on every
+    /// `decide` for VP9 SVC enhancement-layer drops (p4-7); written on
+    /// bandwidth-estimate ingest + room membership changes, and lazily
+    /// inside `decide` when the active-speaker generation moves forward.
+    layer_selector: Arc<RwLock<LayerSelector>>,
 }
 
 impl Forwarder {
@@ -110,12 +116,22 @@ impl Forwarder {
         room: Arc<RwLock<RoomState>>,
         subscriptions: Arc<RwLock<SubscriptionStore>>,
         speakers: watch::Receiver<ActiveSpeakerSet>,
+        layer_selector: Arc<RwLock<LayerSelector>>,
     ) -> Self {
         Self {
             room,
             subscriptions,
             speakers,
+            layer_selector,
         }
+    }
+
+    /// Shared handle to the per-room [`LayerSelector`]. Exposed so the
+    /// bandwidth-estimate ingest path in `chat_server` can call
+    /// [`LayerSelector::recompute_for_receiver`] without re-plumbing the
+    /// handle separately.
+    pub fn layer_selector(&self) -> Arc<RwLock<LayerSelector>> {
+        self.layer_selector.clone()
     }
 
     /// Convenience constructor for tests and the in-crate parity helpers that
@@ -141,6 +157,7 @@ impl Forwarder {
             room,
             subscriptions,
             speakers: rx,
+            layer_selector: Arc::new(RwLock::new(LayerSelector::new())),
         }
     }
 
@@ -149,7 +166,7 @@ impl Forwarder {
     /// Order of evaluation (each drop bumps `sfu_dropped_total{reason=…}`):
     ///
     /// 1. **Self-skip** — sender == receiver → `Drop{self_skip}`.
-    /// 2. **MEDIA filtering** (only for `PacketWrapper.packet_type == MEDIA`
+    /// 2. **AllowSet filter** (only for `PacketWrapper.packet_type == MEDIA`
     ///    with a successfully parsed inner `MediaPacket`):
     ///    * Resolve the receiver's [`crate::sfu::subscription::AllowSet`]
     ///      from the current room membership + speaker set.
@@ -158,7 +175,20 @@ impl Forwarder {
     ///    * Other media types (HEARTBEAT, RTT, KEYFRAME_REQUEST) and unknown
     ///      values pass through — they are control / signalling streams that
     ///      are not subject to subscription filtering.
-    /// 3. **Anything else** — non-MEDIA wrappers or MEDIA wrappers whose
+    /// 3. **VP9 SVC layer-drop** (p4-7) — only for MEDIA `VIDEO`/`SCREEN`
+    ///    packets that carry a `RoutingHeader` and are NOT keyframes:
+    ///    * Consult the cached [`crate::sfu::layer_selector::LayerSelection`]
+    ///      for this receiver (lazily refreshed when the active-speaker
+    ///      generation moves forward).
+    ///    * `routing_header.is_keyframe == true` ALWAYS passes through —
+    ///      keyframes are invariant 1; dropping one breaks the entire
+    ///      reference chain.
+    ///    * Sender's spatial layer not selected → drop (`layer_budget`).
+    ///    * `routing_header.temporal_layer_id` exceeds the selected
+    ///      `max_temporal_layer_id` → drop (`layer_budget`).
+    ///    * Missing `RoutingHeader` or no cached selection → pass through
+    ///      (legacy client; preserves pre-p4-7 behavior).
+    /// 4. **Anything else** — non-MEDIA wrappers or MEDIA wrappers whose
     ///    inner payload didn't parse — forwarded as-is, preserving the
     ///    tolerant pre-p3-5 behavior. The CONGESTION carve-out is enforced
     ///    one layer above (`chat_server::egress_decide_from_parsed`).
@@ -174,11 +204,12 @@ impl Forwarder {
     ) -> ForwardDecision {
         let start = std::time::Instant::now();
 
-        // Snapshot the room membership and refresh the size gauge in one
-        // critical section, then drop the room read lock before doing any
-        // other work. The lock is poison-safe: a panicked writer leaves the
+        // Snapshot the room membership, refresh the size gauge, and read
+        // the receiver's most-recent bandwidth estimate in one critical
+        // section, then drop the room read lock before doing any other
+        // work. The lock is poison-safe: a panicked writer leaves the
         // table readable.
-        let members_snapshot: HashSet<SessionId> = {
+        let (members_snapshot, receiver_bw_kbps): (HashSet<SessionId>, Option<u32>) = {
             let room = match self.room.read() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
@@ -186,7 +217,13 @@ impl Forwarder {
             SFU_ROOM_SIZE
                 .with_label_values(&[room.room_id.as_str()])
                 .set(room.member_count() as f64);
-            room.members.keys().copied().collect()
+            let members: HashSet<SessionId> = room.members.keys().copied().collect();
+            let bw = room
+                .members
+                .get(&receiver_sid)
+                .and_then(|m| m.bandwidth_estimate.as_ref())
+                .map(|est| est.estimated_downlink_kbps);
+            (members, bw)
         };
 
         // 1. Self-skip — sender is the receiver itself.
@@ -196,7 +233,8 @@ impl Forwarder {
             return ForwardDecision::Drop;
         }
 
-        // 2. AllowSet filter for MEDIA packets with a parsed inner MediaPacket.
+        // 2. AllowSet filter + layer-drop for MEDIA packets with a parsed
+        // inner MediaPacket.
         let is_media = packet_wrapper.packet_type == PacketType::MEDIA.into();
         if is_media {
             if let Some(mp) = media_packet {
@@ -206,8 +244,14 @@ impl Forwarder {
                     MediaType::AUDIO | MediaType::VIDEO | MediaType::SCREEN
                 );
                 if needs_filter {
-                    // Lock-free read of the current speaker set.
-                    let speakers_top: Vec<SessionId> = self.speakers.borrow().top.clone();
+                    // Lock-free read of the current speaker set, captured
+                    // ONCE — we reuse both the `top` slice for AllowSet
+                    // resolution and the `generation` counter for the
+                    // LayerSelector cache invalidation check below.
+                    let (speakers_top, speakers_generation): (Vec<SessionId>, u64) = {
+                        let snap = self.speakers.borrow();
+                        (snap.top.clone(), snap.generation)
+                    };
                     let allow = {
                         let store = match self.subscriptions.read() {
                             Ok(g) => g,
@@ -232,6 +276,33 @@ impl Forwarder {
                         observe_decide_latency(start);
                         return ForwardDecision::Drop;
                     }
+
+                    // p4-7: VP9 SVC enhancement-layer drop. Keyframes
+                    // ALWAYS forward (invariant 1 — dropping one breaks
+                    // every dependent frame in the reference chain).
+                    // Legacy clients (no RoutingHeader) pass through.
+                    // VIDEO/SCREEN only — audio has no SVC layers in
+                    // this codebase today.
+                    if matches!(media_type, MediaType::VIDEO | MediaType::SCREEN) {
+                        if let Some(rh) = mp.routing_header.as_ref() {
+                            if !rh.is_keyframe
+                                && self.should_drop_for_layer_budget(
+                                    receiver_sid,
+                                    sender_sid,
+                                    rh.spatial_layer_id,
+                                    rh.temporal_layer_id,
+                                    &allow,
+                                    &speakers_top,
+                                    speakers_generation,
+                                    receiver_bw_kbps,
+                                )
+                            {
+                                SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).inc();
+                                observe_decide_latency(start);
+                                return ForwardDecision::Drop;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -242,6 +313,112 @@ impl Forwarder {
             .inc();
         observe_decide_latency(start);
         ForwardDecision::Forward
+    }
+}
+
+impl Forwarder {
+    /// Decide whether a VP9 SVC enhancement layer should be dropped for
+    /// `receiver_sid` per the cached [`crate::sfu::layer_selector::LayerSelection`].
+    ///
+    /// Lazy-refresh contract:
+    ///
+    /// * No cached selection for the receiver → pass through (return
+    ///   `false`). The bandwidth-ingest path is the authoritative place
+    ///   to seed the cache; a receiver that has never reported a
+    ///   bandwidth estimate gets the legacy "forward everything that
+    ///   passed AllowSet" behavior.
+    /// * Cached selection's `generation` matches the live speaker
+    ///   generation AND `bandwidth_kbps` matches the live estimate →
+    ///   consult the cache directly (single read lock).
+    /// * Otherwise (stale generation / bandwidth) → upgrade to a write
+    ///   lock and recompute via [`crate::sfu::layer_selector::LayerSelector::recompute_for_receiver`].
+    ///
+    /// Returns `true` when the packet should be dropped as exceeding
+    /// the receiver's layer budget. Callers are responsible for emitting
+    /// the `sfu_dropped_total{reason="layer_budget"}` metric.
+    #[allow(clippy::too_many_arguments)]
+    fn should_drop_for_layer_budget(
+        &self,
+        receiver_sid: SessionId,
+        sender_sid: SessionId,
+        spatial_layer_id: u32,
+        temporal_layer_id: u32,
+        allow_set: &crate::sfu::subscription::AllowSet,
+        speaker_set: &[SessionId],
+        speakers_generation: u64,
+        receiver_bw_kbps: Option<u32>,
+    ) -> bool {
+        // No bandwidth estimate yet → pass through (legacy fan-out for
+        // freshly-joined receivers). Same rationale as the cache-miss
+        // case below: we don't have enough information to make a
+        // sensible drop decision.
+        let bw_kbps = match receiver_bw_kbps {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // Fast path: cached selection is fresh (same generation + same
+        // bandwidth budget) → single read lock.
+        {
+            let guard = match self.layer_selector.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(cached) = guard.last_selection_for(receiver_sid) {
+                if cached.generation == speakers_generation && cached.bandwidth_kbps == bw_kbps {
+                    return match cached
+                        .selection
+                        .forward
+                        .get(&(sender_sid, spatial_layer_id))
+                    {
+                        Some(&max_t) => temporal_layer_id > max_t,
+                        None => true,
+                    };
+                }
+            }
+        }
+
+        // Slow path: cache miss / stale → recompute under a write lock.
+        // The "no cached selection at all" case is treated as a stale
+        // miss here (rather than legacy pass-through) because the
+        // receiver HAS a bandwidth estimate, so we have enough info to
+        // make a proper decision.
+        let mut guard = match self.layer_selector.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Re-check under the write lock — another decide caller may
+        // have just refreshed the cache while we waited.
+        if let Some(cached) = guard.last_selection_for(receiver_sid) {
+            if cached.generation == speakers_generation && cached.bandwidth_kbps == bw_kbps {
+                return match cached
+                    .selection
+                    .forward
+                    .get(&(sender_sid, spatial_layer_id))
+                {
+                    Some(&max_t) => temporal_layer_id > max_t,
+                    None => true,
+                };
+            }
+        }
+        guard.recompute_for_receiver(
+            receiver_sid,
+            allow_set,
+            speaker_set,
+            bw_kbps,
+            speakers_generation,
+        );
+        let cached = guard
+            .last_selection_for(receiver_sid)
+            .expect("recompute_for_receiver just inserted the entry");
+        match cached
+            .selection
+            .forward
+            .get(&(sender_sid, spatial_layer_id))
+        {
+            Some(&max_t) => temporal_layer_id > max_t,
+            None => true,
+        }
     }
 }
 

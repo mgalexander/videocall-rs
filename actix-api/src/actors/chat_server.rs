@@ -49,6 +49,7 @@ use videocall_types::SYSTEM_USER_ID;
 use super::packet_handler::{parse_and_inspect, ParsedPacket};
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
+use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::{NatsSpeakerPublisher, SpeakerScorer, SpeakerTick, TickHandle};
 use crate::sfu::subscription::SubscriptionStore;
@@ -262,7 +263,7 @@ impl ChatServer {
                 };
                 guard.forget(*session_id);
             }
-            if let Some(members) = self.room_members.get_mut(room_id) {
+            let room_torn_down = if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|(sid, _, _)| sid != session_id);
                 if members.is_empty() {
                     self.room_members.remove(room_id);
@@ -277,6 +278,27 @@ impl ChatServer {
                     // shared scorer.
                     self.speaker_ticks.remove(room_id);
                     self.speaker_scorers.remove(room_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            // p4-7: a member leaving invalidates every cached layer
+            // selection in the room (the departed member was a candidate
+            // sender for other receivers and may have been pinned/admitted
+            // in someone's selection). Skip when the room was torn down
+            // above — the forwarder is already gone, so invalidating its
+            // cache is dead work.
+            if !room_torn_down {
+                if let Some(fwd) = self.forwarders.get(room_id) {
+                    let ls = fwd.layer_selector();
+                    let mut lg = match ls.write() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    lg.invalidate_all();
                 }
             }
         }
@@ -408,6 +430,19 @@ impl ChatServer {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.apply_update(receiver, update, &members);
+        // p4-7 follow-up: a SubscriptionUpdate may change which senders this
+        // receiver wants without bumping the speaker generation or arriving
+        // alongside a bandwidth-estimate refresh. Invalidate the receiver's
+        // cached layer selection so the next `decide()` call recomputes
+        // against the new `AllowSet`.
+        if let Some(fwd) = self.forwarders.get(room) {
+            let ls = fwd.layer_selector();
+            let mut lg = match ls.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            lg.invalidate_for_receiver(receiver);
+        }
     }
 
     /// Remove a session from the per-room demux receiver map (vc-q0v).
@@ -1173,10 +1208,12 @@ impl Handler<JoinRoom> for ChatServer {
                 let speakers_rx = tick.subscribe();
                 let handle = tick.run();
                 self.speaker_ticks.insert(room.clone(), handle);
+                let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
                 let f = Arc::new(Forwarder::new(
                     room_state.clone(),
                     subscriptions.clone(),
                     speakers_rx,
+                    layer_selector,
                 ));
                 vac.insert(f).clone()
             }
@@ -1190,6 +1227,17 @@ impl Handler<JoinRoom> for ChatServer {
                 Err(poisoned) => poisoned.into_inner(),
             };
             guard.insert_member(session, capabilities);
+        }
+        // p4-7: membership change invalidates every cached layer selection
+        // in the room — the new member's `AllowSet` resolution may now
+        // include them as a candidate sender for existing receivers.
+        {
+            let ls = forwarder.layer_selector();
+            let mut lg = match ls.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            lg.invalidate_all();
         }
         let sfu_mode = self.sfu_config.mode;
 
@@ -1480,11 +1528,27 @@ fn spawn_room_dispatcher(
                                     // `update_bandwidth_estimate` call holds the
                                     // write lock; no awaits within. Poison-safe
                                     // pattern matches the rest of this file.
-                                    let mut guard = match room_state.write() {
+                                    {
+                                        let mut guard = match room_state.write() {
+                                            Ok(g) => g,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        guard.update_bandwidth_estimate(sender_sid, est);
+                                    }
+                                    // p4-7: invalidate the cached layer
+                                    // selection for this receiver so the
+                                    // next `decide()` call recomputes
+                                    // against the fresh bandwidth budget.
+                                    // The DiagnosticsPacket's sender is
+                                    // the receiver whose downlink changed
+                                    // — they're reporting their OWN
+                                    // bandwidth back to the SFU.
+                                    let ls = forwarder.layer_selector();
+                                    let mut lg = match ls.write() {
                                         Ok(g) => g,
                                         Err(poisoned) => poisoned.into_inner(),
                                     };
-                                    guard.update_bandwidth_estimate(sender_sid, est);
+                                    lg.invalidate_for_receiver(sender_sid);
                                 }
                             }
                             Err(e) => {

@@ -27,8 +27,9 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 use tokio::sync::watch;
+use videocall_types::protos::diagnostics_packet::BandwidthEstimate;
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::{MediaPacket, RoutingHeader};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::subscription_packet::SubscriptionUpdate;
@@ -36,6 +37,7 @@ use videocall_types::protos::subscription_packet::SubscriptionUpdate;
 use crate::actors::session_logic::SessionId;
 use crate::metrics::{SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
+use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::ActiveSpeakerSet;
 use crate::sfu::subscription::SubscriptionStore;
@@ -214,7 +216,8 @@ fn build_wired_forwarder(
     // Keep sender alive for the lifetime of the forwarder — borrow() on the
     // receiver would otherwise return the closed-channel sentinel value.
     std::mem::forget(tx);
-    let fwd = Arc::new(Forwarder::new(room, subs.clone(), rx));
+    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let fwd = Arc::new(Forwarder::new(room, subs.clone(), rx, layer_selector));
     (fwd, subs)
 }
 
@@ -393,5 +396,244 @@ fn p3_5_active_speaker_is_admitted_without_explicit_pin() {
     assert!(matches!(
         fwd.decide(receiver, &pw_stranger_video, Some(&mp_stranger_video)),
         ForwardDecision::Drop
+    ));
+}
+
+// ===========================================================================
+// p4-7: VP9 SVC layer-drop using RoutingHeader temporal/spatial ids
+// ===========================================================================
+//
+// One VP9 L1T3 sender emitting T0/T1/T2 frames; three receivers with
+// distinct downlink bandwidth estimates. The LayerSelector budget (with the
+// default 0.85 headroom) is:
+//   * 200 kbps → 170 effective → only T0 (128) fits → T1+T2 dropped.
+//   * 500 kbps → 425 effective → T0 (128) + T1 (+256 = 384) fits, T2
+//     (cum 896) does NOT → T2 dropped.
+//   * 2000 kbps → 1700 effective → full T0+T1+T2 (cum 896) fits → all
+//     temporal layers forwarded.
+//
+// Keyframes always pass through regardless of the layer budget — this is
+// invariant 1 (dropping a keyframe destroys the entire reference chain).
+
+/// Build a MEDIA-wrapped VIDEO packet from `sender` with a `RoutingHeader`
+/// indicating the given spatial/temporal layer and keyframe bit.
+fn build_video_with_layer(
+    sender: SessionId,
+    spatial: u32,
+    temporal: u32,
+    is_keyframe: bool,
+) -> (PacketWrapper, MediaPacket) {
+    let mut rh = RoutingHeader::new();
+    rh.is_keyframe = is_keyframe;
+    rh.spatial_layer_id = spatial;
+    rh.temporal_layer_id = temporal;
+    let mp = MediaPacket {
+        media_type: MediaType::VIDEO.into(),
+        routing_header: ::protobuf::MessageField::some(rh),
+        ..Default::default()
+    };
+    let mut pw = PacketWrapper::new();
+    pw.session_id = sender;
+    pw.packet_type = PacketType::MEDIA.into();
+    pw.user_id = b"sender@example.com".to_vec();
+    pw.data = b"opaque-vp9-bytes".to_vec();
+    (pw, mp)
+}
+
+/// Seed `receiver`'s most-recent bandwidth estimate on the shared room
+/// state. This is what the bandwidth-ingest path
+/// (`chat_server` DiagnosticsPacket handler) does in production.
+fn set_receiver_bandwidth(room: &Arc<RwLock<RoomState>>, receiver: SessionId, downlink_kbps: u32) {
+    let mut est = BandwidthEstimate::new();
+    est.estimated_downlink_kbps = downlink_kbps;
+    let mut guard = room.write().unwrap();
+    guard.update_bandwidth_estimate(receiver, &est);
+}
+
+/// Acceptance for p4-7: one sender, three receivers at 200 / 500 / 2000
+/// kbps. Assert that each receiver only sees the temporal layers its
+/// budget can afford, and that the keyframe always passes through for
+/// each receiver regardless of budget.
+#[test]
+fn p4_7_layer_drop_three_receivers_distinct_budgets() {
+    let sender: SessionId = 200;
+    let r_tight: SessionId = 100; // 200 kbps → T0 only
+    let r_mid: SessionId = 101; // 500 kbps → T0+T1
+    let r_fat: SessionId = 102; // 2000 kbps → T0+T1+T2
+
+    // Build the wired forwarder and snapshot the room handle so we can
+    // seed bandwidth estimates on each receiver directly.
+    let room = Arc::new(RwLock::new(RoomState::new("p4-7-budgets".to_string())));
+    {
+        let mut w = room.write().unwrap();
+        for &sid in &[sender, r_tight, r_mid, r_fat] {
+            w.insert_member(sid, 0);
+        }
+    }
+    let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
+    // Pin each receiver to ONLY the sender so the LayerSelector budget
+    // isn't fragmented across the other receivers (who are members of
+    // the room but, in this test, do not themselves send video). The
+    // legacy-default AllowSet treats every other member as a candidate
+    // sender; an explicit `SubscriptionUpdate` with a single pinned
+    // session collapses that to {sender}, matching the realistic
+    // "one publisher, three subscribers" scenario p4-7 targets.
+    {
+        let members: std::collections::HashSet<SessionId> =
+            [sender, r_tight, r_mid, r_fat].into_iter().collect();
+        let mut s = subs.write().unwrap();
+        s.apply_update(r_tight, sub_update(&[sender], true), &members);
+        s.apply_update(r_mid, sub_update(&[sender], true), &members);
+        s.apply_update(r_fat, sub_update(&[sender], true), &members);
+    }
+    let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
+    std::mem::forget(tx);
+    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let fwd = Arc::new(Forwarder::new(
+        room.clone(),
+        subs.clone(),
+        rx,
+        layer_selector,
+    ));
+
+    // Seed each receiver's downlink budget.
+    set_receiver_bandwidth(&room, r_tight, 200);
+    set_receiver_bandwidth(&room, r_mid, 500);
+    set_receiver_bandwidth(&room, r_fat, 2000);
+
+    // Build the three temporal-layer packets (delta frames, NOT keyframes).
+    let (pw_t0, mp_t0) = build_video_with_layer(sender, 0, 0, false);
+    let (pw_t1, mp_t1) = build_video_with_layer(sender, 0, 1, false);
+    let (pw_t2, mp_t2) = build_video_with_layer(sender, 0, 2, false);
+
+    // --- r_tight (200 kbps): only T0 forwards. ---
+    assert!(
+        matches!(
+            fwd.decide(r_tight, &pw_t0, Some(&mp_t0)),
+            ForwardDecision::Forward
+        ),
+        "T0 base must forward to tight receiver"
+    );
+    let before_lb = SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).get();
+    assert!(
+        matches!(
+            fwd.decide(r_tight, &pw_t1, Some(&mp_t1)),
+            ForwardDecision::Drop
+        ),
+        "T1 must drop for tight receiver (170 kbps budget)"
+    );
+    let after_lb = SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).get();
+    assert!(
+        after_lb > before_lb,
+        "sfu_dropped_total{{reason=\"layer_budget\"}} must increment on T1 drop"
+    );
+    assert!(
+        matches!(
+            fwd.decide(r_tight, &pw_t2, Some(&mp_t2)),
+            ForwardDecision::Drop
+        ),
+        "T2 must drop for tight receiver"
+    );
+
+    // --- r_mid (500 kbps): T0+T1 forward, T2 drops. ---
+    assert!(matches!(
+        fwd.decide(r_mid, &pw_t0, Some(&mp_t0)),
+        ForwardDecision::Forward
+    ));
+    assert!(matches!(
+        fwd.decide(r_mid, &pw_t1, Some(&mp_t1)),
+        ForwardDecision::Forward
+    ));
+    assert!(
+        matches!(
+            fwd.decide(r_mid, &pw_t2, Some(&mp_t2)),
+            ForwardDecision::Drop
+        ),
+        "T2 must drop for mid receiver (425 kbps budget, T0+T1=384 fits but cum-T2=896 does not)"
+    );
+
+    // --- r_fat (2000 kbps): all temporal layers forward. ---
+    for (pw, mp) in [(&pw_t0, &mp_t0), (&pw_t1, &mp_t1), (&pw_t2, &mp_t2)] {
+        assert!(
+            matches!(fwd.decide(r_fat, pw, Some(mp)), ForwardDecision::Forward),
+            "fat receiver (1700 kbps budget) must forward every temporal layer"
+        );
+    }
+
+    // --- Keyframes always pass through, even on the tightest receiver. ---
+    // A T2 KEYFRAME from the sender goes to r_tight (whose layer budget
+    // would normally drop T2): assert Forward, asserting invariant 1.
+    let (pw_kf, mp_kf) = build_video_with_layer(sender, 0, 2, true);
+    assert!(
+        matches!(
+            fwd.decide(r_tight, &pw_kf, Some(&mp_kf)),
+            ForwardDecision::Forward
+        ),
+        "keyframes ALWAYS pass through regardless of layer budget (invariant 1)"
+    );
+}
+
+/// A receiver that has not yet reported a bandwidth estimate must keep
+/// receiving every layer (legacy pass-through). The LayerSelector cache
+/// is only consulted when there's a budget to compare against; the
+/// no-bandwidth path bypasses layer-drop entirely.
+#[test]
+fn p4_7_no_bandwidth_estimate_disables_layer_drop() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    let (fwd, _subs) =
+        build_wired_forwarder("p4-7-no-bw", &[receiver, sender], ActiveSpeakerSet::empty());
+
+    // No `update_bandwidth_estimate` call — receiver has no budget.
+    let (pw_t2, mp_t2) = build_video_with_layer(sender, 0, 2, false);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_t2, Some(&mp_t2)),
+            ForwardDecision::Forward
+        ),
+        "without a bandwidth estimate the layer-drop is skipped"
+    );
+}
+
+/// Legacy clients that don't emit a `RoutingHeader` are unaffected by the
+/// p4-7 layer-drop. A receiver WITH a tight bandwidth budget still gets
+/// the legacy sender's media forwarded as long as the AllowSet permits.
+#[test]
+fn p4_7_legacy_no_routing_header_forwards() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    let room = Arc::new(RwLock::new(RoomState::new("p4-7-legacy".to_string())));
+    {
+        let mut w = room.write().unwrap();
+        w.insert_member(sender, 0);
+        w.insert_member(receiver, 0);
+    }
+    let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
+    let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
+    std::mem::forget(tx);
+    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let fwd = Arc::new(Forwarder::new(
+        room.clone(),
+        subs.clone(),
+        rx,
+        layer_selector,
+    ));
+    set_receiver_bandwidth(&room, receiver, 200); // tight, T1+ would drop
+
+    // No RoutingHeader on this VIDEO packet → pass-through.
+    let mp = MediaPacket {
+        media_type: MediaType::VIDEO.into(),
+        ..Default::default()
+    };
+    let mut pw = PacketWrapper::new();
+    pw.session_id = sender;
+    pw.packet_type = PacketType::MEDIA.into();
+    pw.user_id = b"sender@example.com".to_vec();
+    pw.data = b"opaque".to_vec();
+    assert!(matches!(
+        fwd.decide(receiver, &pw, Some(&mp)),
+        ForwardDecision::Forward
     ));
 }
