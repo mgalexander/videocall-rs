@@ -602,6 +602,7 @@ impl ConnectionManager {
         let own_session_id = self.own_session_id.clone();
         let pending_session_ids = self.pending_session_ids.clone();
         let active_connection_id = self.active_connection_id.clone();
+        let reconnection_phase = self.reconnection_phase.clone();
         let manager_ref = self.manager_ref.clone();
 
         Callback::from(move |packet: PacketWrapper| {
@@ -626,6 +627,18 @@ impl ConnectionManager {
                             return;
                         }
 
+                        // Mark phase as Reconnecting synchronously so that the
+                        // connection-lost callback (which will fire once the
+                        // server closes the old connection) short-circuits at
+                        // its existing phase-guard instead of launching a
+                        // redundant exponential-backoff reconnection loop.
+                        // `complete_election` resets this back to Idle on a
+                        // successful new election.
+                        *reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+                            attempt: 0,
+                            next_delay_ms: 0,
+                        };
+
                         // Notify UI that we're chasing the redirect. Single-
                         // shot bookkeeping & the actual URL swap / election
                         // restart happen inside `apply_admission_redirect`.
@@ -640,6 +653,7 @@ impl ConnectionManager {
                         // bookkeeping so we don't touch the counter here.
                         let manager_ref = manager_ref.clone();
                         let on_state_changed = on_state_changed.clone();
+                        let reconnection_phase = reconnection_phase.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             let Some(mgr_rc) = manager_ref.upgrade() else {
                                 warn!(
@@ -655,6 +669,9 @@ impl ConnectionManager {
 
                             if let Err(e) = result {
                                 error!("apply_admission_redirect failed: {e}");
+                                // Clear the suppression marker so it doesn't
+                                // linger past a terminal failure.
+                                *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
                                 on_state_changed.emit(ConnectionState::Failed {
                                     error: format!("Redirect apply failed: {e}"),
                                     last_known_server: Some(redirect_to),
@@ -969,6 +986,13 @@ impl ConnectionManager {
                 self.active_connection_id
                     .borrow_mut()
                     .replace(connection_id.clone());
+
+                // A successful election clears any in-flight reconnection /
+                // redirect suppression marker. The exponential-backoff
+                // reconnection loop also resets this on its own success
+                // path; setting it here covers the redirect path (which
+                // bypasses that loop).
+                *self.reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
 
                 // Mark as active
                 if let Some(mut_measurement) = self.rtt_measurements.get_mut(&connection_id) {
@@ -3133,6 +3157,87 @@ mod tests {
     fn redirect_chase_depth_initial_value_is_zero() {
         let mgr = make_test_manager();
         assert_eq!(*mgr.redirect_chase_depth.borrow(), 0);
+    }
+
+    // ===================================================================
+    // vc-6rf: suppress reconnect loop while an ADMISSION_DECISION redirect
+    // is in flight.
+    // ===================================================================
+
+    /// The inbound REDIRECT callback marks `reconnection_phase = Reconnecting`
+    /// synchronously (before the manager-borrow happens on the spawned task).
+    /// This unit test mimics that path: it sets the phase the way the
+    /// callback does and then invokes `apply_admission_redirect`. The phase
+    /// must remain Reconnecting after the redirect is applied — the
+    /// connection-lost callback's phase guard relies on this marker still
+    /// being set when the server closes the old connection.
+    #[test]
+    fn redirect_inbound_path_sets_reconnection_phase_to_reconnecting() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+
+        // Step 1 — mimic the synchronous set the inbound callback performs.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 0,
+            next_delay_ms: 0,
+        };
+
+        // Step 2 — apply the redirect (the rest of the callback's work).
+        mgr.apply_admission_redirect(
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string(),
+        )
+        .unwrap();
+
+        // The redirect path leaves the suppression marker in place;
+        // complete_election will clear it on the next successful election.
+        assert!(matches!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting { .. }
+        ));
+    }
+
+    /// A successful `complete_election` must reset `reconnection_phase` to
+    /// Idle. This guarantees that the redirect-path suppression marker
+    /// doesn't outlive the redirect chase.
+    #[test]
+    fn complete_election_resets_reconnection_phase_to_idle() {
+        let mut mgr = make_test_manager();
+
+        // Pretend a redirect is in flight: phase is Reconnecting.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 0,
+            next_delay_ms: 0,
+        };
+
+        // Provide a single usable measurement so find_best_connection() can
+        // elect a winner. The connection itself does not need to exist in
+        // mgr.connections — complete_election guards every Connection access
+        // behind `if let Some(...)`.
+        insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0, 50.0, 50.0]);
+
+        mgr.complete_election();
+
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Idle);
+    }
+
+    /// On election failure (no usable measurements), the phase is NOT reset
+    /// to Idle — only a successful election clears the suppression marker.
+    #[test]
+    fn complete_election_failure_leaves_reconnection_phase_untouched() {
+        let mut mgr = make_test_manager();
+
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 3,
+            next_delay_ms: 2000,
+        };
+
+        // No measurements → find_best_connection returns Err.
+        mgr.complete_election();
+
+        assert!(matches!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting { attempt: 3, .. }
+        ));
     }
 
     // ===================================================================
