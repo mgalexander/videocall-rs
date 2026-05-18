@@ -18,6 +18,7 @@
 
 pub mod callback;
 pub mod feature_flags;
+pub mod frame_marker;
 pub mod protos;
 pub mod user_id;
 pub mod validation;

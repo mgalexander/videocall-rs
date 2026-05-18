@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
+use videocall_types::frame_marker::REFERENCES_T0;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -60,13 +61,6 @@ fn packet_type_label(pw: &PacketWrapper) -> &'static str {
         PacketType::CAPABILITY_ANNOUNCE => "capability_announce",
     }
 }
-
-/// `frame_marker` bit indicating a delta frame depends on a T0 picture in
-/// the same temporal chain. Kept in sync with `videocall-client`'s
-/// `pub(crate) const REFERENCES_T0` (see ADR-0001 for the bitfield layout) —
-/// duplicating the constant here avoids re-exporting a client-side detail
-/// across the workspace boundary.
-const REFERENCES_T0: u32 = 4;
 
 /// Maximum picture_id entries retained per `(receiver, sender)` pair for
 /// the recent-T0 set. The decoder reference window for VP9 SVC is small

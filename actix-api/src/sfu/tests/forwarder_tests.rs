@@ -27,6 +27,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 use tokio::sync::watch;
+use videocall_types::frame_marker::REFERENCES_T0;
 use videocall_types::protos::diagnostics_packet::BandwidthEstimate;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, RoutingHeader};
@@ -820,11 +821,6 @@ fn build_video_ref(
     (pw, mp)
 }
 
-/// Matches `videocall-client`'s `REFERENCES_T0` bit (ADR-0001). Duplicated
-/// here so the test can build raw `frame_marker` values without depending
-/// on a `pub(crate)` constant from another workspace member.
-const REFERENCES_T0_TEST: u32 = 4;
-
 /// Acceptance for p4-9:
 ///   * T1 before any T0 → Drop (reference_miss).
 ///   * T0 picture_id=X → Forward (and recorded).
@@ -849,7 +845,7 @@ fn p4_9_t1_dropped_when_t0_not_forwarded() {
     let before = SFU_DROPPED_TOTAL
         .with_label_values(&["reference_miss"])
         .get();
-    let (pw_t1_orphan, mp_t1_orphan) = build_video_ref(sender, 1, 42, REFERENCES_T0_TEST, false);
+    let (pw_t1_orphan, mp_t1_orphan) = build_video_ref(sender, 1, 42, REFERENCES_T0, false);
     assert!(
         matches!(
             fwd.decide(receiver, &pw_t1_orphan, Some(&mp_t1_orphan)),
@@ -877,7 +873,7 @@ fn p4_9_t1_dropped_when_t0_not_forwarded() {
     );
 
     // --- 3. T1 picture_id=100 referencing the just-recorded T0 → Forward. ---
-    let (pw_t1_ok, mp_t1_ok) = build_video_ref(sender, 1, 100, REFERENCES_T0_TEST, false);
+    let (pw_t1_ok, mp_t1_ok) = build_video_ref(sender, 1, 100, REFERENCES_T0, false);
     assert!(
         matches!(
             fwd.decide(receiver, &pw_t1_ok, Some(&mp_t1_ok)),
@@ -887,7 +883,7 @@ fn p4_9_t1_dropped_when_t0_not_forwarded() {
     );
 
     // --- 4. T1 picture_id=999 (never seen as T0) → Drop. ---
-    let (pw_t1_miss, mp_t1_miss) = build_video_ref(sender, 1, 999, REFERENCES_T0_TEST, false);
+    let (pw_t1_miss, mp_t1_miss) = build_video_ref(sender, 1, 999, REFERENCES_T0, false);
     assert!(
         matches!(
             fwd.decide(receiver, &pw_t1_miss, Some(&mp_t1_miss)),
@@ -912,7 +908,7 @@ fn p4_9_t1_dropped_when_t0_not_forwarded() {
     rh_kf.spatial_layer_id = 1;
     rh_kf.temporal_layer_id = 0;
     rh_kf.picture_id = 7777;
-    rh_kf.frame_marker = REFERENCES_T0_TEST;
+    rh_kf.frame_marker = REFERENCES_T0;
     let mp_kf = MediaPacket {
         media_type: MediaType::VIDEO.into(),
         routing_header: ::protobuf::MessageField::some(rh_kf),
@@ -947,7 +943,7 @@ fn p4_9_t2_also_requires_recent_t0() {
     );
 
     // T2 referencing an unseen T0 → drop.
-    let (pw_t2_orphan, mp_t2_orphan) = build_video_ref(sender, 2, 11, REFERENCES_T0_TEST, false);
+    let (pw_t2_orphan, mp_t2_orphan) = build_video_ref(sender, 2, 11, REFERENCES_T0, false);
     assert!(matches!(
         fwd.decide(receiver, &pw_t2_orphan, Some(&mp_t2_orphan)),
         ForwardDecision::Drop
@@ -959,7 +955,7 @@ fn p4_9_t2_also_requires_recent_t0() {
         fwd.decide(receiver, &pw_t0, Some(&mp_t0)),
         ForwardDecision::Forward
     ));
-    let (pw_t2_ok, mp_t2_ok) = build_video_ref(sender, 2, 11, REFERENCES_T0_TEST, false);
+    let (pw_t2_ok, mp_t2_ok) = build_video_ref(sender, 2, 11, REFERENCES_T0, false);
     assert!(matches!(
         fwd.decide(receiver, &pw_t2_ok, Some(&mp_t2_ok)),
         ForwardDecision::Forward

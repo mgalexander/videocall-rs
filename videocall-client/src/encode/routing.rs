@@ -16,13 +16,9 @@
  * conditions.
  */
 
+use videocall_types::frame_marker::{END_OF_FRAME, REFERENCES_T0, START_OF_FRAME};
 use videocall_types::protos::media_packet::RoutingHeader;
 use web_sys::{EncodedVideoChunk, EncodedVideoChunkMetadata, EncodedVideoChunkType};
-
-// frame_marker bitfield constants — see ADR-0001.
-pub(crate) const START_OF_FRAME: u32 = 1;
-pub(crate) const END_OF_FRAME: u32 = 2;
-pub(crate) const REFERENCES_T0: u32 = 4;
 
 /// Compute the `frame_marker` bitfield for a single WebCodecs-produced frame.
 ///
