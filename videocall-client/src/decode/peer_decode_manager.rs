@@ -993,8 +993,15 @@ impl PeerDecodeManager {
         let removed = self
             .connected_peers
             .remove_if_and_return(|peer| peer.check_heartbeat());
-        for (_session_id, peer) in removed {
-            self.on_peer_removed.emit(peer.sid_str);
+        if !removed.is_empty() {
+            let mut kfr = self.kfr_emission_state.borrow_mut();
+            for (_session_id, peer) in &removed {
+                kfr.remove(&peer.user_id);
+            }
+            drop(kfr);
+            for (_session_id, peer) in removed {
+                self.on_peer_removed.emit(peer.sid_str);
+            }
         }
     }
 
@@ -1185,6 +1192,7 @@ impl PeerDecodeManager {
 
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
+            self.kfr_emission_state.borrow_mut().remove(&peer.user_id);
             self.on_peer_removed.emit(peer.sid_str);
         }
     }
@@ -1201,6 +1209,7 @@ impl PeerDecodeManager {
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
+        self.kfr_emission_state.borrow_mut().clear();
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
