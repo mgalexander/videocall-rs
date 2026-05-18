@@ -89,7 +89,7 @@ impl<T> JitterBuffer<T> {
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
-        println!("[JITTER_BUFFER] Inserting frame: {seq}");
+        log::trace!("[JITTER_BUFFER] Inserting frame: {seq}");
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -101,15 +101,15 @@ impl<T> JitterBuffer<T> {
                 if frame.frame_type == FrameType::KeyFrame
                     && last_decoded.saturating_sub(seq) > STREAM_RESTART_BACKTRACK_THRESHOLD
                 {
-                    println!(
+                    log::trace!(
                         "[JITTER_BUFFER] Detected keyframe with older sequence ({seq} <= {last_decoded}). Assuming stream restart – flushing buffer."
                     );
                     self.flush();
                 } else {
-                    println!("[JITTER_BUFFER] Ignoring old frame: {seq}");
+                    log::trace!("[JITTER_BUFFER] Ignoring old frame: {seq}");
                     self.num_consecutive_old_frames += 1;
                     if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
-                        println!(
+                        log::trace!(
                             "[JITTER_BUFFER] Received {} consecutive old frames. Flushing buffer.",
                             self.num_consecutive_old_frames
                         );
@@ -127,15 +127,15 @@ impl<T> JitterBuffer<T> {
         if self.buffered_frames.len() >= MAX_BUFFER_SIZE {
             // Allow a keyframe to clear the buffer if it's full.
             if frame.frame_type == FrameType::KeyFrame {
-                println!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
+                log::trace!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
                 self.drop_all_frames();
             } else {
-                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
+                log::trace!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
                 return; // Reject the frame.
             }
         }
 
-        println!("[JITTER_BUFFER] Received frame: {seq}");
+        log::trace!("[JITTER_BUFFER] Received frame: {seq}");
 
         self.jitter_estimator.update_estimate(seq, arrival_time_ms);
         self.update_target_playout_delay();
@@ -165,7 +165,7 @@ impl<T> JitterBuffer<T> {
     pub fn find_and_move_continuous_frames(&mut self, current_time_ms: u128) {
         let mut frames_were_moved = false;
 
-        println!(
+        log::trace!(
             "[JB_POLL] Checking buffer. Last decoded: {:?}, Buffer size: {}, Target delay: {:.2}ms",
             self.last_decoded_sequence_number,
             self.buffered_frames.len(),
@@ -198,7 +198,7 @@ impl<T> JitterBuffer<T> {
                 // CASE 1: We are in a continuous stream. Look for the next frame.
                 let next_continuous_seq = last_seq + 1;
                 if self.buffered_frames.contains_key(&next_continuous_seq) {
-                    println!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
+                    log::trace!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
                     Some(next_continuous_seq)
                 } else {
                     // CASE 2: Gap detected. Accept the lowest-sequence
@@ -213,7 +213,7 @@ impl<T> JitterBuffer<T> {
                         .filter(|(_, f)| !f.is_keyframe())
                         .map(|(&s, _)| s);
                     if let Some(k) = forwarded_delta_relax {
-                        println!(
+                        log::trace!(
                             "[JB_POLL] Gap after {last_seq}. Delta {k} available across gap (SFU layer-strip relax)."
                         );
                         Some(k)
@@ -225,11 +225,11 @@ impl<T> JitterBuffer<T> {
                             .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
                             .map(|(&s, _)| s);
                         if let Some(k) = keyframe {
-                            println!(
+                            log::trace!(
                                 "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
                             );
                         } else {
-                            println!(
+                            log::trace!(
                                 "[JB_POLL] Gap after {last_seq}. No subsequent keyframe found."
                             );
                         }
@@ -244,9 +244,9 @@ impl<T> JitterBuffer<T> {
                     .find(|(_, f)| f.is_keyframe())
                     .map(|(&s, _)| s);
                 if let Some(k) = keyframe {
-                    println!("[JB_POLL] Seeking first keyframe. Found: {k}");
+                    log::trace!("[JB_POLL] Seeking first keyframe. Found: {k}");
                 } else {
-                    println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+                    log::trace!("[JB_POLL] Seeking first keyframe. None found in buffer.");
                 }
                 keyframe
             };
@@ -256,7 +256,7 @@ impl<T> JitterBuffer<T> {
                     let time_in_buffer_ms = (current_time_ms - frame.arrival_time_ms) as f64;
 
                     let is_ready = time_in_buffer_ms >= self.target_playout_delay_ms;
-                    println!(
+                    log::trace!(
                         "[JB_POLL] Candidate {key}: Time in buffer: {time_in_buffer_ms:.2}ms, Target: {:.2}ms -> Ready: {is_ready}",
                         self.target_playout_delay_ms
                     );
@@ -272,7 +272,7 @@ impl<T> JitterBuffer<T> {
                             let is_first_frame = self.last_decoded_sequence_number.is_none();
 
                             if is_first_frame || is_gap_recovery {
-                                println!(
+                                log::trace!(
                                     "[JITTER_BUFFER] Keyframe {key} recovery. Dropping frames before it."
                                 );
                                 self.drop_frames_before(key);
@@ -282,7 +282,7 @@ impl<T> JitterBuffer<T> {
                             // forwarded delta (T0, T1, or T2). Any still-buffered
                             // frames with seq < key are now stale (decoder has
                             // moved past them).
-                            println!(
+                            log::trace!(
                                 "[JITTER_BUFFER] Delta {key} crossed gap. Dropping stale frames before it."
                             );
                             self.drop_frames_before(key);
@@ -295,7 +295,7 @@ impl<T> JitterBuffer<T> {
                     }
                 }
             } else {
-                println!("[JB_POLL] No decodable frame found in buffer.");
+                log::trace!("[JB_POLL] No decodable frame found in buffer.");
             }
 
             if !found_frame_to_move {
@@ -311,7 +311,7 @@ impl<T> JitterBuffer<T> {
     /// Pushes a single frame to the shared decodable queue.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
         let seq = frame.sequence_number();
-        println!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
+        log::trace!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
     }
 
@@ -338,7 +338,7 @@ impl<T> JitterBuffer<T> {
 
         self.dropped_frames_count += dropped.len() as u64;
         for key in dropped.keys() {
-            println!("[JITTER_BUFFER] Dropping stale frame: {key}");
+            log::trace!("[JITTER_BUFFER] Dropping stale frame: {key}");
         }
     }
 
@@ -347,7 +347,7 @@ impl<T> JitterBuffer<T> {
         let num_dropped = self.buffered_frames.len() as u64;
         self.buffered_frames.clear();
         self.dropped_frames_count += num_dropped;
-        println!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
+        log::trace!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
     }
 
     /// Flushes the jitter buffer, resetting its state completely.
