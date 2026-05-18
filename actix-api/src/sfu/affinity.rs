@@ -145,10 +145,16 @@ pub fn is_owner(room_id: &str) -> bool {
 /// Pure helper: compute the redirect target headless DNS name when `me`
 /// is NOT the jump-hash owner of `room` under `replicas` replicas.
 ///
-/// Returns `None` when this pod IS the owner (no redirect needed) or when
-/// `replicas == 0` (defensive — single-pod / unconfigured cluster). Returns
-/// `Some(dns)` otherwise, where `dns` follows the StatefulSet headless
-/// service DNS template documented in `sfu-update/PLAN.md` wave 3:
+/// Returns `None` when this pod IS the owner (no redirect needed), when
+/// `replicas == 0` (defensive — single-pod / unconfigured cluster), or
+/// when `me` is `None` (POD_NAME was set but unparseable — we cannot
+/// know whether we're the owner, so we conservatively skip the redirect
+/// rather than risk silently claiming ownership of pod-0's rooms by
+/// coercing `None` to 0 at the call site).
+///
+/// Returns `Some(dns)` otherwise, where `dns` follows the StatefulSet
+/// headless service DNS template documented in `sfu-update/PLAN.md`
+/// wave 3:
 ///
 /// ```text
 /// rustlemania-{transport}-{owner_ord}.{transport}-headless.svc.cluster.local
@@ -164,13 +170,17 @@ pub fn is_owner(room_id: &str) -> bool {
 /// the logic can be exercised without touching process-wide env vars.
 pub fn compute_redirect_target(
     room: &str,
-    me: u32,
+    me: Option<u32>,
     replicas: u32,
     transport_kind: &str,
 ) -> Option<String> {
     if replicas == 0 {
         return None;
     }
+    // Unparseable POD_NAME: skip the redirect. Coercing `None` → 0 would
+    // make a misconfigured pod silently claim ownership of pod-0's
+    // rooms, splitting the cluster.
+    let me = me?;
     let owner = jump_hash(room, replicas);
     if owner == me {
         return None;
@@ -306,14 +316,14 @@ mod tests {
         for i in 0..50 {
             let room = format!("room-{i}");
             assert_eq!(
-                compute_redirect_target(&room, 0, 1, "webtransport"),
+                compute_redirect_target(&room, Some(0), 1, "webtransport"),
                 None,
                 "single-pod owner must not redirect {room}"
             );
         }
         // replicas == 0 is treated as "unconfigured" — never redirect.
         assert_eq!(
-            compute_redirect_target("room-x", 0, 0, "webtransport"),
+            compute_redirect_target("room-x", Some(0), 0, "webtransport"),
             None
         );
     }
@@ -333,14 +343,14 @@ mod tests {
             })
             .expect("among 100 keys, at least one must hash to a non-zero ordinal");
 
-        let target = compute_redirect_target(&room, 0, replicas, "webtransport")
+        let target = compute_redirect_target(&room, Some(0), replicas, "webtransport")
             .expect("non-owner must produce a redirect target");
         let expected =
             format!("rustlemania-webtransport-{owner}.webtransport-headless.svc.cluster.local");
         assert_eq!(target, expected, "DNS must embed owner ordinal");
 
         // websocket variant uses the websocket headless name.
-        let target_ws = compute_redirect_target(&room, 0, replicas, "websocket")
+        let target_ws = compute_redirect_target(&room, Some(0), replicas, "websocket")
             .expect("non-owner must produce a redirect target (ws)");
         let expected_ws =
             format!("rustlemania-websocket-{owner}.websocket-headless.svc.cluster.local");
@@ -348,9 +358,44 @@ mod tests {
 
         // When `me == owner`, no redirect.
         assert_eq!(
-            compute_redirect_target(&room, owner, replicas, "webtransport"),
+            compute_redirect_target(&room, Some(owner), replicas, "webtransport"),
             None,
             "pod must not redirect rooms it owns"
+        );
+    }
+
+    /// 8. `compute_redirect_target`: returns `None` when `me` is `None`.
+    ///
+    /// Locks in the nice-to-have safety fix from the p6-5 follow-up review:
+    /// an unparseable `POD_NAME` must NOT silently coerce to ordinal 0 and
+    /// claim ownership of pod-0's rooms. A `None` self-ordinal means the
+    /// operator misconfigured the pod; the safe response is to skip the
+    /// redirect entirely (the join itself still proceeds — the worst case
+    /// is a sub-optimal pod placement, not a cluster split).
+    #[test]
+    fn compute_redirect_target_none_self_ordinal_skips_redirect() {
+        let replicas = 3u32;
+        // Pick any room that does NOT hash to 0 (so a `me=Some(0)` call
+        // would normally produce a redirect). With `me=None`, no redirect
+        // can be computed because we don't know whether we're the owner.
+        let (room, owner) = (0..100)
+            .find_map(|i| {
+                let r = format!("redirect-room-{i}");
+                let o = jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("among 100 keys, at least one must hash to a non-zero ordinal");
+        // Sanity: with a parseable ordinal, this room WOULD redirect.
+        let baseline = compute_redirect_target(&room, Some(0), replicas, "webtransport");
+        assert!(
+            baseline.is_some(),
+            "baseline: room {room} owned by {owner}, me=0 should redirect"
+        );
+        // With None, the redirect is suppressed.
+        assert_eq!(
+            compute_redirect_target(&room, None, replicas, "webtransport"),
+            None,
+            "unparseable POD_NAME must NOT trigger redirect (would split cluster)"
         );
     }
 }

@@ -36,7 +36,7 @@ use actix::{
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
@@ -63,6 +63,41 @@ use tokio::sync::RwLock as TokioRwLock;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::subscription_packet::SubscriptionUpdate;
+
+/// Cached transport-family identifier for the wave-3 ADMISSION_DECISION
+/// {REDIRECT} DNS template (bead vc-8oa / p6-5).
+///
+/// Resolved exactly once from the `SFU_TRANSPORT_KIND` env var on first
+/// JoinRoom (after the binary's startup sets it; see
+/// `actix-api/src/bin/{webtransport,websocket}_server.rs`). Stored in an
+/// `OnceLock<String>` so subsequent JoinRoom handlers never re-touch the
+/// env. Without caching, every join paid an `env::var` lookup and the
+/// default-on-miss silently masked a misconfigured deployment — the
+/// startup log makes the warning visible at the right time instead.
+static SFU_TRANSPORT_KIND_CACHE: OnceLock<String> = OnceLock::new();
+
+/// Resolve the cached `SFU_TRANSPORT_KIND`, initialising it from the env
+/// on first call. Defaults to `"webtransport"` if the env var is missing —
+/// the binaries unconditionally set this at startup so the default only
+/// fires in tests / misconfigured deployments. The unset-at-runtime branch
+/// emits a one-shot warning so the misconfiguration is observable in logs
+/// without spamming every JoinRoom.
+fn sfu_transport_kind() -> &'static str {
+    SFU_TRANSPORT_KIND_CACHE
+        .get_or_init(|| match std::env::var("SFU_TRANSPORT_KIND") {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    "SFU_TRANSPORT_KIND not set; defaulting to \"webtransport\" for \
+                     ADMISSION_DECISION{{REDIRECT}} DNS. The transport binaries set \
+                     this at startup — if you see this in production, the env wiring \
+                     is broken."
+                );
+                "webtransport".to_string()
+            }
+        })
+        .as_str()
+}
 
 /// Internal message sent via `notify_later` after the reconnection grace period
 /// expires. If the user has not reconnected by the time this message is handled,
@@ -1067,6 +1102,75 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Ok(()));
         }
 
+        // --- Ownership redirect (bead vc-8oa / p6-5) ---
+        // Wave 3 affinity migration: each room is jump-hashed to exactly
+        // one pod ordinal in the StatefulSet. If a client connects to a
+        // non-owner pod, we emit an ADMISSION_DECISION{REDIRECT} hint
+        // pointing at the owner pod's headless DNS and decline the join.
+        // The transport actor closes the connection on JoinRoom Err
+        // (see SessionLogic::handle_join_room_result); the redirect packet
+        // delivered through the recipient mpsc just before that close is
+        // what the client uses to reconnect to the correct pod.
+        //
+        // Observers are EXEMPT — they don't participate in room ownership
+        // (no media write path, no SFU room_state membership). Forcing an
+        // observer to redirect just to listen makes the metrics/diagnostic
+        // path more fragile without any consistency benefit.
+        //
+        // ORDER MATTERS — this MUST run BEFORE the reconnection bookkeeping
+        // below. If we ran it after, a reconnecting user landing on the
+        // wrong pod would lose their old `pending_departures` entry, have
+        // their deferred PARTICIPANT_LEFT cancelled, and be removed from
+        // `room_members` / `room_states` — and then be told to redirect.
+        // Peers would never learn the user left, and the redirect would
+        // not heal it because the leave event never fires. Doing the
+        // ownership check synchronously up front means nothing has been
+        // mutated yet, so there's nothing to roll back. The check also
+        // runs BEFORE the soft/hard-cap admission accounting below so a
+        // redirected client never increments the wrong pod's caps and
+        // never receives a QUEUED/REJECTED packet it would discard anyway.
+        if !observer {
+            let replicas = crate::sfu::affinity::replicas_from_env();
+            let self_ord = crate::sfu::affinity::self_ordinal_from_env();
+            if let Some(target) = crate::sfu::affinity::compute_redirect_target(
+                &room,
+                self_ord,
+                replicas,
+                sfu_transport_kind(),
+            ) {
+                info!(
+                    "JoinRoom redirect: room {} owned by ordinal != self ({:?}); \
+                     redirecting session {} (user {}) to {}",
+                    room, self_ord, session, user_id, target,
+                );
+                if let Some(recipient) = self.sessions.get(&session) {
+                    let bytes =
+                        SessionManager::build_admission_redirect_packet(&target, "wrong_owner");
+                    if let Err(e) = recipient.try_send(Message {
+                        msg: bytes::Bytes::from(bytes),
+                        session,
+                    }) {
+                        warn!(
+                            "Failed to deliver ADMISSION_DECISION{{REDIRECT}} to \
+                             session {}: {}",
+                            session, e
+                        );
+                    }
+                }
+                // No rollback needed: this block runs before
+                // `pending_departures.remove`, before `room_members` /
+                // `room_states` cleanup, and before the
+                // `suppress_join_broadcast` insert. Returning Err here
+                // leaves all of that state untouched so the original
+                // pod's deferred PARTICIPANT_LEFT still fires after the
+                // grace period if the client doesn't successfully
+                // reconnect on the correct pod.
+                return MessageResult(Err(format!(
+                    "Room {room} is owned by a different pod; redirecting to {target}"
+                )));
+            }
+        }
+
         // --- Reconnection grace period: cancel pending departure ---
         // If the same user_id is reconnecting to the same room within
         // the grace window, suppress both PARTICIPANT_LEFT (already deferred)
@@ -1106,67 +1210,6 @@ impl Handler<JoinRoom> for ChatServer {
         // "left" from peers' perspective; observers are never announced.
         if is_reconnection || observer {
             self.suppress_join_broadcast.insert(session);
-        }
-
-        // --- Ownership redirect (bead vc-8oa / p6-5) ---
-        // Wave 3 affinity migration: each room is jump-hashed to exactly
-        // one pod ordinal in the StatefulSet. If a client connects to a
-        // non-owner pod, we emit an ADMISSION_DECISION{REDIRECT} hint
-        // pointing at the owner pod's headless DNS and decline the join.
-        // The transport actor closes the connection on JoinRoom Err
-        // (see SessionLogic::handle_join_room_result); the redirect packet
-        // delivered through the recipient mpsc just before that close is
-        // what the client uses to reconnect to the correct pod.
-        //
-        // Observers are EXEMPT — they don't participate in room ownership
-        // (no media write path, no SFU room_state membership). Forcing an
-        // observer to redirect just to listen makes the metrics/diagnostic
-        // path more fragile without any consistency benefit.
-        //
-        // The check runs BEFORE the soft/hard-cap admission accounting so
-        // a redirected client never increments the wrong pod's caps and
-        // never receives a QUEUED/REJECTED packet it would discard anyway.
-        if !observer {
-            let replicas = crate::sfu::affinity::replicas_from_env();
-            let self_ord = crate::sfu::affinity::self_ordinal_from_env().unwrap_or(0);
-            let transport_kind =
-                std::env::var("SFU_TRANSPORT_KIND").unwrap_or_else(|_| "webtransport".to_string());
-            if let Some(target) = crate::sfu::affinity::compute_redirect_target(
-                &room,
-                self_ord,
-                replicas,
-                &transport_kind,
-            ) {
-                info!(
-                    "JoinRoom redirect: room {} owned by ordinal != self ({}); \
-                     redirecting session {} (user {}) to {}",
-                    room, self_ord, session, user_id, target,
-                );
-                if let Some(recipient) = self.sessions.get(&session) {
-                    let bytes =
-                        SessionManager::build_admission_redirect_packet(&target, "wrong_owner");
-                    if let Err(e) = recipient.try_send(Message {
-                        msg: bytes::Bytes::from(bytes),
-                        session,
-                    }) {
-                        warn!(
-                            "Failed to deliver ADMISSION_DECISION{{REDIRECT}} to \
-                             session {}: {}",
-                            session, e
-                        );
-                    }
-                }
-                // Roll back the suppress_join_broadcast insertion: if the
-                // client reconnects to the correct pod (or, on failure of
-                // the redirect, retries here), it must get a fresh chance
-                // at the legitimate PARTICIPANT_JOINED broadcast.
-                if is_reconnection {
-                    self.suppress_join_broadcast.remove(&session);
-                }
-                return MessageResult(Err(format!(
-                    "Room {room} is owned by a different pod; redirecting to {target}"
-                )));
-            }
         }
 
         // --- Admission control (bead vc-69e / p3-13) ---
@@ -2026,6 +2069,63 @@ impl Handler<SnapshotRoomMembers> for ChatServer {
             .collect();
         entries.sort_by_key(|(sid, _)| *sid);
         Some(entries)
+    }
+}
+
+// ==========================================================================
+// Test-only query: snapshot a (room, user) pending-departure entry.
+// ==========================================================================
+// Returns `Some(old_session)` if a deferred PARTICIPANT_LEFT is pending for
+// the (room, user) key, `None` otherwise. Used by the p6-5 follow-up
+// reconnection-into-redirect test to assert the redirect path runs BEFORE
+// the reconnection bookkeeping (i.e. doesn't drain the pending_departures
+// entry on its way to declining the join).
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "Option<SessionId>")]
+struct SnapshotPendingDeparture {
+    room: String,
+    user_id: String,
+}
+
+#[cfg(test)]
+impl Handler<SnapshotPendingDeparture> for ChatServer {
+    type Result = Option<SessionId>;
+
+    fn handle(
+        &mut self,
+        SnapshotPendingDeparture { room, user_id }: SnapshotPendingDeparture,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.pending_departures
+            .get(&(room, user_id))
+            .map(|p| p.old_session)
+    }
+}
+
+// ==========================================================================
+// Test-only query: snapshot the legacy room_members table for a room.
+// ==========================================================================
+// Mirrors SnapshotRoomMembers but returns the (room_members) tuple rather
+// than the SFU member table — used to assert that the early redirect path
+// does NOT touch the user-visible membership list before declining a join.
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "Option<Vec<(SessionId, String, String)>>")]
+struct SnapshotRoomMembersList {
+    room: String,
+}
+
+#[cfg(test)]
+impl Handler<SnapshotRoomMembersList> for ChatServer {
+    type Result = Option<Vec<(SessionId, String, String)>>;
+
+    fn handle(
+        &mut self,
+        SnapshotRoomMembersList { room }: SnapshotRoomMembersList,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.room_members.get(&room).cloned()
     }
 }
 
@@ -4385,6 +4485,259 @@ mod tests {
                 "redirected session must NOT appear in room_members"
             );
         }
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST (vc-8oa / p6-5 follow-up): redirect runs BEFORE reconnection bookkeeping
+    // ==========================================================================
+    // Locks in the must-fix from the p6-5 review: the ownership redirect
+    // path MUST run synchronously up front, before `pending_departures`,
+    // `room_members`, or `room_states` are touched. If it ran after, a
+    // reconnecting user landing on the wrong pod would:
+    //   1. have their old `pending_departures` entry drained,
+    //   2. have their deferred PARTICIPANT_LEFT timer cancelled,
+    //   3. be removed from `room_members` and `room_states` (old session),
+    //   4. be redirected.
+    // Peers would never see the leave event, and the user would silently
+    // disappear from the room until they reconnected to the correct pod.
+    //
+    // This test simulates the reconnection-into-redirect scenario by
+    // staging a `pending_departures` entry via the Disconnect handler on
+    // pod-0, then issuing a fresh JoinRoom for the same (room, user) where
+    // the room is jump-hash-owned by pod 1 in a 3-replica StatefulSet.
+    // The Err-with-redirect must NOT mutate any reconnection state.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_redirect_does_not_leak_reconnection_state() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+
+        // Pod-0 in a 3-replica cluster.
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Find a room whose jump-hash owner is NOT pod 0 (so the redirect
+        // path actually fires for this pod).
+        let replicas = 3u32;
+        let (room, owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("reconnect-redirect-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // Stage a pending_departures entry for (room, user) the same way
+        // a real disconnect would: we cannot use the JoinRoom→Disconnect
+        // sequence because JoinRoom itself would redirect on this pod for
+        // this room (the whole point of the test). Instead, we drive the
+        // Disconnect handler directly with a dummy session that we DO
+        // pre-register (so Disconnect's cleanup paths are well-defined).
+        //
+        // The Disconnect handler requires the session to have been
+        // ConnectionState::Active to defer (otherwise it bypasses the
+        // grace period). We achieve that by joining with replicas=1 first
+        // (no redirect), activating, then flipping the env to the 3-pod
+        // configuration for the JoinRoom-under-test.
+        std::env::set_var("STATEFULSET_REPLICAS", "1");
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let old_sid: SessionId = 72_000;
+        let user_id = "reconnect-user@example.com";
+
+        chat_server
+            .send(Connect {
+                id: old_sid,
+                addr: dummy.recipient(),
+            })
+            .await
+            .unwrap();
+        chat_server
+            .send(JoinRoom {
+                session: old_sid,
+                room: room.clone(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap()
+            .expect("initial join with replicas=1 must succeed (pod 0 owns everything)");
+        chat_server
+            .send(ActivateConnection { session: old_sid })
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        // Disconnect — defers PARTICIPANT_LEFT by RECONNECT_GRACE_PERIOD.
+        chat_server
+            .send(Disconnect {
+                session: old_sid,
+                room: room.clone(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+            })
+            .await
+            .unwrap();
+
+        // Verify the pending_departures entry was staged.
+        let staged = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.clone(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            staged,
+            Some(old_sid),
+            "pre-condition: Disconnect must stage a pending_departures entry"
+        );
+        // And room_members still contains the old session (cleanup is
+        // deferred to either reconnection or grace-period expiry).
+        let members_before = chat_server
+            .send(SnapshotRoomMembersList { room: room.clone() })
+            .await
+            .unwrap()
+            .expect("room_members entry should exist after Disconnect (deferred cleanup)");
+        assert!(
+            members_before.iter().any(|(s, _, _)| *s == old_sid),
+            "pre-condition: room_members must still contain old session before reconnect"
+        );
+
+        // NOW switch to the 3-replica configuration so the room is owned
+        // by a different pod, and attempt to "reconnect" with a new SID.
+        // The redirect path must fire WITHOUT draining pending_departures
+        // / room_members / room_states.
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let new_sid: SessionId = 72_001;
+        chat_server
+            .send(Connect {
+                id: new_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: new_sid,
+                room: room.clone(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "reconnect onto non-owner pod must be redirected (Err)"
+        );
+
+        // CORE ASSERTION 1: pending_departures entry was NOT drained.
+        // If the redirect block ran after the reconnection bookkeeping,
+        // `pending_departures.remove(&key)` would have fired and this
+        // would be `None`, leaking the deferred PARTICIPANT_LEFT.
+        let after = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.clone(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            after,
+            Some(old_sid),
+            "pending_departures entry MUST survive a redirect — the deferred \
+             PARTICIPANT_LEFT will still fire after the grace period if the \
+             client doesn't successfully reconnect on the correct pod"
+        );
+
+        // CORE ASSERTION 2: room_members entry for the old session is
+        // intact. If the reconnection bookkeeping had run, the old SID
+        // would have been retained out of `room_members`.
+        let members_after = chat_server
+            .send(SnapshotRoomMembersList { room: room.clone() })
+            .await
+            .unwrap()
+            .expect("room_members entry must still exist after redirect");
+        assert!(
+            members_after.iter().any(|(s, _, _)| *s == old_sid),
+            "room_members MUST still contain old session — redirect must not \
+             prematurely evict the disconnected session's row"
+        );
+
+        // CORE ASSERTION 3: the new session was NOT added to room_members.
+        assert!(
+            !members_after.iter().any(|(s, _, _)| *s == new_sid),
+            "redirected session MUST NOT appear in room_members"
+        );
+
+        // SANITY: the REDIRECT packet was delivered.
+        sleep(Duration::from_millis(150)).await;
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner =
+            found.expect("ADMISSION_DECISION{REDIRECT} must be delivered to redirected session");
+        assert_eq!(inner.status.enum_value_or_default(), AdmStatus::REDIRECT);
+        let expected_dns =
+            format!("rustlemania-webtransport-{owner_ord}.webtransport-headless.svc.cluster.local");
+        assert_eq!(inner.redirect_to, expected_dns);
 
         std::env::remove_var("POD_NAME");
         std::env::remove_var("STATEFULSET_REPLICAS");

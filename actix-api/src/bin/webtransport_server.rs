@@ -61,6 +61,19 @@ async fn main() {
         self_ordinal = ?self_ordinal,
         "affinity init"
     );
+    // p6-5 follow-up: surface a misconfigured POD_NAME at startup rather
+    // than letting the JoinRoom handler silently skip redirects on every
+    // join. `self_ordinal_from_env()` returns `None` ONLY when POD_NAME
+    // is set but cannot be parsed as `<name>-<u32>`.
+    if pod_name.is_some() && self_ordinal.is_none() {
+        tracing::warn!(
+            pod_name = ?pod_name,
+            "POD_NAME is set but the trailing ordinal could not be parsed; \
+             room→pod affinity redirects will be DISABLED for this pod. \
+             Expected form: <statefulset>-<ordinal>, e.g. \
+             rustlemania-webtransport-0"
+        );
+    }
 
     let sfu_config = SfuConfig::from_env();
     info!("sfu mode: {}", sfu_config.mode);
