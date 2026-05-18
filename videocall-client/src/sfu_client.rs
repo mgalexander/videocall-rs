@@ -34,10 +34,10 @@ use videocall_types::protos::subscription_packet::{SubscriptionUpdate, Visibilit
 
 use crate::connection::ConnectionController;
 
-/// Default `max_video_kbps` for the wave-1 stub payload. Centralised so wave-3
-/// (p3-8) has one place to swap when bitrate is derived from real visibility
-/// state.
-pub(crate) const DEFAULT_MAX_VIDEO_KBPS: u32 = 2000;
+// `DEFAULT_MAX_VIDEO_KBPS` has moved to
+// `crate::subscription_coalescer::DEFAULT_MAX_VIDEO_KBPS`. Wave-3 (p3-8)
+// drives `SubscriptionUpdate` emission through the coalescer rather than a
+// fixed stub here.
 
 /// Errors returned by [`SfuClient::emit_subscription_update`].
 #[derive(Debug)]
@@ -187,13 +187,12 @@ mod tests {
     // future proto field rename is caught immediately on the on-the-wire shape.
     #[test]
     fn build_packet_round_trips_empty_wave1_stub() {
-        let packet = SfuClient::build_packet("u", vec![], vec![], DEFAULT_MAX_VIDEO_KBPS, true)
-            .expect("build");
+        let packet = SfuClient::build_packet("u", vec![], vec![], 2000, true).expect("build");
 
         let parsed = SubscriptionUpdate::parse_from_bytes(&packet.data).expect("parse inner");
         assert!(parsed.pinned_sessions.is_empty());
         assert!(parsed.slots.is_empty());
-        assert_eq!(parsed.max_video_kbps, DEFAULT_MAX_VIDEO_KBPS);
+        assert_eq!(parsed.max_video_kbps, 2000);
         assert!(parsed.receive_all_audio);
     }
 }

@@ -159,6 +159,11 @@ struct Inner {
     /// The camera encoder's diagnostics loop checks this flag and calls
     /// `force_video_step_down()` on the `EncoderBitrateController`.
     congestion_step_down_requested: Arc<AtomicBool>,
+    /// Debounced visibility/pin tracker. Emits one coalesced
+    /// `SubscriptionUpdate` per ~100ms window. Holds the authoritative
+    /// visibility and pin sets; the UI mutates them through
+    /// `set_peer_visibility` / `set_peer_pinned` on `VideoCallClient`.
+    subscription_coalescer: crate::subscription_coalescer::SubscriptionCoalescer,
 }
 
 /// The main client handle for a video call session.
@@ -252,6 +257,48 @@ impl VideoCallClient {
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
 
+        // Build the subscription coalescer. The emit closure ships the
+        // coalesced update through the wave-1 `SfuClient` (which in turn
+        // serializes and hands off to the elected transport). The flush
+        // trigger uses `gloo::timers::callback::Timeout` so the closure
+        // fires once on the browser event loop after the debounce window;
+        // we deliberately drop the `Timeout` handle (`.forget()`) because
+        // the coalescer itself tracks pending state and a cancelled
+        // `Timeout` would require re-scheduling logic that buys us
+        // nothing.
+        let subscription_coalescer = {
+            let user_id = options.user_id.clone();
+            let conn = connection_controller.clone();
+            let emit: crate::subscription_coalescer::EmitFn = Box::new(
+                move |update: videocall_types::protos::subscription_packet::SubscriptionUpdate| {
+                    let sfu = crate::sfu_client::SfuClient::new(user_id.clone(), conn.clone());
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) = sfu
+                            .emit_subscription_update(
+                                update.pinned_sessions,
+                                update.slots,
+                                update.max_video_kbps,
+                                update.receive_all_audio,
+                            )
+                            .await
+                        {
+                            debug!("Failed to emit coalesced SubscriptionUpdate: {e}");
+                        }
+                    });
+                },
+            );
+            let trigger: crate::subscription_coalescer::FlushTrigger = Box::new(|closure| {
+                gloo::timers::callback::Timeout::new(
+                    crate::subscription_coalescer::COALESCE_WINDOW_MS,
+                    move || {
+                        closure();
+                    },
+                )
+                .forget();
+            });
+            crate::subscription_coalescer::SubscriptionCoalescer::new(emit, trigger)
+        };
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -287,6 +334,7 @@ impl VideoCallClient {
                 force_camera_keyframe: force_camera_keyframe.clone(),
                 force_screen_keyframe: force_screen_keyframe.clone(),
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
+                subscription_coalescer: subscription_coalescer.clone(),
             })),
             connection_controller,
             aes,
@@ -410,9 +458,14 @@ impl VideoCallClient {
 
                             // On connection failure, immediately terminate all
                             // decoder workers so stale WASM instances don't
-                            // accumulate memory during reconnection.
+                            // accumulate memory during reconnection. Also
+                            // scrub the subscription coalescer so a pinned
+                            // peer who was active before the failure doesn't
+                            // keep showing up in `pinned_sessions` after a
+                            // fresh reconnect/election.
                             if matches!(state, ConnectionState::Failed { .. }) {
                                 inner.peer_decode_manager.clear_all_peers();
+                                inner.subscription_coalescer.forget_all_peers();
                             }
                         }
                     }
@@ -846,7 +899,9 @@ impl VideoCallClient {
     /// decoded regardless of visibility.
     ///
     /// Called by the UI layer when an `IntersectionObserver` detects that a
-    /// peer's canvas element has scrolled in or out of the viewport.
+    /// peer's canvas element has scrolled in or out of the viewport. Also
+    /// feeds the subscription coalescer so the SFU learns which peers this
+    /// client actually needs video from.
     pub fn set_peer_visibility(&self, peer_id: &str, visible: bool) {
         let sid: u64 = match peer_id.parse() {
             Ok(v) => v,
@@ -854,33 +909,31 @@ impl VideoCallClient {
         };
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner.peer_decode_manager.set_peer_visibility(sid, visible);
+            inner.subscription_coalescer.set_visible(sid, visible);
         }
-        self.emit_stub_subscription_update();
     }
 
-    /// Fire-and-forget subscription update with wave-1 stub content. Wave-3
-    /// (p3-8) will replace the fixed payload with real per-peer visibility
-    /// state. Failures are logged but never propagated — the SFU treats
-    /// missing subscription packets as "use defaults", so a dropped update
-    /// is a quality degradation, not a correctness bug.
-    fn emit_stub_subscription_update(&self) {
-        let sfu = crate::sfu_client::SfuClient::new(
-            self.options.user_id.clone(),
-            self.connection_controller.clone(),
-        );
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = sfu
-                .emit_subscription_update(
-                    vec![],
-                    vec![],
-                    crate::sfu_client::DEFAULT_MAX_VIDEO_KBPS,
-                    true,
-                )
-                .await
-            {
-                debug!("Failed to emit SubscriptionUpdate: {e}");
-            }
-        });
+    /// Update the pin state for a peer. Pinned peers are reported to the SFU
+    /// in `SubscriptionUpdate.pinned_sessions` so the server can prefer
+    /// allocating bandwidth to them even when they're outside the visible
+    /// viewport.
+    ///
+    /// Called by the UI when the user clicks the pin icon on a peer tile.
+    /// Like `set_peer_visibility`, this feeds the coalescer rather than
+    /// emitting directly — multiple pin toggles inside a 100ms window
+    /// collapse into a single packet.
+    pub fn set_peer_pinned(&self, peer_id: &str, pinned: bool) {
+        let sid: u64 = match peer_id.parse() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        // Borrow asymmetry vs `set_peer_visibility`: that function mutates
+        // `peer_decode_manager` and so needs `try_borrow_mut`. Pinning only
+        // touches the coalescer, whose own interior `RefCell` handles its
+        // mutation — we just need shared access to the `Inner` field.
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.subscription_coalescer.set_pinned(sid, pinned);
+        }
     }
 
     pub fn get_peer_fps(&self, peer_id: &str, media_type: MediaType) -> f64 {
@@ -1197,6 +1250,12 @@ impl Inner {
                         }
                         _ => {
                             self.peer_decode_manager.delete_peer(peer_session_id);
+                            // Decoder-error peer removal is a real peer
+                            // departure from this client's POV; scrub the
+                            // coalescer too so we don't keep advertising
+                            // visibility/pin state for a peer we can no
+                            // longer decode.
+                            self.subscription_coalescer.forget_peer(peer_session_id);
                         }
                     }
                 }
@@ -1307,6 +1366,13 @@ impl Inner {
                             if meeting_packet.session_id != 0 {
                                 self.peer_decode_manager
                                     .delete_peer(meeting_packet.session_id);
+                                // Scrub the coalescer so the departed
+                                // session_id can't linger in
+                                // `pinned_sessions` / `slots`. Without
+                                // this, the SFU keeps reserving bandwidth
+                                // for a participant who has left.
+                                self.subscription_coalescer
+                                    .forget_peer(meeting_packet.session_id);
                             }
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
