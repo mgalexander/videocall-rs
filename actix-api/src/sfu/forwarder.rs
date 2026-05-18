@@ -16,8 +16,9 @@
  * conditions.
  */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -57,6 +58,67 @@ fn packet_type_label(pw: &PacketWrapper) -> &'static str {
         PacketType::LAYER_HINT => "layer_hint",
         PacketType::ADMISSION_DECISION => "admission_decision",
         PacketType::CAPABILITY_ANNOUNCE => "capability_announce",
+    }
+}
+
+/// `frame_marker` bit indicating a delta frame depends on a T0 picture in
+/// the same temporal chain. Kept in sync with `videocall-client`'s
+/// `pub(crate) const REFERENCES_T0` (see ADR-0001 for the bitfield layout) —
+/// duplicating the constant here avoids re-exporting a client-side detail
+/// across the workspace boundary.
+const REFERENCES_T0: u32 = 4;
+
+/// Maximum picture_id entries retained per `(receiver, sender)` pair for
+/// the recent-T0 set. The decoder reference window for VP9 SVC is small
+/// (a few seconds at typical frame rates), so 64 entries is a comfortable
+/// upper bound while keeping the linear scan trivially cheap.
+const RECENT_T0_CAPACITY: usize = 64;
+
+/// TTL after which an entry in the recent-T0 set is considered too stale
+/// to satisfy a T1/T2 reference check. 5s is well past the longest
+/// plausible decoder reference window but short enough that we don't
+/// accumulate dead entries after a sender goes quiet.
+const RECENT_T0_TTL: Duration = Duration::from_secs(5);
+
+/// Per-(receiver, sender) bounded set of T0 picture_ids the SFU has
+/// actually forwarded to this receiver recently.
+///
+/// Two eviction policies, both applied lazily on every `insert`:
+///
+/// * **TTL**: entries older than [`RECENT_T0_TTL`] are dropped from the
+///   front of the deque.
+/// * **Capacity**: after TTL eviction, if the deque still exceeds
+///   [`RECENT_T0_CAPACITY`], the oldest entries are popped from the front.
+///
+/// `contains` is a linear scan over (worst case) 64 entries, which is
+/// faster than a `HashSet` for this size and avoids a second allocation.
+#[derive(Default)]
+struct RecentT0Set {
+    entries: VecDeque<(u64, Instant)>,
+}
+
+impl RecentT0Set {
+    fn insert(&mut self, picture_id: u64, now: Instant) {
+        // TTL eviction from the front (deque is ordered by insertion time
+        // because `now` is monotonic across calls in the same `decide`).
+        while let Some(&(_, t)) = self.entries.front() {
+            if now.duration_since(t) > RECENT_T0_TTL {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.entries.push_back((picture_id, now));
+        // Capacity eviction.
+        while self.entries.len() > RECENT_T0_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    fn contains(&self, picture_id: u64, now: Instant) -> bool {
+        self.entries
+            .iter()
+            .any(|&(pid, t)| pid == picture_id && now.duration_since(t) <= RECENT_T0_TTL)
     }
 }
 
@@ -106,6 +168,18 @@ pub struct Forwarder {
     /// bandwidth-estimate ingest + room membership changes, and lazily
     /// inside `decide` when the active-speaker generation moves forward.
     layer_selector: Arc<RwLock<LayerSelector>>,
+    /// p4-9: per-`(receiver, sender)` bounded set of T0 `picture_id`s the
+    /// SFU has actually forwarded to this receiver in the recent past.
+    /// Consulted on every T1/T2 frame whose `frame_marker & REFERENCES_T0`
+    /// bit is set, so we can drop reference-dependent frames whose
+    /// reference picture was dropped upstream (e.g. by an AllowSet flip).
+    ///
+    /// The lock is taken in `write()` mode unconditionally inside `decide`
+    /// because the critical section is a hash lookup + at most one
+    /// 64-entry VecDeque push/scan — adding a read-then-upgrade dance
+    /// would cost more than it saves at this size. Lock poisoning is
+    /// handled like every other lock in this module (`.into_inner()`).
+    recent_t0: Arc<RwLock<HashMap<(SessionId, SessionId), RecentT0Set>>>,
 }
 
 impl Forwarder {
@@ -124,6 +198,7 @@ impl Forwarder {
             subscriptions,
             speakers,
             layer_selector,
+            recent_t0: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -159,6 +234,7 @@ impl Forwarder {
             subscriptions,
             speakers: rx,
             layer_selector: Arc::new(RwLock::new(LayerSelector::new())),
+            recent_t0: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -195,7 +271,17 @@ impl Forwarder {
     ///      `max_temporal_layer_id` → drop (`layer_budget`).
     ///    * Missing `RoutingHeader` or no cached selection → pass through
     ///      (legacy client; preserves pre-p4-7 behavior).
-    /// 4. **Anything else** — non-MEDIA wrappers or MEDIA wrappers whose
+    /// 4. **Reference-aware drop** (p4-9) — only for MEDIA `VIDEO`/`SCREEN`
+    ///    packets that carry a `RoutingHeader` and are NOT keyframes:
+    ///    * If `temporal_layer_id == 0` (a T0 delta that just survived
+    ///      step 3) → record its `picture_id` in the recent-T0 set for
+    ///      this `(receiver, sender)` pair.
+    ///    * If `frame_marker & REFERENCES_T0 != 0` (T1/T2 delta
+    ///      referencing a T0) AND `picture_id` is NOT in the recent-T0
+    ///      set → drop (`reference_miss`). This prevents decoder
+    ///      reference errors when the referenced T0 was dropped
+    ///      upstream (AllowSet flip, etc.).
+    /// 5. **Anything else** — non-MEDIA wrappers or MEDIA wrappers whose
     ///    inner payload didn't parse — forwarded as-is, preserving the
     ///    tolerant pre-p3-5 behavior. The CONGESTION carve-out is enforced
     ///    one layer above (`chat_server::egress_decide_from_parsed`).
@@ -313,6 +399,46 @@ impl Forwarder {
                                 SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).inc();
                                 observe_decide_latency(start);
                                 return ForwardDecision::Drop;
+                            }
+
+                            // p4-9: reference-aware drop. Keyframes always
+                            // pass through (they reset the reference chain
+                            // — invariant 1). For everything else:
+                            //   * A T0 delta that survived the layer-budget
+                            //     check WILL be forwarded → record its
+                            //     picture_id for this (receiver, sender).
+                            //   * A T1/T2 whose `frame_marker` claims a T0
+                            //     reference is dropped if that T0 is NOT
+                            //     in the recent set — its reference picture
+                            //     was never delivered to the decoder.
+                            // p4-8 makes T0 layer-budget-drop impossible
+                            // in practice, but the AllowSet flip case is
+                            // still real, so this check is meaningful.
+                            if !rh.is_keyframe {
+                                let key = (receiver_sid, sender_sid);
+                                let now = Instant::now();
+                                if rh.temporal_layer_id == 0 {
+                                    let mut guard = match self.recent_t0.write() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    guard.entry(key).or_default().insert(rh.picture_id, now);
+                                } else if rh.frame_marker & REFERENCES_T0 != 0 {
+                                    let guard = match self.recent_t0.read() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    let seen = guard
+                                        .get(&key)
+                                        .is_some_and(|s| s.contains(rh.picture_id, now));
+                                    if !seen {
+                                        SFU_DROPPED_TOTAL
+                                            .with_label_values(&["reference_miss"])
+                                            .inc();
+                                        observe_decide_latency(start);
+                                        return ForwardDecision::Drop;
+                                    }
+                                }
                             }
                         }
                     }

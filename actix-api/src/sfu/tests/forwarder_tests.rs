@@ -778,3 +778,242 @@ fn p4_8_higher_layer_keyframe_obeys_budget() {
         "sfu_dropped_total{{reason=\"layer_budget\"}} must increment on higher-layer keyframe drop"
     );
 }
+
+// ===========================================================================
+// p4-9: REFERENCES_T0 drop when the referenced T0 was not forwarded
+// ===========================================================================
+//
+// The SFU keeps a per-`(receiver, sender)` bounded set of recently-forwarded
+// T0 picture_ids. A T1/T2 delta whose `frame_marker & REFERENCES_T0` bit is
+// set but whose `picture_id` is not in that set is dropped with reason
+// `reference_miss` — its reference picture was dropped upstream (typically
+// by an AllowSet flip mid-stream) and forwarding it would only produce a
+// decoder reference error on the client. Keyframes always bypass this check
+// because they reset the reference chain (invariant 1).
+
+/// Build a delta VIDEO MediaPacket with explicit `picture_id` and
+/// `frame_marker`. Mirrors `build_video_with_layer` but also sets the
+/// reference-tracking fields that p4-9 cares about.
+fn build_video_ref(
+    sender: SessionId,
+    temporal: u32,
+    picture_id: u64,
+    frame_marker: u32,
+    is_keyframe: bool,
+) -> (PacketWrapper, MediaPacket) {
+    let mut rh = RoutingHeader::new();
+    rh.is_keyframe = is_keyframe;
+    rh.spatial_layer_id = 0;
+    rh.temporal_layer_id = temporal;
+    rh.picture_id = picture_id;
+    rh.frame_marker = frame_marker;
+    let mp = MediaPacket {
+        media_type: MediaType::VIDEO.into(),
+        routing_header: ::protobuf::MessageField::some(rh),
+        ..Default::default()
+    };
+    let mut pw = PacketWrapper::new();
+    pw.session_id = sender;
+    pw.packet_type = PacketType::MEDIA.into();
+    pw.user_id = b"sender@example.com".to_vec();
+    pw.data = b"opaque-vp9-bytes".to_vec();
+    (pw, mp)
+}
+
+/// Matches `videocall-client`'s `REFERENCES_T0` bit (ADR-0001). Duplicated
+/// here so the test can build raw `frame_marker` values without depending
+/// on a `pub(crate)` constant from another workspace member.
+const REFERENCES_T0_TEST: u32 = 4;
+
+/// Acceptance for p4-9:
+///   * T1 before any T0 → Drop (reference_miss).
+///   * T0 picture_id=X → Forward (and recorded).
+///   * T1 picture_id=X referencing T0 → Forward.
+///   * T1 picture_id=Y (never seen as T0) → Drop.
+///   * Keyframe with picture_id never seen as T0 → Forward (bypass).
+#[test]
+fn p4_9_t1_dropped_when_t0_not_forwarded() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    // No bandwidth estimate → p4-7 layer-budget is disabled (legacy
+    // pass-through). The AllowSet defaults admit every other member, so
+    // the only filter in play is the new p4-9 reference check.
+    let (fwd, _subs) = build_wired_forwarder(
+        "p4-9-references-t0",
+        &[receiver, sender],
+        ActiveSpeakerSet::empty(),
+    );
+
+    // --- 1. T1 with no preceding T0 → Drop (reference_miss). ---
+    let before = SFU_DROPPED_TOTAL
+        .with_label_values(&["reference_miss"])
+        .get();
+    let (pw_t1_orphan, mp_t1_orphan) = build_video_ref(sender, 1, 42, REFERENCES_T0_TEST, false);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_t1_orphan, Some(&mp_t1_orphan)),
+            ForwardDecision::Drop
+        ),
+        "T1 referencing an unseen T0 must drop"
+    );
+    let after = SFU_DROPPED_TOTAL
+        .with_label_values(&["reference_miss"])
+        .get();
+    assert!(
+        after > before,
+        "sfu_dropped_total{{reason=\"reference_miss\"}} must increment on the orphan-T1 drop: before={before} after={after}"
+    );
+
+    // --- 2. T0 picture_id=100 → Forward (and recorded). ---
+    // T0 deltas don't have the REFERENCES_T0 bit set.
+    let (pw_t0, mp_t0) = build_video_ref(sender, 0, 100, 0, false);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_t0, Some(&mp_t0)),
+            ForwardDecision::Forward
+        ),
+        "T0 delta must forward when AllowSet admits the sender"
+    );
+
+    // --- 3. T1 picture_id=100 referencing the just-recorded T0 → Forward. ---
+    let (pw_t1_ok, mp_t1_ok) = build_video_ref(sender, 1, 100, REFERENCES_T0_TEST, false);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_t1_ok, Some(&mp_t1_ok)),
+            ForwardDecision::Forward
+        ),
+        "T1 referencing a recorded T0 must forward"
+    );
+
+    // --- 4. T1 picture_id=999 (never seen as T0) → Drop. ---
+    let (pw_t1_miss, mp_t1_miss) = build_video_ref(sender, 1, 999, REFERENCES_T0_TEST, false);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_t1_miss, Some(&mp_t1_miss)),
+            ForwardDecision::Drop
+        ),
+        "T1 referencing an unseen T0 picture_id must drop even after other T0s were recorded"
+    );
+
+    // --- 5. Keyframe with picture_id never seen as T0 → Forward (bypass). ---
+    // Keyframes reset the reference chain — they MUST pass through
+    // regardless of recent-T0 state. Note the REFERENCES_T0 bit is set
+    // here just to prove the keyframe bypass takes precedence over the
+    // bit check (a real encoder wouldn't set REFERENCES_T0 on a keyframe).
+    //
+    // We use a higher-spatial-layer keyframe (S=1) so we don't increment
+    // the global SFU_KEYFRAME_FORWARDED_TOTAL counter — that counter
+    // tracks only T0+S0 base keyframes (p4-8 invariant) and is asserted
+    // on by `p4_8_higher_layer_keyframe_obeys_budget`, which races this
+    // test under parallel `cargo test` execution.
+    let mut rh_kf = RoutingHeader::new();
+    rh_kf.is_keyframe = true;
+    rh_kf.spatial_layer_id = 1;
+    rh_kf.temporal_layer_id = 0;
+    rh_kf.picture_id = 7777;
+    rh_kf.frame_marker = REFERENCES_T0_TEST;
+    let mp_kf = MediaPacket {
+        media_type: MediaType::VIDEO.into(),
+        routing_header: ::protobuf::MessageField::some(rh_kf),
+        ..Default::default()
+    };
+    let mut pw_kf = PacketWrapper::new();
+    pw_kf.session_id = sender;
+    pw_kf.packet_type = PacketType::MEDIA.into();
+    pw_kf.user_id = b"sender@example.com".to_vec();
+    pw_kf.data = b"opaque-vp9-bytes".to_vec();
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_kf, Some(&mp_kf)),
+            ForwardDecision::Forward
+        ),
+        "keyframes must bypass the reference-miss check (invariant 1)"
+    );
+}
+
+/// A T2 (or higher) delta with the REFERENCES_T0 bit set behaves the same
+/// way as a T1: the picture_id must have been recorded as a forwarded T0
+/// or the packet is dropped.
+#[test]
+fn p4_9_t2_also_requires_recent_t0() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    let (fwd, _subs) = build_wired_forwarder(
+        "p4-9-t2-ref",
+        &[receiver, sender],
+        ActiveSpeakerSet::empty(),
+    );
+
+    // T2 referencing an unseen T0 → drop.
+    let (pw_t2_orphan, mp_t2_orphan) = build_video_ref(sender, 2, 11, REFERENCES_T0_TEST, false);
+    assert!(matches!(
+        fwd.decide(receiver, &pw_t2_orphan, Some(&mp_t2_orphan)),
+        ForwardDecision::Drop
+    ));
+
+    // Forward the matching T0, then the T2 must forward.
+    let (pw_t0, mp_t0) = build_video_ref(sender, 0, 11, 0, false);
+    assert!(matches!(
+        fwd.decide(receiver, &pw_t0, Some(&mp_t0)),
+        ForwardDecision::Forward
+    ));
+    let (pw_t2_ok, mp_t2_ok) = build_video_ref(sender, 2, 11, REFERENCES_T0_TEST, false);
+    assert!(matches!(
+        fwd.decide(receiver, &pw_t2_ok, Some(&mp_t2_ok)),
+        ForwardDecision::Forward
+    ));
+}
+
+/// A T1 whose `frame_marker` does NOT have the `REFERENCES_T0` bit set is
+/// not subject to the reference-miss check — the SFU has no claim about
+/// what frame it depends on, so we conservatively let it through.
+#[test]
+fn p4_9_t1_without_references_bit_is_passthrough() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    let (fwd, _subs) = build_wired_forwarder(
+        "p4-9-no-ref-bit",
+        &[receiver, sender],
+        ActiveSpeakerSet::empty(),
+    );
+
+    // frame_marker = 0 → no REFERENCES_T0 bit, even though temporal_layer_id
+    // is 1. Real encoders always set the bit, but the SFU must not assume.
+    let (pw, mp) = build_video_ref(sender, 1, 1234, 0, false);
+    assert!(matches!(
+        fwd.decide(receiver, &pw, Some(&mp)),
+        ForwardDecision::Forward
+    ));
+}
+
+/// Legacy clients that don't emit a `RoutingHeader` at all are unaffected
+/// — same carve-out as p4-7. A VIDEO MediaPacket with no RoutingHeader
+/// passes straight through the AllowSet to the forward branch.
+#[test]
+fn p4_9_legacy_no_routing_header_passthrough() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    let (fwd, _subs) = build_wired_forwarder(
+        "p4-9-legacy",
+        &[receiver, sender],
+        ActiveSpeakerSet::empty(),
+    );
+
+    let mp = MediaPacket {
+        media_type: MediaType::VIDEO.into(),
+        ..Default::default()
+    };
+    let mut pw = PacketWrapper::new();
+    pw.session_id = sender;
+    pw.packet_type = PacketType::MEDIA.into();
+    pw.user_id = b"sender@example.com".to_vec();
+    pw.data = b"opaque".to_vec();
+    assert!(matches!(
+        fwd.decide(receiver, &pw, Some(&mp)),
+        ForwardDecision::Forward
+    ));
+}
