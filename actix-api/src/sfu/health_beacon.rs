@@ -18,29 +18,37 @@
 
 //! Owner-pod 5s health beacons on `room.{room}.system` (P6 wave-2 bead vc-kol / p6-7).
 //!
-//! Every owner pod (per [`crate::sfu::affinity::is_owner`]) runs one background
-//! task per owned room. Every [`BEACON_INTERVAL`] the task assembles a
-//! [`HealthBeaconPacket`] from the live [`RoomState`] plus a cheap CPU-load
-//! estimate, wraps it in a [`PacketWrapper`] with `packet_type = HEALTH_BEACON`
-//! and `user_id = SYSTEM_USER_ID`, and publishes it to `room.{room_id}.system`.
+//! Every owner pod (per [`crate::sfu::affinity::is_owner`]) runs a single
+//! background task — the [`BeaconHub`] — that fans out beacons for every
+//! owned room. Every [`BEACON_INTERVAL`] the hub iterates over its registry,
+//! assembles a [`HealthBeaconPacket`] from each live [`RoomState`] plus a
+//! single pod-wide CPU-load estimate, wraps it in a [`PacketWrapper`] with
+//! `packet_type = HEALTH_BEACON` and `user_id = SYSTEM_USER_ID`, and publishes
+//! it to `room.{room_id}.system`.
 //!
 //! Spill pods consume this stream (p6-8 — wave 3) to decide whether to accept
 //! additional joiners for the room.
 //!
 //! Lifecycle:
 //!
-//! * Spawn on the first `JoinRoom` for a room, alongside the
-//!   [`crate::sfu::speaker::SpeakerTick`]. Only spawn when this pod is the
-//!   room's owner; non-owner pods stay silent.
-//! * The task re-checks ownership on every tick — replica scale changes
+//! * The hub is spawned once at [`crate::actors::chat_server::ChatServer::new`]
+//!   and runs for the lifetime of the process.
+//! * On the first `JoinRoom` for a room (alongside the
+//!   [`crate::sfu::speaker::SpeakerTick`]) the chat-server calls
+//!   [`BeaconHub::register`] when this pod is the room's owner.
+//! * The hub re-checks ownership on every tick — replica scale changes
 //!   during runtime are rare but possible, and a former owner must stop
 //!   emitting once the room migrates.
-//! * Tear down by dropping the [`BeaconHandle`], which aborts the task. The
-//!   chat-server holds the handle in `health_beacon_ticks`, mirroring the
-//!   `speaker_ticks` map.
+//! * On room drain the chat-server calls [`BeaconHub::unregister`].
+//! * Dropping the [`BeaconHub`] aborts the underlying task.
+//!
+//! Collapsing N per-room tasks into one hub (vc-c6l) eliminates per-room
+//! timer state and per-room `Arc<dyn ...>` clones; at 200 owned rooms this
+//! is the difference between 200 tokio tasks and one.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protobuf::Message as ProtoMessage;
@@ -141,8 +149,7 @@ pub fn linux_cpu_load_estimate() -> f32 {
 ///
 /// Cached in a process-wide [`OnceLock`]: the CPU count does not change at
 /// runtime on the pods we deploy to, and parsing `/proc/cpuinfo` line-by-line
-/// on every beacon tick is wasted I/O at the per-room cadence (200 owned
-/// rooms × 1 tick / 5 s = 40 reads/s before caching).
+/// on every beacon tick is wasted I/O.
 fn num_online_cpus() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| match std::fs::read_to_string("/proc/cpuinfo") {
@@ -242,78 +249,103 @@ impl CpuLoadSource for LinuxCpuLoad {
     }
 }
 
-/// Cancels the background beacon task when dropped.
+/// Shared registry of owned rooms whose beacons the hub task should emit
+/// on each tick. Keyed by room id, values are the same
+/// `Arc<RwLock<RoomState>>` the chat-server stores in its `room_states`
+/// map — sharing the Arc means the hub sees live `member_count` updates
+/// without any extra synchronisation.
+type Registry = Arc<Mutex<HashMap<String, Arc<RwLock<RoomState>>>>>;
+
+/// Single owner-pod beacon task that emits beacons for all registered
+/// rooms (vc-c6l).
 ///
-/// Returned by [`spawn_health_beacon_loop`]; aborts the underlying tokio
-/// task on `Drop` so callers cannot leak the loop.
+/// Replaces the per-room [`tokio::task`] model: one timer, one CPU-load
+/// read per tick, one small mutex on the registry. Drop aborts the task.
 #[derive(Debug)]
-pub struct BeaconHandle {
+pub struct BeaconHub {
+    rooms: Registry,
     join: JoinHandle<()>,
 }
 
-impl BeaconHandle {
-    /// Test-only accessor for the underlying join handle, used to assert
-    /// the task is still running.
+impl BeaconHub {
+    /// Add `room_id` to the registry. Called by the chat-server on the
+    /// first `JoinRoom` for an owned room, alongside the speaker tick.
+    /// Idempotent: re-registering the same room replaces the stored
+    /// `Arc<RwLock<RoomState>>` (callers always pass the same pointer, but
+    /// this keeps the invariant robust against future refactors).
+    pub fn register(&self, room_id: String, state: Arc<RwLock<RoomState>>) {
+        let mut g = match self.rooms.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.insert(room_id, state);
+    }
+
+    /// Remove `room_id` from the registry. Called by the chat-server on
+    /// room drain. Safe no-op if the room was never registered (non-owner
+    /// pods never register).
+    pub fn unregister(&self, room_id: &str) {
+        let mut g = match self.rooms.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.remove(room_id);
+    }
+
+    /// Test-only accessor: returns whether the hub's background task has
+    /// already terminated. Production code does not need this; only the
+    /// abort-on-drop test relies on it.
     #[cfg(test)]
     pub(crate) fn is_finished(&self) -> bool {
         self.join.is_finished()
     }
 }
 
-impl Drop for BeaconHandle {
+impl Drop for BeaconHub {
     fn drop(&mut self) {
         self.join.abort();
     }
 }
 
-/// Spawn the per-room beacon loop with the production interval.
+/// Spawn the single owner-pod beacon hub with the production interval.
 ///
-/// Convenience wrapper around [`spawn_health_beacon_loop_with_interval`].
-pub fn spawn_health_beacon_loop(
-    room_id: String,
-    room_state: Arc<RwLock<RoomState>>,
+/// Convenience wrapper around [`spawn_beacon_hub_with_interval`].
+pub fn spawn_beacon_hub(
     owner_check: Arc<dyn OwnerCheck>,
     cpu_load: Arc<dyn CpuLoadSource>,
     publisher: Arc<dyn HealthBeaconPublisher>,
-) -> BeaconHandle {
-    spawn_health_beacon_loop_with_interval(
-        room_id,
-        room_state,
-        owner_check,
-        cpu_load,
-        publisher,
-        BEACON_INTERVAL,
-    )
+) -> BeaconHub {
+    spawn_beacon_hub_with_interval(owner_check, cpu_load, publisher, BEACON_INTERVAL)
 }
 
-/// Spawn the per-room beacon loop with a custom interval (primarily for tests).
+/// Spawn the beacon hub with a custom interval (primarily for tests).
 ///
 /// The first beacon fires after `interval` (not immediately) so the tick
 /// cadence matches the documented "every 5 seconds" contract from the
-/// moment the loop starts. On each tick:
+/// moment the hub starts. On each tick:
 ///
-/// 1. Re-check [`OwnerCheck::is_owner`]. Non-owners skip the publish
-///    silently — keeps the task safe to spawn unconditionally if needed,
-///    and tolerates runtime replica scale changes that may transfer
-///    ownership away from this pod.
-/// 2. Snapshot the room's `member_count` under a short read lock.
-///    Capturing the count once per tick (rather than per field) keeps the
-///    lock window tiny — there is no per-member iteration in the beacon
-///    hot path.
-/// 3. Read CPU load via [`CpuLoadSource::load`] and build the payload.
-/// 4. Publish to `room.{room_id}.system`.
+/// 1. Take a brief lock on the registry and clone out
+///    `(room_id, Arc<RwLock<RoomState>>)` pairs. The lock is released
+///    before any publish work happens — registry mutations from the
+///    chat-server actor must not be blocked by I/O.
+/// 2. Read CPU load via [`CpuLoadSource::load`] **once** for the tick.
+///    All rooms in this tick share the same pod-wide value.
+/// 3. For each registered room: re-check [`OwnerCheck::is_owner`] and
+///    skip the publish silently if false — tolerates runtime replica
+///    scale changes that may transfer ownership away from this pod.
+/// 4. Snapshot the room's `member_count` under a short read lock and
+///    publish to `room.{room_id}.system`.
 ///
-/// Returns a [`BeaconHandle`] that aborts the task on drop. The chat-server
-/// stores this handle alongside its `speaker_ticks` and drops both on room
-/// drain.
-pub fn spawn_health_beacon_loop_with_interval(
-    room_id: String,
-    room_state: Arc<RwLock<RoomState>>,
+/// Returns a [`BeaconHub`] that aborts the task on drop. The chat-server
+/// holds the hub for the lifetime of the process.
+pub fn spawn_beacon_hub_with_interval(
     owner_check: Arc<dyn OwnerCheck>,
     cpu_load: Arc<dyn CpuLoadSource>,
     publisher: Arc<dyn HealthBeaconPublisher>,
     interval: Duration,
-) -> BeaconHandle {
+) -> BeaconHub {
+    let rooms: Registry = Arc::new(Mutex::new(HashMap::new()));
+    let rooms_for_task = rooms.clone();
     let join = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // `Delay` (rather than the default `Burst`) prevents missed ticks
@@ -324,30 +356,47 @@ pub fn spawn_health_beacon_loop_with_interval(
         // at `t = interval`, not `t = 0`. Matches the SpeakerTick pattern
         // and gives joiners a moment to register before being counted.
         ticker.tick().await;
-        // Whitespace-safe subject — matches every other `room.{room}.system`
-        // publish/subscribe site in `chat_server.rs` (vc-kol follow-up).
-        let subject = system_subject(&room_id);
         loop {
             ticker.tick().await;
-            if !owner_check.is_owner(&room_id) {
-                // Pod is no longer the owner (e.g., replica scale-out
-                // moved this room elsewhere). Stay alive — ownership may
-                // come back — but emit nothing.
+            // Snapshot the registry into a small Vec so the lock window
+            // is bounded by the registry size, not by the publish work
+            // that follows.
+            let snapshot: Vec<(String, Arc<RwLock<RoomState>>)> = {
+                let g = match rooms_for_task.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            if snapshot.is_empty() {
                 continue;
             }
-            // Tiny critical section: only the count is read, no per-member
-            // iteration. Survives a panicked writer (poison) by treating
-            // the poisoned state as readable — we are not mutating.
-            let participant_count = match room_state.read() {
-                Ok(g) => g.member_count() as u32,
-                Err(poisoned) => poisoned.into_inner().member_count() as u32,
-            };
+            // One CPU-load read per tick, pod-wide. Owner pods that own
+            // 200 rooms used to read this 200×/tick; now it's 1×/tick.
             let cpu = cpu_load.load();
-            let payload = build_health_beacon_payload(participant_count, cpu, SystemTime::now());
-            publisher.publish(subject.clone(), payload);
+            let now = SystemTime::now();
+            for (room_id, state) in snapshot {
+                if !owner_check.is_owner(&room_id) {
+                    // Pod is no longer the owner (e.g., replica scale-out
+                    // moved this room elsewhere). Stay registered —
+                    // ownership may come back — but emit nothing.
+                    continue;
+                }
+                // Tiny critical section: only the count is read, no
+                // per-member iteration. Survives a panicked writer
+                // (poison) by treating the poisoned state as readable —
+                // we are not mutating.
+                let participant_count = match state.read() {
+                    Ok(g) => g.member_count() as u32,
+                    Err(poisoned) => poisoned.into_inner().member_count() as u32,
+                };
+                let subject = system_subject(&room_id);
+                let payload = build_health_beacon_payload(participant_count, cpu, now);
+                publisher.publish(subject, payload);
+            }
         }
     });
-    BeaconHandle { join }
+    BeaconHub { rooms, join }
 }
 
 #[cfg(test)]
@@ -394,7 +443,7 @@ mod tests {
     }
 
     /// Owner toggles between owner and non-owner across calls — used to
-    /// verify the loop respects ownership on every tick.
+    /// verify the hub respects ownership on every tick.
     #[derive(Debug, Default)]
     struct ToggleOwner {
         calls: Mutex<Vec<bool>>,
@@ -438,6 +487,31 @@ mod tests {
         HealthBeaconPacket::parse_from_bytes(&wrapper.data).expect("decode beacon")
     }
 
+    /// Build a populated `RoomState` for `room_id` with `n` members.
+    fn make_room(room_id: &str, n: usize) -> Arc<RwLock<RoomState>> {
+        let state = Arc::new(RwLock::new(RoomState::new(room_id.into())));
+        {
+            let mut g = state.write().unwrap();
+            for sid in 1..=n {
+                g.insert_member(sid as u64, 0);
+            }
+            assert_eq!(g.member_count(), n);
+        }
+        state
+    }
+
+    /// Advance the paused runtime by `step` and yield enough times that
+    /// the hub task wakes, takes the registry snapshot, and runs its
+    /// publish loop.
+    async fn advance_one_tick(step: Duration) {
+        tokio::time::advance(step).await;
+        // The ticker fires, then the loop body runs. A handful of yields
+        // is more than enough — the body is short and synchronous.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// `build_health_beacon_payload` round-trips count, cpu, and timestamp.
     #[test]
     fn payload_round_trips_fields() {
@@ -462,210 +536,6 @@ mod tests {
         assert!(decode(&low).cpu_load.abs() < 1e-6);
     }
 
-    /// vc-kol acceptance test: a room with 5 members produces a beacon
-    /// whose `participant_count` decodes to 5.
-    #[tokio::test(start_paused = true)]
-    async fn beacon_reports_participant_count_for_five_members() {
-        let room_state = Arc::new(RwLock::new(RoomState::new("room-5".into())));
-        {
-            let mut g = room_state.write().unwrap();
-            for sid in 1..=5 {
-                g.insert_member(sid, 0);
-            }
-            assert_eq!(g.member_count(), 5);
-        }
-        let publisher = Arc::new(FakePublisher::new());
-        let handle = spawn_health_beacon_loop_with_interval(
-            "room-5".into(),
-            room_state.clone(),
-            Arc::new(AlwaysOwner),
-            Arc::new(FixedCpu(0.25)),
-            publisher.clone(),
-            Duration::from_millis(100),
-        );
-        // Let the spawned task initialise its interval.
-        tokio::task::yield_now().await;
-        // Advance well past the first interval boundary.
-        tokio::time::advance(Duration::from_millis(120)).await;
-        tokio::task::yield_now().await;
-
-        let published = publisher.drain();
-        assert!(
-            !published.is_empty(),
-            "at least one beacon should have been published after one interval"
-        );
-        let (subject, payload) = &published[0];
-        assert_eq!(subject, "room.room-5.system");
-        let beacon = decode(payload);
-        assert_eq!(beacon.participant_count, 5);
-        assert!((beacon.cpu_load - 0.25).abs() < 1e-6);
-        assert!(beacon.reported_at_ms > 0, "reported_at_ms should be set");
-
-        drop(handle);
-    }
-
-    /// Cadence test: ~5s cadence in production translates to one beacon
-    /// per `interval`. We use a short interval with paused virtual time
-    /// to keep the test fast.
-    #[tokio::test(start_paused = true)]
-    async fn beacons_fire_at_interval_cadence() {
-        let room_state = Arc::new(RwLock::new(RoomState::new("room-c".into())));
-        {
-            let mut g = room_state.write().unwrap();
-            g.insert_member(1, 0);
-        }
-        let publisher = Arc::new(FakePublisher::new());
-        let interval = Duration::from_millis(50);
-        let handle = spawn_health_beacon_loop_with_interval(
-            "room-c".into(),
-            room_state,
-            Arc::new(AlwaysOwner),
-            Arc::new(FixedCpu(0.1)),
-            publisher.clone(),
-            interval,
-        );
-        tokio::task::yield_now().await;
-
-        // Advance four intervals — expect roughly four beacons.
-        for _ in 0..4 {
-            tokio::time::advance(interval).await;
-            // Yield twice: the ticker fires, and then the loop body runs.
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-        }
-        let count = publisher.drain().len();
-        assert!(
-            (3..=5).contains(&count),
-            "expected ~4 beacons after 4 intervals, got {count}"
-        );
-
-        drop(handle);
-    }
-
-    /// Non-owner pods stay quiet — the task survives but emits nothing.
-    #[tokio::test(start_paused = true)]
-    async fn non_owner_pod_emits_no_beacons() {
-        let room_state = Arc::new(RwLock::new(RoomState::new("room-q".into())));
-        {
-            let mut g = room_state.write().unwrap();
-            g.insert_member(1, 0);
-        }
-        let publisher = Arc::new(FakePublisher::new());
-        let handle = spawn_health_beacon_loop_with_interval(
-            "room-q".into(),
-            room_state,
-            Arc::new(NeverOwner),
-            Arc::new(FixedCpu(0.5)),
-            publisher.clone(),
-            Duration::from_millis(50),
-        );
-        tokio::task::yield_now().await;
-        for _ in 0..3 {
-            tokio::time::advance(Duration::from_millis(50)).await;
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            publisher.drain().is_empty(),
-            "non-owner pod must not publish beacons"
-        );
-        // Task must still be alive — ownership might come back later.
-        assert!(
-            !handle.is_finished(),
-            "loop must persist across non-owner ticks"
-        );
-
-        drop(handle);
-    }
-
-    /// Runtime ownership transition: a pod that starts as owner and later
-    /// loses ownership emits while owner, then stops.
-    #[tokio::test(start_paused = true)]
-    async fn beacons_pause_when_ownership_lost() {
-        let room_state = Arc::new(RwLock::new(RoomState::new("room-t".into())));
-        {
-            let mut g = room_state.write().unwrap();
-            g.insert_member(1, 0);
-            g.insert_member(2, 0);
-        }
-        // Owner for the first two ticks, then not.
-        let owner = Arc::new(ToggleOwner::new(vec![true, true, false, false]));
-        let publisher = Arc::new(FakePublisher::new());
-        let handle = spawn_health_beacon_loop_with_interval(
-            "room-t".into(),
-            room_state,
-            owner.clone(),
-            Arc::new(FixedCpu(0.0)),
-            publisher.clone(),
-            Duration::from_millis(50),
-        );
-        tokio::task::yield_now().await;
-        // First two ticks publish.
-        for _ in 0..2 {
-            tokio::time::advance(Duration::from_millis(50)).await;
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-        }
-        let after_owner_ticks = publisher.drain().len();
-        assert!(
-            after_owner_ticks >= 1,
-            "must publish while owning, got {after_owner_ticks}"
-        );
-
-        // Next two ticks do not.
-        for _ in 0..2 {
-            tokio::time::advance(Duration::from_millis(50)).await;
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            publisher.drain().is_empty(),
-            "no publishes after ownership lost"
-        );
-
-        drop(handle);
-    }
-
-    /// Dropping the [`BeaconHandle`] aborts the task: subsequent virtual
-    /// time advances produce no new publishes.
-    #[tokio::test(start_paused = true)]
-    async fn dropping_handle_aborts_loop() {
-        let room_state = Arc::new(RwLock::new(RoomState::new("room-d".into())));
-        {
-            let mut g = room_state.write().unwrap();
-            g.insert_member(1, 0);
-        }
-        let publisher = Arc::new(FakePublisher::new());
-        let handle = spawn_health_beacon_loop_with_interval(
-            "room-d".into(),
-            room_state,
-            Arc::new(AlwaysOwner),
-            Arc::new(FixedCpu(0.0)),
-            publisher.clone(),
-            Duration::from_millis(50),
-        );
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(50)).await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-        let pre_drop = publisher.drain().len();
-        assert!(pre_drop >= 1, "expected ≥1 publish before drop");
-
-        drop(handle);
-        // Give the runtime a chance to actually abort the task.
-        tokio::task::yield_now().await;
-
-        for _ in 0..3 {
-            tokio::time::advance(Duration::from_millis(50)).await;
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            publisher.drain().is_empty(),
-            "no publishes after BeaconHandle drop"
-        );
-    }
-
     /// `linux_cpu_load_estimate` returns a value in `[0, 1]` on any platform
     /// (returns 0 on missing /proc/loadavg).
     #[test]
@@ -677,48 +547,242 @@ mod tests {
     /// `system_subject` rewrites whitespace in the room id so the published
     /// subject is wire-legal and matches the rest of the codebase's
     /// `room.{room}.system` convention.
-    ///
-    /// vc-kol follow-up: every other site that builds the system subject in
-    /// `chat_server.rs` calls `.replace(' ', "_")` before formatting; the
-    /// beacon publisher must do the same so the spill controller (p6-8) sees
-    /// beacons for rooms whose ids contain spaces.
     #[test]
     fn system_subject_replaces_spaces_with_underscores() {
         assert_eq!(system_subject("foo bar"), "room.foo_bar.system");
-        // Multiple spaces are all rewritten.
         assert_eq!(system_subject("a b c"), "room.a_b_c.system");
-        // Rooms without spaces are unchanged.
         assert_eq!(system_subject("plain-room"), "room.plain-room.system");
     }
 
-    /// End-to-end: a room id with a space publishes its beacon on the
-    /// normalised subject (matches `chat_server.rs`'s convention).
-    ///
-    /// Without the `.replace(' ', "_")` fix, the beacon loop would publish
-    /// to `room.foo bar.system` (subject contains a space), which is both
-    /// invalid as a NATS subject and would never match the spill
-    /// controller's subscription pattern.
+    /// Hub publishes a beacon for a single registered room on each tick.
     #[tokio::test(start_paused = true)]
-    async fn beacon_publishes_on_normalised_subject() {
-        let room_id = "foo bar".to_string();
-        let room_state = Arc::new(RwLock::new(RoomState::new(room_id.clone())));
-        {
-            let mut g = room_state.write().unwrap();
-            g.insert_member(1, 0);
-        }
+    async fn hub_emits_for_single_registered_room() {
         let publisher = Arc::new(FakePublisher::new());
-        let handle = spawn_health_beacon_loop_with_interval(
-            room_id,
-            room_state,
+        let hub = spawn_beacon_hub_with_interval(
+            Arc::new(AlwaysOwner),
+            Arc::new(FixedCpu(0.25)),
+            publisher.clone(),
+            Duration::from_millis(50),
+        );
+        hub.register("room-5".into(), make_room("room-5", 5));
+        tokio::task::yield_now().await;
+        advance_one_tick(Duration::from_millis(60)).await;
+
+        let published = publisher.drain();
+        assert!(
+            !published.is_empty(),
+            "at least one beacon expected after the first interval"
+        );
+        let (subject, payload) = &published[0];
+        assert_eq!(subject, "room.room-5.system");
+        let beacon = decode(payload);
+        assert_eq!(beacon.participant_count, 5);
+        assert!((beacon.cpu_load - 0.25).abs() < 1e-6);
+        assert!(beacon.reported_at_ms > 0);
+
+        drop(hub);
+    }
+
+    /// Hub fans out beacons for MULTIPLE registered rooms in a single
+    /// tick — the perf-relevant case the refactor enables.
+    #[tokio::test(start_paused = true)]
+    async fn hub_emits_for_multiple_registered_rooms() {
+        let publisher = Arc::new(FakePublisher::new());
+        let hub = spawn_beacon_hub_with_interval(
+            Arc::new(AlwaysOwner),
+            Arc::new(FixedCpu(0.1)),
+            publisher.clone(),
+            Duration::from_millis(50),
+        );
+        hub.register("room-a".into(), make_room("room-a", 2));
+        hub.register("room-b".into(), make_room("room-b", 3));
+        hub.register("room-c".into(), make_room("room-c", 4));
+        tokio::task::yield_now().await;
+        advance_one_tick(Duration::from_millis(60)).await;
+
+        let published = publisher.drain();
+        // Each tick must produce exactly one beacon per registered room.
+        let mut by_subject: HashMap<String, HealthBeaconPacket> = HashMap::new();
+        for (subject, payload) in &published {
+            by_subject.insert(subject.clone(), decode(payload));
+        }
+        assert_eq!(
+            by_subject.len(),
+            3,
+            "expected one beacon per room, got {} ({published:?})",
+            by_subject.len()
+        );
+        assert_eq!(
+            by_subject
+                .get("room.room-a.system")
+                .unwrap()
+                .participant_count,
+            2
+        );
+        assert_eq!(
+            by_subject
+                .get("room.room-b.system")
+                .unwrap()
+                .participant_count,
+            3
+        );
+        assert_eq!(
+            by_subject
+                .get("room.room-c.system")
+                .unwrap()
+                .participant_count,
+            4
+        );
+
+        drop(hub);
+    }
+
+    /// Hub skips rooms on ticks where `is_owner` returns false (preserves
+    /// the prior `ToggleOwner` semantics for runtime ownership transitions).
+    #[tokio::test(start_paused = true)]
+    async fn hub_skips_rooms_when_not_owner_on_tick() {
+        let publisher = Arc::new(FakePublisher::new());
+        // Two outcomes per tick (one per room). Tick 1: both owners.
+        // Tick 2: neither.
+        let owner = Arc::new(ToggleOwner::new(vec![true, true, false, false]));
+        let hub = spawn_beacon_hub_with_interval(
+            owner.clone(),
+            Arc::new(FixedCpu(0.0)),
+            publisher.clone(),
+            Duration::from_millis(50),
+        );
+        hub.register("room-t1".into(), make_room("room-t1", 1));
+        hub.register("room-t2".into(), make_room("room-t2", 2));
+        tokio::task::yield_now().await;
+
+        advance_one_tick(Duration::from_millis(50)).await;
+        let owned = publisher.drain();
+        assert!(
+            !owned.is_empty(),
+            "expected publishes on first tick while owning, got {}",
+            owned.len()
+        );
+
+        advance_one_tick(Duration::from_millis(50)).await;
+        assert!(
+            publisher.drain().is_empty(),
+            "no publishes once ownership lost"
+        );
+        // Hub task must still be alive — ownership may return.
+        assert!(
+            !hub.is_finished(),
+            "hub task must persist across non-owner ticks"
+        );
+
+        drop(hub);
+    }
+
+    /// A non-owner pod (every owner-check returns false) emits nothing,
+    /// but the hub task itself stays alive.
+    #[tokio::test(start_paused = true)]
+    async fn hub_emits_nothing_for_non_owner_pod() {
+        let publisher = Arc::new(FakePublisher::new());
+        let hub = spawn_beacon_hub_with_interval(
+            Arc::new(NeverOwner),
+            Arc::new(FixedCpu(0.5)),
+            publisher.clone(),
+            Duration::from_millis(50),
+        );
+        hub.register("room-q".into(), make_room("room-q", 1));
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            advance_one_tick(Duration::from_millis(50)).await;
+        }
+        assert!(
+            publisher.drain().is_empty(),
+            "non-owner pod must not publish beacons"
+        );
+        assert!(
+            !hub.is_finished(),
+            "hub task must persist even when nothing is published"
+        );
+
+        drop(hub);
+    }
+
+    /// `unregister` removes a room from the rotation — no further beacons
+    /// fire for it.
+    #[tokio::test(start_paused = true)]
+    async fn hub_honors_unregister() {
+        let publisher = Arc::new(FakePublisher::new());
+        let hub = spawn_beacon_hub_with_interval(
             Arc::new(AlwaysOwner),
             Arc::new(FixedCpu(0.0)),
             publisher.clone(),
             Duration::from_millis(50),
         );
+        hub.register("room-u".into(), make_room("room-u", 1));
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(60)).await;
+
+        advance_one_tick(Duration::from_millis(50)).await;
+        let pre = publisher.drain();
+        assert!(
+            pre.iter().any(|(s, _)| s == "room.room-u.system"),
+            "expected a beacon for room-u before unregister"
+        );
+
+        hub.unregister("room-u");
+        for _ in 0..3 {
+            advance_one_tick(Duration::from_millis(50)).await;
+        }
+        let post = publisher.drain();
+        assert!(
+            post.iter().all(|(s, _)| s != "room.room-u.system"),
+            "no beacons for room-u after unregister, got {post:?}"
+        );
+
+        drop(hub);
+    }
+
+    /// Dropping the [`BeaconHub`] aborts the task: subsequent virtual
+    /// time advances produce no new publishes.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_hub_aborts_task() {
+        let publisher = Arc::new(FakePublisher::new());
+        let hub = spawn_beacon_hub_with_interval(
+            Arc::new(AlwaysOwner),
+            Arc::new(FixedCpu(0.0)),
+            publisher.clone(),
+            Duration::from_millis(50),
+        );
+        hub.register("room-d".into(), make_room("room-d", 1));
         tokio::task::yield_now().await;
+        advance_one_tick(Duration::from_millis(50)).await;
+        let pre_drop = publisher.drain().len();
+        assert!(pre_drop >= 1, "expected at least 1 publish before drop");
+
+        drop(hub);
+        // Give the runtime a chance to actually abort the task.
         tokio::task::yield_now().await;
+
+        for _ in 0..3 {
+            advance_one_tick(Duration::from_millis(50)).await;
+        }
+        assert!(
+            publisher.drain().is_empty(),
+            "no publishes after BeaconHub drop"
+        );
+    }
+
+    /// End-to-end: a room id with a space publishes its beacon on the
+    /// normalised subject (matches `chat_server.rs`'s convention).
+    #[tokio::test(start_paused = true)]
+    async fn hub_publishes_on_normalised_subject() {
+        let publisher = Arc::new(FakePublisher::new());
+        let hub = spawn_beacon_hub_with_interval(
+            Arc::new(AlwaysOwner),
+            Arc::new(FixedCpu(0.0)),
+            publisher.clone(),
+            Duration::from_millis(50),
+        );
+        hub.register("foo bar".into(), make_room("foo bar", 1));
+        tokio::task::yield_now().await;
+        advance_one_tick(Duration::from_millis(60)).await;
 
         let published = publisher.drain();
         assert!(
@@ -731,6 +795,6 @@ mod tests {
             "subject must normalise the space in 'foo bar' to 'foo_bar'"
         );
 
-        drop(handle);
+        drop(hub);
     }
 }

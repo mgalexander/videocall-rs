@@ -280,7 +280,7 @@ fn room_id_from_subject(subject: &str) -> Option<&str> {
 
 /// Cancels the background ingest task when dropped.
 ///
-/// Mirrors the [`crate::sfu::health_beacon::BeaconHandle`] pattern:
+/// Mirrors the [`crate::sfu::health_beacon::BeaconHub`] pattern:
 /// callers retain this handle for the lifetime of the SFU process and
 /// drop it on shutdown to abort the task.
 #[derive(Debug)]

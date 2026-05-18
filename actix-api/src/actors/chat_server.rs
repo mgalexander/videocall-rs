@@ -52,7 +52,7 @@ use super::packet_handler::{
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::health_beacon::{
-    spawn_health_beacon_loop, BeaconHandle, EnvOwnerCheck, LinuxCpuLoad, NatsHealthBeaconPublisher,
+    spawn_beacon_hub, BeaconHub, EnvOwnerCheck, LinuxCpuLoad, NatsHealthBeaconPublisher,
 };
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
@@ -236,15 +236,17 @@ pub struct ChatServer {
     /// `watch::Receiver` reads from, so the channel stays open for as long
     /// as the tick handle is retained here.
     speaker_ticks: HashMap<String, TickHandle>,
-    /// Per-room owner-pod health beacon (vc-kol / p6-7). Materialised in
-    /// the same `Vacant` branch as the speaker tick, but ONLY when this
-    /// pod is the room's owner per [`crate::sfu::affinity::is_owner`].
-    /// Dropped in the same code paths that remove `speaker_ticks`; the
-    /// `Drop` impl on [`BeaconHandle`] aborts the background task.
+    /// Single owner-pod health-beacon hub (vc-kol / p6-7, refactored in
+    /// vc-c6l from N per-room tasks to one). Registered with the room id
+    /// alongside the speaker tick, but ONLY when this pod is the room's
+    /// owner per [`crate::sfu::affinity::is_owner`]. Unregistered in the
+    /// same code paths that remove `speaker_ticks`; the `Drop` impl on
+    /// [`BeaconHub`] aborts the background task on shutdown.
     ///
-    /// Non-owner pods have no entry — they silently consume the beacons
-    /// the owner publishes on `room.{room}.system` (p6-8, wave 3).
-    health_beacon_ticks: HashMap<String, BeaconHandle>,
+    /// Non-owner pods never register any rooms — they silently consume
+    /// the beacons the owner publishes on `room.{room}.system` (p6-8,
+    /// wave 3).
+    beacon_hub: BeaconHub,
     /// Per-room demux state (one NATS subscription per room, fanned out to
     /// all local receivers). Lazily created on the first `JoinRoom` for a
     /// room and torn down when the room drains. See [`RoomDispatch`].
@@ -253,6 +255,16 @@ pub struct ChatServer {
 
 impl ChatServer {
     pub async fn new(nats_connection: async_nats::client::Client) -> Self {
+        // vc-c6l: a single owner-pod hub replaces the previous N per-room
+        // tasks. The hub always runs (1 task, 1 timer) and stays empty on
+        // non-owner pods. Eager-init avoids special-casing `ChatServer::new`
+        // for the rare case of a pod that never owns a room.
+        let beacon_publisher = Arc::new(NatsHealthBeaconPublisher::new(nats_connection.clone()));
+        let beacon_hub = spawn_beacon_hub(
+            Arc::new(EnvOwnerCheck),
+            Arc::new(LinuxCpuLoad),
+            beacon_publisher,
+        );
         ChatServer {
             nats_connection,
             joined_sessions: HashSet::new(),
@@ -268,7 +280,7 @@ impl ChatServer {
             subscriptions: HashMap::new(),
             speaker_scorers: HashMap::new(),
             speaker_ticks: HashMap::new(),
-            health_beacon_ticks: HashMap::new(),
+            beacon_hub,
             room_dispatch: HashMap::new(),
         }
     }
@@ -329,10 +341,10 @@ impl ChatServer {
                     // shared scorer.
                     self.speaker_ticks.remove(room_id);
                     self.speaker_scorers.remove(room_id);
-                    // vc-kol / p6-7: dropping the BeaconHandle aborts the
-                    // 5s health-beacon loop. Non-owner pods never had an
-                    // entry; `remove` is a safe no-op there.
-                    self.health_beacon_ticks.remove(room_id);
+                    // vc-kol / p6-7 (vc-c6l): unregister the room from the
+                    // shared owner-pod beacon hub. Non-owner pods never
+                    // registered; `unregister` is a safe no-op there.
+                    self.beacon_hub.unregister(room_id);
                     true
                 } else {
                     false
@@ -810,10 +822,10 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                         // aborts the background task.
                         self.speaker_ticks.remove(&room);
                         self.speaker_scorers.remove(&room);
-                        // vc-kol / p6-7: tear down the owner-pod health
-                        // beacon. Non-owner pods never inserted; the
-                        // remove is a no-op.
-                        self.health_beacon_ticks.remove(&room);
+                        // vc-kol / p6-7 (vc-c6l): drop this room from the
+                        // shared owner-pod beacon hub. Non-owner pods
+                        // never registered; `unregister` is a no-op.
+                        self.beacon_hub.unregister(&room);
                     }
                 }
                 return;
@@ -1399,24 +1411,15 @@ impl Handler<JoinRoom> for ChatServer {
                 let speakers_rx = tick.subscribe();
                 let handle = tick.run();
                 self.speaker_ticks.insert(room.clone(), handle);
-                // vc-kol / p6-7: spawn the 5s owner-pod health beacon
-                // alongside the speaker tick — only when this pod is the
+                // vc-kol / p6-7 (vc-c6l): register the room with the
+                // shared owner-pod beacon hub — only when this pod is the
                 // room's owner per the consistent-hash jump (p6-1).
                 // Non-owner pods stay silent so the topic carries exactly
-                // one beacon stream per room. The beacon task itself
-                // re-checks ownership on each tick (defensive against
-                // runtime replica scale changes).
+                // one beacon stream per room. The hub itself re-checks
+                // ownership on each tick (defensive against runtime
+                // replica scale changes).
                 if crate::sfu::affinity::is_owner(&room) {
-                    let beacon_publisher =
-                        Arc::new(NatsHealthBeaconPublisher::new(self.nats_connection.clone()));
-                    let beacon_handle = spawn_health_beacon_loop(
-                        room.clone(),
-                        room_state.clone(),
-                        Arc::new(EnvOwnerCheck),
-                        Arc::new(LinuxCpuLoad),
-                        beacon_publisher,
-                    );
-                    self.health_beacon_ticks.insert(room.clone(), beacon_handle);
+                    self.beacon_hub.register(room.clone(), room_state.clone());
                 }
                 // vc-wls: bare `Arc<LayerSelector>` — the selector now
                 // owns its own interior locking (DashMap shards for the
