@@ -43,6 +43,16 @@ async fn main() {
 
     info!("Starting WebTransport server with actor-based session handling");
 
+    let pod_name = std::env::var("POD_NAME").ok();
+    let self_ordinal = sec_api::sfu::affinity::self_ordinal_from_env();
+    let replicas = sec_api::sfu::affinity::replicas_from_env();
+    info!(
+        pod_name = ?pod_name,
+        replicas,
+        self_ordinal = ?self_ordinal,
+        "affinity init"
+    );
+
     let sfu_config = SfuConfig::from_env();
     info!("sfu mode: {}", sfu_config.mode);
     if sfu_config.mode == SfuMode::Sfu {
