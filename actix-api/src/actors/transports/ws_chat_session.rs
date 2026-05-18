@@ -22,21 +22,43 @@
 //! to `SessionLogic`. It handles WebSocket-specific I/O via `WebsocketContext`.
 
 use crate::actors::chat_server::ChatServer;
+use crate::actors::packet_handler::parse_and_inspect;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
+use crate::sfu::priority_queue::{
+    classify_outbound, Class, PriorityReceiver, PrioritySender, SendOutcome,
+};
 use actix::ActorFutureExt;
 use actix::{
     clock::Instant, fut, Actor, ActorContext, Addr, AsyncContext, ContextFutureSpawner, Handler,
-    Running, StreamHandler, WrapFuture,
+    Message as ActixMessage, Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
+use bytes::Bytes;
 use tracing::{error, info, trace};
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
+
+/// Internal actor message that carries a pre-classified outbound frame
+/// drained from the per-session [`PriorityReceiver`] back to the actor for
+/// `ctx.binary` write. Single TCP stream means the priority ordering happens
+/// at the SEND side (drain order), not in the wire — the goal is to drop
+/// enhancement layers before they hit the kernel buffer, not to reorder bytes
+/// already on the wire.
+///
+/// Worst-case head-of-line on the wire side is exactly 1 frame: while the
+/// drainer is parked on `addr.send(SendBinaryFrame).await`, a newly-arrived
+/// higher-priority frame jumps the in-queue order but still sits behind the
+/// already-committed in-flight `SendBinaryFrame`. By design (per PLAN.md
+/// Phase 5) — single-frame HoL is acceptable for the same reason WS can't
+/// reorder bytes already in the kernel buffer.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct SendBinaryFrame(Bytes);
 
 /// WebSocket Chat Session Actor
 ///
@@ -51,6 +73,15 @@ pub struct WsChatSession {
 
     /// Track if ActivateConnection has been sent
     activated: bool,
+
+    /// Outbound priority sender (5-class bandwidth-aware queue, p5-1/p5-2/p5-3).
+    /// `Handler<Message>` classifies each outbound frame and pushes it here.
+    outbound_tx: PrioritySender,
+
+    /// Per-session priority receiver, taken by `started()` and moved into the
+    /// drainer task. `Option` so the receiver — which is single-consumer — can
+    /// be handed off exactly once.
+    pending_rx: Option<PriorityReceiver>,
 }
 
 impl WsChatSession {
@@ -76,10 +107,15 @@ impl WsChatSession {
             observer,
         );
 
+        let (outbound_tx, channels) = PrioritySender::new();
+        let pending_rx = Some(PriorityReceiver::new(channels));
+
         WsChatSession {
             logic,
             heartbeat: Instant::now(),
             activated: false,
+            outbound_tx,
+            pending_rx,
         }
     }
 
@@ -106,6 +142,27 @@ impl Actor for WsChatSession {
     fn started(&mut self, ctx: &mut Self::Context) {
         // Track connection start
         self.logic.track_connection_start("websocket");
+
+        // Spawn the priority-queue drainer BEFORE registering with ChatServer
+        // so any inbound `Message` already routed through `Handler<Message>` is
+        // guaranteed a consumer. The drainer pulls from `PriorityReceiver` in
+        // strict-priority + 8-packet-fairness order (p5-2) and round-trips
+        // each `Bytes` back through the actor mailbox so `ctx.binary` can be
+        // called inside the actor's context. `addr.send().await` provides
+        // natural backpressure: if the actor cannot keep up with writes, the
+        // drainer parks rather than overflowing the actor mailbox, leaving
+        // the bounded class queues to apply their drop policies upstream.
+        if let Some(mut receiver) = self.pending_rx.take() {
+            let addr = ctx.address();
+            actix_rt::spawn(async move {
+                while let Some(bytes) = receiver.recv().await {
+                    if addr.send(SendBinaryFrame(bytes)).await.is_err() {
+                        // Actor stopped — its mailbox is closed. Exit cleanly.
+                        break;
+                    }
+                }
+            });
+        }
 
         // Start session via SessionManager
         let session_manager = self.logic.session_manager.clone();
@@ -176,13 +233,77 @@ impl Actor for WsChatSession {
 // Message Handlers
 // =============================================================================
 
-/// Handle outbound messages from ChatServer
+/// Handle outbound messages from ChatServer.
+///
+/// Each frame is classified by [`classify_outbound`] (p5-3) and pushed into
+/// the per-session [`PrioritySender`]. The bounded class queues drop layers
+/// per their policy before the bytes hit the wire — this is the WS-side
+/// production swap (p5-5) that makes bandwidth-aware priority queuing run on
+/// the WebSocket path, matching p5-4 for the WebTransport path.
 impl Handler<Message> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
-        ctx.binary(bytes);
+
+        // Parse the wrapper once for classification AND sender-session-id
+        // attribution (the latter is what `on_outbound_drop` keys congestion
+        // tracking off of, matching the WT-side `Handler<Message>`).
+        let parsed = parse_and_inspect(bytes.as_ref());
+        let class = match &parsed {
+            Some(p) => {
+                let media_type = p
+                    .media_packet
+                    .as_ref()
+                    .map(|mp| mp.media_type.enum_value_or_default());
+                classify_outbound(&p.wrapper, media_type, p.routing_header())
+            }
+            // Wrapper parse failure: fall back to P3VideoBase, matching
+            // `classify_outbound`'s unknown-packet-type branch.
+            None => Class::P3VideoBase,
+        };
+        let sender_session_id = parsed.as_ref().map(|p| p.wrapper.session_id).unwrap_or(0);
+
+        match self.outbound_tx.send(class, bytes) {
+            SendOutcome::Sent => {}
+            SendOutcome::Dropped(dropped_class, reason) => {
+                trace!(
+                    "WS outbound drop: session {} class {:?} reason {}",
+                    self.logic.id,
+                    dropped_class,
+                    reason
+                );
+                // Preserve legacy CONGESTION attribution: surface the drop to
+                // the sender's CongestionTracker so the threshold-based
+                // CONGESTION signal still fires while p5-7/p5-10 wire per-class
+                // accounting in. Upstream filters (CONGESTION carve-out
+                // p2-5/vc-b95, self-skip p2-3, AllowSet p3-5, layer-drop p4-7)
+                // all run BEFORE this send, so only already-eligible packets
+                // reach this drop point.
+                if sender_session_id != 0 {
+                    self.logic.on_outbound_drop(sender_session_id);
+                }
+            }
+            SendOutcome::Refused(_) => {
+                // P0Control class full — per PLAN.md Phase 5 we terminate the
+                // session because the control channel must never wedge.
+                error!(
+                    "P0Control class full — terminating WS session {}",
+                    self.logic.id
+                );
+                ctx.stop();
+            }
+        }
+    }
+}
+
+/// Write a priority-ordered binary frame to the WebSocket. Delivered by the
+/// drainer task (see [`Actor::started`]).
+impl Handler<SendBinaryFrame> for WsChatSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: SendBinaryFrame, ctx: &mut Self::Context) -> Self::Result {
+        ctx.binary(msg.0);
     }
 }
 
@@ -236,7 +357,25 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
                 match action {
                     InboundAction::Echo(bytes) => {
-                        ctx.binary(bytes.as_ref().clone());
+                        // RTT echo is the only path that produces Echo today
+                        // (see `session_logic::handle_inbound` PacketKind::Rtt
+                        // arm). RTT classifies as P0Control under
+                        // `classify_outbound`, so route the echo through the
+                        // priority queue at that class — keeps ordering
+                        // invariants honest and avoids a direct-write bypass
+                        // around the per-session queue.
+                        let echo_bytes = Bytes::from(bytes.as_ref().clone());
+                        match self.outbound_tx.send(Class::P0Control, echo_bytes) {
+                            SendOutcome::Sent => {}
+                            SendOutcome::Dropped(_, _) => {}
+                            SendOutcome::Refused(_) => {
+                                error!(
+                                    "P0Control class full on RTT echo — terminating WS session {}",
+                                    self.logic.id
+                                );
+                                ctx.stop();
+                            }
+                        }
                     }
                     InboundAction::Forward(bytes) => {
                         ctx.notify(Packet { data: bytes });
@@ -274,6 +413,29 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
     fn finished(&mut self, ctx: &mut Self::Context) {
         ctx.stop()
+    }
+}
+
+/// Classify the outbound bytes by parse-and-inspecting the wrapper once.
+///
+/// Routes the bytes into one of the 5 priority classes per p5-3. If the outer
+/// `PacketWrapper` fails to parse, we fall back to `P3VideoBase` — same
+/// fallback as `classify_outbound`'s unknown-packet-type branch.
+///
+/// Test-only helper; `Handler<Message>` inlines the parse so it can also
+/// extract the sender's `session_id` for CongestionTracker attribution
+/// without a second parse pass.
+#[cfg(test)]
+fn classify_outbound_bytes(bytes: &Bytes) -> Class {
+    match parse_and_inspect(bytes.as_ref()) {
+        Some(parsed) => {
+            let media_type = parsed
+                .media_packet
+                .as_ref()
+                .map(|mp| mp.media_type.enum_value_or_default());
+            classify_outbound(&parsed.wrapper, media_type, parsed.routing_header())
+        }
+        None => Class::P3VideoBase,
     }
 }
 
@@ -522,5 +684,110 @@ mod tests {
 
         println!("\n=== SESSION LIFECYCLE TEST PASSED (WebSocket) ===");
         Ok(())
+    }
+
+    // ----- p5-5: classify + priority-queue swap (burst test) -----
+    //
+    // Acceptance: feed a burst of P4Enhancement frames alongside a P0Control
+    // frame, assert P0Control drains before any of the burst's tail. This is
+    // the WebSocket-side equivalent of p5-4's WT burst test.
+
+    use crate::sfu::priority_queue::PrioritySender as PqSender;
+    use videocall_types::protos::media_packet::media_packet::MediaType as PbMediaType;
+    use videocall_types::protos::media_packet::{MediaPacket, RoutingHeader};
+    use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as PbPacketType;
+    use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    fn build_p0_control_bytes() -> Bytes {
+        // SPEAKER_UPDATE is unambiguously P0Control, with no need for an
+        // inner MediaPacket parse.
+        let mut w = PacketWrapper::new();
+        w.packet_type = PbPacketType::SPEAKER_UPDATE.into();
+        Bytes::from(w.write_to_bytes().expect("serialize SPEAKER_UPDATE"))
+    }
+
+    fn build_p4_enhancement_bytes() -> Bytes {
+        // VIDEO + non-T0/S0 routing header lands in P4Enhancement.
+        let mut rh = RoutingHeader::new();
+        rh.is_keyframe = false;
+        rh.temporal_layer_id = 2;
+        rh.spatial_layer_id = 0;
+
+        let mut mp = MediaPacket::new();
+        mp.media_type = PbMediaType::VIDEO.into();
+        mp.routing_header = ::protobuf::MessageField::some(rh);
+        let inner = mp.write_to_bytes().expect("serialize MediaPacket");
+
+        let mut w = PacketWrapper::new();
+        w.packet_type = PbPacketType::MEDIA.into();
+        w.data = inner;
+        Bytes::from(w.write_to_bytes().expect("serialize MEDIA wrapper"))
+    }
+
+    #[test]
+    fn classify_outbound_bytes_routes_speaker_update_to_p0_control() {
+        let bytes = build_p0_control_bytes();
+        assert_eq!(classify_outbound_bytes(&bytes), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_bytes_routes_video_enhancement_to_p4_enhancement() {
+        let bytes = build_p4_enhancement_bytes();
+        assert_eq!(classify_outbound_bytes(&bytes), Class::P4Enhancement);
+    }
+
+    #[test]
+    fn classify_outbound_bytes_unparseable_falls_back_to_p3_video_base() {
+        // Garbage that fails PacketWrapper parse.
+        let bytes = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(classify_outbound_bytes(&bytes), Class::P3VideoBase);
+    }
+
+    /// Burst test: push 100 P4Enhancement frames followed by a single
+    /// P0Control frame through the same path used by `Handler<Message>`
+    /// (classify + `PrioritySender::send`). Assert the P0Control frame
+    /// drains BEFORE any of the P4 tail — i.e. strict priority is honored
+    /// even when the P4 queue is loaded first.
+    #[tokio::test]
+    async fn p5_5_burst_test_p0_preempts_p4_tail_on_ws_path() {
+        let (sender, channels) = PqSender::new();
+        let mut receiver = PriorityReceiver::new(channels);
+
+        // Push a burst of P4Enhancement frames. P4 has a 256-slot HeadDrop
+        // queue, so 100 will all be admitted.
+        for _ in 0..100 {
+            let bytes = build_p4_enhancement_bytes();
+            let class = classify_outbound_bytes(&bytes);
+            assert_eq!(class, Class::P4Enhancement);
+            assert_eq!(sender.send(class, bytes), SendOutcome::Sent);
+        }
+
+        // Now push a single P0Control frame AFTER the P4 tail is enqueued.
+        let p0_bytes = build_p0_control_bytes();
+        let p0_class = classify_outbound_bytes(&p0_bytes);
+        assert_eq!(p0_class, Class::P0Control);
+        let p0_marker = p0_bytes.clone();
+        assert_eq!(sender.send(p0_class, p0_bytes), SendOutcome::Sent);
+
+        // First drain MUST be the P0Control frame, not any of the buffered
+        // P4 frames — strict priority. We compare bytes equality against the
+        // SPEAKER_UPDATE marker because P4 frames are MEDIA wrappers with
+        // distinct inner payloads.
+        let first = receiver.recv().await.expect("at least one packet");
+        assert_eq!(
+            first, p0_marker,
+            "P0Control must drain first under strict priority, ahead of the P4 burst tail"
+        );
+
+        // Remaining 100 drains must all be P4 frames (and exactly 100).
+        let mut tail_count = 0;
+        drop(sender);
+        while let Some(bytes) = receiver.recv().await {
+            assert_ne!(bytes, p0_marker, "no second P0Control should appear");
+            // Sanity: every tail entry classifies back to P4Enhancement.
+            assert_eq!(classify_outbound_bytes(&bytes), Class::P4Enhancement);
+            tail_count += 1;
+        }
+        assert_eq!(tail_count, 100, "all 100 P4 frames must drain");
     }
 }
