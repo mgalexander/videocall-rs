@@ -22,24 +22,21 @@
 //! to `SessionLogic`. It handles WebTransport-specific I/O via channels.
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::packet_handler::DATAGRAM_MAX_SIZE;
+use crate::actors::packet_handler::parse_and_inspect;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
+use crate::sfu::priority_queue::{classify_outbound, Class, PrioritySender, SendOutcome};
 use actix::{
     fut, Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, ContextFutureSpawner,
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
-use protobuf::Message as ProtobufMessage;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
@@ -48,25 +45,6 @@ const WT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Keep-alive ping data (WebTransport-specific)
 const KEEP_ALIVE_PING: &[u8] = b"ping";
-
-/// Outbound message with transport type specification
-#[derive(Debug, Clone)]
-pub enum WtOutbound {
-    /// Send via UniStream (reliable, ordered)
-    UniStream(Bytes),
-    /// Send via Datagram (unreliable, unordered, low latency)
-    Datagram(Bytes),
-}
-
-/// Result of attempting to send an outbound message to the WebTransport channel.
-enum WtSendResult {
-    /// Message sent successfully.
-    Sent,
-    /// Channel is full; message was dropped.
-    Dropped,
-    /// Channel is closed; connection is dead.
-    Dead,
-}
 
 /// Source of inbound data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +77,13 @@ pub struct WtChatSession {
     /// Heartbeat tracking (transport-specific timing)
     heartbeat: actix::clock::Instant,
 
-    /// Channel to send data back to WebTransport session
-    outbound_tx: mpsc::Sender<WtOutbound>,
+    /// Bandwidth-aware priority sender for outbound packets (p5-4).
+    ///
+    /// Replaces the legacy `mpsc::Sender<WtOutbound>(256)` with a five-class
+    /// priority queue (P0 Control → P4 Enhancement) that applies per-class
+    /// drop policies. The bridge writer task drains via [`PriorityReceiver`]
+    /// with strict-priority + 8-packet fairness quantum.
+    outbound_tx: PrioritySender,
 
     /// Track if ActivateConnection has been sent
     activated: bool,
@@ -113,7 +96,7 @@ impl WtChatSession {
         room: String,
         user_id: String,
         display_name: String,
-        outbound_tx: mpsc::Sender<WtOutbound>,
+        outbound_tx: PrioritySender,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -138,88 +121,66 @@ impl WtChatSession {
         }
     }
 
-    /// Send outbound message via the channel (reliable unidirectional stream).
-    /// Returns false if the channel is closed (connection dead).
+    /// Classify `bytes` (a serialized `PacketWrapper`) into a priority
+    /// [`Class`], parsing the inner `MediaPacket` for routing-header awareness
+    /// when the wrapper is MEDIA. Returns [`Class::P3VideoBase`] as the
+    /// fallback if the wrapper itself fails to parse (matches
+    /// [`classify_outbound`]'s unknown-type fallback).
+    fn classify_bytes(bytes: &[u8]) -> Class {
+        match parse_and_inspect(bytes) {
+            Some(parsed) => {
+                let media_type = parsed
+                    .media_packet
+                    .as_ref()
+                    .map(|mp| mp.media_type.enum_value_or_default());
+                classify_outbound(&parsed.wrapper, media_type, parsed.routing_header())
+            }
+            None => Class::P3VideoBase,
+        }
+    }
+
+    /// Enqueue a server-originated control packet (SESSION_ASSIGNED,
+    /// MEETING_STARTED, MEETING_ENDED) onto the outbound priority queue.
+    ///
+    /// Returns `false` if the P0 control class queue is full
+    /// ([`SendOutcome::Refused`]), in which case the caller should treat the
+    /// session as failed and stop. These packets are all P0Control by
+    /// construction, but we classify uniformly to keep one code path.
     fn send(&self, data: Vec<u8>) -> bool {
-        match self
-            .outbound_tx
-            .try_send(WtOutbound::UniStream(data.into()))
-        {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+        let bytes = Bytes::from(data);
+        let class = Self::classify_bytes(&bytes);
+        match self.outbound_tx.send(class, bytes) {
+            SendOutcome::Sent => true,
+            SendOutcome::Dropped(class, reason) => {
+                // Should not happen for control packets (all classify to
+                // P0Control which uses NeverDrop), but log if it does so we
+                // surface unexpected classification regressions.
                 warn!(
-                    "Outbound channel closed for session {}, connection dead",
+                    "Outbound control packet dropped on session {}: {:?} ({})",
+                    self.logic.id, class, reason
+                );
+                true
+            }
+            SendOutcome::Refused(_) => {
+                error!(
+                    "P0Control class queue full for session {} on control send — \
+                     terminating session per PLAN.md",
                     self.logic.id
                 );
                 false
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                error!(
-                    "Outbound channel full for session {}, dropping message",
-                    self.logic.id
-                );
-                true // Channel still open, just full
-            }
         }
     }
 
-    /// Send outbound message, automatically choosing datagram or stream.
+    /// Start heartbeat check (WebTransport-specific timing).
     ///
-    /// Control packets (heartbeats, RTT probes, diagnostics) that fit within
-    /// the datagram MTU are sent via unreliable datagrams — they are periodic
-    /// and expendable, so lower overhead matters more than guaranteed delivery.
-    ///
-    /// Media packets (VIDEO, AUDIO, SCREEN) use reliable unidirectional streams
-    /// to avoid visual/audio artifacts from packet loss.
-    ///
-    /// The `is_media` hint is pre-computed by the caller from an already-parsed
-    /// `PacketWrapper`, avoiding a redundant protobuf parse on every outbound
-    /// packet.
-    fn send_auto(&self, data: Bytes, is_media: bool) -> WtSendResult {
-        let outbound = if !is_media && data.len() <= DATAGRAM_MAX_SIZE {
-            WtOutbound::Datagram(data)
-        } else {
-            WtOutbound::UniStream(data)
-        };
-
-        match self.outbound_tx.try_send(outbound) {
-            Ok(()) => WtSendResult::Sent,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                warn!(
-                    "Outbound channel closed for session {}, connection dead",
-                    self.logic.id
-                );
-                WtSendResult::Dead
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                error!(
-                    "Outbound channel full for session {}, dropping message",
-                    self.logic.id
-                );
-                WtSendResult::Dropped
-            }
-        }
-    }
-
-    /// Check if the outbound channel is closed
-    fn is_connection_dead(&self) -> bool {
-        self.outbound_tx.is_closed()
-    }
-
-    /// Start heartbeat check (WebTransport-specific timing)
+    /// With the legacy `mpsc::Sender::is_closed` gone, dead-connection
+    /// detection now flows through the bridge writer task: when QUIC I/O
+    /// fails the writer ends, `wait_for_disconnect` returns, and
+    /// `StopSession` is delivered to this actor. The heartbeat watchdog
+    /// remains as the client-inactivity backstop.
     fn start_heartbeat(&self, ctx: &mut Context<Self>) {
         ctx.run_interval(WT_HEARTBEAT_INTERVAL, |act, ctx| {
-            // Check if connection is dead (channel closed)
-            if act.is_connection_dead() {
-                warn!(
-                    "WebTransport connection dead (channel closed), stopping session {}",
-                    act.logic.id
-                );
-                ctx.stop();
-                return;
-            }
-
-            // Check heartbeat timeout
             if actix::clock::Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
                 warn!(
                     "WebTransport client heartbeat failed, disconnecting session {}",
@@ -309,14 +270,11 @@ impl Actor for WtChatSession {
 
 /// Handle outbound messages from ChatServer.
 ///
-/// Uses `send_auto` to route control packets (heartbeats, RTT, diagnostics)
-/// via datagrams (periodic and expendable) and media packets (VIDEO, AUDIO,
-/// SCREEN) via reliable streams (avoids visual/audio artifacts).
-///
-/// The outbound `msg.msg` is a serialized `PacketWrapper`. We parse it once
-/// to extract both the sender's `session_id` (for congestion tracking) and
-/// the `packet_type` (for datagram vs. stream routing), avoiding a second
-/// parse inside `send_auto`.
+/// Routes packets into the per-session [`PrioritySender`] (p5-4 swap).
+/// `parse_and_inspect` produces the outer wrapper and (for MEDIA) the inner
+/// `MediaPacket` in a single pass so `classify_outbound` can read the routing
+/// header without a second parse. Drops feed the legacy per-sender
+/// `CongestionTracker`; p5-7 will introduce per-class drop wiring on top.
 ///
 /// Note: `msg.session` is the **receiver's** session ID (set by
 /// `chat_server::handle_msg`), NOT the sender's. The sender's session ID
@@ -327,27 +285,36 @@ impl Handler<Message> for WtChatSession {
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
 
-        // Parse the PacketWrapper once to extract the sender's session_id
-        // and packet_type. This avoids a redundant parse in send_auto and
-        // ensures congestion tracking targets the correct (sender) session.
-        let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
-        let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
-        let is_media = parsed
-            .as_ref()
-            .map(|pw| pw.packet_type == PacketType::MEDIA.into())
-            .unwrap_or(false);
-
-        match self.send_auto(bytes, is_media) {
-            WtSendResult::Sent => {}
-            WtSendResult::Dead => {
-                ctx.stop();
+        let parsed = parse_and_inspect(&msg.msg);
+        let sender_session_id = parsed.as_ref().map(|p| p.wrapper.session_id).unwrap_or(0);
+        let class = match parsed.as_ref() {
+            Some(p) => {
+                let media_type = p
+                    .media_packet
+                    .as_ref()
+                    .map(|mp| mp.media_type.enum_value_or_default());
+                classify_outbound(&p.wrapper, media_type, p.routing_header())
             }
-            WtSendResult::Dropped => {
-                // Outbound channel full -- record the drop for the actual sender
-                // so we can send CONGESTION feedback when the threshold is exceeded.
+            None => Class::P3VideoBase,
+        };
+
+        match self.outbound_tx.send(class, bytes) {
+            SendOutcome::Sent => {}
+            SendOutcome::Dropped(_class, _reason) => {
+                // Priority queue dropped a packet under its per-class
+                // policy. Preserve legacy CONGESTION feedback by reporting
+                // the drop against the original sender's session id.
+                // Per-class drop wiring (p5-7) will refine this.
                 if sender_session_id != 0 {
                     self.logic.on_outbound_drop(sender_session_id);
                 }
+            }
+            SendOutcome::Refused(_) => {
+                error!(
+                    "P0Control class queue full for session {} — terminating session per PLAN.md",
+                    self.logic.id
+                );
+                ctx.stop();
             }
         }
     }
@@ -382,28 +349,27 @@ impl Handler<WtInbound> for WtChatSession {
 
         match action {
             InboundAction::Echo(data) => {
-                let outbound = match msg.source {
-                    WtInboundSource::UniStream => {
-                        WtOutbound::UniStream(Bytes::from(data.as_ref().clone()))
+                // RTT echoes flow through the priority queue (P0Control by
+                // classification). The bridge writer recovers UniStream-vs-
+                // Datagram by inspecting the packet; the original inbound
+                // source no longer drives the choice (MEDIA RTT → UniStream
+                // matches the legacy `send_auto` path for `is_media=true`).
+                let bytes = Bytes::from(data.as_ref().clone());
+                let class = Self::classify_bytes(&bytes);
+                match self.outbound_tx.send(class, bytes) {
+                    SendOutcome::Sent => {}
+                    SendOutcome::Dropped(_, _) => {
+                        // RTT echoes that don't classify as P0Control could
+                        // hit a tail-drop policy; the echo is best-effort
+                        // and clients re-issue probes regularly.
                     }
-                    WtInboundSource::Datagram => {
-                        WtOutbound::Datagram(Bytes::from(data.as_ref().clone()))
-                    }
-                };
-                match self.outbound_tx.try_send(outbound) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!(
-                            "Outbound channel closed while echoing RTT for session {}",
+                    SendOutcome::Refused(_) => {
+                        error!(
+                            "P0Control class queue full on RTT echo for session {} — \
+                             terminating session",
                             self.logic.id
                         );
                         ctx.stop();
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        error!(
-                            "Outbound channel full, dropping RTT echo for session {}",
-                            self.logic.id
-                        );
                     }
                 }
             }

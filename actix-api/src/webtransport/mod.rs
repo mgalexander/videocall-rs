@@ -19,10 +19,11 @@
 mod bridge;
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
+use crate::actors::transports::wt_chat_session::WtChatSession;
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
+use crate::sfu::priority_queue::{PriorityReceiver, PrioritySender};
 use crate::token_validator;
 use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
@@ -31,7 +32,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace_span, warn};
 
 lazy_static::lazy_static! {
@@ -347,8 +347,12 @@ async fn handle_webtransport_session(
     session_manager: SessionManager,
     observer: bool,
 ) -> anyhow::Result<()> {
-    // Create channel for actor → WebTransport I/O
-    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
+    // Build the bandwidth-aware priority queue for actor → WebTransport I/O
+    // (p5-4 swap, replacing the legacy mpsc::channel::<WtOutbound>(256)).
+    // The sender goes to the actor; the receiver is owned by the bridge
+    // writer task and drains with strict-priority + 8-packet fairness.
+    let (outbound_tx, priority_channels) = PrioritySender::new();
+    let outbound_rx = PriorityReceiver::new(priority_channels);
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(

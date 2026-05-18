@@ -31,4 +31,4 @@ pub mod ws_chat_session;
 pub mod wt_chat_session;
 
 pub use ws_chat_session::WsChatSession;
-pub use wt_chat_session::{StopSession, WtChatSession, WtInbound, WtInboundSource, WtOutbound};
+pub use wt_chat_session::{StopSession, WtChatSession, WtInbound, WtInboundSource};
