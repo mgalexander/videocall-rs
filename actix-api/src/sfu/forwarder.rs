@@ -485,6 +485,57 @@ impl Forwarder {
         observe_decide_latency(start);
         ForwardDecision::Forward
     }
+
+    /// Reap all per-session state held by this forwarder for `sid`.
+    ///
+    /// Called from the chat-server `LeaveRoom` path so that
+    /// receivers and senders that join/leave a long-lived room do
+    /// not accumulate ~2KB per (receiver, sender) pair in `recent_t0`
+    /// plus hysteresis state in the `LayerSelector` indefinitely.
+    ///
+    /// Specifically:
+    ///
+    /// * Removes every `recent_t0` entry whose key is `(sid, *)` or
+    ///   `(*, sid)` — `sid` may have been either the receiver or the
+    ///   sender side of the pair.
+    /// * Calls [`LayerSelector::prune_stale`] for `sid`, which drops
+    ///   any hysteresis state plus the cached selection keyed by
+    ///   `sid` as a receiver.
+    ///
+    /// Idempotent: safe to call for a `sid` that has no state.
+    pub fn prune_session(&self, sid: SessionId) {
+        {
+            let mut guard = match self.recent_t0.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.retain(|&(rcv, snd), _| rcv != sid && snd != sid);
+        }
+        self.layer_selector.prune_stale(sid);
+    }
+
+    /// Test-only accessor: number of `(receiver, sender)` pairs
+    /// currently tracked in the recent-T0 map. Used to assert the
+    /// pruning side-effect in unit tests.
+    #[cfg(test)]
+    pub fn recent_t0_pair_count(&self) -> usize {
+        let guard = match self.recent_t0.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.len()
+    }
+
+    /// Test-only accessor: `true` iff the recent-T0 map currently
+    /// holds an entry for the exact `(receiver, sender)` key.
+    #[cfg(test)]
+    pub fn recent_t0_contains_pair(&self, receiver: SessionId, sender: SessionId) -> bool {
+        let guard = match self.recent_t0.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.contains_key(&(receiver, sender))
+    }
 }
 
 impl Forwarder {

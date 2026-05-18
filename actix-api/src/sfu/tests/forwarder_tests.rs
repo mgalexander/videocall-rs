@@ -43,7 +43,7 @@ use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::ActiveSpeakerSet;
-use crate::sfu::subscription::SubscriptionStore;
+use crate::sfu::subscription::{AllowSet, LayerPref, SubscriptionStore};
 
 fn make_packet(sender_sid: u64) -> PacketWrapper {
     let mut pw = PacketWrapper::new();
@@ -1012,4 +1012,96 @@ fn p4_9_legacy_no_routing_header_passthrough() {
         fwd.decide(receiver, &pw, Some(&mp)),
         ForwardDecision::Forward
     ));
+}
+
+/// vc-78q: `Forwarder::prune_session` removes every recent-T0 pair
+/// that touches the departing session (as receiver OR as sender) and
+/// leaves pairs that don't touch it alone. Idempotent.
+#[test]
+fn vc_78q_prune_session_clears_recent_t0_for_departed_sid() {
+    let a: SessionId = 100;
+    let b: SessionId = 200;
+    let c: SessionId = 300;
+
+    // Three members, no bandwidth estimate set, default AllowSet —
+    // every T0 will be forwarded and recorded under the (receiver,
+    // sender) key it was decided for.
+    let (fwd, _subs) = build_wired_forwarder("vc-78q-prune", &[a, b, c], ActiveSpeakerSet::empty());
+
+    // Forward a T0 in every directed pair so the recent_t0 map ends
+    // up with 6 entries: (rcv, snd) for every ordered (rcv != snd).
+    let mut picture_id: u64 = 1;
+    for &rcv in &[a, b, c] {
+        for &snd in &[a, b, c] {
+            if rcv == snd {
+                continue;
+            }
+            let (pw, mp) = build_video_ref(snd, 0, picture_id, 0, false);
+            assert!(
+                matches!(fwd.decide(rcv, &pw, Some(&mp)), ForwardDecision::Forward),
+                "T0 for (rcv={rcv}, snd={snd}) must forward"
+            );
+            picture_id += 1;
+        }
+    }
+    assert_eq!(fwd.recent_t0_pair_count(), 6);
+
+    // Prune `b`: every pair involving `b` (as receiver or sender)
+    // must vanish. The remaining (a, c) and (c, a) pairs must stay.
+    fwd.prune_session(b);
+    assert_eq!(fwd.recent_t0_pair_count(), 2);
+    assert!(fwd.recent_t0_contains_pair(a, c));
+    assert!(fwd.recent_t0_contains_pair(c, a));
+    assert!(!fwd.recent_t0_contains_pair(a, b));
+    assert!(!fwd.recent_t0_contains_pair(b, a));
+    assert!(!fwd.recent_t0_contains_pair(b, c));
+    assert!(!fwd.recent_t0_contains_pair(c, b));
+
+    // Idempotent: pruning a sid that has no remaining state is a no-op.
+    fwd.prune_session(b);
+    assert_eq!(fwd.recent_t0_pair_count(), 2);
+
+    // Pruning `a` and then `c` empties the map entirely.
+    fwd.prune_session(a);
+    fwd.prune_session(c);
+    assert_eq!(fwd.recent_t0_pair_count(), 0);
+}
+
+/// vc-78q: `Forwarder::prune_session` also reaps `LayerSelector`
+/// per-receiver state for the departing sid (hysteresis + cached
+/// selection). Cross-checked via `LayerSelector::last_selection_for`.
+#[test]
+fn vc_78q_prune_session_clears_layer_selector_state() {
+    let receiver: SessionId = 100;
+    let sender: SessionId = 200;
+
+    let room = Arc::new(RwLock::new(RoomState::new("vc-78q-ls".to_string())));
+    {
+        let mut w = room.write().unwrap();
+        w.insert_member(receiver, 0);
+        w.insert_member(sender, 0);
+    }
+    let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
+    let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
+    std::mem::forget(tx);
+    let layer_selector = Arc::new(LayerSelector::new());
+    let fwd = Forwarder::new(room, subs, rx, layer_selector.clone());
+
+    // Seed the cached selection for `receiver`. Bandwidth=2000 kbps
+    // is comfortably above the L1T3 ladder so at least the sender's
+    // T0 will be admitted.
+    let mut allow = AllowSet::new();
+    allow.video.insert(sender, LayerPref::default());
+    allow.audio.insert(sender);
+    layer_selector.recompute_for_receiver(receiver, &allow, &[sender], 2000, 0);
+    assert!(
+        layer_selector.last_selection_for(receiver).is_some(),
+        "precondition: receiver should have a cached selection after recompute"
+    );
+
+    fwd.prune_session(receiver);
+    assert!(
+        layer_selector.last_selection_for(receiver).is_none(),
+        "prune_session must drop the receiver's cached LayerSelector state"
+    );
 }

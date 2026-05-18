@@ -292,12 +292,20 @@ impl ChatServer {
             // in someone's selection). Skip when the room was torn down
             // above — the forwarder is already gone, so invalidating its
             // cache is dead work.
+            //
+            // vc-78q: additionally reap the departing session's per-pair
+            // state from the forwarder — recent_t0 entries keyed by
+            // (sid, *) / (*, sid) and the LayerSelector hysteresis +
+            // cached selection keyed by `sid` as a receiver. Without
+            // this, long-lived rooms accumulate ~2KB per pair indefinitely
+            // as receivers and senders churn.
             if !room_torn_down {
                 if let Some(fwd) = self.forwarders.get(room_id) {
                     // vc-wls: no lock to acquire — interior mutability
                     // is handled inside the selector (DashMap shard
                     // locks for `last_selections`, mutex for hysteresis).
                     fwd.layer_selector().invalidate_all();
+                    fwd.prune_session(*session_id);
                 }
             }
         }
