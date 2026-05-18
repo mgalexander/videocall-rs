@@ -108,9 +108,6 @@ const DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(5);
 struct ReceiverHysteresis {
     /// Selection actually emitted to the forwarder on the last call.
     last_selection: LayerSelection,
-    /// Wall time of the most recent `pick_with_hysteresis` call.
-    #[allow(dead_code)] // recorded for future telemetry / debug snapshots
-    last_decided_at: Instant,
     /// Start of the continuous interval during which the receiver has
     /// had `>= 20%` headroom on `last_selection`. `None` whenever the
     /// latest observation fell below threshold (streak broken).
@@ -297,6 +294,16 @@ impl LayerSelector {
     ///
     /// `now` is injected for deterministic tests; production code passes
     /// `Instant::now()`.
+    ///
+    /// # Concurrency
+    ///
+    /// This method takes `&mut self` because it mutates the per-receiver
+    /// hysteresis map. Within a single room the surrounding actor model
+    /// already serializes calls, so an owned `LayerSelector` is fine.
+    /// Sharing one instance across rooms (e.g. via `Arc<LayerSelector>`)
+    /// is **no longer safe** once hysteresis is in play — cross-room
+    /// sharing requires external synchronization such as
+    /// `Arc<Mutex<LayerSelector>>`.
     pub fn pick_with_hysteresis(
         &mut self,
         receiver_sid: SessionId,
@@ -315,7 +322,6 @@ impl LayerSelector {
                 receiver_sid,
                 ReceiverHysteresis {
                     last_selection: candidate.clone(),
-                    last_decided_at: now,
                     headroom_streak_start: if headroom_ok { Some(now) } else { None },
                     last_downgrade_at: None,
                 },
@@ -336,7 +342,6 @@ impl LayerSelector {
                     .receiver_state
                     .get_mut(&receiver_sid)
                     .expect("state existed above");
-                entry.last_decided_at = now;
                 entry.headroom_streak_start = new_streak;
                 entry.last_selection.clone()
             }
@@ -347,7 +352,6 @@ impl LayerSelector {
                     .get_mut(&receiver_sid)
                     .expect("state existed above");
                 entry.last_selection = candidate.clone();
-                entry.last_decided_at = now;
                 entry.headroom_streak_start = None;
                 entry.last_downgrade_at = Some(now);
                 candidate
@@ -381,7 +385,6 @@ impl LayerSelector {
                         .get_mut(&receiver_sid)
                         .expect("state existed above");
                     entry.last_selection = candidate.clone();
-                    entry.last_decided_at = now;
                     // Reset streak: the new (larger) selection's headroom
                     // must build up from scratch before a further upgrade.
                     entry.headroom_streak_start = None;
@@ -391,7 +394,6 @@ impl LayerSelector {
                         .receiver_state
                         .get_mut(&receiver_sid)
                         .expect("state existed above");
-                    entry.last_decided_at = now;
                     entry.headroom_streak_start = new_streak;
                     entry.last_selection.clone()
                 }
@@ -829,6 +831,7 @@ mod tests {
 
     /// Hysteresis #4: cooldown gate — after a downgrade, no upgrade can
     /// happen for > 5 s even if headroom is wide open the whole time.
+    /// Polls every 500 ms across the window for broad coverage.
     #[test]
     fn hysteresis_cooldown_blocks_upgrade() {
         let mut sel = LayerSelector::new();
@@ -840,22 +843,22 @@ mod tests {
         assert_eq!(high.forward.get(&(2, 0)), Some(&2));
 
         // Bandwidth collapses → immediate downgrade to T0.
-        let downgraded =
-            sel.pick_with_hysteresis(1, &allow, &[], 200, t0 + Duration::from_millis(100));
+        let downgrade_at = t0 + Duration::from_millis(100);
+        let downgraded = sel.pick_with_hysteresis(1, &allow, &[], 200, downgrade_at);
         assert_eq!(downgraded.forward.get(&(2, 0)), Some(&0));
 
-        // Bandwidth springs back high; poll every 500 ms for 5 s. The
-        // cooldown is "> 5 s since downgrade" (recorded at t0 + 100 ms),
-        // so even at t0 + 5.1 s we should still be blocked: cooldown
-        // expires only at t0 + 5.1 s + epsilon > 5 s from downgrade.
+        // Bandwidth springs back high; poll every 500 ms across the
+        // cooldown window. Every call within the window must stay
+        // blocked. The loop intentionally stops *before* the boundary
+        // tick — boundary behavior is checked explicitly below.
         let mut last = downgraded.clone();
         let mut tick = 1u64;
         loop {
-            let now = t0 + Duration::from_millis(100) + Duration::from_millis(500 * tick);
             let elapsed_since_downgrade = Duration::from_millis(500 * tick);
-            if elapsed_since_downgrade > DOWNGRADE_COOLDOWN {
+            if elapsed_since_downgrade >= DOWNGRADE_COOLDOWN {
                 break;
             }
+            let now = downgrade_at + elapsed_since_downgrade;
             last = sel.pick_with_hysteresis(1, &allow, &[], 2000, now);
             assert_eq!(
                 last, downgraded,
@@ -863,9 +866,169 @@ mod tests {
             );
             tick += 1;
         }
+        assert_eq!(last, downgraded, "loop must end with no upgrade emitted");
+    }
 
-        // Sanity: we never observed an upgrade in the loop.
-        assert_eq!(last, downgraded);
+    /// Hysteresis #4b: cooldown boundary — the cooldown gate is
+    /// `now - last_downgrade_at > DOWNGRADE_COOLDOWN`, so:
+    ///
+    /// * At exactly `downgrade_at + DOWNGRADE_COOLDOWN` the gate must
+    ///   still BLOCK (equality fails strict `>`).
+    /// * At `downgrade_at + DOWNGRADE_COOLDOWN + 1 ms` the gate must
+    ///   ALLOW (streak gate also satisfied — see setup below).
+    ///
+    /// This catches a regression that flipped `>` to `>=`.
+    #[test]
+    fn hysteresis_cooldown_boundary_strict() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        // Seed at T2 with generous budget.
+        let high = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0);
+        assert_eq!(high.forward.get(&(2, 0)), Some(&2));
+
+        // Downgrade at t0 + 100 ms.
+        let downgrade_at = t0 + Duration::from_millis(100);
+        let downgraded = sel.pick_with_hysteresis(1, &allow, &[], 200, downgrade_at);
+        assert_eq!(downgraded.forward.get(&(2, 0)), Some(&0));
+
+        // Take a call early in the cooldown window so the streak begins
+        // building well before the boundary. At this point the streak is
+        // None (just reset by the downgrade); this call sets it to
+        // Some(downgrade_at + 200 ms). By the boundary, the streak will
+        // be ~4.9 s long → streak gate satisfied.
+        let streak_seed = downgrade_at + Duration::from_millis(200);
+        let still_blocked = sel.pick_with_hysteresis(1, &allow, &[], 2000, streak_seed);
+        assert_eq!(still_blocked, downgraded, "still in cooldown shortly after");
+
+        // Exactly at the boundary: cooldown == 5 s → strict `>` is FALSE → still blocked.
+        let at_boundary = downgrade_at + DOWNGRADE_COOLDOWN;
+        let boundary_call = sel.pick_with_hysteresis(1, &allow, &[], 2000, at_boundary);
+        assert_eq!(
+            boundary_call, downgraded,
+            "at exactly downgrade + 5s the cooldown must still BLOCK"
+        );
+
+        // One millisecond past the boundary: gate flips to ALLOW.
+        let past_boundary = at_boundary + Duration::from_millis(1);
+        let after = sel.pick_with_hysteresis(1, &allow, &[], 2000, past_boundary);
+        assert_eq!(
+            after.forward.get(&(2, 0)),
+            Some(&2),
+            "1 ms past downgrade + 5s the upgrade must fire (T2)"
+        );
+    }
+
+    /// Hysteresis #4c: state-machine — upgrade fires *immediately* once
+    /// the cooldown expires, with no additional 3 s wait, provided the
+    /// streak was already building during the cooldown window.
+    ///
+    /// This validates that the streak tracker keeps running while
+    /// upgrades are gated off by cooldown — it does not require a
+    /// post-cooldown rebuild from scratch.
+    #[test]
+    fn hysteresis_upgrade_fires_immediately_after_cooldown() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        // Seed at T2.
+        let _ = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0);
+
+        // Downgrade at t0 + 100 ms.
+        let downgrade_at = t0 + Duration::from_millis(100);
+        let downgraded = sel.pick_with_hysteresis(1, &allow, &[], 200, downgrade_at);
+        assert_eq!(downgraded.forward.get(&(2, 0)), Some(&0));
+
+        // Establish high bandwidth early in cooldown so the streak
+        // starts building. (One call is enough; the loop below keeps
+        // observations consistent at high bandwidth.)
+        let _ = sel.pick_with_hysteresis(
+            1,
+            &allow,
+            &[],
+            2000,
+            downgrade_at + Duration::from_millis(200),
+        );
+
+        // Hold high bandwidth across the entire cooldown window (well
+        // past the 3 s streak threshold). All these calls must stay
+        // blocked by cooldown alone.
+        for ms in [500u64, 1000, 2000, 3000, 4000, 4900] {
+            let now = downgrade_at + Duration::from_millis(ms);
+            let out = sel.pick_with_hysteresis(1, &allow, &[], 2000, now);
+            assert_eq!(out, downgraded, "blocked by cooldown at +{ms} ms");
+        }
+
+        // First tick past the cooldown boundary → upgrade fires
+        // immediately. Streak has been Some for ~4.8 s ≫ 3 s.
+        let past_boundary = downgrade_at + DOWNGRADE_COOLDOWN + Duration::from_millis(1);
+        let upgraded = sel.pick_with_hysteresis(1, &allow, &[], 2000, past_boundary);
+        assert_eq!(
+            upgraded.forward.get(&(2, 0)),
+            Some(&2),
+            "upgrade must fire on the first call past the cooldown boundary, no streak rebuild"
+        );
+    }
+
+    /// Hysteresis #4d: two upgrades in a row require a fresh streak.
+    ///
+    /// After an upgrade emits, `headroom_streak_start` resets to `None`.
+    /// A subsequent strictly-larger candidate (e.g. budget rising to
+    /// admit one more temporal layer) must therefore wait 3 s for the
+    /// new streak to satisfy — it cannot ride the previous streak.
+    #[test]
+    fn hysteresis_back_to_back_upgrade_requires_streak_rebuild() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        // Seed with a budget that fits T0 only (200 × 0.85 = 170; T1
+        // cumulative = 384). Streak headroom check at this seed: budget
+        // 170 ≥ T0_kbps 128 × 1.20 = 153.6 → streak starts at t0.
+        let seed = sel.pick_with_hysteresis(1, &allow, &[], 200, t0);
+        assert_eq!(seed.forward.get(&(2, 0)), Some(&0));
+
+        // At t0 + 3 s open the budget enough for T1 (but NOT T2). 500 ×
+        // 0.85 = 425; T1 cumulative = 384 (fits), T2 cumulative = 896
+        // (doesn't). Candidate = T1, streak satisfies, cooldown clear →
+        // first upgrade fires.
+        let first_upgrade_at = t0 + Duration::from_secs(3);
+        let first_upgrade = sel.pick_with_hysteresis(1, &allow, &[], 500, first_upgrade_at);
+        assert_eq!(
+            first_upgrade.forward.get(&(2, 0)),
+            Some(&1),
+            "first upgrade should land at T1"
+        );
+
+        // Immediately raise bandwidth to push the candidate to T2. The
+        // streak was just reset by the upgrade — so the very next call,
+        // even with sustained high bandwidth, must NOT upgrade.
+        let just_after = first_upgrade_at + Duration::from_millis(100);
+        let blocked = sel.pick_with_hysteresis(1, &allow, &[], 2000, just_after);
+        assert_eq!(
+            blocked, first_upgrade,
+            "second upgrade must be blocked immediately after the first — streak was reset"
+        );
+
+        // Poll across the new streak window. Just under 3 s after the
+        // streak restarted (streak start = just_after), still blocked.
+        let almost = just_after + Duration::from_millis(2900);
+        let still_blocked = sel.pick_with_hysteresis(1, &allow, &[], 2000, almost);
+        assert_eq!(
+            still_blocked, first_upgrade,
+            "second upgrade must wait for the full 3 s streak"
+        );
+
+        // At streak_start + 3 s the second upgrade fires.
+        let streak_satisfied_at = just_after + UPGRADE_STREAK_REQUIRED;
+        let second_upgrade = sel.pick_with_hysteresis(1, &allow, &[], 2000, streak_satisfied_at);
+        assert_eq!(
+            second_upgrade.forward.get(&(2, 0)),
+            Some(&2),
+            "second upgrade should land at T2 once the rebuilt streak satisfies"
+        );
     }
 
     /// Hysteresis #5: immediate downgrade. A bandwidth drop hits on the
