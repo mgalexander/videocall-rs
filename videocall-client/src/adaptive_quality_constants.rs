@@ -311,6 +311,12 @@ pub const KEYFRAME_REQUEST_TIMEOUT_MS: u64 = 1000;
 /// Prevents flooding the sender with PLI requests.
 pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: u64 = 500;
 
+/// Minimum interval between keyframe requests triggered by the SVC T0-stall
+/// detector (milliseconds). Longer than KEYFRAME_REQUEST_MIN_INTERVAL_MS to
+/// avoid hammering low-uplink senders during transient T0 loss: each KFR
+/// forces a full I-frame re-encode and bursts ~50–150KB of uplink bandwidth.
+pub const KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS: u64 = 2000;
+
 // ---------------------------------------------------------------------------
 // Reconnection
 // ---------------------------------------------------------------------------

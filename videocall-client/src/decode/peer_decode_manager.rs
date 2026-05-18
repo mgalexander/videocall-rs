@@ -20,7 +20,8 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
-    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
+    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS,
+    KEYFRAME_REQUEST_TIMEOUT_MS,
 };
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
@@ -574,10 +575,21 @@ impl Peer {
     ///    correct path.
     ///
     /// Once `video_gap_detected_at_ms` / `screen_gap_detected_at_ms` is set,
-    /// the standard `KEYFRAME_REQUEST_TIMEOUT_MS` + `KEYFRAME_REQUEST_MIN_INTERVAL_MS`
-    /// rate-limit applies. A keyframe (`frame_type == "key"`) clears the gap
-    /// state and refreshes `last_t0_received_ms` (keyframes are T0 by
-    /// definition).
+    /// the `KEYFRAME_REQUEST_TIMEOUT_MS` detection trigger plus a per-path
+    /// rate-limit applies:
+    ///
+    /// - **SVC video path** (RoutingHeader present): uses
+    ///   `KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS` (longer) because the
+    ///   T0-stall detector is heuristic — armed from T1/T2 liveness while T0
+    ///   is silent — and each KFR forces a full I-frame re-encode that bursts
+    ///   ~50–150KB on a low-uplink sender. Throttling protects senders
+    ///   during transient T0 loss.
+    /// - **Legacy/SCREEN path** (sequence-gap): uses
+    ///   `KEYFRAME_REQUEST_MIN_INTERVAL_MS` (shorter) because the detector
+    ///   fires on a real observed sequence gap and should remain responsive.
+    ///
+    /// A keyframe (`frame_type == "key"`) clears the gap state and refreshes
+    /// `last_t0_received_ms` (keyframes are T0 by definition).
     fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> Option<MediaType> {
         let frame_type_str = packet.frame_type.as_str();
         let now = now_ms();
@@ -623,14 +635,17 @@ impl Peer {
                     // decoder's own keyframe-waiting state machine.
                 }
 
-                // Apply the standard rate-limited dispatch on
-                // `video_gap_detected_at_ms`.
+                // Apply the rate-limited dispatch on
+                // `video_gap_detected_at_ms`. The SVC stall path uses a
+                // longer minimum interval (see
+                // KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS) to avoid
+                // hammering low-uplink senders during transient T0 loss.
                 if let Some(gap_time) = self.video_gap_detected_at_ms {
                     let elapsed_since_gap = now.saturating_sub(gap_time);
                     let elapsed_since_last_req =
                         now.saturating_sub(self.last_video_keyframe_request_ms);
                     if elapsed_since_gap >= KEYFRAME_REQUEST_TIMEOUT_MS
-                        && elapsed_since_last_req >= KEYFRAME_REQUEST_MIN_INTERVAL_MS
+                        && elapsed_since_last_req >= KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS
                     {
                         self.last_video_keyframe_request_ms = now;
                         return Some(MediaType::VIDEO);
@@ -2711,8 +2726,11 @@ mod tests {
 
     /// After a T0-stall KFR fires, an immediate follow-up T1 arrival must
     /// NOT fire another KFR — `last_video_keyframe_request_ms` was just set
-    /// and `KEYFRAME_REQUEST_MIN_INTERVAL_MS` has not elapsed. Pins the
-    /// rate-limit invariant on the SVC path.
+    /// and `KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS` has not elapsed.
+    /// Pins the rate-limit invariant on the SVC path: the SVC stall path
+    /// uses a longer minimum interval (2000ms) than the legacy/screen
+    /// sequence-gap path (500ms) to avoid hammering low-uplink senders
+    /// during transient T0 loss.
     #[wasm_bindgen_test]
     fn svc_t0_stall_kfr_respects_rate_limit() {
         let (mut peer, _muted) = make_test_peer(224);
@@ -2736,16 +2754,51 @@ mod tests {
             peer.last_video_keyframe_request_ms > 0,
             "Precondition: rate-limit timestamp recorded"
         );
+        let first_kfr_ts = peer.last_video_keyframe_request_ms;
 
         // Immediately re-arm the gap timestamp (still past timeout) but
         // do NOT advance `last_video_keyframe_request_ms`. The rate-limit
-        // alone must now suppress a second fire.
+        // alone must now suppress a second fire. The SVC stall path uses
+        // KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS (2000ms), which has
+        // not elapsed since `first_kfr_ts` (this whole test runs in ms).
         peer.video_gap_detected_at_ms =
             Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
         let result2 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(13, 1, 13, false));
         assert!(
             result2.is_none(),
-            "Second KFR within KEYFRAME_REQUEST_MIN_INTERVAL_MS must be rate-limited"
+            "Second KFR within KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS must be rate-limited"
+        );
+        assert_eq!(
+            peer.last_video_keyframe_request_ms, first_kfr_ts,
+            "Rate-limited call must not update last_video_keyframe_request_ms"
+        );
+
+        // Sanity: backdate `last_video_keyframe_request_ms` to be older
+        // than the SVC stall min-interval and confirm the next call is
+        // permitted to fire. This pins that we're throttling against the
+        // *new* longer interval, not the legacy 500ms one (a second
+        // backdated only by KEYFRAME_REQUEST_MIN_INTERVAL_MS must still be
+        // suppressed).
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms =
+            now_ms().saturating_sub(KEYFRAME_REQUEST_MIN_INTERVAL_MS + 100);
+        let result3 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(14, 2, 14, false));
+        assert!(
+            result3.is_none(),
+            "SVC stall path must throttle past KEYFRAME_REQUEST_MIN_INTERVAL_MS — \
+             only KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS unblocks it"
+        );
+
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms =
+            now_ms().saturating_sub(KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS + 100);
+        let result4 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(15, 1, 15, false));
+        assert_eq!(
+            result4,
+            Some(MediaType::VIDEO),
+            "SVC stall KFR must fire once KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS has elapsed"
         );
     }
 
