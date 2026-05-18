@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: webtransport-headless
+  labels:
+    {{- include "rustlemania.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "rustlemania.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: webtransport
+      port: 443
+      protocol: UDP
+    - name: health
+      port: 444
+      protocol: TCP

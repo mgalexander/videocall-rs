@@ -1,10 +1,11 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "rustlemania.fullname" . }}
   labels:
     {{- include "rustlemania.labels" . | nindent 4 }}
 spec:
+  serviceName: webtransport-headless
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
@@ -36,6 +37,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: STATEFULSET_REPLICAS
+              value: "{{ .Values.replicaCount }}"
           ports:
             - name: wt-api
               containerPort: {{ .Values.service.port }}
