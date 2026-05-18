@@ -31,10 +31,12 @@
 //! spatial layer (id `0`) and the selection is indexed by
 //! `(sender_sid, spatial_layer_id) → max_temporal_layer_id`.
 //!
-//! Hysteresis (upgrade watchdog + downgrade cooldown) lands in p4-6.
+//! Hysteresis (upgrade watchdog + downgrade cooldown) lands in p4-6 — see
+//! [`LayerSelector::pick_with_hysteresis`].
 //! Forwarder consumption of the [`LayerSelection`] lands in p4-7.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::actors::session_logic::SessionId;
 
@@ -86,17 +88,70 @@ impl LayerSelection {
     }
 }
 
-/// Configurable greedy two-pass layer selector.
+/// Minimum bandwidth headroom (as fraction over the active selection's
+/// bitrate) we require to even consider an upgrade. 1.20 = 20% headroom.
+const UPGRADE_HEADROOM_RATIO: f32 = 1.20;
+
+/// Continuous time the upgrade-headroom predicate must hold before we
+/// trigger an upgrade. PLAN.md Phase 4: 3 seconds.
+const UPGRADE_STREAK_REQUIRED: Duration = Duration::from_secs(3);
+
+/// Cooldown after a downgrade during which upgrades are blocked. PLAN.md
+/// Phase 4: > 5 seconds since last downgrade.
+const DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Per-receiver hysteresis bookkeeping for [`LayerSelector`].
 ///
-/// Stateless: a single `LayerSelector` instance can be shared across all
-/// receivers in a room. Configuration knobs are intended to be loaded
-/// once at startup from [`super::config::SfuConfig`].
+/// Owned by the selector; one entry per receiver `SessionId`. Pruned via
+/// [`LayerSelector::prune_stale`] when a receiver leaves the room.
+#[derive(Debug, Clone)]
+struct ReceiverHysteresis {
+    /// Selection actually emitted to the forwarder on the last call.
+    last_selection: LayerSelection,
+    /// Wall time of the most recent `pick_with_hysteresis` call.
+    #[allow(dead_code)] // recorded for future telemetry / debug snapshots
+    last_decided_at: Instant,
+    /// Start of the continuous interval during which the receiver has
+    /// had `>= 20%` headroom on `last_selection`. `None` whenever the
+    /// latest observation fell below threshold (streak broken).
+    headroom_streak_start: Option<Instant>,
+    /// When we last emitted a strictly smaller selection for this
+    /// receiver. Used to enforce the post-downgrade cooldown.
+    last_downgrade_at: Option<Instant>,
+}
+
+/// Direction of change between two [`LayerSelection`]s.
+///
+/// Conservative on mixed motion: if any sender lost ground (dropped out
+/// entirely or saw its temporal layer reduced) we classify the whole
+/// transition as a downgrade, even if another sender simultaneously
+/// gained ground. This biases toward stability — we never starve a
+/// receiver of budget for a newly-promoted sender while another is still
+/// throttled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionDelta {
+    Identical,
+    Upgrade,
+    Downgrade,
+}
+
+/// Configurable greedy two-pass layer selector with per-receiver
+/// upgrade/downgrade hysteresis.
+///
+/// `pick_layers` itself remains stateless. `pick_with_hysteresis` layers
+/// on per-receiver memory: an upgrade watchdog (≥20% headroom held for
+/// ≥3 s, plus a 5 s cooldown after any downgrade) and an immediate
+/// downgrade path. State is keyed by receiver `SessionId` and must be
+/// reaped via [`Self::prune_stale`] on `LeaveRoom`.
 #[derive(Debug, Clone)]
 pub struct LayerSelector {
     /// Hard cap on per-receiver forwarded video bitrate (kbps).
     pub max_video_kbps: u32,
     /// Fraction of the measured downlink we actually fill (0.0..=1.0).
     pub bandwidth_headroom_pct: f32,
+    /// Per-receiver hysteresis state. Populated lazily on first
+    /// `pick_with_hysteresis` call; pruned via `prune_stale`.
+    receiver_state: HashMap<SessionId, ReceiverHysteresis>,
 }
 
 impl LayerSelector {
@@ -104,6 +159,7 @@ impl LayerSelector {
         Self {
             max_video_kbps: DEFAULT_MAX_VIDEO_KBPS,
             bandwidth_headroom_pct: DEFAULT_BANDWIDTH_HEADROOM_PCT,
+            receiver_state: HashMap::new(),
         }
     }
 
@@ -213,6 +269,146 @@ impl LayerSelector {
         selection
     }
 
+    /// Greedy two-pass selection wrapped in per-receiver hysteresis.
+    ///
+    /// Computes a fresh candidate via [`Self::pick_layers`], compares it
+    /// to the receiver's last-emitted selection, and applies the
+    /// upgrade/downgrade rules from PLAN.md Phase 4:
+    ///
+    /// * **Downgrade** (selection shrinks — any sender removed or any
+    ///   temporal layer reduced, including mixed motion): emit
+    ///   immediately, record `last_downgrade_at`, reset the headroom
+    ///   streak.
+    /// * **Upgrade** (selection grows — new sender admitted or any
+    ///   temporal layer raised, with no regression): emit only if all
+    ///   three gates pass — (1) effective budget for `bandwidth_kbps`
+    ///   is `>= last_selection.total_kbps() * 1.20` (≥ 20% headroom
+    ///   over the *current* selection), (2) that headroom condition
+    ///   has held continuously for `>= 3 s`, and (3) it has been
+    ///   `> 5 s` since the last downgrade for this receiver (or there
+    ///   has never been one). Failing any gate, the receiver's
+    ///   `last_selection` is returned unchanged.
+    /// * **Identical**: return `last_selection`; update the streak
+    ///   tracker against the current bandwidth observation.
+    ///
+    /// On the very first call for a receiver, the candidate is emitted
+    /// directly and the streak is seeded if the receiver already has
+    /// enough headroom over the fresh selection.
+    ///
+    /// `now` is injected for deterministic tests; production code passes
+    /// `Instant::now()`.
+    pub fn pick_with_hysteresis(
+        &mut self,
+        receiver_sid: SessionId,
+        allow_set: &AllowSet,
+        speaker_set: &[SessionId],
+        bandwidth_kbps: u32,
+        now: Instant,
+    ) -> LayerSelection {
+        let candidate = self.pick_layers(receiver_sid, allow_set, speaker_set, bandwidth_kbps);
+        let budget = self.effective_budget_kbps(bandwidth_kbps);
+
+        // First-ever decision for this receiver: emit and seed state.
+        let Some(state) = self.receiver_state.get(&receiver_sid).cloned() else {
+            let headroom_ok = has_upgrade_headroom(budget, &candidate);
+            self.receiver_state.insert(
+                receiver_sid,
+                ReceiverHysteresis {
+                    last_selection: candidate.clone(),
+                    last_decided_at: now,
+                    headroom_streak_start: if headroom_ok { Some(now) } else { None },
+                    last_downgrade_at: None,
+                },
+            );
+            return candidate;
+        };
+
+        match compare_selections(&state.last_selection, &candidate) {
+            SelectionDelta::Identical => {
+                // Selection unchanged; update streak against current bandwidth.
+                let headroom_ok = has_upgrade_headroom(budget, &state.last_selection);
+                let new_streak = match (headroom_ok, state.headroom_streak_start) {
+                    (true, Some(start)) => Some(start),
+                    (true, None) => Some(now),
+                    (false, _) => None,
+                };
+                let entry = self
+                    .receiver_state
+                    .get_mut(&receiver_sid)
+                    .expect("state existed above");
+                entry.last_decided_at = now;
+                entry.headroom_streak_start = new_streak;
+                entry.last_selection.clone()
+            }
+            SelectionDelta::Downgrade => {
+                // Immediate. No gates. Reset streak; record downgrade time.
+                let entry = self
+                    .receiver_state
+                    .get_mut(&receiver_sid)
+                    .expect("state existed above");
+                entry.last_selection = candidate.clone();
+                entry.last_decided_at = now;
+                entry.headroom_streak_start = None;
+                entry.last_downgrade_at = Some(now);
+                candidate
+            }
+            SelectionDelta::Upgrade => {
+                // Three gates. All must pass.
+                let headroom_ok = has_upgrade_headroom(budget, &state.last_selection);
+                let streak_satisfied = match state.headroom_streak_start {
+                    Some(start) if headroom_ok => {
+                        now.saturating_duration_since(start) >= UPGRADE_STREAK_REQUIRED
+                    }
+                    _ => false,
+                };
+                let cooldown_satisfied = match state.last_downgrade_at {
+                    None => true,
+                    Some(t) => now.saturating_duration_since(t) > DOWNGRADE_COOLDOWN,
+                };
+
+                // Always refresh the streak tracker against the prior
+                // selection; if we don't upgrade now, we may upgrade on
+                // a later tick.
+                let new_streak = match (headroom_ok, state.headroom_streak_start) {
+                    (true, Some(start)) => Some(start),
+                    (true, None) => Some(now),
+                    (false, _) => None,
+                };
+
+                if headroom_ok && streak_satisfied && cooldown_satisfied {
+                    let entry = self
+                        .receiver_state
+                        .get_mut(&receiver_sid)
+                        .expect("state existed above");
+                    entry.last_selection = candidate.clone();
+                    entry.last_decided_at = now;
+                    // Reset streak: the new (larger) selection's headroom
+                    // must build up from scratch before a further upgrade.
+                    entry.headroom_streak_start = None;
+                    candidate
+                } else {
+                    let entry = self
+                        .receiver_state
+                        .get_mut(&receiver_sid)
+                        .expect("state existed above");
+                    entry.last_decided_at = now;
+                    entry.headroom_streak_start = new_streak;
+                    entry.last_selection.clone()
+                }
+            }
+        }
+    }
+
+    /// Drop any hysteresis state for `receiver_sid`.
+    ///
+    /// Intended to be called from the room's `LeaveRoom` handling so a
+    /// rejoining receiver doesn't inherit the previous session's
+    /// upgrade-streak / cooldown timers. Safe to call for receivers that
+    /// have no state (no-op).
+    pub fn prune_stale(&mut self, receiver_sid: SessionId) {
+        self.receiver_state.remove(&receiver_sid);
+    }
+
     /// Effective bitrate budget for this pick:
     /// `min(bandwidth_kbps * headroom_pct, max_video_kbps)`.
     fn effective_budget_kbps(&self, bandwidth_kbps: u32) -> u32 {
@@ -271,6 +467,65 @@ fn ordered_senders(
     ordered.extend(tail);
 
     ordered
+}
+
+/// Classify the transition from `prev` to `next`.
+///
+/// Treats *any* loss (a sender that was forwarded but no longer is, or a
+/// sender whose temporal layer dropped) as a [`SelectionDelta::Downgrade`]
+/// — even when offset by another sender gaining ground. This conservative
+/// rule keeps the hysteresis path free of pathological "mixed motion"
+/// states where a gain and a loss cancel out into a no-op classification.
+///
+/// `Upgrade` requires at least one strict improvement (new sender or
+/// raised temporal layer) and zero regressions. `Identical` means every
+/// `(sender, spatial)` key matches with identical max temporal id.
+fn compare_selections(prev: &LayerSelection, next: &LayerSelection) -> SelectionDelta {
+    let mut any_loss = false;
+    let mut any_gain = false;
+
+    // Walk previous entries: are they gone, or did they shrink?
+    for (key, &prev_t) in &prev.forward {
+        match next.forward.get(key) {
+            None => any_loss = true,
+            Some(&next_t) if next_t < prev_t => any_loss = true,
+            Some(&next_t) if next_t > prev_t => any_gain = true,
+            _ => {}
+        }
+    }
+
+    // Walk current entries: any brand-new senders?
+    for key in next.forward.keys() {
+        if !prev.forward.contains_key(key) {
+            any_gain = true;
+        }
+    }
+
+    if any_loss {
+        SelectionDelta::Downgrade
+    } else if any_gain {
+        SelectionDelta::Upgrade
+    } else {
+        SelectionDelta::Identical
+    }
+}
+
+/// Does the receiver have ≥ 20% headroom over `selection`?
+///
+/// Uses the same `effective_budget_kbps` lens as `pick_layers` (the caller
+/// is expected to pass that pre-computed value as `budget`) so the
+/// configured `bandwidth_headroom_pct` stays consistent with selection.
+/// The 20% margin is applied to the *selection's* bitrate, not the raw
+/// downlink. An empty selection always reports "enough headroom" (there
+/// is nothing to protect against).
+fn has_upgrade_headroom(budget_kbps: u32, selection: &LayerSelection) -> bool {
+    let selection_kbps = selection.total_kbps();
+    if selection_kbps == 0 {
+        return true;
+    }
+    // budget >= selection * 1.20, evaluated in f32 to avoid integer
+    // truncation surprises around the threshold.
+    (budget_kbps as f32) >= (selection_kbps as f32) * UPGRADE_HEADROOM_RATIO
 }
 
 #[cfg(test)]
@@ -485,5 +740,259 @@ mod tests {
         assert_eq!(out.forward.get(&(30, 0)), Some(&0), "speaker admitted");
         assert!(!out.forward.contains_key(&(10, 0)));
         assert!(!out.forward.contains_key(&(20, 0)));
+    }
+
+    // ----------------------------------------------------------------
+    // Hysteresis tests (p4-6).
+    // ----------------------------------------------------------------
+
+    /// Hysteresis #1: steady-state — same inputs over 10 calls 1 s apart
+    /// return the same selection every time and never re-emit.
+    #[test]
+    fn hysteresis_steady_state_no_change() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        let baseline = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0);
+        for i in 1..=10 {
+            let now = t0 + Duration::from_secs(i);
+            let out = sel.pick_with_hysteresis(1, &allow, &[], 2000, now);
+            assert_eq!(
+                out, baseline,
+                "steady-state must be stable across call #{i}"
+            );
+        }
+    }
+
+    /// Hysteresis #2: a brief headroom spike (< 3 s) must NOT trigger an
+    /// upgrade. Receiver starts in a T0-only state at 200 kbps, then sees
+    /// 2 s at 2000 kbps — not long enough to satisfy the streak gate.
+    #[test]
+    fn hysteresis_brief_headroom_spike_no_upgrade() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        // Seed: 200 kbps → T0 only (cumulative 128 kbps).
+        let initial = sel.pick_with_hysteresis(1, &allow, &[], 200, t0);
+        assert_eq!(initial.forward.get(&(2, 0)), Some(&0));
+
+        // 2 s of high bandwidth; must still report the seeded selection.
+        let mid = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0 + Duration::from_secs(2));
+        assert_eq!(
+            mid, initial,
+            "<3s streak must not upgrade even with huge headroom"
+        );
+
+        // Bandwidth drops back; streak should be re-broken automatically.
+        let after = sel.pick_with_hysteresis(1, &allow, &[], 200, t0 + Duration::from_millis(2500));
+        assert_eq!(after, initial);
+    }
+
+    /// Hysteresis #3: sustained headroom for ≥ 3 s with no recent
+    /// downgrade triggers the upgrade. Verifies both that pre-mark calls
+    /// don't upgrade and that the at-mark call does.
+    #[test]
+    fn hysteresis_sustained_headroom_triggers_upgrade() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        // Seed at T0-only with a budget tight enough that the candidate
+        // *is* T0 but loose enough to satisfy 20% headroom over T0
+        // (so the streak can start at t0). 200 × 0.85 = 170 ≥ 128 × 1.20
+        // = 153.6, so the streak begins on this very first call.
+        let initial = sel.pick_with_hysteresis(1, &allow, &[], 200, t0);
+        assert_eq!(initial.forward.get(&(2, 0)), Some(&0));
+
+        // Open up bandwidth — candidate is now T2, an upgrade, but the
+        // streak is < 3 s old.
+        let at_t1s = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0 + Duration::from_secs(1));
+        assert_eq!(at_t1s, initial, "1s in — streak too short");
+
+        let at_t2s = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0 + Duration::from_secs(2));
+        assert_eq!(at_t2s, initial, "2s in — streak too short");
+
+        // At t0 + 3 s the streak is exactly 3 s ≥ required threshold.
+        // The cooldown gate passes (never downgraded), headroom holds,
+        // so the upgrade fires on this call.
+        let at_t3s = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0 + Duration::from_secs(3));
+        assert_ne!(at_t3s, initial, "streak >= 3s should have upgraded");
+        // 2000 × 0.85 = 1700 budget → full L1T3 ladder for one sender (T2).
+        assert_eq!(
+            at_t3s.forward.get(&(2, 0)),
+            Some(&2),
+            "should upgrade to T2"
+        );
+    }
+
+    /// Hysteresis #4: cooldown gate — after a downgrade, no upgrade can
+    /// happen for > 5 s even if headroom is wide open the whole time.
+    #[test]
+    fn hysteresis_cooldown_blocks_upgrade() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        // Seed at T2 (full ladder) with generous budget.
+        let high = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0);
+        assert_eq!(high.forward.get(&(2, 0)), Some(&2));
+
+        // Bandwidth collapses → immediate downgrade to T0.
+        let downgraded =
+            sel.pick_with_hysteresis(1, &allow, &[], 200, t0 + Duration::from_millis(100));
+        assert_eq!(downgraded.forward.get(&(2, 0)), Some(&0));
+
+        // Bandwidth springs back high; poll every 500 ms for 5 s. The
+        // cooldown is "> 5 s since downgrade" (recorded at t0 + 100 ms),
+        // so even at t0 + 5.1 s we should still be blocked: cooldown
+        // expires only at t0 + 5.1 s + epsilon > 5 s from downgrade.
+        let mut last = downgraded.clone();
+        let mut tick = 1u64;
+        loop {
+            let now = t0 + Duration::from_millis(100) + Duration::from_millis(500 * tick);
+            let elapsed_since_downgrade = Duration::from_millis(500 * tick);
+            if elapsed_since_downgrade > DOWNGRADE_COOLDOWN {
+                break;
+            }
+            last = sel.pick_with_hysteresis(1, &allow, &[], 2000, now);
+            assert_eq!(
+                last, downgraded,
+                "upgrade must be blocked during cooldown at {elapsed_since_downgrade:?}"
+            );
+            tick += 1;
+        }
+
+        // Sanity: we never observed an upgrade in the loop.
+        assert_eq!(last, downgraded);
+    }
+
+    /// Hysteresis #5: immediate downgrade. A bandwidth drop hits on the
+    /// next call with no streak/cooldown delay, and `last_downgrade_at`
+    /// is recorded (verified by blocking a subsequent upgrade attempt).
+    #[test]
+    fn hysteresis_immediate_downgrade() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        let high = sel.pick_with_hysteresis(1, &allow, &[], 2000, t0);
+        assert_eq!(high.forward.get(&(2, 0)), Some(&2));
+
+        // Sharp drop — next call must return smaller selection.
+        let now = t0 + Duration::from_millis(50);
+        let dropped = sel.pick_with_hysteresis(1, &allow, &[], 200, now);
+        assert_eq!(dropped.forward.get(&(2, 0)), Some(&0));
+
+        // Verify last_downgrade_at was set: an immediate upgrade attempt
+        // with huge bandwidth at t+1s must still be blocked by cooldown.
+        let blocked = sel.pick_with_hysteresis(1, &allow, &[], 2000, now + Duration::from_secs(1));
+        assert_eq!(blocked, dropped, "cooldown should block immediate upgrade");
+    }
+
+    /// Hysteresis #6: `prune_stale` wipes receiver state. A subsequent
+    /// call after pruning must behave like a first-time call (emit the
+    /// fresh candidate immediately, no streak inherited).
+    #[test]
+    fn hysteresis_prune_clears_state() {
+        let mut sel = LayerSelector::new();
+        let allow = allow_set_with(&[2]);
+        let t0 = Instant::now();
+
+        // Establish state with a low-budget seed.
+        let seed = sel.pick_with_hysteresis(1, &allow, &[], 200, t0);
+        assert_eq!(seed.forward.get(&(2, 0)), Some(&0));
+
+        // Without pruning, a high-bandwidth call should NOT upgrade
+        // immediately (streak hasn't been satisfied).
+        let pre_prune =
+            sel.pick_with_hysteresis(1, &allow, &[], 2000, t0 + Duration::from_millis(100));
+        assert_eq!(
+            pre_prune, seed,
+            "without prune, upgrade still gated by streak"
+        );
+
+        // Prune and call again with high bandwidth — should emit the
+        // full ladder immediately (first-time path).
+        sel.prune_stale(1);
+        let post_prune =
+            sel.pick_with_hysteresis(1, &allow, &[], 2000, t0 + Duration::from_millis(200));
+        assert_eq!(
+            post_prune.forward.get(&(2, 0)),
+            Some(&2),
+            "post-prune call should emit fresh candidate (T2) directly"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // compare_selections unit tests — the conservative mixed-motion rule.
+    // ----------------------------------------------------------------
+
+    fn sel_from(pairs: &[(SessionId, u32)]) -> LayerSelection {
+        let mut s = LayerSelection::new();
+        for &(sid, t) in pairs {
+            s.forward.insert((sid, 0), t);
+        }
+        s
+    }
+
+    #[test]
+    fn compare_identical() {
+        let a = sel_from(&[(2, 1), (3, 0)]);
+        let b = sel_from(&[(2, 1), (3, 0)]);
+        assert_eq!(compare_selections(&a, &b), SelectionDelta::Identical);
+    }
+
+    #[test]
+    fn compare_pure_upgrade_new_sender() {
+        let a = sel_from(&[(2, 0)]);
+        let b = sel_from(&[(2, 0), (3, 0)]);
+        assert_eq!(compare_selections(&a, &b), SelectionDelta::Upgrade);
+    }
+
+    #[test]
+    fn compare_pure_upgrade_higher_temporal() {
+        let a = sel_from(&[(2, 0), (3, 0)]);
+        let b = sel_from(&[(2, 1), (3, 0)]);
+        assert_eq!(compare_selections(&a, &b), SelectionDelta::Upgrade);
+    }
+
+    #[test]
+    fn compare_pure_downgrade_dropped_sender() {
+        let a = sel_from(&[(2, 1), (3, 0)]);
+        let b = sel_from(&[(2, 1)]);
+        assert_eq!(compare_selections(&a, &b), SelectionDelta::Downgrade);
+    }
+
+    #[test]
+    fn compare_pure_downgrade_lower_temporal() {
+        let a = sel_from(&[(2, 2)]);
+        let b = sel_from(&[(2, 1)]);
+        assert_eq!(compare_selections(&a, &b), SelectionDelta::Downgrade);
+    }
+
+    /// Mixed motion (one gain + one loss) is conservatively a downgrade.
+    #[test]
+    fn compare_mixed_motion_is_downgrade() {
+        let a = sel_from(&[(2, 1), (3, 0)]);
+        // Sender 2 keeps T1, sender 3 dropped, sender 4 appears at T0.
+        let b = sel_from(&[(2, 1), (4, 0)]);
+        assert_eq!(compare_selections(&a, &b), SelectionDelta::Downgrade);
+    }
+
+    #[test]
+    fn has_upgrade_headroom_empty_selection_is_true() {
+        assert!(has_upgrade_headroom(0, &LayerSelection::new()));
+        assert!(has_upgrade_headroom(100, &LayerSelection::new()));
+    }
+
+    /// 20% headroom math: a 128 kbps selection needs a budget of ≥ 153.6
+    /// (-> at integer budget 154 it passes; at 153 it doesn't).
+    #[test]
+    fn has_upgrade_headroom_threshold() {
+        let s = sel_from(&[(2, 0)]); // 128 kbps
+        assert!(!has_upgrade_headroom(153, &s), "153 < 128*1.20 = 153.6");
+        assert!(has_upgrade_headroom(154, &s), "154 >= 153.6");
     }
 }
