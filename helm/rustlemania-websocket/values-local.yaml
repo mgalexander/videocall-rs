@@ -26,6 +26,13 @@ env:
   # raw bytes; color escapes broke validate-app.sh's auth="on" match.
   - name: NO_COLOR
     value: "1"
+  # Local stack runs SFU_MODE=sfu to exercise the new forwarder
+  # plumbing (P2 landed pass-through semantics; behavior should be
+  # observationally equivalent to legacy). Production overlays leave
+  # SFU_MODE unset (defaults to legacy). Per PLAN.md operating model:
+  # "the local stack should be the SFU testing ground."
+  - name: SFU_MODE
+    value: sfu
   - name: ACTIX_PORT
     value: "8080"
   - name: UI_ENDPOINT
