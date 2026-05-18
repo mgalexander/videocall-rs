@@ -301,6 +301,39 @@ impl ConnectionManager {
         self.manager_ref = weak;
     }
 
+    /// Mark the reconnection phase as `Reconnecting` from the inbound REDIRECT
+    /// path WITHOUT clobbering a backoff loop's live counters.
+    ///
+    /// The `ReconnectionPhase::Reconnecting { attempt, next_delay_ms }` variant
+    /// is overloaded by two cooperating mechanisms:
+    ///
+    /// 1. The exponential-backoff reconnection loop (`run_reconnection_loop`)
+    ///    publishes its real attempt counter and next-delay there so UI
+    ///    consumers can render "retrying in Ns (attempt N)".
+    /// 2. The ADMISSION_DECISION REDIRECT inbound path (vc-6rf) uses the same
+    ///    variant with sentinel zeros as a *suppression marker* — its only job
+    ///    is to make the connection-lost callback's phase guard short-circuit
+    ///    so a redundant backoff loop is not spawned on top of the redirect
+    ///    chase.
+    ///
+    /// If a REDIRECT arrives AFTER the connection-lost callback has already
+    /// fired and the backoff loop is mid-flight (vc-339), a naive unconditional
+    /// write would reset the published counters to `attempt=0, next_delay_ms=0`,
+    /// which UI consumers reading `reconnection_phase()` would briefly observe
+    /// as an attempt-counter regression. We therefore preserve the in-flight
+    /// values whenever the phase is already `Reconnecting` — the backoff loop
+    /// owns those fields. Otherwise we install the sentinel-zeros marker.
+    fn mark_reconnecting_preserving_in_flight(phase: &RefCell<ReconnectionPhase>) {
+        let already_reconnecting =
+            matches!(*phase.borrow(), ReconnectionPhase::Reconnecting { .. });
+        if !already_reconnecting {
+            *phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+                attempt: 0,
+                next_delay_ms: 0,
+            };
+        }
+    }
+
     /// Kick off the initial server election. Must be called **after**
     /// `set_manager_ref()` so that the connection-lost callbacks capture a
     /// valid `Weak` back-reference to the owning `Rc<RefCell<ConnectionManager>>`.
@@ -634,10 +667,17 @@ impl ConnectionManager {
                         // redundant exponential-backoff reconnection loop.
                         // `complete_election` resets this back to Idle on a
                         // successful new election.
-                        *reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
-                            attempt: 0,
-                            next_delay_ms: 0,
-                        };
+                        //
+                        // The `Reconnecting` variant doubles as both an
+                        // "in-flight backoff loop" indicator (with real
+                        // attempt/next_delay_ms counters owned by
+                        // `run_reconnection_loop`) and a "redirect chase in
+                        // flight" suppression marker (with sentinel zeros).
+                        // vc-339: if a REDIRECT arrives while a backoff loop is
+                        // already mid-flight, preserve its live counters so UI
+                        // consumers don't observe a transient attempt-counter
+                        // regression.
+                        Self::mark_reconnecting_preserving_in_flight(&reconnection_phase);
 
                         // Notify UI that we're chasing the redirect. Single-
                         // shot bookkeeping & the actual URL swap / election
@@ -3238,6 +3278,83 @@ mod tests {
             mgr.reconnection_phase(),
             ReconnectionPhase::Reconnecting { attempt: 3, .. }
         ));
+    }
+
+    // ===================================================================
+    // vc-339: redirect inbound path must not clobber a backoff loop's
+    // live attempt/next_delay_ms counters.
+    // ===================================================================
+
+    /// If a REDIRECT packet arrives AFTER the connection-lost callback has
+    /// already spawned `run_reconnection_loop` and the loop has published its
+    /// real attempt/next_delay_ms values, the inbound REDIRECT path must
+    /// preserve those counters. Otherwise any UI consumer reading
+    /// `reconnection_phase()` between the REDIRECT write and the next loop
+    /// iteration would observe a transient attempt-counter regression.
+    #[test]
+    fn redirect_inbound_path_preserves_in_flight_backoff_attempt() {
+        let mgr = make_test_manager();
+
+        // Mid-flight backoff loop state.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 3,
+            next_delay_ms: 2000,
+        };
+
+        // Apply the same read-modify-write the inbound REDIRECT handler uses.
+        ConnectionManager::mark_reconnecting_preserving_in_flight(&mgr.reconnection_phase);
+
+        // Backoff loop's published counters must be untouched.
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 3,
+                next_delay_ms: 2000,
+            }
+        );
+    }
+
+    /// When no backoff loop is in flight (phase is Idle), the inbound REDIRECT
+    /// path installs the sentinel-zeros suppression marker so the connection-
+    /// lost callback's phase guard short-circuits on the close that follows
+    /// the redirect.
+    #[test]
+    fn redirect_inbound_path_sets_sentinel_when_phase_is_idle() {
+        let mgr = make_test_manager();
+
+        // Phase starts as Idle.
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Idle);
+
+        ConnectionManager::mark_reconnecting_preserving_in_flight(&mgr.reconnection_phase);
+
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 0,
+                next_delay_ms: 0,
+            }
+        );
+    }
+
+    /// `Failed` is not `Reconnecting`, so the inbound REDIRECT path resets it
+    /// to the sentinel-zeros marker rather than leaving the terminal-failure
+    /// state in place. This guards against a stale `Failed` outliving a
+    /// subsequent reconnection opportunity.
+    #[test]
+    fn redirect_inbound_path_overwrites_failed_with_sentinel() {
+        let mgr = make_test_manager();
+
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
+
+        ConnectionManager::mark_reconnecting_preserving_in_flight(&mgr.reconnection_phase);
+
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 0,
+                next_delay_ms: 0,
+            }
+        );
     }
 
     // ===================================================================
