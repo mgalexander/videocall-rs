@@ -1524,6 +1524,15 @@ impl Inner {
                     String::from_utf8_lossy(&response.user_id)
                 );
             }
+            Ok(PacketType::HEALTH_BEACON) => {
+                // p6-7: owner-pod liveness signal on `room.{room}.system`,
+                // intended for spill-pod consumption. Clients don't act on
+                // these today; logging at debug keeps the hot path quiet.
+                debug!(
+                    "Received HEALTH_BEACON packet from {} -- ignored (server-only)",
+                    String::from_utf8_lossy(&response.user_id)
+                );
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

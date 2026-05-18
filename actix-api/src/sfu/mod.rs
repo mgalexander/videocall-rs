@@ -21,6 +21,7 @@ pub use config::{SfuConfig, SfuMode};
 
 pub mod affinity;
 pub mod forwarder;
+pub mod health_beacon;
 pub mod layer_selector;
 pub mod priority_queue;
 pub mod room_state;

@@ -4,6 +4,7 @@ pub mod admission_decision_packet;
 pub mod aes_packet;
 pub mod connection_packet;
 pub mod diagnostics_packet;
+pub mod health_beacon_packet;
 pub mod health_packet;
 pub mod media_packet;
 pub mod meeting_packet;

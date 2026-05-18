@@ -17,6 +17,7 @@ message PacketWrapper {
     LAYER_HINT = 12;
     ADMISSION_DECISION = 13;
     CAPABILITY_ANNOUNCE = 14;
+    HEALTH_BEACON = 15;
   }
   
   PacketType packet_type = 1;

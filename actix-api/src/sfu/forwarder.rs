@@ -59,6 +59,7 @@ fn packet_type_label(pw: &PacketWrapper) -> &'static str {
         PacketType::LAYER_HINT => "layer_hint",
         PacketType::ADMISSION_DECISION => "admission_decision",
         PacketType::CAPABILITY_ANNOUNCE => "capability_announce",
+        PacketType::HEALTH_BEACON => "health_beacon",
     }
 }
 

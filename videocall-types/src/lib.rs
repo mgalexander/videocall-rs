@@ -100,6 +100,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::CAPABILITY_ANNOUNCE => {
                 write!(f, "CAPABILITY_ANNOUNCE")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::HEALTH_BEACON => {
+                write!(f, "HEALTH_BEACON")
+            }
         }
     }
 }
