@@ -18,6 +18,7 @@
 
 pub mod forwarder_parity_tests;
 pub mod forwarder_tests;
+pub mod layer_selector_thrash_tests;
 pub mod parse_once_tests;
 pub mod room_state_tests;
 pub mod speaker_tests;
