@@ -29,11 +29,19 @@
 //! (p3-3 NATS publisher, p3-5 forwarder integration).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use protobuf::Message as ProtoMessage;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
+use tracing::warn;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::speaker_update_packet::{SpeakerEntry, SpeakerUpdate};
+use videocall_types::user_id::to_user_id_bytes;
+use videocall_types::SYSTEM_USER_ID;
 
 use crate::actors::session_logic::SessionId;
 
@@ -198,6 +206,56 @@ struct CandidateState {
     below_since: Option<Instant>,
 }
 
+/// Sink for SpeakerUpdate broadcasts, abstracted so unit tests can swap a
+/// real `async_nats::Client` for a collecting fake. Fire-and-forget by
+/// design: implementations spawn their own async work and must not block
+/// the tick loop. Failures are an implementation concern (typically logged
+/// and dropped) — losing a single SpeakerUpdate is preferable to stalling
+/// the 200ms cadence.
+pub trait SpeakerPublisher: Send + Sync + fmt::Debug {
+    /// Publish `payload` on `subject`. Must not block; implementations
+    /// spawn the async send themselves.
+    fn publish(&self, subject: String, payload: Vec<u8>);
+}
+
+/// Production [`SpeakerPublisher`] backed by an `async_nats::Client`.
+///
+/// Cloning the inner `async_nats::Client` is cheap (it's `Arc`-wrapped),
+/// so each `publish` call spawns a tokio task with its own handle and
+/// returns immediately.
+#[derive(Clone)]
+pub struct NatsSpeakerPublisher {
+    client: async_nats::Client,
+}
+
+impl NatsSpeakerPublisher {
+    pub fn new(client: async_nats::Client) -> Self {
+        Self { client }
+    }
+}
+
+impl fmt::Debug for NatsSpeakerPublisher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NatsSpeakerPublisher").finish()
+    }
+}
+
+impl SpeakerPublisher for NatsSpeakerPublisher {
+    fn publish(&self, subject: String, payload: Vec<u8>) {
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.publish(subject.clone(), payload.into()).await {
+                warn!(
+                    target: "sfu_speaker",
+                    subject = %subject,
+                    error = %e,
+                    "SpeakerUpdate publish failed"
+                );
+            }
+        });
+    }
+}
+
 /// Cancels the background tick task when dropped.
 ///
 /// Returned by [`SpeakerTick::run`]; aborts the underlying tokio task on
@@ -225,6 +283,13 @@ pub struct SpeakerTick {
     tx: watch::Sender<ActiveSpeakerSet>,
     rx: watch::Receiver<ActiveSpeakerSet>,
     interval: Duration,
+    /// Sanitized room id used as the middle segment of
+    /// `room.{room_id}.system`. Empty when no publisher is attached.
+    room_id: String,
+    /// p3-3: optional sink for SpeakerUpdate broadcasts. `None` means
+    /// "compute set transitions but do not announce them" — useful for
+    /// the hysteresis-only unit tests inherited from p3-2.
+    publisher: Option<Arc<dyn SpeakerPublisher>>,
 }
 
 /// Internal mutable state used by the tick task and `current()` accessor.
@@ -235,13 +300,28 @@ struct TickState {
 }
 
 impl SpeakerTick {
-    /// Create a new speaker tick over `scorer` with the default 200ms cadence.
-    pub fn new(scorer: Arc<RwLock<SpeakerScorer>>) -> Self {
-        Self::with_interval(scorer, TICK_INTERVAL)
+    /// Create a new speaker tick over `scorer` with the default 200ms cadence,
+    /// announcing every generation change to `room.{room_id}.system` via
+    /// `publisher`. Production callers (chat_server) pass a
+    /// [`NatsSpeakerPublisher`] wrapping the shared `async_nats::Client`.
+    pub fn new(
+        scorer: Arc<RwLock<SpeakerScorer>>,
+        room_id: impl Into<String>,
+        publisher: Arc<dyn SpeakerPublisher>,
+    ) -> Self {
+        Self::with_interval(scorer, TICK_INTERVAL, room_id, Some(publisher))
     }
 
-    /// Create a tick with a custom interval (primarily for tests).
-    pub fn with_interval(scorer: Arc<RwLock<SpeakerScorer>>, interval: Duration) -> Self {
+    /// Create a tick with a custom interval and optional publisher
+    /// (primarily for tests). When `publisher` is `None`, generation
+    /// changes still update the `watch` channel but no SpeakerUpdate is
+    /// broadcast — the p3-2 hysteresis tests rely on this.
+    pub fn with_interval(
+        scorer: Arc<RwLock<SpeakerScorer>>,
+        interval: Duration,
+        room_id: impl Into<String>,
+        publisher: Option<Arc<dyn SpeakerPublisher>>,
+    ) -> Self {
         let initial = ActiveSpeakerSet::empty();
         let (tx, rx) = watch::channel(initial.clone());
         Self {
@@ -253,6 +333,8 @@ impl SpeakerTick {
             tx,
             rx,
             interval,
+            room_id: room_id.into(),
+            publisher,
         }
     }
 
@@ -276,6 +358,8 @@ impl SpeakerTick {
         let state = self.state;
         let tx = self.tx;
         let interval = self.interval;
+        let room_id = self.room_id;
+        let publisher = self.publisher;
         let join = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // Skip the immediate first-tick fire so the loop body actually
@@ -293,7 +377,7 @@ impl SpeakerTick {
                 // so the hysteresis windows respect `tokio::time::pause`
                 // in tests; in production both clocks advance identically.
                 let now = tokio::time::Instant::now().into_std();
-                Self::tick_once(&scorer, &state, &tx, now).await;
+                Self::tick_once(&scorer, &state, &tx, now, &room_id, publisher.as_deref()).await;
             }
         });
         TickHandle { join }
@@ -305,7 +389,15 @@ impl SpeakerTick {
     /// [`Self::tick_once`] over `self`'s shared state.
     #[cfg(test)]
     pub(crate) async fn drive_tick_for_test(&self, now: Instant) {
-        Self::tick_once(&self.scorer, &self.state, &self.tx, now).await;
+        Self::tick_once(
+            &self.scorer,
+            &self.state,
+            &self.tx,
+            now,
+            &self.room_id,
+            self.publisher.as_deref(),
+        )
+        .await;
     }
 
     /// One scoring pass. Extracted so tests can drive ticks deterministically
@@ -315,6 +407,8 @@ impl SpeakerTick {
         state: &Arc<RwLock<TickState>>,
         tx: &watch::Sender<ActiveSpeakerSet>,
         now: Instant,
+        room_id: &str,
+        publisher: Option<&dyn SpeakerPublisher>,
     ) {
         // Lift the scorer read into a snapshot so we can drop the lock
         // before mutating tick state (the scorer also serves the ingest
@@ -403,7 +497,7 @@ impl SpeakerTick {
         let next_top: Vec<SessionId> = eligible.into_iter().map(|(sid, _)| sid).collect();
 
         // Set change detection: membership-or-order change bumps generation.
-        if next_top != st.current.top {
+        let snapshot_for_publish = if next_top != st.current.top {
             let new_gen = st.current.generation.wrapping_add(1);
             st.current = ActiveSpeakerSet {
                 top: next_top,
@@ -413,7 +507,10 @@ impl SpeakerTick {
             // `send` only fails if there are zero receivers; we always hold
             // one ourselves in `self.rx`, so this is infallible in practice.
             let _ = tx.send(st.current.clone());
-        }
+            Some(st.current.clone())
+        } else {
+            None
+        };
 
         // Garbage-collect candidates that are no longer relevant: not in
         // the current set, not in the latest observation, and either have
@@ -436,6 +533,58 @@ impl SpeakerTick {
                 None => false,
             }
         });
+        drop(st);
+
+        // p3-3: on every generation bump, broadcast the new active set to
+        // `room.{room_id}.system` so spill pods + clients can react
+        // without polling. No-op when no publisher is wired (test config)
+        // or `room_id` is empty (also test config).
+        if let (Some(snap), Some(pub_)) = (snapshot_for_publish, publisher) {
+            if !room_id.is_empty() {
+                let payload = Self::build_speaker_update_payload(scorer, &snap).await;
+                let subject = format!("room.{}.system", room_id);
+                pub_.publish(subject, payload);
+            }
+        }
+    }
+
+    /// Serialize an [`ActiveSpeakerSet`] snapshot as a `SpeakerUpdate`
+    /// wrapped in a `PacketWrapper` (PacketType::SPEAKER_UPDATE,
+    /// user_id = SYSTEM_USER_ID), matching the wire shape that p3-5
+    /// (forwarder) and p3-6 (client) decode.
+    ///
+    /// Re-acquires the scorer read lock to fill in `score` and
+    /// `is_speaking` per entry; the lock is held only for the duration
+    /// of the snapshot copy.
+    async fn build_speaker_update_payload(
+        scorer: &Arc<RwLock<SpeakerScorer>>,
+        snap: &ActiveSpeakerSet,
+    ) -> Vec<u8> {
+        let top_speakers: Vec<SpeakerEntry> = {
+            let guard = scorer.read().await;
+            snap.top
+                .iter()
+                .map(|sid| SpeakerEntry {
+                    session_id: *sid,
+                    score: guard.score(*sid),
+                    is_speaking: guard.is_speaking(*sid),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let update = SpeakerUpdate {
+            top_speakers,
+            generation: snap.generation,
+            ..Default::default()
+        };
+        let data = update.write_to_bytes().unwrap_or_default();
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::SPEAKER_UPDATE.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data,
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap_or_default()
     }
 }
 
@@ -535,7 +684,40 @@ mod tests {
     /// against a freshly-constructed tick. Avoids the live spawn loop so
     /// hysteresis windows can be exercised in microseconds of wall time.
     async fn drive_tick(tick: &SpeakerTick, now: Instant) {
-        SpeakerTick::tick_once(&tick.scorer, &tick.state, &tick.tx, now).await;
+        SpeakerTick::tick_once(
+            &tick.scorer,
+            &tick.state,
+            &tick.tx,
+            now,
+            &tick.room_id,
+            tick.publisher.as_deref(),
+        )
+        .await;
+    }
+
+    /// Test-only [`SpeakerPublisher`] that collects every publish call into
+    /// a shared `Vec` so assertions can introspect the bytes (and decode
+    /// them as `PacketWrapper`/`SpeakerUpdate`).
+    type PublishedLog = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    #[derive(Debug, Default, Clone)]
+    struct FakePublisher {
+        published: PublishedLog,
+    }
+
+    impl FakePublisher {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn drain(&self) -> Vec<(String, Vec<u8>)> {
+            std::mem::take(&mut *self.published.lock().unwrap())
+        }
+    }
+
+    impl SpeakerPublisher for FakePublisher {
+        fn publish(&self, subject: String, payload: Vec<u8>) {
+            self.published.lock().unwrap().push((subject, payload));
+        }
     }
 
     /// Build a scorer that already has a high stable EWMA for `sid` by
@@ -551,7 +733,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tick_fires_periodically_and_observes_scorer() {
         let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
         let mut rx = tick.subscribe();
 
         // Seed a dominant speaker BEFORE the tick task starts so the very
@@ -587,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn hysteresis_entry_requires_full_window() {
         let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
         // Sender 7 has a high EWMA but we only give it one tick above —
         // less than the 200ms entry window required for admission.
@@ -628,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn hysteresis_exit_requires_full_window() {
         let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
         // Bring sender 5 into the set: high score across an entry window.
         {
@@ -683,7 +865,7 @@ mod tests {
     #[tokio::test]
     async fn generation_increments_only_on_set_change() {
         let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
         // Seed two stable speakers above threshold.
         {
@@ -740,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn top_n_cap_respected_with_excess_speakers() {
         let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
         // Seed 6 speakers all above threshold, with distinct scores so
         // sort ordering is deterministic. MAX_SPEAKERS = 4 → the lowest
@@ -770,5 +952,101 @@ mod tests {
         assert_eq!(snap.top, vec![10, 20, 30, 40]);
         assert!(!snap.top.contains(&50));
         assert!(!snap.top.contains(&60));
+    }
+
+    // -----------------------------------------------------------------
+    // p3-3: SpeakerUpdate NATS publication
+    // -----------------------------------------------------------------
+
+    /// On every generation change, the tick must publish exactly one
+    /// `PacketWrapper<SpeakerUpdate>` to `room.{room_id}.system`. A
+    /// no-op tick (set unchanged) must NOT publish.
+    #[tokio::test]
+    async fn publishes_speaker_update_on_generation_change() {
+        use protobuf::Message as ProtoMessage;
+
+        let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
+        let publisher = Arc::new(FakePublisher::new());
+        let tick = SpeakerTick::with_interval(
+            scorer.clone(),
+            Duration::from_millis(200),
+            "room-42",
+            Some(publisher.clone() as Arc<dyn SpeakerPublisher>),
+        );
+
+        // Seed a dominant speaker and let it traverse the entry window so
+        // the second tick promotes it → generation bumps from 0 → 1.
+        {
+            let mut s = scorer.write().await;
+            seed_high_score(&mut s, 99, 0.9);
+        }
+        let t0 = Instant::now();
+        drive_tick(&tick, t0).await; // marks above_since, no change yet
+        assert!(publisher.drain().is_empty(), "no publish before admission",);
+
+        drive_tick(&tick, t0 + Duration::from_millis(200)).await; // admit
+        let snap = tick.current().await;
+        assert!(snap.top.contains(&99), "speaker admitted: {:?}", snap.top);
+        assert_eq!(snap.generation, 1);
+
+        let published = publisher.drain();
+        assert_eq!(
+            published.len(),
+            1,
+            "exactly one SpeakerUpdate published on admission"
+        );
+        let (subject, payload) = &published[0];
+        assert_eq!(
+            subject, "room.room-42.system",
+            "publish targets room.{{room}}.system"
+        );
+
+        // The payload must round-trip as a PacketWrapper(SPEAKER_UPDATE)
+        // carrying a SpeakerUpdate with the expected generation + entries.
+        let wrapper = PacketWrapper::parse_from_bytes(payload).expect("decode PacketWrapper");
+        assert_eq!(
+            wrapper.packet_type,
+            PacketType::SPEAKER_UPDATE.into(),
+            "wrapper type must be SPEAKER_UPDATE"
+        );
+        let update = SpeakerUpdate::parse_from_bytes(&wrapper.data).expect("decode SpeakerUpdate");
+        assert_eq!(update.generation, 1);
+        assert_eq!(update.top_speakers.len(), 1);
+        assert_eq!(update.top_speakers[0].session_id, 99);
+        assert!(update.top_speakers[0].score > SPEAKING_FLOOR);
+
+        // A no-op tick must NOT publish even though set membership is
+        // stable (regression guard for unconditional publishing).
+        {
+            let mut s = scorer.write().await;
+            // Re-observe to keep EWMA fresh without changing order.
+            s.observe(99, 0.9, true);
+        }
+        drive_tick(&tick, t0 + Duration::from_millis(400)).await;
+        assert!(
+            publisher.drain().is_empty(),
+            "no publish when generation is unchanged",
+        );
+    }
+
+    /// When constructed without a publisher (the p3-2 hysteresis-test
+    /// path), generation changes must still update internal state but
+    /// must NOT panic or attempt to publish.
+    #[tokio::test]
+    async fn no_publisher_means_no_publish() {
+        let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
+        let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
+        {
+            let mut s = scorer.write().await;
+            seed_high_score(&mut s, 1, 0.9);
+        }
+        let t0 = Instant::now();
+        drive_tick(&tick, t0).await;
+        drive_tick(&tick, t0 + Duration::from_millis(200)).await;
+        // If we got here without panicking, the None-publisher branch is
+        // exercised. Sanity-check the state still advanced.
+        let snap = tick.current().await;
+        assert!(snap.top.contains(&1));
+        assert_eq!(snap.generation, 1);
     }
 }

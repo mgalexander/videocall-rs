@@ -190,7 +190,7 @@ fn seed_high_score(scorer: &mut SpeakerScorer, sid: u64, level: f32) {
 #[tokio::test]
 async fn hysteresis_entry_brief_spike_below_window_does_not_admit() {
     let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
     // Seed 7 above floor.
     {
@@ -234,7 +234,7 @@ async fn hysteresis_entry_brief_spike_below_window_does_not_admit() {
 #[tokio::test]
 async fn hysteresis_entry_sustained_above_window_admits() {
     let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
     {
         let mut s = scorer.write().await;
@@ -265,7 +265,7 @@ async fn hysteresis_entry_sustained_above_window_admits() {
 #[tokio::test]
 async fn hysteresis_exit_brief_dip_below_window_does_not_evict() {
     let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
     // Admit sender 5 first (two ticks separated by the entry window).
     {
@@ -306,7 +306,7 @@ async fn hysteresis_exit_brief_dip_below_window_does_not_evict() {
 #[tokio::test]
 async fn hysteresis_exit_sustained_below_window_evicts() {
     let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
     {
         let mut s = scorer.write().await;
@@ -349,7 +349,7 @@ async fn hysteresis_exit_sustained_below_window_evicts() {
 #[tokio::test]
 async fn generation_does_not_increment_when_set_is_stable() {
     let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
     {
         let mut s = scorer.write().await;
@@ -391,7 +391,7 @@ async fn generation_does_not_increment_when_set_is_stable() {
 #[tokio::test]
 async fn generation_increments_on_each_set_change() {
     let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
     // Step A: admit sender 1.
     {
@@ -458,7 +458,7 @@ async fn generation_increments_on_each_set_change() {
 #[tokio::test]
 async fn top_n_cap_truncates_to_max_speakers_sorted_by_score() {
     let scorer = Arc::new(RwLock::new(SpeakerScorer::new()));
-    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200));
+    let tick = SpeakerTick::with_interval(scorer.clone(), Duration::from_millis(200), "", None);
 
     // 10 senders all above floor, with distinct descending scores so
     // sort order is deterministic. MAX_SPEAKERS = 4 → only the top 4
