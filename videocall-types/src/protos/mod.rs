@@ -1,5 +1,6 @@
 // @generated
 
+pub mod admission_decision_packet;
 pub mod aes_packet;
 pub mod connection_packet;
 pub mod diagnostics_packet;

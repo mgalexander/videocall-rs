@@ -92,3 +92,26 @@ pub const MAX_PARTICIPANTS_PER_ROOM: usize = 200;
 
 /// Env var name for overriding [`MAX_PARTICIPANTS_PER_ROOM`].
 pub const MAX_PARTICIPANTS_ENV: &str = "MAX_PARTICIPANTS_PER_ROOM";
+
+/// Soft cap on the number of non-observer participants in a single room.
+///
+/// When a non-observer joins a room that already has `>= WAITING_ROOM_THRESHOLD`
+/// but `< MAX_PARTICIPANTS_PER_ROOM` members, the join is admitted normally but
+/// the server emits an informational `ADMISSION_DECISION` packet so the client
+/// can surface a "near capacity" hint to the user.
+///
+/// This is wave-1 of the admission control work (bead vc-69e / p3-13). The
+/// `QUEUED` status does NOT yet imply a holding-room or actual queueing
+/// mechanism — the joiner is fully admitted. Wave-3 will introduce the real
+/// queue semantics; until then `position` is purely informational.
+///
+/// Observers (read-only sessions joining via the waiting room) are NOT counted
+/// against this threshold — their join path bypasses `room_members` tracking,
+/// mirroring the `MAX_PARTICIPANTS_PER_ROOM` policy.
+///
+/// Tunable at deploy time via the [`WAITING_ROOM_THRESHOLD_ENV`] env var
+/// (read by `JoinRoom` handler at runtime; default applies if unset).
+pub const WAITING_ROOM_THRESHOLD: usize = 195;
+
+/// Env var name for overriding [`WAITING_ROOM_THRESHOLD`].
+pub const WAITING_ROOM_THRESHOLD_ENV: &str = "WAITING_ROOM_THRESHOLD";

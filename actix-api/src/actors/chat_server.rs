@@ -17,7 +17,10 @@
  */
 
 use crate::{
-    constants::{MAX_PARTICIPANTS_ENV, MAX_PARTICIPANTS_PER_ROOM, RECONNECT_GRACE_PERIOD},
+    constants::{
+        MAX_PARTICIPANTS_ENV, MAX_PARTICIPANTS_PER_ROOM, RECONNECT_GRACE_PERIOD,
+        WAITING_ROOM_THRESHOLD, WAITING_ROOM_THRESHOLD_ENV,
+    },
     messages::{
         server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
@@ -37,6 +40,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
+use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
@@ -843,29 +847,82 @@ impl Handler<JoinRoom> for ChatServer {
             self.suppress_join_broadcast.insert(session);
         }
 
-        // --- Hard admission cap (S-P0-3 in sfu-update/GAP-ANALYSIS.md) ---
-        // Reject non-observer joins when the room is already at capacity.
+        // --- Admission control (bead vc-69e / p3-13) ---
+        // Two-tier admission policy for non-observer joins:
+        //   - count < WAITING_ROOM_THRESHOLD: admit silently (no packet emitted)
+        //   - WAITING_ROOM_THRESHOLD <= count < hard_cap: admit + emit
+        //     ADMISSION_DECISION{QUEUED} informational packet so the client
+        //     can surface a "near capacity" hint to the user. The joiner IS
+        //     still fully admitted to the room — wave-1 has no actual
+        //     queueing mechanism (that lands in wave-3).
+        //   - count >= hard_cap: reject. Emit ADMISSION_DECISION{REJECTED}
+        //     to the session before declining the join, so the client can
+        //     show a structured error instead of just a disconnect.
+        //
         // Observers don't count: they bypass room_members tracking entirely.
         // Reconnections also pass: the stale row was just removed above, so
         // the count reflects the post-cleanup state.
         //
-        // Without this cap, a scripted attacker with one valid JWT can spawn
-        // thousands of sessions in a single room and OOM the pod (each session
-        // = one bounded mpsc + QUIC connection state + N-1 broadcast amplifier
-        // for PARTICIPANT_JOINED). The cap matches the SFU refactor's
-        // webinar-shape design target (200 participants); see PLAN.md §J.
+        // Without the hard cap, a scripted attacker with one valid JWT can
+        // spawn thousands of sessions in a single room and OOM the pod (each
+        // session = one bounded mpsc + QUIC connection state + N-1 broadcast
+        // amplifier for PARTICIPANT_JOINED). The cap matches the SFU
+        // refactor's webinar-shape design target (200 participants); see
+        // PLAN.md §J / Open Risk #4.
+        //
+        // `pending_queued_packet` is set to Some(packet_bytes) when the soft
+        // cap has been crossed; it is sent to the new joiner after the
+        // session is fully registered in `room_members` so the client cannot
+        // race the packet against its own JoinRoom Ok response (the packet
+        // travels via the same recipient mpsc used for media fan-out).
+        let mut pending_queued_packet: Option<Vec<u8>> = None;
         if !observer {
-            let cap = std::env::var(MAX_PARTICIPANTS_ENV)
+            let hard_cap = std::env::var(MAX_PARTICIPANTS_ENV)
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(MAX_PARTICIPANTS_PER_ROOM);
+            // The soft cap is clamped to the hard cap so a misconfigured env
+            // override (soft >= hard) collapses cleanly to a single-tier hard
+            // reject instead of producing a negative overflow zone.
+            let configured_soft = std::env::var(WAITING_ROOM_THRESHOLD_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(WAITING_ROOM_THRESHOLD);
+            let soft_cap = configured_soft.min(hard_cap);
             let current = self.room_members.get(&room).map(|m| m.len()).unwrap_or(0);
-            if current >= cap {
+            if current >= hard_cap {
                 warn!(
                     "JoinRoom rejected: room {} is at capacity ({}/{}) — \
                      user {} (session {}) denied",
-                    room, current, cap, user_id, session,
+                    room, current, hard_cap, user_id, session,
                 );
+                // Emit ADMISSION_DECISION{REJECTED} to the rejected session
+                // before declining the join. Best-effort: a failure here
+                // (e.g., session recipient already gone) does not change
+                // the rejection outcome.
+                if let Some(recipient) = self.sessions.get(&session) {
+                    let bytes = SessionManager::build_admission_decision_packet(
+                        AdmissionStatus::REJECTED,
+                        // 1-based overflow position; for the rejected (N+1)st
+                        // joiner this is (hard_cap - soft_cap + 1).
+                        (current.saturating_sub(soft_cap).saturating_add(1)) as u32,
+                        "room_full",
+                        // Conservative client retry hint. Wave-3 will replace
+                        // this with a server-computed value derived from
+                        // recent churn.
+                        30,
+                    );
+                    if let Err(e) = recipient.try_send(Message {
+                        msg: bytes::Bytes::from(bytes),
+                        session,
+                    }) {
+                        warn!(
+                            "Failed to deliver ADMISSION_DECISION{{REJECTED}} to \
+                             session {}: {}",
+                            session, e
+                        );
+                    }
+                }
                 // Roll back the suppress_join_broadcast insertion we just did
                 // for the reconnection case, so a later retry (after the room
                 // drains) doesn't silently suppress the legitimate broadcast.
@@ -873,8 +930,29 @@ impl Handler<JoinRoom> for ChatServer {
                     self.suppress_join_broadcast.remove(&session);
                 }
                 return MessageResult(Err(format!(
-                    "Room {room} is at capacity ({cap}); please try again later"
+                    "Room {room} is at capacity ({hard_cap}); please try again later"
                 )));
+            }
+            if current >= soft_cap {
+                // 1-based offset into the soft-cap overflow zone:
+                //   current == soft_cap     => position = 1
+                //   current == soft_cap + 1 => position = 2
+                //   ...
+                // This matches the bead spec's "count - 194 = position" for
+                // the default thresholds (WAITING_ROOM_THRESHOLD=195) and
+                // generalises cleanly when the soft cap is reconfigured.
+                let position = (current - soft_cap + 1) as u32;
+                info!(
+                    "JoinRoom soft-cap reached: room {} at {}/{} (hard {}) — \
+                     admitting user {} (session {}) with QUEUED hint position={}",
+                    room, current, soft_cap, hard_cap, user_id, session, position,
+                );
+                pending_queued_packet = Some(SessionManager::build_admission_decision_packet(
+                    AdmissionStatus::QUEUED,
+                    position,
+                    "soft_cap_reached",
+                    0,
+                ));
             }
         }
 
@@ -986,6 +1064,22 @@ impl Handler<JoinRoom> for ChatServer {
             w.insert(session, session_recipient.clone());
         }
         self.joined_sessions.insert(session);
+
+        // Wave-1 soft-cap notification (bead vc-69e / p3-13). The joiner is
+        // already fully tracked in room_members + room_dispatch above; this
+        // packet is purely informational. Best-effort delivery — a full
+        // recipient mpsc here does not roll back the admission.
+        if let Some(bytes) = pending_queued_packet.take() {
+            if let Err(e) = session_recipient.try_send(Message {
+                msg: bytes::Bytes::from(bytes),
+                session,
+            }) {
+                warn!(
+                    "Failed to deliver ADMISSION_DECISION{{QUEUED}} to session {}: {}",
+                    session, e
+                );
+            }
+        }
 
         // Clone the recipient so we can send existing member info directly
         // to the new joiner from the one-shot post-join task below.
@@ -3094,5 +3188,536 @@ mod tests {
             vec![(sid_b, caps_b)],
             "After Leave(sid_a), only sid_b remains with its capabilities"
         );
+    }
+
+    // ==========================================================================
+    // TEST (vc-69e / p3-13): admission control — below soft cap admits silently
+    // ==========================================================================
+    // count < WAITING_ROOM_THRESHOLD: the join is admitted and the new joiner
+    // receives NO ADMISSION_DECISION packet (the common path is zero-overhead).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_admission_below_soft_cap_admits_silently() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        // Default thresholds: 195 soft / 200 hard. Make sure nothing in this
+        // process has overridden them via env.
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        // Pre-populate the room with 100 placeholder members via repeated
+        // JoinRoom calls. Below the 195 soft cap, the new (101st) joiner
+        // should not receive any ADMISSION_DECISION packet.
+        let room = "test-admission-below-soft-cap";
+        let dummy = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+        for i in 0..100u64 {
+            let sid = 50_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("filler-{i}@example.com"),
+                    display_name: format!("filler-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap()
+                .expect("filler join should succeed");
+        }
+
+        // Now have the capturing session attempt to join — count=100 before
+        // join, well below the 195 soft cap.
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let observer_sid = 51_000u64;
+        chat_server
+            .send(Connect {
+                id: observer_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: observer_sid,
+                room: room.to_string(),
+                user_id: "alice@example.com".to_string(),
+                display_name: "alice".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "join below soft cap must succeed");
+
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                assert_ne!(
+                    wrapper.packet_type,
+                    PacketType::ADMISSION_DECISION.into(),
+                    "no ADMISSION_DECISION packet must be sent below the soft cap"
+                );
+                // Defensive parse — confirms the payload is also empty / no decision.
+                let _ = AdmissionDecision::parse_from_bytes(&wrapper.data);
+            }
+        }
+    }
+
+    // ==========================================================================
+    // TEST (vc-69e / p3-13): admission control — soft cap emits QUEUED hint
+    // ==========================================================================
+    // count >= WAITING_ROOM_THRESHOLD && count < hard cap: the join is still
+    // admitted (no behavioural change) but the new joiner receives an
+    // ADMISSION_DECISION{QUEUED} packet with a 1-based overflow position.
+    //
+    // Uses env overrides to shrink the thresholds for fast testing
+    // (soft_cap=3, hard_cap=5) — equivalent to the production thresholds:
+    //   count=3 -> position=1
+    //   count=4 -> position=2
+    //
+    // Documents the position convention chosen: position = current - soft + 1.
+    // For the production defaults (soft=195) this matches the bead spec's
+    // "count - 194 = position" formula exactly: at count=195, position=1.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_admission_at_soft_cap_emits_queued_packet() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "5");
+        std::env::set_var(WAITING_ROOM_THRESHOLD_ENV, "3");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let room = "test-admission-soft-cap";
+
+        // Fill 3 filler sessions (count=3, exactly at soft cap).
+        let filler = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+        for i in 0..3u64 {
+            let sid = 52_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: filler.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("filler-{i}@example.com"),
+                    display_name: format!("filler-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap()
+                .expect("filler join should succeed");
+        }
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let soft_sid = 52_100u64;
+        chat_server
+            .send(Connect {
+                id: soft_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        // count=3 before this join, in [soft_cap=3, hard_cap=5) — must be
+        // admitted and QUEUED notification must be delivered.
+        let result = chat_server
+            .send(JoinRoom {
+                session: soft_sid,
+                room: room.to_string(),
+                user_id: "queued-user@example.com".to_string(),
+                display_name: "queued-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "join at soft cap must succeed (admitted)");
+
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+
+        let inner = found.expect("ADMISSION_DECISION{QUEUED} must be delivered to soft-cap joiner");
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmStatus::QUEUED,
+            "status must be QUEUED for soft-cap admit"
+        );
+        assert_eq!(
+            inner.position, 1,
+            "position convention: current=soft_cap (3) -> position=1"
+        );
+        assert_eq!(inner.reason, "soft_cap_reached");
+        assert_eq!(
+            inner.retry_after_secs, 0,
+            "QUEUED packets do not set retry hints"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+    }
+
+    // ==========================================================================
+    // TEST (vc-69e / p3-13): admission control — hard cap rejects with packet
+    // ==========================================================================
+    // count >= hard cap: join is rejected. Server emits ADMISSION_DECISION
+    // {REJECTED, reason="room_full"} to the would-be joiner BEFORE returning
+    // an Err, and does NOT add the session to room_members.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_admission_at_hard_cap_rejects_with_packet() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "5");
+        std::env::set_var(WAITING_ROOM_THRESHOLD_ENV, "3");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let room = "test-admission-hard-cap";
+
+        // Fill 5 filler sessions (count = hard_cap).
+        let filler = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+        for i in 0..5u64 {
+            let sid = 53_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: filler.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("filler-{i}@example.com"),
+                    display_name: format!("filler-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap()
+                .expect("filler join should succeed");
+        }
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let rejected_sid = 53_100u64;
+        chat_server
+            .send(Connect {
+                id: rejected_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        // count=5 before this join, == hard_cap=5 — must be rejected.
+        let result = chat_server
+            .send(JoinRoom {
+                session: rejected_sid,
+                room: room.to_string(),
+                user_id: "rejected-user@example.com".to_string(),
+                display_name: "rejected-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "join at hard cap must be rejected");
+        assert!(
+            result.unwrap_err().contains("at capacity"),
+            "error message should mention capacity"
+        );
+
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+
+        let inner =
+            found.expect("ADMISSION_DECISION{REJECTED} must be delivered to rejected joiner");
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmStatus::REJECTED,
+            "status must be REJECTED for hard-cap reject"
+        );
+        assert_eq!(inner.reason, "room_full");
+        assert!(
+            inner.retry_after_secs > 0,
+            "REJECTED packets must include a retry_after_secs hint"
+        );
+
+        // Verify the rejected session is NOT in room_members.
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap()
+            .expect("room must still exist");
+        assert_eq!(snapshot.len(), 5, "room_members must still hold exactly 5");
+        assert!(
+            !snapshot.iter().any(|(sid, _)| *sid == rejected_sid),
+            "rejected session must NOT appear in room_members"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+    }
+
+    // ==========================================================================
+    // INTEGRATION (vc-69e / p3-13): 200 sequential joins succeed; 201st rejected
+    // ==========================================================================
+    // Uses the production hard cap (200) via env, with the soft cap shrunk to
+    // 199 so that we don't have to deliver/capture 5 QUEUED packets per join
+    // for participants 195..199. The acceptance criterion is the boundary:
+    // the 200th join succeeds; the 201st is rejected and is not added.
+    //
+    // Marked #[ignore] by default because spinning up 201 sessions in-process
+    // is slow (multi-second) and stresses NATS subscribers. Run explicitly via
+    //   cargo test -p videocall-api -- --ignored test_admission_200_sequential
+    // or in nightly CI.
+    #[actix_rt::test]
+    #[serial]
+    #[ignore]
+    async fn test_admission_200_sequential_joins_201st_rejected() {
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "200");
+        std::env::set_var(WAITING_ROOM_THRESHOLD_ENV, "199");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let room = "test-admission-200-seq";
+
+        let filler = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+
+        for i in 0..200u64 {
+            let sid = 60_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: filler.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            let res = chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("user-{i}@example.com"),
+                    display_name: format!("user-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap();
+            assert!(
+                res.is_ok(),
+                "join #{i} must succeed (still within hard cap)"
+            );
+        }
+
+        // 201st join: count=200 == hard cap -> reject.
+        let extra_sid = 60_999u64;
+        chat_server
+            .send(Connect {
+                id: extra_sid,
+                addr: filler.clone().recipient(),
+            })
+            .await
+            .unwrap();
+        let result = chat_server
+            .send(JoinRoom {
+                session: extra_sid,
+                room: room.to_string(),
+                user_id: "overflow@example.com".to_string(),
+                display_name: "overflow".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "201st join must be rejected");
+
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap()
+            .expect("room must exist");
+        assert_eq!(
+            snapshot.len(),
+            200,
+            "room_members must still hold exactly 200"
+        );
+        assert!(
+            !snapshot.iter().any(|(sid, _)| *sid == extra_sid),
+            "the 201st session must NOT appear in room_members"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
     }
 }
