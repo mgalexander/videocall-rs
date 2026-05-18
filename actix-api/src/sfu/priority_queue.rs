@@ -48,6 +48,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
+use tracing::debug;
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::RoutingHeader;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 /// Outbound class. Lower number = higher priority.
 ///
@@ -100,6 +105,128 @@ impl Class {
             Class::P4Enhancement,
         ]
     }
+}
+
+/// Classify an outbound packet into the priority queue [`Class`] it should
+/// be routed into.
+///
+/// This is the p5-3 classifier called by the p5-4 / p5-5 transport wiring
+/// to decide which class queue a `PacketWrapper` should land in on egress.
+///
+/// # Hot path discipline
+///
+/// This function is invoked on every outbound packet and must remain
+/// allocation-free. It only reads:
+/// * `packet_wrapper.packet_type` (a `protobuf::EnumOrUnknown<PacketType>`),
+/// * `media_type` (the caller's already-parsed `MediaPacket.media_type`
+///   — passed in so we never re-parse the inner payload here),
+/// * `routing_header` layer ids (`is_keyframe`, `temporal_layer_id`,
+///   `spatial_layer_id`).
+///
+/// # Deviation from bead vc-cbj spec
+///
+/// The bead's pseudocode references several `PacketType` variants that do
+/// not actually exist in the protobuf-generated enum
+/// (`videocall_types::protos::packet_wrapper::packet_wrapper::PacketType`).
+/// Specifically:
+/// * `PacketType::HEARTBEAT` / `PacketType::RTT` / `PacketType::AUDIO`
+///   are not `PacketType` values — they are `MediaType` sub-variants nested
+///   inside a MEDIA-wrapped `MediaPacket`.
+/// * `PacketType::MEETING_ACTIVATED` / `PacketType::MEETING_DEACTIVATED`
+///   are `MeetingEventType` sub-variants nested inside a MEETING-wrapped
+///   `MeetingPacket`.
+///
+/// To preserve the bead's intent (HEARTBEAT/RTT/AUDIO classifying correctly)
+/// without doing a second parse of the inner payload, the signature takes
+/// an explicit `media_type: Option<MediaType>` parameter that the caller
+/// supplies from the already-parsed `MediaPacket` (e.g. via
+/// `ParsedPacket::media_packet.as_ref().map(|mp| mp.media_type.enum_value_or_default())`).
+/// `MEETING` as a whole is routed to `P0Control` since both of its event
+/// sub-types in the bead spec are control-class.
+///
+/// # Returns
+/// * [`Class::P0Control`] for control packets (`CONGESTION`, `SESSION_ASSIGNED`,
+///   `SPEAKER_UPDATE`, `MEETING`, `SUBSCRIPTION_UPDATE`, `LAYER_HINT`,
+///   `ADMISSION_DECISION`, `CAPABILITY_ANNOUNCE`, plus MEDIA wrappers whose
+///   inner `MediaType` is `HEARTBEAT`, `RTT`, or `KEYFRAME_REQUEST`).
+/// * [`Class::P1Audio`] for MEDIA wrappers whose inner `MediaType` is `AUDIO`.
+/// * [`Class::P2Keyframe`] for MEDIA video with `is_keyframe && temporal=0 && spatial=0`.
+/// * [`Class::P3VideoBase`] for MEDIA video with `temporal=0 && spatial=0`
+///   (non-keyframe), MEDIA without a routing header (legacy clients), and as
+///   the fallback for unhandled / unknown packet types (logged at debug level
+///   so a flood of unknown types from a misbehaving client can't spam
+///   production logs on the hot path).
+/// * [`Class::P4Enhancement`] for MEDIA video on enhancement layers or
+///   screenshare. SCREEN is always P4 regardless of routing-header layer ids.
+pub fn classify_outbound(
+    packet_wrapper: &PacketWrapper,
+    media_type: Option<MediaType>,
+    routing_header: Option<&RoutingHeader>,
+) -> Class {
+    // 1. Control-class shortcuts (highest priority). `packet_type` is a
+    //    `protobuf::EnumOrUnknown<PacketType>`; comparing against
+    //    `PacketType::FOO.into()` is the established codebase pattern (see
+    //    e.g. `chat_server.rs` CONGESTION carve-out and `packet_handler.rs`
+    //    classification).
+    let pt = packet_wrapper.packet_type;
+    if pt == PacketType::CONGESTION.into()
+        || pt == PacketType::SESSION_ASSIGNED.into()
+        || pt == PacketType::SPEAKER_UPDATE.into()
+        || pt == PacketType::MEETING.into()
+        || pt == PacketType::SUBSCRIPTION_UPDATE.into()
+        || pt == PacketType::LAYER_HINT.into()
+        || pt == PacketType::ADMISSION_DECISION.into()
+        || pt == PacketType::CAPABILITY_ANNOUNCE.into()
+    {
+        return Class::P0Control;
+    }
+
+    // 2. MEDIA wrappers: dispatch by inner `MediaType` first (so HEARTBEAT /
+    //    RTT control sub-types and AUDIO get correct routing), then by
+    //    routing-header layer ids for VIDEO / SCREEN.
+    if pt == PacketType::MEDIA.into() {
+        match media_type {
+            Some(MediaType::HEARTBEAT)
+            | Some(MediaType::RTT)
+            | Some(MediaType::KEYFRAME_REQUEST) => return Class::P0Control,
+            Some(MediaType::AUDIO) => return Class::P1Audio,
+            _ => {}
+        }
+
+        // Screenshare is always P4 enhancement, regardless of layer ids.
+        // Without this short-circuit, a SCREEN packet with is_keyframe + T0/S0
+        // would otherwise land in P2Keyframe, contradicting the class table.
+        if matches!(media_type, Some(MediaType::SCREEN)) {
+            return Class::P4Enhancement;
+        }
+
+        let rh = match routing_header {
+            Some(h) => h,
+            // Legacy client / unparseable inner: default to base video.
+            None => return Class::P3VideoBase,
+        };
+
+        // Keyframe + T0 + S0 -> P2 (the most critical video class).
+        if rh.is_keyframe && rh.temporal_layer_id == 0 && rh.spatial_layer_id == 0 {
+            return Class::P2Keyframe;
+        }
+        // Base spatial (S0), base temporal (T0), non-keyframe -> P3.
+        if rh.spatial_layer_id == 0 && rh.temporal_layer_id == 0 {
+            return Class::P3VideoBase;
+        }
+        // Enhancement layers (T>0 or S>0) and screen share -> P4.
+        return Class::P4Enhancement;
+    }
+
+    // 3. Fallback for unhandled packet types. Logged at `debug!` rather than
+    //    `warn!` because a misbehaving client could flood unknown packet types
+    //    and produce unbounded log spam on the hot path; developers running
+    //    with `RUST_LOG=debug` will still see if a new variant slips through.
+    debug!(
+        packet_type = ?packet_wrapper.packet_type,
+        "unclassified outbound packet, defaulting to P3VideoBase"
+    );
+    Class::P3VideoBase
 }
 
 /// Drop behavior when a class queue is at capacity.
@@ -510,5 +637,171 @@ mod tests {
         let (sender, mut channels) = PrioritySender::new();
         drop(sender);
         assert!(channels.p1_audio.recv().await.is_none());
+    }
+
+    // --- p5-3: classify_outbound -------------------------------------------
+
+    fn wrapper_with(pt: PacketType) -> PacketWrapper {
+        let mut w = PacketWrapper::new();
+        w.packet_type = pt.into();
+        w
+    }
+
+    fn routing_header(is_keyframe: bool, t: u32, s: u32) -> RoutingHeader {
+        let mut h = RoutingHeader::new();
+        h.is_keyframe = is_keyframe;
+        h.temporal_layer_id = t;
+        h.spatial_layer_id = s;
+        h
+    }
+
+    #[test]
+    fn classify_outbound_congestion_is_p0_control() {
+        let w = wrapper_with(PacketType::CONGESTION);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_heartbeat_is_p0_control() {
+        // HEARTBEAT travels as MEDIA + inner MediaType::HEARTBEAT.
+        let w = wrapper_with(PacketType::MEDIA);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::HEARTBEAT), None),
+            Class::P0Control
+        );
+    }
+
+    #[test]
+    fn classify_outbound_rtt_is_p0_control() {
+        let w = wrapper_with(PacketType::MEDIA);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::RTT), None),
+            Class::P0Control
+        );
+    }
+
+    #[test]
+    fn classify_outbound_session_assigned_is_p0_control() {
+        let w = wrapper_with(PacketType::SESSION_ASSIGNED);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_speaker_update_is_p0_control() {
+        let w = wrapper_with(PacketType::SPEAKER_UPDATE);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_meeting_is_p0_control() {
+        // Covers MEETING_ACTIVATED / MEETING_DEACTIVATED in the bead spec —
+        // both are sub-variants of the MEETING PacketType wrapper.
+        let w = wrapper_with(PacketType::MEETING);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_audio_is_p1_audio() {
+        let w = wrapper_with(PacketType::MEDIA);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::AUDIO), None),
+            Class::P1Audio
+        );
+    }
+
+    #[test]
+    fn classify_outbound_media_keyframe_base_layer_is_p2_keyframe() {
+        let w = wrapper_with(PacketType::MEDIA);
+        let rh = routing_header(true, 0, 0);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::VIDEO), Some(&rh)),
+            Class::P2Keyframe
+        );
+    }
+
+    #[test]
+    fn classify_outbound_media_base_layer_non_keyframe_is_p3_video_base() {
+        let w = wrapper_with(PacketType::MEDIA);
+        let rh = routing_header(false, 0, 0);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::VIDEO), Some(&rh)),
+            Class::P3VideoBase
+        );
+    }
+
+    #[test]
+    fn classify_outbound_media_enhancement_layer_is_p4_enhancement() {
+        let w = wrapper_with(PacketType::MEDIA);
+        // temporal=2, spatial=0 -> T2 enhancement
+        let rh = routing_header(false, 2, 0);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::VIDEO), Some(&rh)),
+            Class::P4Enhancement
+        );
+    }
+
+    #[test]
+    fn classify_outbound_media_without_routing_header_is_p3_video_base() {
+        // Legacy client: MEDIA wrapper with no inner routing header. We
+        // also leave `media_type` as None (e.g. encrypted inner that the
+        // caller couldn't parse).
+        let w = wrapper_with(PacketType::MEDIA);
+        assert_eq!(classify_outbound(&w, None, None), Class::P3VideoBase);
+    }
+
+    #[test]
+    fn classify_outbound_unknown_packet_type_is_p3_video_base() {
+        // PACKET_TYPE_UNKNOWN does not appear in the control-class list, is
+        // not MEDIA, and should hit the debug-fallback branch.
+        let w = wrapper_with(PacketType::PACKET_TYPE_UNKNOWN);
+        assert_eq!(classify_outbound(&w, None, None), Class::P3VideoBase);
+    }
+
+    #[test]
+    fn classify_outbound_keyframe_request_is_p0_control() {
+        // KEYFRAME_REQUEST is signaling, not video data — it must classify as
+        // P0Control and NOT fall through to the routing-header layer check.
+        let w = wrapper_with(PacketType::MEDIA);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::KEYFRAME_REQUEST), None),
+            Class::P0Control
+        );
+    }
+
+    #[test]
+    fn classify_outbound_screen_share_is_p4_enhancement() {
+        // Routing header that WOULD classify VIDEO as P2Keyframe — we pick
+        // is_keyframe=true, T=0, S=0 specifically to prove that SCREEN
+        // overrides routing-header-based classification.
+        let w = wrapper_with(PacketType::MEDIA);
+        let rh = routing_header(true, 0, 0);
+        assert_eq!(
+            classify_outbound(&w, Some(MediaType::SCREEN), Some(&rh)),
+            Class::P4Enhancement
+        );
+    }
+
+    #[test]
+    fn classify_outbound_subscription_update_is_p0_control() {
+        let w = wrapper_with(PacketType::SUBSCRIPTION_UPDATE);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_layer_hint_is_p0_control() {
+        let w = wrapper_with(PacketType::LAYER_HINT);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_admission_decision_is_p0_control() {
+        let w = wrapper_with(PacketType::ADMISSION_DECISION);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    #[test]
+    fn classify_outbound_capability_announce_is_p0_control() {
+        let w = wrapper_with(PacketType::CAPABILITY_ANNOUNCE);
+        assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
     }
 }
