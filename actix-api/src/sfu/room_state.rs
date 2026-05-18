@@ -29,6 +29,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use videocall_types::protos::diagnostics_packet::BandwidthEstimate;
+
 use crate::actors::session_logic::SessionId;
 
 /// Client supports the SFU routing header on media packets.
@@ -59,6 +61,17 @@ pub struct MemberEntry {
     /// Observers receive media but do not send any. Set by the JoinRoom
     /// path in p2-6.
     pub is_observer: bool,
+    /// Latest receiver downlink bandwidth estimate reported by this member's
+    /// client via `DiagnosticsPacket.bandwidth_estimate` (p4-4). Consumed by
+    /// the LayerSelector (p4-5) to budget per-receiver layer selection.
+    /// `None` until the first estimate arrives — clients may join and
+    /// publish media before they have any congestion data to share.
+    pub bandwidth_estimate: Option<BandwidthEstimate>,
+    /// Wall-clock instant at which `bandwidth_estimate` was last written.
+    /// `None` iff `bandwidth_estimate` is `None`. The LayerSelector can use
+    /// this to detect stale estimates (e.g. a client whose diagnostics
+    /// uplink is broken even though their session is alive).
+    pub bandwidth_estimate_updated_at: Option<Instant>,
 }
 
 /// Authoritative per-room state for the SFU.
@@ -93,8 +106,29 @@ impl RoomState {
             last_speaker_score: 0.0,
             is_speaking: false,
             is_observer: false,
+            bandwidth_estimate: None,
+            bandwidth_estimate_updated_at: None,
         };
         self.members.insert(sid, entry);
+    }
+
+    /// Update the cached bandwidth estimate for an existing member.
+    ///
+    /// Called from the per-room dispatcher on each inbound
+    /// `DiagnosticsPacket` whose `bandwidth_estimate` field is populated
+    /// (p4-4). The estimate becomes the input to the LayerSelector (p4-5)
+    /// when choosing per-receiver SVC layers.
+    ///
+    /// No-op if `sid` is not present in the room: clients can briefly send
+    /// diagnostics packets that arrive after a `LeaveRoom`/disconnect has
+    /// already pruned the member from the room state. We deliberately
+    /// avoid auto-inserting a phantom member entry — the JoinRoom path is
+    /// the sole authority on membership.
+    pub fn update_bandwidth_estimate(&mut self, sid: SessionId, est: &BandwidthEstimate) {
+        if let Some(entry) = self.members.get_mut(&sid) {
+            entry.bandwidth_estimate = Some(est.clone());
+            entry.bandwidth_estimate_updated_at = Some(Instant::now());
+        }
     }
 
     /// Remove a member from the room. No-op if absent.
@@ -130,5 +164,86 @@ impl RoomState {
 impl Default for RoomState {
     fn default() -> Self {
         Self::new(String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_estimate() -> BandwidthEstimate {
+        let mut est = BandwidthEstimate::new();
+        est.estimated_downlink_kbps = 1200;
+        est.estimated_loss_rate = 0.02;
+        est.rtt_ms = 47;
+        est
+    }
+
+    #[test]
+    fn member_defaults_have_no_bandwidth_estimate() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(7, 0);
+        let entry = room.members.get(&7).expect("member should be present");
+        assert!(entry.bandwidth_estimate.is_none());
+        assert!(entry.bandwidth_estimate_updated_at.is_none());
+    }
+
+    #[test]
+    fn update_bandwidth_estimate_round_trips_value_and_sets_timestamp() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(42, 0);
+
+        // Establish a "before" instant we can compare the timestamp against.
+        let before = Instant::now();
+        let est = sample_estimate();
+        room.update_bandwidth_estimate(42, &est);
+
+        let entry = room.members.get(&42).expect("member should be present");
+        let stored = entry
+            .bandwidth_estimate
+            .as_ref()
+            .expect("estimate should be present");
+        assert_eq!(stored.estimated_downlink_kbps, est.estimated_downlink_kbps);
+        assert_eq!(stored.estimated_loss_rate, est.estimated_loss_rate);
+        assert_eq!(stored.rtt_ms, est.rtt_ms);
+
+        let ts = entry
+            .bandwidth_estimate_updated_at
+            .expect("timestamp should be set");
+        assert!(ts >= before);
+        assert!(ts <= Instant::now());
+    }
+
+    #[test]
+    fn update_bandwidth_estimate_is_noop_for_absent_member() {
+        let mut room = RoomState::new("r".into());
+        // Note: no insert_member — sid 99 is unknown.
+        room.update_bandwidth_estimate(99, &sample_estimate());
+        assert!(
+            !room.members.contains_key(&99),
+            "absent sid must not be auto-inserted"
+        );
+        assert_eq!(room.member_count(), 0);
+    }
+
+    #[test]
+    fn update_bandwidth_estimate_overwrites_previous_value() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(1, 0);
+
+        let mut first = BandwidthEstimate::new();
+        first.estimated_downlink_kbps = 500;
+        room.update_bandwidth_estimate(1, &first);
+
+        let mut second = BandwidthEstimate::new();
+        second.estimated_downlink_kbps = 2500;
+        room.update_bandwidth_estimate(1, &second);
+
+        let stored = room
+            .members
+            .get(&1)
+            .and_then(|m| m.bandwidth_estimate.as_ref())
+            .expect("estimate should be present");
+        assert_eq!(stored.estimated_downlink_kbps, 2500);
     }
 }

@@ -16,9 +16,10 @@
  * conditions.
  */
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -32,9 +33,11 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::window;
 
-use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
+use videocall_types::protos::diagnostics_packet::{
+    AudioMetrics, BandwidthEstimate, DiagnosticsPacket, VideoMetrics,
+};
 
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_diagnostics::{global_sender, metric, now_ms, subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 // Basic structure for diagnostics events
@@ -213,6 +216,12 @@ struct DiagnosticWorker {
     packet_handler: Option<Callback<DiagnosticsPacket>>,
     receiver: Receiver<DiagnosticEvent>,
     userid: String,
+    /// Latest RTT (ms) to the active server, populated from the global
+    /// diagnostics bus by a subscription task spawned in `DiagnosticManager::new`.
+    /// Shared via `Rc<RefCell<_>>` so the subscriber task can update it
+    /// without going through the mpsc channel (avoids back-pressure from
+    /// the 1Hz connection_manager broadcasts).
+    current_rtt_ms: Rc<RefCell<Option<u32>>>,
 }
 
 impl std::fmt::Debug for DiagnosticManager {
@@ -229,6 +238,43 @@ impl DiagnosticManager {
     pub fn new(userid: String) -> Self {
         let (sender, receiver) = mpsc::channel(100);
 
+        // Shared RTT snapshot updated by the global-bus subscriber task and
+        // read by the worker when emitting DiagnosticsPackets.
+        let current_rtt_ms: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+        // Spawn a subscriber task that listens to the global diagnostics bus
+        // for the `active_server_rtt` metric (broadcast at ~1Hz by
+        // `connection_manager::report_diagnostics`) and stores the latest
+        // value in `current_rtt_ms`. Mirrors the pattern used by
+        // `HealthReporter::start_diagnostics_subscription`.
+        let rtt_weak: Weak<RefCell<Option<u32>>> = Rc::downgrade(&current_rtt_ms);
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut receiver = subscribe();
+            while let Ok(event) = receiver.recv().await {
+                let Some(rtt_rc) = Weak::upgrade(&rtt_weak) else {
+                    // DiagnosticManager has been dropped; stop the task.
+                    break;
+                };
+                if event.subsystem == "connection_manager" {
+                    for m in &event.metrics {
+                        if m.name == "active_server_rtt" {
+                            if let MetricValue::F64(v) = &m.value {
+                                // Clamp to u32; negative or NaN-ish values
+                                // would never originate from the RTT pipeline,
+                                // but guard anyway.
+                                let rtt = if v.is_finite() && *v >= 0.0 {
+                                    (*v).round() as u32
+                                } else {
+                                    0
+                                };
+                                *rtt_rc.borrow_mut() = Some(rtt);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Spawn the worker to process events
         let worker = DiagnosticWorker {
             fps_trackers: HashMap::new(),
@@ -238,6 +284,7 @@ impl DiagnosticManager {
             report_interval_ms: 500,
             receiver,
             userid,
+            current_rtt_ms,
         };
 
         wasm_bindgen_futures::spawn_local(worker.run());
@@ -483,6 +530,23 @@ impl DiagnosticWorker {
                         video_metrics.bitrate_kbps = tracker.current_bitrate as u32;
                         packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
                     }
+
+                    // Attach the receiver's link estimate so the SFU
+                    // LayerSelector (p4-5) can budget per-receiver layers.
+                    // The same `BandwidthEstimate` is repeated across all
+                    // per-peer/per-media DiagnosticsPackets emitted in this
+                    // window (default `report_interval_ms` = 500ms, ~2Hz) —
+                    // intentional and keeps the server ingest stateless
+                    // (see vc-clq / p4-4).
+                    let mut be = BandwidthEstimate::new();
+                    // TODO(p4-5): populate from decoder-side downlink
+                    // throughput telemetry; no aggregate exists today.
+                    be.estimated_downlink_kbps = 0;
+                    // TODO(p4-5): populate from decoder-side loss-rate
+                    // telemetry; no client-side counter exists today.
+                    be.estimated_loss_rate = 0.0;
+                    be.rtt_ms = self.current_rtt_ms.borrow().unwrap_or(0);
+                    packet.bandwidth_estimate = ::protobuf::MessageField::some(be);
 
                     debug!(
                         "Sending diagnostic packet to {}: {:?} FPS: {:.2} Bitrate: {:.1} kbit/s",

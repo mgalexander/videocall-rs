@@ -45,6 +45,10 @@ pub struct DiagnosticsPacket {
     ///  Audio-specific metrics (only populated for audio streams)
     // @@protoc_insertion_point(field:DiagnosticsPacket.audio_metrics)
     pub audio_metrics: ::protobuf::MessageField<AudioMetrics>,
+    ///  Receiver's estimated downlink bandwidth and link state. Consumed by
+    ///  the SFU LayerSelector (p4-5) to budget per-receiver layer selection.
+    // @@protoc_insertion_point(field:DiagnosticsPacket.bandwidth_estimate)
+    pub bandwidth_estimate: ::protobuf::MessageField<BandwidthEstimate>,
     // special fields
     // @@protoc_insertion_point(special_field:DiagnosticsPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -62,7 +66,7 @@ impl DiagnosticsPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(7);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "stream_id",
@@ -98,6 +102,11 @@ impl DiagnosticsPacket {
             "audio_metrics",
             |m: &DiagnosticsPacket| { &m.audio_metrics },
             |m: &mut DiagnosticsPacket| { &mut m.audio_metrics },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, BandwidthEstimate>(
+            "bandwidth_estimate",
+            |m: &DiagnosticsPacket| { &m.bandwidth_estimate },
+            |m: &mut DiagnosticsPacket| { &mut m.bandwidth_estimate },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<DiagnosticsPacket>(
             "DiagnosticsPacket",
@@ -138,6 +147,9 @@ impl ::protobuf::Message for DiagnosticsPacket {
                 58 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.audio_metrics)?;
                 },
+                66 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.bandwidth_estimate)?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -173,6 +185,10 @@ impl ::protobuf::Message for DiagnosticsPacket {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if let Some(v) = self.bandwidth_estimate.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -200,6 +216,9 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if let Some(v) = self.audio_metrics.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(7, v, os)?;
         }
+        if let Some(v) = self.bandwidth_estimate.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(8, v, os)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -224,6 +243,7 @@ impl ::protobuf::Message for DiagnosticsPacket {
         self.media_type = ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::MEDIA_TYPE_UNKNOWN);
         self.video_metrics.clear();
         self.audio_metrics.clear();
+        self.bandwidth_estimate.clear();
         self.special_fields.clear();
     }
 
@@ -236,6 +256,7 @@ impl ::protobuf::Message for DiagnosticsPacket {
             media_type: ::protobuf::EnumOrUnknown::from_i32(0),
             video_metrics: ::protobuf::MessageField::none(),
             audio_metrics: ::protobuf::MessageField::none(),
+            bandwidth_estimate: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -256,6 +277,176 @@ impl ::std::fmt::Display for DiagnosticsPacket {
 }
 
 impl ::protobuf::reflect::ProtobufValue for DiagnosticsPacket {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+///  Receiver's downlink bandwidth estimate, reported by the client and
+///  consumed by the SFU's LayerSelector to budget per-receiver layer
+///  selection.
+// @@protoc_insertion_point(message:BandwidthEstimate)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct BandwidthEstimate {
+    // message fields
+    ///  Receiver's estimated downlink bandwidth in kbps. From the
+    ///  client's existing congestion/throughput tracking. The SFU
+    ///  uses 85% of this as the layer budget (15% headroom for ACKs,
+    ///  protocol overhead, and burst absorption).
+    // @@protoc_insertion_point(field:BandwidthEstimate.estimated_downlink_kbps)
+    pub estimated_downlink_kbps: u32,
+    ///  Receiver's estimated downlink loss rate, 0..1. Currently
+    ///  unused by the LayerSelector but reserved for future P4+
+    ///  refinements (e.g. drop enhancement layers under high loss).
+    // @@protoc_insertion_point(field:BandwidthEstimate.estimated_loss_rate)
+    pub estimated_loss_rate: f32,
+    ///  RTT to the SFU in milliseconds. Used by the LayerSelector
+    ///  upgrade-watchdog (needs sustained headroom to upgrade).
+    // @@protoc_insertion_point(field:BandwidthEstimate.rtt_ms)
+    pub rtt_ms: u32,
+    // special fields
+    // @@protoc_insertion_point(special_field:BandwidthEstimate.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a BandwidthEstimate {
+    fn default() -> &'a BandwidthEstimate {
+        <BandwidthEstimate as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl BandwidthEstimate {
+    pub fn new() -> BandwidthEstimate {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "estimated_downlink_kbps",
+            |m: &BandwidthEstimate| { &m.estimated_downlink_kbps },
+            |m: &mut BandwidthEstimate| { &mut m.estimated_downlink_kbps },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "estimated_loss_rate",
+            |m: &BandwidthEstimate| { &m.estimated_loss_rate },
+            |m: &mut BandwidthEstimate| { &mut m.estimated_loss_rate },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "rtt_ms",
+            |m: &BandwidthEstimate| { &m.rtt_ms },
+            |m: &mut BandwidthEstimate| { &mut m.rtt_ms },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BandwidthEstimate>(
+            "BandwidthEstimate",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for BandwidthEstimate {
+    const NAME: &'static str = "BandwidthEstimate";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.estimated_downlink_kbps = is.read_uint32()?;
+                },
+                21 => {
+                    self.estimated_loss_rate = is.read_float()?;
+                },
+                24 => {
+                    self.rtt_ms = is.read_uint32()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.estimated_downlink_kbps != 0 {
+            my_size += ::protobuf::rt::uint32_size(1, self.estimated_downlink_kbps);
+        }
+        if self.estimated_loss_rate != 0. {
+            my_size += 1 + 4;
+        }
+        if self.rtt_ms != 0 {
+            my_size += ::protobuf::rt::uint32_size(3, self.rtt_ms);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.estimated_downlink_kbps != 0 {
+            os.write_uint32(1, self.estimated_downlink_kbps)?;
+        }
+        if self.estimated_loss_rate != 0. {
+            os.write_float(2, self.estimated_loss_rate)?;
+        }
+        if self.rtt_ms != 0 {
+            os.write_uint32(3, self.rtt_ms)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> BandwidthEstimate {
+        BandwidthEstimate::new()
+    }
+
+    fn clear(&mut self) {
+        self.estimated_downlink_kbps = 0;
+        self.estimated_loss_rate = 0.;
+        self.rtt_ms = 0;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static BandwidthEstimate {
+        static instance: BandwidthEstimate = BandwidthEstimate {
+            estimated_downlink_kbps: 0,
+            estimated_loss_rate: 0.,
+            rtt_ms: 0,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for BandwidthEstimate {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("BandwidthEstimate").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for BandwidthEstimate {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for BandwidthEstimate {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
@@ -543,65 +734,99 @@ impl ::protobuf::reflect::ProtobufValue for AudioMetrics {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1etypes/diagnostics_packet.proto\x1a\x18types/media_packet.proto\"\
-    \xac\x02\n\x11DiagnosticsPacket\x12\x1b\n\tstream_id\x18\x01\x20\x01(\tR\
+    \x8b\x03\n\x11DiagnosticsPacket\x12\x1b\n\tstream_id\x18\x01\x20\x01(\tR\
     \x08streamId\x12\x1b\n\tsender_id\x18\x02\x20\x01(\tR\x08senderId\x12\
     \x1b\n\ttarget_id\x18\x03\x20\x01(\tR\x08targetId\x12!\n\x0ctimestamp_ms\
     \x18\x04\x20\x01(\x04R\x0btimestampMs\x125\n\nmedia_type\x18\x05\x20\x01\
     (\x0e2\x16.MediaPacket.MediaTypeR\tmediaType\x122\n\rvideo_metrics\x18\
     \x06\x20\x01(\x0b2\r.VideoMetricsR\x0cvideoMetrics\x122\n\raudio_metrics\
-    \x18\x07\x20\x01(\x0b2\r.AudioMetricsR\x0caudioMetrics\"T\n\x0cVideoMetr\
-    ics\x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\
-    \x0cbitrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbps\"T\n\x0cAudioMetrics\
-    \x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\x0cb\
-    itrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbpsJ\xf9\n\n\x06\x12\x04\0\0\
-    \x1f\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n+\n\x02\x03\0\x12\x03\x03\0\"\
-    \x1a\x20\x20Import\x20the\x20MediaPacket\x20message\n\n\n\n\x02\x04\0\
-    \x12\x04\x05\0\x13\x01\n\n\n\x03\x04\0\x01\x12\x03\x05\x08\x19\nY\n\x04\
-    \x04\0\x02\0\x12\x03\x07\x02\x17\x1a\x16\x20Basic\x20identification\n\"4\
-    \x20Identifier\x20for\x20the\x20specific\x20stream\x20being\x20diagnosed\
-    \n\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x07\x02\x08\n\x0c\n\x05\x04\0\x02\
-    \0\x01\x12\x03\x07\t\x12\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x07\x15\x16\
-    \nA\n\x04\x04\0\x02\x01\x12\x03\x08\x02\x17\"4\x20Email/ID\x20of\x20who\
-    \x20is\x20sending\x20this\x20diagnostic\x20message\n\n\x0c\n\x05\x04\0\
-    \x02\x01\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
-    \x08\t\x12\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x08\x15\x16\n6\n\x04\
-    \x04\0\x02\x02\x12\x03\t\x02\x17\")\x20Email/ID\x20of\x20who\x20the\x20d\
-    iagnostic\x20is\x20about\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\t\x02\
-    \x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\t\t\x12\n\x0c\n\x05\x04\0\x02\
-    \x02\x03\x12\x03\t\x15\x16\nO\n\x04\x04\0\x02\x03\x12\x03\n\x02\x1a\"B\
-    \x20When\x20these\x20diagnostics\x20were\x20collected\x20(milliseconds\
-    \x20since\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\n\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x03\x01\x12\x03\n\t\x15\n\x0c\n\x05\x04\0\x02\x03\
-    \x03\x12\x03\n\x18\x19\n1\n\x04\x04\0\x02\x04\x12\x03\x0c\x02'\"$\x20Typ\
-    e\x20of\x20media\x20(audio/video/screen)\n\n\x0c\n\x05\x04\0\x02\x04\x06\
-    \x12\x03\x0c\x02\x17\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x0c\x18\"\n\
-    \x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x0c%&\nH\n\x04\x04\0\x02\x05\x12\
-    \x03\x0f\x02!\x1a;\x20Video-specific\x20metrics\x20(only\x20populated\
-    \x20for\x20video\x20streams)\n\n\x0c\n\x05\x04\0\x02\x05\x06\x12\x03\x0f\
-    \x02\x0e\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x0f\x0f\x1c\n\x0c\n\x05\
-    \x04\0\x02\x05\x03\x12\x03\x0f\x1f\x20\nH\n\x04\x04\0\x02\x06\x12\x03\
-    \x12\x02!\x1a;\x20Audio-specific\x20metrics\x20(only\x20populated\x20for\
-    \x20audio\x20streams)\n\n\x0c\n\x05\x04\0\x02\x06\x06\x12\x03\x12\x02\
-    \x0e\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x12\x0f\x1c\n\x0c\n\x05\x04\0\
-    \x02\x06\x03\x12\x03\x12\x1f\x20\n/\n\x02\x04\x01\x12\x04\x16\0\x19\x01\
-    \x1a#\x20Video-specific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\x01\x01\
-    \x12\x03\x16\x08\x14\n5\n\x04\x04\x01\x02\0\x12\x03\x17\x02\x19\"(\x20Fr\
-    ames\x20per\x20second\x20being\x20received\x20(fps)\n\n\x0c\n\x05\x04\
-    \x01\x02\0\x05\x12\x03\x17\x02\x07\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03\
-    \x17\x08\x14\n\x0c\n\x05\x04\x01\x02\0\x03\x12\x03\x17\x17\x18\n=\n\x04\
-    \x04\x01\x02\x01\x12\x03\x18\x02\x1a\"0\x20Current\x20measured\x20bitrat\
-    e\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x01\x02\x01\x05\x12\
-    \x03\x18\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03\x18\t\x15\n\x0c\
-    \n\x05\x04\x01\x02\x01\x03\x12\x03\x18\x18\x19\n/\n\x02\x04\x02\x12\x04\
-    \x1c\0\x1f\x01\x1a#\x20Audio-specific\x20diagnostic\x20metrics\n\n\n\n\
-    \x03\x04\x02\x01\x12\x03\x1c\x08\x14\n5\n\x04\x04\x02\x02\0\x12\x03\x1d\
-    \x02\x19\"(\x20Frames\x20per\x20second\x20being\x20received\x20(fps)\n\n\
-    \x0c\n\x05\x04\x02\x02\0\x05\x12\x03\x1d\x02\x07\n\x0c\n\x05\x04\x02\x02\
-    \0\x01\x12\x03\x1d\x08\x14\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03\x1d\x17\
-    \x18\n=\n\x04\x04\x02\x02\x01\x12\x03\x1e\x02\x1a\"0\x20Current\x20measu\
-    red\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x02\x02\
-    \x01\x05\x12\x03\x1e\x02\x08\n\x0c\n\x05\x04\x02\x02\x01\x01\x12\x03\x1e\
-    \t\x15\n\x0c\n\x05\x04\x02\x02\x01\x03\x12\x03\x1e\x18\x19b\x06proto3\
+    \x18\x07\x20\x01(\x0b2\r.AudioMetricsR\x0caudioMetrics\x12F\n\x12bandwid\
+    th_estimate\x18\x08\x20\x01(\x0b2\x12.BandwidthEstimateH\0R\x11bandwidth\
+    Estimate\x88\x01\x01B\x15\n\x13_bandwidth_estimate\"\x92\x01\n\x11Bandwi\
+    dthEstimate\x126\n\x17estimated_downlink_kbps\x18\x01\x20\x01(\rR\x15est\
+    imatedDownlinkKbps\x12.\n\x13estimated_loss_rate\x18\x02\x20\x01(\x02R\
+    \x11estimatedLossRate\x12\x15\n\x06rtt_ms\x18\x03\x20\x01(\rR\x05rttMs\"\
+    T\n\x0cVideoMetrics\x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsR\
+    eceived\x12!\n\x0cbitrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbps\"T\n\
+    \x0cAudioMetrics\x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsRece\
+    ived\x12!\n\x0cbitrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbpsJ\xae\x13\
+    \n\x06\x12\x04\0\07\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n+\n\x02\x03\0\
+    \x12\x03\x03\0\"\x1a\x20\x20Import\x20the\x20MediaPacket\x20message\n\n\
+    \n\n\x02\x04\0\x12\x04\x05\0\x17\x01\n\n\n\x03\x04\0\x01\x12\x03\x05\x08\
+    \x19\nY\n\x04\x04\0\x02\0\x12\x03\x07\x02\x17\x1a\x16\x20Basic\x20identi\
+    fication\n\"4\x20Identifier\x20for\x20the\x20specific\x20stream\x20being\
+    \x20diagnosed\n\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x07\x02\x08\n\x0c\n\
+    \x05\x04\0\x02\0\x01\x12\x03\x07\t\x12\n\x0c\n\x05\x04\0\x02\0\x03\x12\
+    \x03\x07\x15\x16\nA\n\x04\x04\0\x02\x01\x12\x03\x08\x02\x17\"4\x20Email/\
+    ID\x20of\x20who\x20is\x20sending\x20this\x20diagnostic\x20message\n\n\
+    \x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\
+    \x01\x01\x12\x03\x08\t\x12\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x08\x15\
+    \x16\n6\n\x04\x04\0\x02\x02\x12\x03\t\x02\x17\")\x20Email/ID\x20of\x20wh\
+    o\x20the\x20diagnostic\x20is\x20about\n\n\x0c\n\x05\x04\0\x02\x02\x05\
+    \x12\x03\t\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\t\t\x12\n\x0c\n\
+    \x05\x04\0\x02\x02\x03\x12\x03\t\x15\x16\nO\n\x04\x04\0\x02\x03\x12\x03\
+    \n\x02\x1a\"B\x20When\x20these\x20diagnostics\x20were\x20collected\x20(m\
+    illiseconds\x20since\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\n\
+    \x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\n\t\x15\n\x0c\n\x05\x04\0\
+    \x02\x03\x03\x12\x03\n\x18\x19\n1\n\x04\x04\0\x02\x04\x12\x03\x0c\x02'\"\
+    $\x20Type\x20of\x20media\x20(audio/video/screen)\n\n\x0c\n\x05\x04\0\x02\
+    \x04\x06\x12\x03\x0c\x02\x17\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x0c\
+    \x18\"\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x0c%&\nH\n\x04\x04\0\x02\
+    \x05\x12\x03\x0f\x02!\x1a;\x20Video-specific\x20metrics\x20(only\x20popu\
+    lated\x20for\x20video\x20streams)\n\n\x0c\n\x05\x04\0\x02\x05\x06\x12\
+    \x03\x0f\x02\x0e\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x0f\x0f\x1c\n\x0c\
+    \n\x05\x04\0\x02\x05\x03\x12\x03\x0f\x1f\x20\nH\n\x04\x04\0\x02\x06\x12\
+    \x03\x12\x02!\x1a;\x20Audio-specific\x20metrics\x20(only\x20populated\
+    \x20for\x20audio\x20streams)\n\n\x0c\n\x05\x04\0\x02\x06\x06\x12\x03\x12\
+    \x02\x0e\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x12\x0f\x1c\n\x0c\n\x05\
+    \x04\0\x02\x06\x03\x12\x03\x12\x1f\x20\n\x99\x01\n\x04\x04\0\x02\x07\x12\
+    \x03\x16\x024\x1a\x8b\x01\x20Receiver's\x20estimated\x20downlink\x20band\
+    width\x20and\x20link\x20state.\x20Consumed\x20by\n\x20the\x20SFU\x20Laye\
+    rSelector\x20(p4-5)\x20to\x20budget\x20per-receiver\x20layer\x20selectio\
+    n.\n\n\x0c\n\x05\x04\0\x02\x07\x04\x12\x03\x16\x02\n\n\x0c\n\x05\x04\0\
+    \x02\x07\x06\x12\x03\x16\x0b\x1c\n\x0c\n\x05\x04\0\x02\x07\x01\x12\x03\
+    \x16\x1d/\n\x0c\n\x05\x04\0\x02\x07\x03\x12\x03\x1623\n\x9f\x01\n\x02\
+    \x04\x01\x12\x04\x1c\0+\x01\x1a\x92\x01\x20Receiver's\x20downlink\x20ban\
+    dwidth\x20estimate,\x20reported\x20by\x20the\x20client\x20and\n\x20consu\
+    med\x20by\x20the\x20SFU's\x20LayerSelector\x20to\x20budget\x20per-receiv\
+    er\x20layer\n\x20selection.\n\n\n\n\x03\x04\x01\x01\x12\x03\x1c\x08\x19\
+    \n\xed\x01\n\x04\x04\x01\x02\0\x12\x03!\x02%\x1a\xdf\x01\x20Receiver's\
+    \x20estimated\x20downlink\x20bandwidth\x20in\x20kbps.\x20From\x20the\n\
+    \x20client's\x20existing\x20congestion/throughput\x20tracking.\x20The\
+    \x20SFU\n\x20uses\x2085%\x20of\x20this\x20as\x20the\x20layer\x20budget\
+    \x20(15%\x20headroom\x20for\x20ACKs,\n\x20protocol\x20overhead,\x20and\
+    \x20burst\x20absorption).\n\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03!\x02\
+    \x08\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03!\t\x20\n\x0c\n\x05\x04\x01\
+    \x02\0\x03\x12\x03!#$\n\xbe\x01\n\x04\x04\x01\x02\x01\x12\x03&\x02\x20\
+    \x1a\xb0\x01\x20Receiver's\x20estimated\x20downlink\x20loss\x20rate,\x20\
+    0..1.\x20Currently\n\x20unused\x20by\x20the\x20LayerSelector\x20but\x20r\
+    eserved\x20for\x20future\x20P4+\n\x20refinements\x20(e.g.\x20drop\x20enh\
+    ancement\x20layers\x20under\x20high\x20loss).\n\n\x0c\n\x05\x04\x01\x02\
+    \x01\x05\x12\x03&\x02\x07\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03&\x08\
+    \x1b\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03&\x1e\x1f\n\x81\x01\n\x04\
+    \x04\x01\x02\x02\x12\x03*\x02\x14\x1at\x20RTT\x20to\x20the\x20SFU\x20in\
+    \x20milliseconds.\x20Used\x20by\x20the\x20LayerSelector\n\x20upgrade-wat\
+    chdog\x20(needs\x20sustained\x20headroom\x20to\x20upgrade).\n\n\x0c\n\
+    \x05\x04\x01\x02\x02\x05\x12\x03*\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\
+    \x01\x12\x03*\t\x0f\n\x0c\n\x05\x04\x01\x02\x02\x03\x12\x03*\x12\x13\n/\
+    \n\x02\x04\x02\x12\x04.\01\x01\x1a#\x20Video-specific\x20diagnostic\x20m\
+    etrics\n\n\n\n\x03\x04\x02\x01\x12\x03.\x08\x14\n5\n\x04\x04\x02\x02\0\
+    \x12\x03/\x02\x19\"(\x20Frames\x20per\x20second\x20being\x20received\x20\
+    (fps)\n\n\x0c\n\x05\x04\x02\x02\0\x05\x12\x03/\x02\x07\n\x0c\n\x05\x04\
+    \x02\x02\0\x01\x12\x03/\x08\x14\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03/\
+    \x17\x18\n=\n\x04\x04\x02\x02\x01\x12\x030\x02\x1a\"0\x20Current\x20meas\
+    ured\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x02\x02\
+    \x01\x05\x12\x030\x02\x08\n\x0c\n\x05\x04\x02\x02\x01\x01\x12\x030\t\x15\
+    \n\x0c\n\x05\x04\x02\x02\x01\x03\x12\x030\x18\x19\n/\n\x02\x04\x03\x12\
+    \x044\07\x01\x1a#\x20Audio-specific\x20diagnostic\x20metrics\n\n\n\n\x03\
+    \x04\x03\x01\x12\x034\x08\x14\n5\n\x04\x04\x03\x02\0\x12\x035\x02\x19\"(\
+    \x20Frames\x20per\x20second\x20being\x20received\x20(fps)\n\n\x0c\n\x05\
+    \x04\x03\x02\0\x05\x12\x035\x02\x07\n\x0c\n\x05\x04\x03\x02\0\x01\x12\
+    \x035\x08\x14\n\x0c\n\x05\x04\x03\x02\0\x03\x12\x035\x17\x18\n=\n\x04\
+    \x04\x03\x02\x01\x12\x036\x02\x1a\"0\x20Current\x20measured\x20bitrate\
+    \x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x03\x02\x01\x05\x12\
+    \x036\x02\x08\n\x0c\n\x05\x04\x03\x02\x01\x01\x12\x036\t\x15\n\x0c\n\x05\
+    \x04\x03\x02\x01\x03\x12\x036\x18\x19b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -620,8 +845,9 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(1);
             deps.push(super::media_packet::file_descriptor().clone());
-            let mut messages = ::std::vec::Vec::with_capacity(3);
+            let mut messages = ::std::vec::Vec::with_capacity(4);
             messages.push(DiagnosticsPacket::generated_message_descriptor_data());
+            messages.push(BandwidthEstimate::generated_message_descriptor_data());
             messages.push(VideoMetrics::generated_message_descriptor_data());
             messages.push(AudioMetrics::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(0);

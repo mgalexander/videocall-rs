@@ -39,8 +39,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
@@ -813,6 +814,16 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             .entry(room.clone())
             .or_insert_with(|| Arc::new(TokioRwLock::new(SpeakerScorer::new())))
             .clone();
+        // p4-4: the dispatcher needs the room's RoomState handle to record
+        // per-receiver bandwidth estimates from DiagnosticsPacket ingest.
+        // The forwarder above keeps room_state alive, so this lookup should
+        // always succeed; fall back to materialising a fresh entry to keep
+        // the respawn path infallible (matches the scorer fallback above).
+        let room_state = self
+            .room_states
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(RoomState::new(room.clone()))))
+            .clone();
         let subject = format!("room.{room}.*").replace(' ', "_");
         let sfu_mode = self.sfu_config.mode;
         warn!(
@@ -832,6 +843,7 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             forwarder,
             scorer,
             receivers.clone(),
+            room_state,
             ctx.address(),
         );
         self.room_dispatch
@@ -1206,6 +1218,7 @@ impl Handler<JoinRoom> for ChatServer {
                     forwarder.clone(),
                     scorer.clone(),
                     receivers.clone(),
+                    room_state.clone(),
                     ctx.address(),
                 );
                 let recvs = receivers.clone();
@@ -1365,6 +1378,11 @@ fn spawn_room_dispatcher(
     forwarder: Arc<Forwarder>,
     scorer: Arc<TokioRwLock<SpeakerScorer>>,
     receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+    // p4-4: per-room SFU state for the bandwidth-estimate ingest path. We
+    // hold an `Arc<RwLock<_>>` so the dispatcher can take a short write
+    // lock when a client sends a DiagnosticsPacket; the JoinRoom handler
+    // owns the same Arc so member inserts/removes remain visible here.
+    room_state: Arc<RwLock<RoomState>>,
     chat_server: actix::Addr<ChatServer>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1423,6 +1441,60 @@ fn spawn_room_dispatcher(
                             // a read for a snapshot copy; neither holds
                             // the lock across other awaits.
                             scorer.write().await.observe(sender_sid, level, hint);
+                        }
+                    }
+                }
+            }
+
+            // p4-4: DiagnosticsPacket ingest — record the sender's most
+            // recent receiver-downlink bandwidth estimate on its
+            // MemberEntry so the LayerSelector (p4-5) can budget per-
+            // receiver layer selection. We do NOT consume the packet:
+            // diagnostics continue through the existing fan-out so peers
+            // who today forward/inspect diagnostics keep seeing them.
+            //
+            // Gated on SfuMode::Sfu (mirrors the scorer gate above):
+            // legacy mode bypasses the forwarder, so storing the estimate
+            // would be pure waste.
+            //
+            // Cost: one extra `DiagnosticsPacket::parse_from_bytes` per
+            // inbound DIAGNOSTICS message (the client emits per peer × per
+            // media-type on its `report_interval_ms` cadence, ~2Hz by
+            // default). Negligible relative to the MEDIA hot path.
+            if sfu_mode == SfuMode::Sfu {
+                if let Some(p) = parsed.as_ref() {
+                    if p.wrapper.packet_type == PacketType::DIAGNOSTICS.into() {
+                        match DiagnosticsPacket::parse_from_bytes(&p.wrapper.data) {
+                            Ok(diag) => {
+                                if let Some(est) = diag.bandwidth_estimate.as_ref() {
+                                    let sender_sid = p.wrapper.session_id;
+                                    debug!(
+                                        "received bandwidth estimate from {}: \
+                                         {}kbps rtt={}ms loss={}",
+                                        sender_sid,
+                                        est.estimated_downlink_kbps,
+                                        est.rtt_ms,
+                                        est.estimated_loss_rate,
+                                    );
+                                    // Tight critical section: only the
+                                    // `update_bandwidth_estimate` call holds the
+                                    // write lock; no awaits within. Poison-safe
+                                    // pattern matches the rest of this file.
+                                    let mut guard = match room_state.write() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    guard.update_bandwidth_estimate(sender_sid, est);
+                                }
+                            }
+                            Err(e) => {
+                                trace!(
+                                    "DiagnosticsPacket parse failed for session {} in room {}: {}",
+                                    p.wrapper.session_id,
+                                    room,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
