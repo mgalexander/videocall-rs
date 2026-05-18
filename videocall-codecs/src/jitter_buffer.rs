@@ -321,18 +321,24 @@ impl<T> JitterBuffer<T> {
     }
 
     /// Removes all frames from the buffer with a sequence number less than the given one.
+    ///
+    /// Allocation-free: uses `BTreeMap::split_off` to partition the map by key without
+    /// building any temporary `Vec`. `split_off(&sequence_number)` returns the entries
+    /// with keys `>= sequence_number` (the ones we keep); we then swap that back into
+    /// `self.buffered_frames` and drain the leftover (entries with keys `< sequence_number`)
+    /// for logging and counting. This matters because under SVC layer-stripping
+    /// (bead vc-v82) this runs on every gap-recovery layer-strip — roughly 30 fps × N
+    /// peers — and a Vec-per-call adds up quickly on constrained devices.
     fn drop_frames_before(&mut self, sequence_number: u64) {
-        let keys_to_drop: Vec<u64> = self
-            .buffered_frames
-            .keys()
-            .cloned()
-            .filter(|&k| k < sequence_number)
-            .collect();
+        // `split_off(&k)` retains keys `< k` in `self.buffered_frames` and returns a
+        // new map with keys `>= k`. We want the opposite (keep `>= k`, drop `< k`),
+        // so swap the two halves.
+        let kept = self.buffered_frames.split_off(&sequence_number);
+        let dropped = std::mem::replace(&mut self.buffered_frames, kept);
 
-        self.dropped_frames_count += keys_to_drop.len() as u64;
-        for key in keys_to_drop {
+        self.dropped_frames_count += dropped.len() as u64;
+        for key in dropped.keys() {
             println!("[JITTER_BUFFER] Dropping stale frame: {key}");
-            self.buffered_frames.remove(&key);
         }
     }
 
