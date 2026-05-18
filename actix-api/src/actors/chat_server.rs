@@ -1606,13 +1606,13 @@ fn spawn_room_dispatcher(
                                     // `update_bandwidth_estimate` call holds the
                                     // write lock; no awaits within. Poison-safe
                                     // pattern matches the rest of this file.
-                                    {
+                                    let should_invalidate = {
                                         let mut guard = match room_state.write() {
                                             Ok(g) => g,
                                             Err(poisoned) => poisoned.into_inner(),
                                         };
-                                        guard.update_bandwidth_estimate(sender_sid, est);
-                                    }
+                                        guard.update_bandwidth_estimate(sender_sid, est)
+                                    };
                                     // p4-7: invalidate the cached layer
                                     // selection for this receiver so the
                                     // next `decide()` call recomputes
@@ -1622,9 +1622,24 @@ fn spawn_room_dispatcher(
                                     // — they're reporting their OWN
                                     // bandwidth back to the SFU.
                                     // vc-wls: lock-free per-key invalidate.
-                                    forwarder
-                                        .layer_selector()
-                                        .invalidate_for_receiver(sender_sid);
+                                    //
+                                    // vc-17e: skip both the invalidate AND
+                                    // the underlying `bandwidth_estimate`
+                                    // overwrite when the new value is
+                                    // within noise. The forwarder's cache-
+                                    // validity check is exact equality on
+                                    // `bandwidth_kbps` (forwarder.rs), so
+                                    // a chatty client that we let through
+                                    // here would still miss the cache and
+                                    // force a recompute every tick — the
+                                    // suppression has to be paired in
+                                    // `update_bandwidth_estimate` to be
+                                    // load-bearing.
+                                    if should_invalidate {
+                                        forwarder
+                                            .layer_selector()
+                                            .invalidate_for_receiver(sender_sid);
+                                    }
                                 }
                             }
                             Err(e) => {

@@ -450,7 +450,10 @@ fn set_receiver_bandwidth(room: &Arc<RwLock<RoomState>>, receiver: SessionId, do
     let mut est = BandwidthEstimate::new();
     est.estimated_downlink_kbps = downlink_kbps;
     let mut guard = room.write().unwrap();
-    guard.update_bandwidth_estimate(receiver, &est);
+    // Discarding the invalidate-hint is fine in a test helper that only
+    // seeds initial state — the forwarder tests don't exercise the
+    // LayerSelector cache-suppression path.
+    let _ = guard.update_bandwidth_estimate(receiver, &est);
 }
 
 /// Acceptance for p4-7: one sender, three receivers at 200 / 500 / 2000

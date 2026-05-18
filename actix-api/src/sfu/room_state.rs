@@ -43,6 +43,22 @@ pub const CAP_SVC: u32 = 2;
 /// Client supports the subscription model (subscribe/unsubscribe to peers).
 pub const CAP_SUBSCRIPTION: u32 = 4;
 
+/// vc-17e: absolute-kbps threshold above which a bandwidth-estimate refresh
+/// is considered significant enough to invalidate the LayerSelector cache.
+/// Tuned to be larger than typical BWE jitter (~tens of kbps) but small
+/// relative to T0/T1/T2 step sizes so legitimate layer transitions are
+/// never masked.
+pub const BWE_INVALIDATE_ABS_KBPS: u32 = 50;
+
+/// vc-17e: relative threshold (in percent) used in conjunction with
+/// [`BWE_INVALIDATE_ABS_KBPS`]. Either crossing triggers invalidation, so
+/// an estimate update is skipped only when BOTH the absolute and relative
+/// diffs are below their respective thresholds. The relative threshold
+/// matters in the low-bandwidth regime (10% of 200 kbps = 20 kbps, well
+/// under the absolute floor); the absolute threshold matters in the
+/// high-bandwidth regime (50 kbps on a 2 Mbps link is ~2.5%).
+pub const BWE_INVALIDATE_REL_PCT: u32 = 10;
+
 /// Per-member entry tracked by the room.
 ///
 /// Speaker-scoring fields (`last_speaker_score`, `is_speaking`) are present
@@ -62,16 +78,21 @@ pub struct MemberEntry {
     /// Observers receive media but do not send any. Set by the JoinRoom
     /// path in p2-6.
     pub is_observer: bool,
-    /// Latest receiver downlink bandwidth estimate reported by this member's
-    /// client via `DiagnosticsPacket.bandwidth_estimate` (p4-4). Consumed by
-    /// the LayerSelector (p4-5) to budget per-receiver layer selection.
-    /// `None` until the first estimate arrives — clients may join and
-    /// publish media before they have any congestion data to share.
+    /// Last receiver downlink bandwidth estimate reported by this member's
+    /// client via `DiagnosticsPacket.bandwidth_estimate` (p4-4), filtered
+    /// to the most recent value that materially differed from the prior
+    /// reading (vc-17e: see [`RoomState::update_bandwidth_estimate`]).
+    /// Consumed by the LayerSelector (p4-5) to budget per-receiver layer
+    /// selection. `None` until the first estimate arrives — clients may
+    /// join and publish media before they have any congestion data to
+    /// share.
     pub bandwidth_estimate: Option<BandwidthEstimate>,
-    /// Wall-clock instant at which `bandwidth_estimate` was last written.
-    /// `None` iff `bandwidth_estimate` is `None`. The LayerSelector can use
-    /// this to detect stale estimates (e.g. a client whose diagnostics
-    /// uplink is broken even though their session is alive).
+    /// Wall-clock instant at which the client most recently reported a
+    /// `DiagnosticsPacket.bandwidth_estimate`, regardless of whether that
+    /// report crossed the vc-17e divergence threshold. Tracks liveness of
+    /// the diagnostics uplink — use this to detect a stuck client, not
+    /// the freshness of `bandwidth_estimate` as a numeric value.
+    /// `None` iff `bandwidth_estimate` is `None`.
     pub bandwidth_estimate_updated_at: Option<Instant>,
 }
 
@@ -206,11 +227,66 @@ impl RoomState {
     /// already pruned the member from the room state. We deliberately
     /// avoid auto-inserting a phantom member entry — the JoinRoom path is
     /// the sole authority on membership.
-    pub fn update_bandwidth_estimate(&mut self, sid: SessionId, est: &BandwidthEstimate) {
-        if let Some(entry) = self.members.get_mut(&sid) {
+    ///
+    /// **vc-17e — divergence-gated persistence.** The stored
+    /// [`MemberEntry::bandwidth_estimate`] is the cache baseline that the
+    /// LayerSelector recompute fast-path (`forwarder.rs` cache-validity
+    /// check) reads to decide whether its cached selection is still valid.
+    /// That check is exact equality on `estimated_downlink_kbps`, so if we
+    /// overwrite the stored value on every diagnostics tick the cache will
+    /// miss every tick — defeating the whole point of suppressing the
+    /// LayerSelector invalidate call.
+    ///
+    /// Therefore: when the new estimate is within noise of the stored one
+    /// (below both [`BWE_INVALIDATE_ABS_KBPS`] absolute AND
+    /// [`BWE_INVALIDATE_REL_PCT`] relative), we leave `bandwidth_estimate`
+    /// unchanged but still bump `bandwidth_estimate_updated_at` so the
+    /// liveness signal continues to reflect when the client last reported.
+    /// Drift accumulates against the cached baseline and triggers a write
+    /// (and invalidation) only when it crosses threshold.
+    ///
+    /// Returns `true` iff the caller should invalidate the LayerSelector
+    /// cache for this receiver. Always `true` when there was no prior
+    /// estimate; `true` when the new value diverges from the cached one
+    /// by more than the absolute OR relative threshold; otherwise `false`.
+    /// Spammy clients whose reports barely move the needle do not force an
+    /// O(allow_set × speakers) recompute on every diagnostics tick.
+    ///
+    /// `#[must_use]` because dropping the return at the production callsite
+    /// silently regresses the optimization (the caller would unconditionally
+    /// invalidate). Test helpers that only seed state can `let _ = ...`.
+    #[must_use]
+    pub fn update_bandwidth_estimate(&mut self, sid: SessionId, est: &BandwidthEstimate) -> bool {
+        let Some(entry) = self.members.get_mut(&sid) else {
+            return false;
+        };
+        // Always refresh the liveness timestamp — even sub-threshold writes
+        // tell us the client's diagnostics uplink is alive.
+        entry.bandwidth_estimate_updated_at = Some(Instant::now());
+
+        let prev_kbps = entry
+            .bandwidth_estimate
+            .as_ref()
+            .map(|e| e.estimated_downlink_kbps);
+        let new_kbps = est.estimated_downlink_kbps;
+
+        let significant = match prev_kbps {
+            None => true,
+            Some(prev) => {
+                let abs_diff = prev.abs_diff(new_kbps);
+                // (abs_diff * 100) / prev > BWE_INVALIDATE_REL_PCT,
+                // rearranged to avoid floating point and divide-by-zero
+                // (prev==0 with new>0 yields LHS>0 > RHS=0 = true).
+                abs_diff > BWE_INVALIDATE_ABS_KBPS
+                    || u64::from(abs_diff) * 100
+                        > u64::from(prev) * u64::from(BWE_INVALIDATE_REL_PCT)
+            }
+        };
+
+        if significant {
             entry.bandwidth_estimate = Some(est.clone());
-            entry.bandwidth_estimate_updated_at = Some(Instant::now());
         }
+        significant
     }
 
     /// Remove a member from the room. No-op if absent.
@@ -280,7 +356,8 @@ mod tests {
         // Establish a "before" instant we can compare the timestamp against.
         let before = Instant::now();
         let est = sample_estimate();
-        room.update_bandwidth_estimate(42, &est);
+        // First update (no prior estimate) must always request invalidation.
+        assert!(room.update_bandwidth_estimate(42, &est));
 
         let entry = room.members.get(&42).expect("member should be present");
         let stored = entry
@@ -302,7 +379,7 @@ mod tests {
     fn update_bandwidth_estimate_is_noop_for_absent_member() {
         let mut room = RoomState::new("r".into());
         // Note: no insert_member — sid 99 is unknown.
-        room.update_bandwidth_estimate(99, &sample_estimate());
+        assert!(!room.update_bandwidth_estimate(99, &sample_estimate()));
         assert!(
             !room.members.contains_key(&99),
             "absent sid must not be auto-inserted"
@@ -391,11 +468,17 @@ mod tests {
 
         let mut first = BandwidthEstimate::new();
         first.estimated_downlink_kbps = 500;
-        room.update_bandwidth_estimate(1, &first);
+        assert!(
+            room.update_bandwidth_estimate(1, &first),
+            "first estimate (no prior value) must invalidate"
+        );
 
         let mut second = BandwidthEstimate::new();
         second.estimated_downlink_kbps = 2500;
-        room.update_bandwidth_estimate(1, &second);
+        assert!(
+            room.update_bandwidth_estimate(1, &second),
+            "5x jump must invalidate"
+        );
 
         let stored = room
             .members
@@ -403,5 +486,147 @@ mod tests {
             .and_then(|m| m.bandwidth_estimate.as_ref())
             .expect("estimate should be present");
         assert_eq!(stored.estimated_downlink_kbps, 2500);
+    }
+
+    /// vc-17e: tiny diffs within noise must NOT trigger invalidation, so a
+    /// chatty client cannot force an O(allow_set × speakers) recompute on
+    /// every diagnostics tick. The stored value is intentionally left at
+    /// the baseline so the LayerSelector cache-validity check (exact
+    /// equality on `bandwidth_kbps`) continues to hit; only the liveness
+    /// timestamp moves forward.
+    #[test]
+    fn update_bandwidth_estimate_skips_invalidation_within_noise() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(1, 0);
+
+        let mut first = BandwidthEstimate::new();
+        first.estimated_downlink_kbps = 2000;
+        assert!(room.update_bandwidth_estimate(1, &first));
+        let ts_after_first = room
+            .members
+            .get(&1)
+            .and_then(|m| m.bandwidth_estimate_updated_at)
+            .expect("timestamp set");
+
+        // +10 kbps: below both the 50 kbps abs and 10% rel thresholds.
+        let mut second = BandwidthEstimate::new();
+        second.estimated_downlink_kbps = 2010;
+        assert!(
+            !room.update_bandwidth_estimate(1, &second),
+            "10 kbps drift (0.5%) must not invalidate"
+        );
+
+        // Stored value MUST remain the baseline so the forwarder cache hits.
+        let entry = room.members.get(&1).expect("member present");
+        assert_eq!(
+            entry
+                .bandwidth_estimate
+                .as_ref()
+                .expect("estimate present")
+                .estimated_downlink_kbps,
+            2000,
+            "sub-threshold updates must not overwrite the cache baseline"
+        );
+        // Liveness timestamp still advances (or stays the same instant —
+        // the second write happens at >= the first instant).
+        let ts_after_second = entry.bandwidth_estimate_updated_at.expect("timestamp set");
+        assert!(ts_after_second >= ts_after_first);
+    }
+
+    /// vc-17e: absolute threshold triggers in the high-bandwidth regime where
+    /// 50 kbps is well below the relative threshold (2.5% of 2 Mbps).
+    #[test]
+    fn update_bandwidth_estimate_invalidates_on_absolute_diff() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(1, 0);
+
+        let mut first = BandwidthEstimate::new();
+        first.estimated_downlink_kbps = 2000;
+        assert!(room.update_bandwidth_estimate(1, &first));
+
+        // +60 kbps absolute, 3% relative — abs threshold crosses, rel does not.
+        let mut second = BandwidthEstimate::new();
+        second.estimated_downlink_kbps = 2060;
+        assert!(
+            room.update_bandwidth_estimate(1, &second),
+            "60 kbps move must invalidate via absolute threshold"
+        );
+    }
+
+    /// vc-17e: relative threshold triggers in the low-bandwidth regime where
+    /// 10% is well below the 50 kbps absolute threshold.
+    #[test]
+    fn update_bandwidth_estimate_invalidates_on_relative_diff() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(1, 0);
+
+        let mut first = BandwidthEstimate::new();
+        first.estimated_downlink_kbps = 100;
+        assert!(room.update_bandwidth_estimate(1, &first));
+
+        // +30 kbps = 30% relative, below the 50 kbps absolute floor. Rel
+        // threshold must catch it so low-budget receivers still react.
+        let mut second = BandwidthEstimate::new();
+        second.estimated_downlink_kbps = 130;
+        assert!(
+            room.update_bandwidth_estimate(1, &second),
+            "30% move on 100 kbps must invalidate via relative threshold"
+        );
+    }
+
+    /// vc-17e: prev=0 with new>0 (a client transitioning out of a "no
+    /// estimate" sentinel into a real value) MUST invalidate. The
+    /// relative-threshold check naturally handles this: any positive
+    /// `abs_diff` produces LHS>0 strictly greater than RHS=0.
+    #[test]
+    fn update_bandwidth_estimate_invalidates_on_transition_from_zero() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(1, 0);
+
+        let mut zero = BandwidthEstimate::new();
+        zero.estimated_downlink_kbps = 0;
+        assert!(room.update_bandwidth_estimate(1, &zero));
+
+        // A small positive value (10 kbps) is below the 50 kbps absolute
+        // threshold AND the relative check would divide-by-zero if naïve.
+        // Both edges must converge on "invalidate".
+        let mut tiny = BandwidthEstimate::new();
+        tiny.estimated_downlink_kbps = 10;
+        assert!(
+            room.update_bandwidth_estimate(1, &tiny),
+            "0 → 10 kbps transition must invalidate (no divide-by-zero short-circuit)"
+        );
+
+        // And 0 → 0 must NOT invalidate.
+        room.insert_member(2, 0);
+        let mut z2 = BandwidthEstimate::new();
+        z2.estimated_downlink_kbps = 0;
+        assert!(room.update_bandwidth_estimate(2, &z2));
+        let mut z3 = BandwidthEstimate::new();
+        z3.estimated_downlink_kbps = 0;
+        assert!(
+            !room.update_bandwidth_estimate(2, &z3),
+            "0 → 0 (no change) must not invalidate"
+        );
+    }
+
+    /// vc-17e: exactly-at-threshold values do NOT invalidate (strict >).
+    /// Locks in the boundary so future tuning is intentional.
+    #[test]
+    fn update_bandwidth_estimate_at_threshold_does_not_invalidate() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(1, 0);
+
+        let mut first = BandwidthEstimate::new();
+        first.estimated_downlink_kbps = 1000;
+        assert!(room.update_bandwidth_estimate(1, &first));
+
+        // Exactly +50 kbps and exactly 5% — neither strictly exceeds.
+        let mut second = BandwidthEstimate::new();
+        second.estimated_downlink_kbps = 1050;
+        assert!(
+            !room.update_bandwidth_estimate(1, &second),
+            "exactly-50 kbps / 5% diff must not invalidate"
+        );
     }
 }
