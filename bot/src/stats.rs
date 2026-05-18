@@ -60,6 +60,18 @@ pub struct BotStats {
     pub drops: AtomicU64,
     /// Unix-millis when the bot connected; `0` if never connected.
     pub connected_at_ms: AtomicU64,
+    /// Failover-test bookkeeping (p6-11): unix-millis of the last successfully
+    /// drained inbound packet. `0` until the first packet arrives.
+    pub last_packet_at_ms: AtomicU64,
+    /// Failover-test bookkeeping (p6-11): unix-millis at which the bot first
+    /// detected an inbound gap (session close, accept-uni error, or stream
+    /// drain error). `0` if no gap has been observed in this run. Sticky:
+    /// only the first gap of the run is recorded.
+    pub disconnect_at_ms: AtomicU64,
+    /// Failover-test bookkeeping (p6-11): unix-millis of the first inbound
+    /// packet drained after `disconnect_at_ms`. `0` if no successful packet
+    /// has arrived post-gap. Sticky: only the first reconnect is recorded.
+    pub reconnect_at_ms: AtomicU64,
 }
 
 impl BotStats {
@@ -84,6 +96,38 @@ impl BotStats {
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Record one successfully drained inbound stream and update the
+    /// failover-test bookkeeping (`last_packet_at_ms` and, if this is the
+    /// first packet after a recorded disconnect, `reconnect_at_ms`).
+    ///
+    /// `now_ms` is the wall-clock unix-millis the caller observed when the
+    /// packet finished draining. Centralising the timestamp here keeps the
+    /// "first-post-gap" detection branch atomic-free in the hot path.
+    pub fn record_packet_at(&self, bytes: u64, now_ms: u64) {
+        self.record_packet(bytes);
+        self.last_packet_at_ms.store(now_ms, Ordering::Relaxed);
+        // Sticky reconnect timestamp: only set the first time we see a packet
+        // after a disconnect was observed. CAS from 0 -> now_ms keeps this
+        // race-free across the per-stream tasks.
+        if self.disconnect_at_ms.load(Ordering::Relaxed) != 0 {
+            let _ = self.reconnect_at_ms.compare_exchange(
+                0,
+                now_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Mark the first observed disconnect for this run. Sticky: subsequent
+    /// calls are no-ops (CAS 0 -> now_ms).
+    pub fn mark_disconnected_at(&self, now_ms: u64) {
+        let _ =
+            self.disconnect_at_ms
+                .compare_exchange(0, now_ms, Ordering::Relaxed, Ordering::Relaxed);
+        self.connected.store(false, Ordering::Relaxed);
+    }
+
     /// Record a failed-to-drain inbound stream.
     pub fn record_drop(&self) {
         self.drops.fetch_add(1, Ordering::Relaxed);
@@ -97,6 +141,16 @@ impl BotStats {
         } else {
             0
         };
+        let disconnect_at_ms = self.disconnect_at_ms.load(Ordering::Relaxed);
+        let reconnect_at_ms = self.reconnect_at_ms.load(Ordering::Relaxed);
+        let downtime_ms = match (disconnect_at_ms, reconnect_at_ms) {
+            (0, _) => None,
+            (_, 0) => None,
+            (d, r) if r >= d => Some(r - d),
+            // Clock skew / out-of-order observation: clamp to zero rather
+            // than reporting a negative downtime.
+            _ => Some(0),
+        };
         BotStatsSnapshot {
             user_id: self.user_id.clone(),
             role: self.role,
@@ -105,11 +159,27 @@ impl BotStats {
             bytes_received: bytes,
             drops: self.drops.load(Ordering::Relaxed),
             avg_bandwidth_bps,
+            disconnect_at_ms: if disconnect_at_ms == 0 {
+                None
+            } else {
+                Some(disconnect_at_ms)
+            },
+            reconnect_at_ms: if reconnect_at_ms == 0 {
+                None
+            } else {
+                Some(reconnect_at_ms)
+            },
+            downtime_ms,
         }
     }
 }
 
 /// Serializable per-bot snapshot included in the summary JSON.
+///
+/// `disconnect_at_ms`, `reconnect_at_ms`, and `downtime_ms` are only populated
+/// in failover-test mode; they remain `None` for ordinary orchestrate runs so
+/// the existing JSON schema is forward-compatible (consumers see absent
+/// fields when serialized with `serde_json` and `Option::None` -> `null`).
 #[derive(Debug, Clone, Serialize)]
 pub struct BotStatsSnapshot {
     pub user_id: String,
@@ -119,4 +189,10 @@ pub struct BotStatsSnapshot {
     pub bytes_received: u64,
     pub drops: u64,
     pub avg_bandwidth_bps: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downtime_ms: Option<u64>,
 }

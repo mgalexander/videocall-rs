@@ -18,6 +18,7 @@
 
 mod audio_producer;
 mod config;
+mod failover;
 mod orchestrate;
 mod stats;
 mod video_encoder; // VP9 encoder from videocall-cli
@@ -35,6 +36,7 @@ use tracing::{error, info, warn};
 use video_producer::VideoProducer;
 use webtransport_client::WebTransportClient;
 
+use crate::failover::FailoverConfig;
 use crate::orchestrate::OrchestrationConfig;
 
 /// CLI for the videocall bot.
@@ -90,6 +92,21 @@ struct Cli {
     /// Directory containing the JPEG sequence senders should publish.
     #[arg(long, default_value = ".")]
     image_dir: String,
+
+    /// Failover-test orchestration mode (bead vc-607 / p6-11). Requires the
+    /// same flags as `--orchestrate` (`--room`, `--senders`, `--listeners`,
+    /// `--duration`, `--server-url`), but additionally wraps each listener
+    /// in a reconnect loop so per-listener downtime can be measured across
+    /// an SFU pod kill. Mutually exclusive with `--orchestrate`.
+    #[arg(long)]
+    failover_test: bool,
+
+    /// Reconnect interval (milliseconds) inside the failover-test listener
+    /// loop. Defaults to 500ms. Tuned to be small enough that the recovery
+    /// window dominates downtime measurement, but not so small that we
+    /// hammer the LB during the kill window.
+    #[arg(long, default_value_t = 500)]
+    reconnect_interval_ms: u64,
 }
 
 #[tokio::main]
@@ -104,6 +121,17 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    if cli.orchestrate && cli.failover_test {
+        return Err(anyhow::anyhow!(
+            "--orchestrate and --failover-test are mutually exclusive"
+        ));
+    }
+
+    if cli.failover_test {
+        let cfg = build_failover_config(cli)?;
+        return failover::run(cfg).await;
+    }
+
     if cli.orchestrate {
         let cfg = build_orchestration_config(cli)?;
         return orchestrate::run(cfg).await;
@@ -111,6 +139,43 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting videocall synthetic client bot (single-bot mode)");
     run_single_bot_mode().await
+}
+
+fn build_failover_config(cli: Cli) -> anyhow::Result<FailoverConfig> {
+    let room = cli
+        .room
+        .ok_or_else(|| anyhow::anyhow!("--room is required in --failover-test mode"))?;
+    let senders = cli
+        .senders
+        .ok_or_else(|| anyhow::anyhow!("--senders is required in --failover-test mode"))?;
+    let listeners = cli
+        .listeners
+        .ok_or_else(|| anyhow::anyhow!("--listeners is required in --failover-test mode"))?;
+    let duration_s = cli
+        .duration
+        .ok_or_else(|| anyhow::anyhow!("--duration is required in --failover-test mode"))?;
+    let server_url = cli
+        .server_url
+        .ok_or_else(|| anyhow::anyhow!("--server-url is required in --failover-test mode"))?;
+
+    if listeners == 0 {
+        return Err(anyhow::anyhow!(
+            "--listeners must be > 0 in --failover-test mode (downtime is measured on listeners)"
+        ));
+    }
+
+    Ok(FailoverConfig {
+        room,
+        senders,
+        listeners,
+        duration: Duration::from_secs(duration_s),
+        server_url: url::Url::parse(&server_url)
+            .map_err(|e| anyhow::anyhow!("Invalid --server-url: {e}"))?,
+        insecure: cli.insecure,
+        audio_path: cli.audio_path,
+        image_dir: cli.image_dir,
+        reconnect_interval: Duration::from_millis(cli.reconnect_interval_ms),
+    })
 }
 
 fn build_orchestration_config(cli: Cli) -> anyhow::Result<OrchestrationConfig> {

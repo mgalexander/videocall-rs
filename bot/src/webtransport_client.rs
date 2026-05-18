@@ -18,12 +18,15 @@
 
 use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::Notify;
 use tokio::time;
 use tracing::{debug, info, warn};
 use url::Url;
+use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
+use videocall_types::protos::admission_decision_packet::AdmissionDecision;
 use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
@@ -34,11 +37,56 @@ use web_transport_quinn::{ClientBuilder, Session};
 use crate::config::ClientConfig;
 use crate::stats::BotStats;
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Shared per-client signal channel that the inbound consumer uses to notify
+/// the orchestrator that the session has ended (either cleanly, by error, or
+/// by an `ADMISSION_DECISION{REDIRECT}` arriving just before the close).
+///
+/// Used only in failover-test mode. Ordinary `--orchestrate` runs never look
+/// at this; the bot loops via `std::future::pending` and is task-aborted at
+/// duration end.
+#[derive(Default)]
+pub struct SessionEndSignal {
+    /// Fires when the inbound consumer exits. Multi-consumer-safe via
+    /// `Notify::notified()`.
+    pub notify: Notify,
+    /// Set to `Some(redirect_to)` if an `ADMISSION_DECISION{REDIRECT}` was
+    /// observed before the session ended. The orchestrator may consult this
+    /// to direct the next reconnect attempt at the named pod (best-effort —
+    /// the local k3d cluster typically can't resolve the cluster-internal
+    /// DNS from outside, so the test falls back to the original LB URL).
+    pub redirect_to: Mutex<Option<String>>,
+    /// Set to `true` once any terminal condition is observed. Used so a
+    /// reconnect loop can drop into the wait state without racing the
+    /// notification.
+    pub ended: AtomicBool,
+}
+
+impl SessionEndSignal {
+    fn fire(&self, redirect: Option<String>) {
+        if let Some(r) = redirect {
+            *self.redirect_to.lock().unwrap() = Some(r);
+        }
+        self.ended.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+}
+
 pub struct WebTransportClient {
     config: ClientConfig,
     session: Option<Session>,
     quit: Arc<AtomicBool>,
     stats: Option<Arc<BotStats>>,
+    /// Optional session-end signal, attached by the failover-test orchestrator
+    /// via [`with_session_end_signal`](Self::with_session_end_signal) before
+    /// [`connect`](Self::connect). `None` for default runs.
+    session_end: Option<Arc<SessionEndSignal>>,
 }
 
 impl WebTransportClient {
@@ -48,6 +96,7 @@ impl WebTransportClient {
             session: None,
             quit: Arc::new(AtomicBool::new(false)),
             stats: None,
+            session_end: None,
         }
     }
 
@@ -56,6 +105,14 @@ impl WebTransportClient {
     /// counters as packets arrive.
     pub fn with_stats(mut self, stats: Arc<BotStats>) -> Self {
         self.stats = Some(stats);
+        self
+    }
+
+    /// Attach a session-end signal. Used by the failover-test orchestrator
+    /// (p6-11) to detect when the inbound side closes so it can launch a
+    /// reconnect attempt. No-op for default runs.
+    pub fn with_session_end_signal(mut self, signal: Arc<SessionEndSignal>) -> Self {
+        self.session_end = Some(signal);
         self
     }
 
@@ -98,11 +155,7 @@ impl WebTransportClient {
         );
 
         if let Some(stats) = &self.stats {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            stats.mark_connected(now_ms);
+            stats.mark_connected(now_ms());
         }
 
         // Send connection packet
@@ -193,13 +246,27 @@ impl WebTransportClient {
         }
     }
 
-    /// Start a task to consume all inbound unistreams to avoid being a slow consumer
+    /// Start a task to consume all inbound unistreams to avoid being a slow
+    /// consumer.
+    ///
+    /// Failover-test mode (p6-11) layers two extra behaviours on top:
+    ///
+    /// 1. Each drained stream is parsed as a `PacketWrapper`. If we see an
+    ///    `ADMISSION_DECISION{REDIRECT}`, we stash `redirect_to` on the
+    ///    [`SessionEndSignal`] so the orchestrator can use it on the next
+    ///    reconnect attempt. The redirect packet arrives **immediately
+    ///    before** the SFU closes the session, so we must capture it before
+    ///    treating the subsequent `accept_uni` error as a plain disconnect.
+    /// 2. On any terminal condition (accept-uni error, quit flag) we mark
+    ///    the bot as disconnected (sticky first-gap timestamp) and fire the
+    ///    session-end notification.
     async fn start_inbound_consumer(&self) {
         if let Some(session) = &self.session {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
             let quit = self.quit.clone();
             let stats = self.stats.clone();
+            let session_end = self.session_end.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -209,18 +276,35 @@ impl WebTransportClient {
 
                     match session.accept_uni().await {
                         Ok(mut stream) => {
-                            // Drain the stream - we don't need the data, just consume it
-                            let user_id = user_id.clone();
-                            let stats = stats.clone();
-                            tokio::spawn(async move {
+                            // Default path: spawn per-stream so accept and
+                            // drain run concurrently — preserves the
+                            // pre-p6-11 behaviour for the orchestrate / 200-
+                            // bot harness.
+                            //
+                            // Failover-test path (`session_end` attached):
+                            // drain inline so we observe REDIRECT bytes
+                            // before the next `accept_uni` returns an
+                            // error and breaks the loop. Throughput on a
+                            // single listener bot is low enough that
+                            // sequential draining is fine.
+                            if let Some(signal_handle) = &session_end {
                                 match stream.read_to_end(usize::MAX).await {
                                     Ok(data) => {
-                                        if let Some(stats) = stats {
-                                            stats.record_packet(data.len() as u64);
+                                        let t = now_ms();
+                                        if let Some(stats) = &stats {
+                                            stats.record_packet_at(data.len() as u64, t);
+                                        }
+                                        if let Some(target) = try_extract_redirect_target(&data) {
+                                            info!(
+                                                "Listener {} received ADMISSION_DECISION REDIRECT to {}",
+                                                user_id, target
+                                            );
+                                            *signal_handle.redirect_to.lock().unwrap() =
+                                                Some(target);
                                         }
                                     }
                                     Err(e) => {
-                                        if let Some(stats) = stats {
+                                        if let Some(stats) = &stats {
                                             stats.record_drop();
                                         }
                                         debug!(
@@ -229,13 +313,43 @@ impl WebTransportClient {
                                         );
                                     }
                                 }
-                            });
+                            } else {
+                                let stats_spawn = stats.clone();
+                                let user_id_spawn = user_id.clone();
+                                tokio::spawn(async move {
+                                    match stream.read_to_end(usize::MAX).await {
+                                        Ok(data) => {
+                                            if let Some(stats) = stats_spawn {
+                                                stats.record_packet(data.len() as u64);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if let Some(stats) = stats_spawn {
+                                                stats.record_drop();
+                                            }
+                                            debug!(
+                                                "Error reading inbound unistream for {}: {}",
+                                                user_id_spawn, e
+                                            );
+                                        }
+                                    }
+                                });
+                            }
                         }
                         Err(e) => {
                             debug!("Inbound consumer ended for {}: {}", user_id, e);
                             break;
                         }
                     }
+                }
+                // Terminal: mark disconnect (sticky) and signal the
+                // orchestrator. Both are no-ops when the failover-test
+                // wiring isn't attached.
+                if let Some(stats) = &stats {
+                    stats.mark_disconnected_at(now_ms());
+                }
+                if let Some(signal) = &session_end {
+                    signal.fire(None);
                 }
                 info!("Inbound consumer stopped for {}", user_id);
             });
@@ -281,5 +395,85 @@ impl WebTransportClient {
     pub fn stop(&self) {
         self.quit.store(true, Ordering::Relaxed);
         info!("Stopping WebTransport client for {}", self.config.user_id);
+    }
+}
+
+/// Parse `data` as a `PacketWrapper`; if it is an `ADMISSION_DECISION` with
+/// `status = REDIRECT` and a non-empty `redirect_to`, return that target.
+///
+/// Returns `None` for any other packet type, parse failure, or empty target.
+/// Cheap: protobuf parse on a small wrapper, then a single field check.
+fn try_extract_redirect_target(data: &[u8]) -> Option<String> {
+    let wrapper = PacketWrapper::parse_from_bytes(data).ok()?;
+    if wrapper.packet_type != PacketType::ADMISSION_DECISION.into() {
+        return None;
+    }
+    let decision = AdmissionDecision::parse_from_bytes(&wrapper.data).ok()?;
+    if decision.status != AdmissionStatus::REDIRECT.into() {
+        return None;
+    }
+    if decision.redirect_to.is_empty() {
+        return None;
+    }
+    Some(decision.redirect_to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_extract_redirect_target_parses_redirect_packet() {
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::REDIRECT.into(),
+            redirect_to: "rustlemania-webtransport-0.webtransport-headless.svc.cluster.local"
+                .to_string(),
+            reason: "wrong_owner".to_string(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            user_id: b"system".to_vec(),
+            data: decision.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+
+        let got = try_extract_redirect_target(&bytes).expect("redirect target");
+        assert!(got.contains("rustlemania-webtransport-0"));
+    }
+
+    #[test]
+    fn try_extract_redirect_target_ignores_non_redirect_admission() {
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::QUEUED.into(),
+            position: 1,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            data: decision.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        assert!(try_extract_redirect_target(&wrapper.write_to_bytes().unwrap()).is_none());
+    }
+
+    #[test]
+    fn try_extract_redirect_target_ignores_media() {
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        assert!(try_extract_redirect_target(&wrapper.write_to_bytes().unwrap()).is_none());
+    }
+
+    #[test]
+    fn try_extract_redirect_target_ignores_garbage() {
+        assert!(try_extract_redirect_target(&[0xff, 0xff, 0xff]).is_none());
     }
 }
