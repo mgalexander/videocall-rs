@@ -36,6 +36,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
+use videocall_types::protos::admission_decision_packet::AdmissionDecision;
 use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -82,6 +84,46 @@ fn monotonic_now_ms() -> f64 {
         .and_then(|w| w.performance())
         .map(|p| p.now())
         .unwrap_or_else(js_sys::Date::now)
+}
+
+/// Replace the host portion of a URL of the form
+/// `scheme://host[:port][/path][?query][#fragment]` with `new_host`,
+/// preserving everything else verbatim.
+///
+/// IPv6 literals (bracketed hosts) are NOT supported. Returns `None` if the
+/// input is missing the `scheme://` prefix or has an empty host segment.
+///
+/// Used by [`ConnectionManager::apply_admission_redirect`] to rewrite an
+/// existing template URL so it points at the redirect target while preserving
+/// scheme, port, and path.
+fn substitute_url_host(url: &str, new_host: &str) -> Option<String> {
+    // Split into scheme and the rest at "://".
+    let scheme_end = url.find("://")?;
+    let scheme = &url[..scheme_end];
+    if scheme.is_empty() {
+        return None;
+    }
+    let rest = &url[scheme_end + 3..];
+
+    // Find where the authority component (host[:port]) ends — at the first
+    // '/', '?', or '#'.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let tail = &rest[auth_end..];
+
+    if authority.is_empty() {
+        return None;
+    }
+
+    // Preserve the port (if any) from the authority.
+    let port = authority.rsplit_once(':').map(|(_, p)| p);
+
+    let new_authority = match port {
+        Some(p) => format!("{new_host}:{p}"),
+        None => new_host.to_string(),
+    };
+
+    Some(format!("{scheme}://{new_authority}{tail}"))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +244,13 @@ pub struct ConnectionManager {
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
     intentionally_disconnected: Rc<RefCell<bool>>,
+
+    /// Number of ADMISSION_DECISION REDIRECT responses chased so far on this
+    /// manager instance. A redirect must be one-shot: if a redirect target
+    /// ALSO redirects, that signals a config / jump-hash inconsistency and we
+    /// fail hard rather than infinite-loop. This counter is only reset by
+    /// constructing a fresh `ConnectionManager` (i.e. a new join attempt).
+    redirect_chase_depth: Rc<RefCell<u32>>,
 }
 
 impl ConnectionManager {
@@ -240,6 +289,7 @@ impl ConnectionManager {
             reelection_in_progress: false,
             old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            redirect_chase_depth: Rc::new(RefCell::new(0)),
         };
 
         Ok(manager)
@@ -304,6 +354,130 @@ impl ConnectionManager {
 
         // Start fresh election — creates new connections and begins RTT probing.
         self.start_election()
+    }
+
+    /// Apply an `ADMISSION_DECISION { status=REDIRECT, redirect_to=<dns> }`
+    /// from the server: rewrite the configured URL list so that the matching
+    /// transport now points at a single URL whose host is `redirect_to`,
+    /// clear the other transport's URL list, tear down all current
+    /// connections, and start a fresh election.
+    ///
+    /// The transport (WebSocket vs WebTransport) is inferred from
+    /// `redirect_to` itself — the server's DNS format is
+    /// `rustlemania-{transport}-{ordinal}.{transport}-headless.svc.cluster.local`.
+    /// The redirect is authoritative about which pod owns the room, so the
+    /// other transport list is cleared: probing the wrong-owner pod over
+    /// another transport would just redirect again.
+    ///
+    /// Single-shot: each call increments `redirect_chase_depth`. Once depth
+    /// reaches 2, this method refuses to chase further (treats it as a config
+    /// or jump-hash inconsistency) and returns `Err`. The counter is only
+    /// reset by constructing a fresh `ConnectionManager`.
+    ///
+    /// Returns `Err` if no existing options URL of the matching transport is
+    /// available to serve as a template (we need its scheme, port, and path),
+    /// if the transport hint is missing from `redirect_to`, or if the chase
+    /// depth limit has been hit.
+    pub fn apply_admission_redirect(&mut self, redirect_to: String) -> Result<()> {
+        info!("Applying ADMISSION_DECISION redirect to {redirect_to}");
+
+        // Single-shot bookkeeping. Bump first so a re-entrant redirect (e.g.
+        // arriving while we're still tearing the old connection down) still
+        // trips the guard.
+        let new_depth = {
+            let mut d = self.redirect_chase_depth.borrow_mut();
+            *d += 1;
+            *d
+        };
+        if new_depth >= 2 {
+            let msg = format!(
+                "Redirect chase depth = {new_depth}; refusing to chase further (likely config / jump-hash inconsistency)",
+            );
+            error!("{msg}");
+            // The caller (inbound callback) maps this Err to
+            // ConnectionState::Failed with last_known_server = Some(redirect_to),
+            // so we don't double-emit here.
+            return Err(anyhow!(msg));
+        }
+
+        // Infer transport from the DNS pattern. Strict: an empty / unknown
+        // hint is a config bug — fail hard rather than guess.
+        let is_webtransport = if redirect_to.contains("-webtransport-") {
+            true
+        } else if redirect_to.contains("-websocket-") {
+            false
+        } else {
+            let msg =
+                format!("ADMISSION_DECISION redirect_to has no transport hint: {redirect_to}",);
+            error!("{msg}");
+            return Err(anyhow!(msg));
+        };
+
+        // Pick a template URL from the current options so we can preserve
+        // scheme, port, and path while swapping the host.
+        let template = if is_webtransport {
+            self.options.webtransport_urls.first().cloned()
+        } else {
+            self.options.websocket_urls.first().cloned()
+        };
+
+        let template = match template {
+            Some(t) => t,
+            None => {
+                let msg = format!(
+                    "ADMISSION_DECISION redirect to {redirect_to} but no template {} URL is configured",
+                    if is_webtransport { "WebTransport" } else { "WebSocket" },
+                );
+                error!("{msg}");
+                return Err(anyhow!(msg));
+            }
+        };
+
+        let new_url = match substitute_url_host(&template, &redirect_to) {
+            Some(u) => u,
+            None => {
+                let msg = format!(
+                    "ADMISSION_DECISION redirect: failed to substitute host in template {template} with {redirect_to}",
+                );
+                error!("{msg}");
+                return Err(anyhow!(msg));
+            }
+        };
+
+        // Authoritative swap: matching transport -> single redirect URL; the
+        // other list is cleared so we don't probe the wrong-owner pod via the
+        // alternate transport.
+        if is_webtransport {
+            self.options.webtransport_urls = vec![new_url.clone()];
+            self.options.websocket_urls.clear();
+        } else {
+            self.options.websocket_urls = vec![new_url.clone()];
+            self.options.webtransport_urls.clear();
+        }
+
+        info!(
+            "Redirect target URL = {new_url} (transport = {})",
+            if is_webtransport {
+                "WebTransport"
+            } else {
+                "WebSocket"
+            },
+        );
+
+        // Tear down current connections and start a fresh, immediate election
+        // (no exponential backoff — the redirect is authoritative & instant).
+        //
+        // Skip the live election restart if the manager_ref hasn't been wired
+        // up yet — this matters for unit tests that exercise this method
+        // directly without a full `ConnectionController` around it. In
+        // production `set_manager_ref` is called by `ConnectionController::new`
+        // before any inbound packets can arrive.
+        if self.manager_ref.upgrade().is_some() {
+            self.reset_and_start_election()
+        } else {
+            debug!("apply_admission_redirect: manager_ref not set — skipping election restart (test-only path)");
+            Ok(())
+        }
     }
 
     /// Start the election process by creating all connections upfront
@@ -423,12 +597,81 @@ impl ConnectionManager {
         let userid = self.options.userid.clone();
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
+        let on_state_changed = self.options.on_state_changed.clone();
         let rtt_responses = self.rtt_responses.clone();
         let own_session_id = self.own_session_id.clone();
         let pending_session_ids = self.pending_session_ids.clone();
         let active_connection_id = self.active_connection_id.clone();
+        let manager_ref = self.manager_ref.clone();
 
         Callback::from(move |packet: PacketWrapper| {
+            // Intercept ADMISSION_DECISION REDIRECT before forwarding to UI.
+            //
+            // p6-6: the server emits an ADMISSION_DECISION{ status=REDIRECT,
+            // redirect_to=<owner-pod DNS> } when this connection landed on the
+            // wrong jump-hash owner pod. We swap the configured URLs to the
+            // target pod and restart the election. Other statuses (ADMITTED /
+            // QUEUED / REJECTED / UNKNOWN) flow through to `on_inbound_media`
+            // unchanged so existing/future handlers can react.
+            if packet.packet_type == PacketType::ADMISSION_DECISION.into() {
+                if let Ok(decision) = AdmissionDecision::parse_from_bytes(&packet.data) {
+                    if decision.status == AdmissionStatus::REDIRECT.into() {
+                        let redirect_to = decision.redirect_to.clone();
+                        info!(
+                            "ADMISSION_DECISION REDIRECT received on {connection_id}: target={redirect_to}",
+                        );
+
+                        if redirect_to.is_empty() {
+                            warn!("ADMISSION_DECISION REDIRECT with empty redirect_to — ignoring",);
+                            return;
+                        }
+
+                        // Notify UI that we're chasing the redirect. Single-
+                        // shot bookkeeping & the actual URL swap / election
+                        // restart happen inside `apply_admission_redirect`.
+                        on_state_changed.emit(ConnectionState::Reconnecting {
+                            server_url: redirect_to.clone(),
+                            attempt: 1,
+                        });
+
+                        // Dispatch to the manager on a fresh task so we don't
+                        // borrow the manager from inside the inbound callback.
+                        // `apply_admission_redirect` owns the chase-depth
+                        // bookkeeping so we don't touch the counter here.
+                        let manager_ref = manager_ref.clone();
+                        let on_state_changed = on_state_changed.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let Some(mgr_rc) = manager_ref.upgrade() else {
+                                warn!(
+                                    "ADMISSION_DECISION REDIRECT: manager dropped before redirect could be applied",
+                                );
+                                return;
+                            };
+
+                            let result = {
+                                let mut mgr = mgr_rc.borrow_mut();
+                                mgr.apply_admission_redirect(redirect_to.clone())
+                            };
+
+                            if let Err(e) = result {
+                                error!("apply_admission_redirect failed: {e}");
+                                on_state_changed.emit(ConnectionState::Failed {
+                                    error: format!("Redirect apply failed: {e}"),
+                                    last_known_server: Some(redirect_to),
+                                });
+                            }
+                        });
+
+                        return;
+                    }
+                } else {
+                    warn!(
+                        "ADMISSION_DECISION packet on {connection_id} failed to parse — forwarding as-is",
+                    );
+                }
+                // Non-REDIRECT statuses fall through to on_inbound_media below.
+            }
+
             // Intercept SESSION_ASSIGNED before anything else
             if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
                 let sid = packet.session_id;
@@ -1901,6 +2144,7 @@ mod tests {
             reelection_in_progress: false,
             old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            redirect_chase_depth: Rc::new(RefCell::new(0)),
         }
     }
 
@@ -2721,6 +2965,174 @@ mod tests {
         // Should return Ok without changing state.
         assert!(mgr.start_reelection().is_ok());
         assert!(mgr.is_reelection_in_progress());
+    }
+
+    // ===================================================================
+    // 11. ADMISSION_DECISION redirect handling (p6-6)
+    // ===================================================================
+
+    #[test]
+    fn substitute_url_host_replaces_host_with_port() {
+        let out = substitute_url_host(
+            "wss://old.example.com:443/lobby",
+            "rustlemania-websocket-3.websocket-headless.svc.cluster.local",
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some("wss://rustlemania-websocket-3.websocket-headless.svc.cluster.local:443/lobby")
+        );
+    }
+
+    #[test]
+    fn substitute_url_host_replaces_host_without_port() {
+        let out = substitute_url_host(
+            "https://old.example.com/lobby",
+            "rustlemania-webtransport-0.webtransport-headless.svc.cluster.local",
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                "https://rustlemania-webtransport-0.webtransport-headless.svc.cluster.local/lobby"
+            )
+        );
+    }
+
+    #[test]
+    fn substitute_url_host_preserves_query_string() {
+        let out = substitute_url_host("wss://old.example.com:443/lobby?token=abc", "new.host");
+        assert_eq!(out.as_deref(), Some("wss://new.host:443/lobby?token=abc"));
+    }
+
+    #[test]
+    fn substitute_url_host_preserves_fragment() {
+        let out = substitute_url_host("https://old.example.com/path#frag", "new.host");
+        assert_eq!(out.as_deref(), Some("https://new.host/path#frag"));
+    }
+
+    #[test]
+    fn substitute_url_host_handles_bare_host_no_path() {
+        let out = substitute_url_host("wss://old.example.com", "new.host");
+        assert_eq!(out.as_deref(), Some("wss://new.host"));
+
+        let out = substitute_url_host("wss://old.example.com:9443", "new.host");
+        assert_eq!(out.as_deref(), Some("wss://new.host:9443"));
+    }
+
+    #[test]
+    fn substitute_url_host_returns_none_for_malformed_input() {
+        assert!(substitute_url_host("not-a-url", "new.host").is_none());
+        assert!(substitute_url_host("://no-scheme.example.com", "new.host").is_none());
+        assert!(substitute_url_host("wss://", "new.host").is_none());
+        assert!(substitute_url_host("wss:///just-path", "new.host").is_none());
+    }
+
+    #[test]
+    fn apply_admission_redirect_webtransport_target_swaps_url_lists() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls = vec!["wss://old-ws.example.com:443/lobby".to_string()];
+
+        let redirect_dns =
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string();
+        mgr.apply_admission_redirect(redirect_dns.clone()).unwrap();
+
+        // WebTransport list is replaced with a single substituted URL.
+        assert_eq!(mgr.options.webtransport_urls.len(), 1);
+        assert_eq!(
+            mgr.options.webtransport_urls[0],
+            format!("https://{redirect_dns}:9443/lobby")
+        );
+
+        // The other transport's list is cleared (the redirect is
+        // authoritative; we don't want to probe the wrong-owner pod over WS).
+        assert!(mgr.options.websocket_urls.is_empty());
+
+        // Depth counter incremented.
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 1);
+    }
+
+    #[test]
+    fn apply_admission_redirect_websocket_target_swaps_url_lists() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls = vec!["wss://old-ws.example.com:443/lobby".to_string()];
+
+        let redirect_dns =
+            "rustlemania-websocket-5.websocket-headless.svc.cluster.local".to_string();
+        mgr.apply_admission_redirect(redirect_dns.clone()).unwrap();
+
+        // WebSocket list is replaced with a single substituted URL.
+        assert_eq!(mgr.options.websocket_urls.len(), 1);
+        assert_eq!(
+            mgr.options.websocket_urls[0],
+            format!("wss://{redirect_dns}:443/lobby")
+        );
+
+        // The WebTransport list is cleared.
+        assert!(mgr.options.webtransport_urls.is_empty());
+
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 1);
+    }
+
+    #[test]
+    fn apply_admission_redirect_second_call_fails_hard() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+
+        // First call succeeds.
+        mgr.apply_admission_redirect(
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string(),
+        )
+        .unwrap();
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 1);
+
+        // Second call: depth would become >= 2 → fail hard.
+        let result = mgr.apply_admission_redirect(
+            "rustlemania-webtransport-7.webtransport-headless.svc.cluster.local".to_string(),
+        );
+        assert!(result.is_err(), "second redirect should fail");
+        assert!(*mgr.redirect_chase_depth.borrow() >= 2);
+    }
+
+    #[test]
+    fn apply_admission_redirect_fails_when_no_matching_template_url() {
+        let mut mgr = make_test_manager();
+        // Only WebTransport templates configured; redirect points to WebSocket.
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls.clear();
+
+        let result = mgr.apply_admission_redirect(
+            "rustlemania-websocket-3.websocket-headless.svc.cluster.local".to_string(),
+        );
+        assert!(
+            result.is_err(),
+            "redirect without matching template URL should fail hard"
+        );
+
+        // URL lists must be unchanged on failure.
+        assert_eq!(mgr.options.webtransport_urls.len(), 1);
+        assert!(mgr.options.websocket_urls.is_empty());
+    }
+
+    #[test]
+    fn apply_admission_redirect_fails_when_dns_has_no_transport_hint() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls = vec!["wss://old-ws.example.com:443/lobby".to_string()];
+
+        // DNS missing the "-webtransport-" / "-websocket-" infix.
+        let result = mgr.apply_admission_redirect("some-random-pod.svc.cluster.local".to_string());
+        assert!(result.is_err());
+
+        // URL lists must be unchanged on failure.
+        assert_eq!(mgr.options.webtransport_urls.len(), 1);
+        assert_eq!(mgr.options.websocket_urls.len(), 1);
+    }
+
+    #[test]
+    fn redirect_chase_depth_initial_value_is_zero() {
+        let mgr = make_test_manager();
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 0);
     }
 
     // ===================================================================
