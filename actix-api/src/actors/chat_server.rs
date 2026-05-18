@@ -49,10 +49,11 @@ use super::packet_handler::{parse_and_inspect, ParsedPacket};
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::room_state::RoomState;
-use crate::sfu::speaker::ActiveSpeakerSet;
+use crate::sfu::speaker::{NatsSpeakerPublisher, SpeakerScorer, SpeakerTick, TickHandle};
 use crate::sfu::subscription::SubscriptionStore;
 use crate::sfu::{SfuConfig, SfuMode};
-use tokio::sync::watch;
+use tokio::sync::RwLock as TokioRwLock;
+use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::subscription_packet::SubscriptionUpdate;
 
 /// Internal message sent via `notify_later` after the reconnection grace period
@@ -168,12 +169,30 @@ pub struct ChatServer {
     /// The forwarder reads this store on every `decide()` to determine which
     /// senders' MEDIA may be forwarded to each receiver.
     subscriptions: HashMap<String, Arc<RwLock<SubscriptionStore>>>,
-    /// Per-room active-speaker-set sender. The forwarder reads the set via a
-    /// cloned `watch::Receiver`. Today the sender stays inert (initial empty
-    /// snapshot); the speaker tick from p3-2 is not yet wired in (that's a
-    /// follow-up). Holding the sender keeps the channel open so every
-    /// forwarder's `watch::Receiver::borrow()` returns a valid snapshot.
-    speakers: HashMap<String, watch::Sender<ActiveSpeakerSet>>,
+    /// Per-room shared scorer (p3-11 wiring).
+    ///
+    /// The per-room dispatcher task observes each inbound AUDIO
+    /// `MediaPacket`'s `RoutingHeader.audio_level` / `is_speaking` hint into
+    /// this scorer; the per-room [`SpeakerTick`] reads it on its 200ms
+    /// cadence to compute the [`ActiveSpeakerSet`] snapshot consumed by the
+    /// forwarder and broadcast to clients on `room.{room}.system`.
+    ///
+    /// Stored alongside `speaker_ticks` (one-to-one), but kept in its own
+    /// map so the dispatcher can clone an `Arc` without touching the tick
+    /// handle's lifecycle.
+    speaker_scorers: HashMap<String, Arc<TokioRwLock<SpeakerScorer>>>,
+    /// Per-room speaker tick. Holds the join handle returned by
+    /// [`SpeakerTick::run`]; dropping the handle aborts the background
+    /// task. Torn down in the same code paths that remove `speaker_scorers`
+    /// and `room_states` when a room drains.
+    ///
+    /// The tick is also responsible for publishing `SpeakerUpdate`
+    /// `PacketWrapper`s on `room.{room}.system` via its embedded
+    /// [`NatsSpeakerPublisher`]. The tick internally owns the
+    /// `watch::Sender<ActiveSpeakerSet>` that the forwarder's
+    /// `watch::Receiver` reads from, so the channel stays open for as long
+    /// as the tick handle is retained here.
+    speaker_ticks: HashMap<String, TickHandle>,
     /// Per-room demux state (one NATS subscription per room, fanned out to
     /// all local receivers). Lazily created on the first `JoinRoom` for a
     /// room and torn down when the room drains. See [`RoomDispatch`].
@@ -195,7 +214,8 @@ impl ChatServer {
             room_states: HashMap::new(),
             forwarders: HashMap::new(),
             subscriptions: HashMap::new(),
-            speakers: HashMap::new(),
+            speaker_scorers: HashMap::new(),
+            speaker_ticks: HashMap::new(),
             room_dispatch: HashMap::new(),
         }
     }
@@ -249,10 +269,13 @@ impl ChatServer {
                     self.forwarders.remove(room_id);
                     self.room_states.remove(room_id);
                     self.subscriptions.remove(room_id);
-                    // Dropping the watch sender closes the channel; the
-                    // forwarder we just removed is the only holder of the
-                    // matching receiver, so this is a clean teardown.
-                    self.speakers.remove(room_id);
+                    // p3-11: dropping the TickHandle aborts the speaker
+                    // tick task, which in turn drops its `watch::Sender`
+                    // and closes the channel the (already-removed)
+                    // forwarder's receiver was watching. Then drop the
+                    // shared scorer.
+                    self.speaker_ticks.remove(room_id);
+                    self.speaker_scorers.remove(room_id);
                 }
             }
         }
@@ -685,6 +708,12 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                         // Mirror room_members lifecycle for SFU state.
                         self.forwarders.remove(&room);
                         self.room_states.remove(&room);
+                        self.subscriptions.remove(&room);
+                        // p3-11: tear down the speaker tick + scorer for
+                        // the now-empty room. Dropping the TickHandle
+                        // aborts the background task.
+                        self.speaker_ticks.remove(&room);
+                        self.speaker_scorers.remove(&room);
                     }
                 }
                 return;
@@ -775,6 +804,15 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             );
             return;
         };
+        // p3-11: the scorer should also still be live as long as the
+        // forwarder is, since both share the room lifecycle. Fall back to
+        // a fresh empty scorer if it has somehow been evicted — the
+        // dispatcher must always have one to observe into.
+        let scorer = self
+            .speaker_scorers
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(TokioRwLock::new(SpeakerScorer::new())))
+            .clone();
         let subject = format!("room.{room}.*").replace(' ', "_");
         let sfu_mode = self.sfu_config.mode;
         warn!(
@@ -792,6 +830,7 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             subject,
             sfu_mode,
             forwarder,
+            scorer,
             receivers.clone(),
             ctx.address(),
         );
@@ -1098,31 +1137,38 @@ impl Handler<JoinRoom> for ChatServer {
             .entry(room.clone())
             .or_insert_with(|| Arc::new(RwLock::new(SubscriptionStore::new())))
             .clone();
-        // Materialise the per-room active-speaker-set channel on first join.
-        // The sender is retained on `self.speakers` so the channel stays open
-        // for as long as the room exists; the receiver is cloned into the
-        // forwarder. The p3-2 SpeakerTick is not yet wired into chat_server
-        // (separate bead) — until then the channel stays at the initial empty
-        // snapshot, and resolve() falls back to pinned/slots tiers only.
-        let speakers_rx = self
-            .speakers
+        // p3-11: materialise the per-room speaker scorer + tick on first
+        // join. The tick owns the `watch::Sender<ActiveSpeakerSet>` it drives
+        // on its 200ms cadence; we subscribe BEFORE calling `run()` so the
+        // forwarder's receiver is wired up to the same channel the tick task
+        // will publish to. The tick handle is retained in `speaker_ticks`;
+        // dropping it on room drain aborts the background task.
+        let scorer = self
+            .speaker_scorers
             .entry(room.clone())
-            .or_insert_with(|| {
-                let (tx, _rx) = watch::channel(ActiveSpeakerSet::empty());
-                tx
-            })
-            .subscribe();
-        let forwarder = self
-            .forwarders
-            .entry(room.clone())
-            .or_insert_with(|| {
-                Arc::new(Forwarder::new(
+            .or_insert_with(|| Arc::new(TokioRwLock::new(SpeakerScorer::new())))
+            .clone();
+        // Atomically materialise the speaker tick + forwarder on first join.
+        // Using `Entry::Vacant` here (rather than two `or_insert_with` calls
+        // with a precomputed `speakers_rx`) keeps `speaker_ticks` and
+        // `forwarders` impossible to drift: either both exist (occupied
+        // branch reuses the cached forwarder) or both are inserted together.
+        let forwarder = match self.forwarders.entry(room.clone()) {
+            std::collections::hash_map::Entry::Occupied(occ) => occ.get().clone(),
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                let publisher = Arc::new(NatsSpeakerPublisher::new(self.nats_connection.clone()));
+                let tick = SpeakerTick::new(scorer.clone(), room.clone(), publisher);
+                let speakers_rx = tick.subscribe();
+                let handle = tick.run();
+                self.speaker_ticks.insert(room.clone(), handle);
+                let f = Arc::new(Forwarder::new(
                     room_state.clone(),
                     subscriptions.clone(),
                     speakers_rx,
-                ))
-            })
-            .clone();
+                ));
+                vac.insert(f).clone()
+            }
+        };
         {
             // Poison-safe write: a panicked previous writer leaves the
             // table mutable. Capabilities default to 0 today; later phases
@@ -1158,6 +1204,7 @@ impl Handler<JoinRoom> for ChatServer {
                     subject.clone(),
                     sfu_mode,
                     forwarder.clone(),
+                    scorer.clone(),
                     receivers.clone(),
                     ctx.address(),
                 );
@@ -1309,12 +1356,14 @@ impl Handler<JoinRoom> for ChatServer {
 /// case (1) the abort drops the message channel before the send can race,
 /// which is fine: the handler checks whether the entry is still present
 /// and exits if not.
+#[allow(clippy::too_many_arguments)]
 fn spawn_room_dispatcher(
     nc: async_nats::client::Client,
     room: String,
     subject: String,
     sfu_mode: SfuMode,
     forwarder: Arc<Forwarder>,
+    scorer: Arc<TokioRwLock<SpeakerScorer>>,
     receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
     chat_server: actix::Addr<ChatServer>,
 ) -> JoinHandle<()> {
@@ -1346,6 +1395,38 @@ fn spawn_room_dispatcher(
             // can `clone()` a refcount bump per forwarded receiver.
             let parsed = parse_and_inspect(&msg.payload[..]);
             let subject_str: &str = msg.subject.as_ref();
+
+            // p3-11: feed the per-room SpeakerScorer for every inbound
+            // AUDIO MediaPacket whose RoutingHeader carries an
+            // `audio_level`. The SpeakerTick reads the scorer on its
+            // 200ms cadence to maintain the ActiveSpeakerSet snapshot
+            // that the forwarder consumes (via watch::Receiver) and that
+            // is broadcast to clients on `room.{room}.system`.
+            //
+            // Gated on SFU mode: in legacy mode the scorer is never
+            // consulted (the forwarder is bypassed), so the write is pure
+            // waste — skip it entirely on the legacy hot path.
+            if sfu_mode == SfuMode::Sfu {
+                if let Some(p) = parsed.as_ref() {
+                    if let Some(rh) = p.routing_header() {
+                        let is_audio = p
+                            .media_packet
+                            .as_ref()
+                            .map(|mp| mp.media_type == MediaType::AUDIO.into())
+                            .unwrap_or(false);
+                        if is_audio {
+                            let sender_sid = p.wrapper.session_id;
+                            let level = rh.audio_level;
+                            let hint = rh.is_speaking;
+                            // Short critical section: `observe()` is sync.
+                            // The competing acquirer is `tick_once` taking
+                            // a read for a snapshot copy; neither holds
+                            // the lock across other awaits.
+                            scorer.write().await.observe(sender_sid, level, hint);
+                        }
+                    }
+                }
+            }
 
             // Snapshot the recipients under the read lock, then drop it
             // before fan-out. Recipient<_> is Clone (Arc-backed inside
