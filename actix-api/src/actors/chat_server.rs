@@ -370,6 +370,7 @@ impl ChatServer {
         user_id: Option<&str>,
         display_name: Option<&str>,
         observer: bool,
+        was_active: bool,
     ) {
         // Drop the session marker. The session's receiver entry in the
         // per-room demux is removed below (we need the room id for that).
@@ -478,14 +479,21 @@ impl ChatServer {
                 return;
             }
 
-            if let Some(state) = self.connection_states.get(session_id) {
-                if *state != ConnectionState::Active {
-                    info!(
-                        "Skipping PARTICIPANT_LEFT for non-active session {}",
-                        session_id
-                    );
-                    return;
-                }
+            // vc-9g7 follow-up: gate on the caller-supplied `was_active`
+            // snapshot. The previous in-band lookup against
+            // `self.connection_states` was racy: every caller in this file
+            // removes the session's `connection_states` entry BEFORE
+            // invoking `leave_rooms` (e.g. `Handler<Disconnect>` at the top
+            // of its body), so the lookup always returned `None` and the
+            // gate became a no-op — letting PARTICIPANT_LEFT fire for
+            // sessions that never reached `Active`. Callers now pass the
+            // value they captured before mutating state.
+            if !was_active {
+                info!(
+                    "Skipping PARTICIPANT_LEFT for non-active session {}",
+                    session_id
+                );
+                return;
             }
 
             tokio::spawn(async move {
@@ -646,6 +654,7 @@ impl Handler<Disconnect> for ChatServer {
             user_id,
             display_name,
             observer,
+            redirect,
         }: Disconnect,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -664,12 +673,57 @@ impl Handler<Disconnect> for ChatServer {
         // Observers and non-active sessions bypass the grace period — they
         // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
         if observer {
+            // Observers short-circuit inside `leave_rooms` before the
+            // `was_active` gate is consulted, so the value is academic
+            // here — pass the real captured value for consistency rather
+            // than a hard-coded literal.
             self.leave_rooms(
                 &session,
                 Some(&room),
                 Some(&user_id),
                 Some(&display_name),
                 true,
+                was_active,
+            );
+            return;
+        }
+
+        // vc-9g7 (p6-9 follow-up): cross-region redirect synthesizes a
+        // Disconnect addressed to ourselves so the normal leave path runs.
+        // The redirected client is being told to reconnect *to a different
+        // pod in a different region* — it will NOT reconnect to this pod,
+        // so the RECONNECT_GRACE_PERIOD deferral is pure dead time that
+        // produces a ~2.25s ghost-participant window for cross-region peers
+        // federated via NATS (PARTICIPANT_JOINED → PARTICIPANT_LEFT pair).
+        //
+        // Mirror what the deferred path does on entry (drop joined_sessions
+        // and the per-room receiver) and then call `leave_rooms` directly
+        // instead of going through ExecutePendingDeparture. The
+        // PARTICIPANT_LEFT broadcast inside `leave_rooms` correctly gates
+        // on whether the session ever reached Active: if it never did
+        // (likely, given the KV-roundtrip window), the broadcast is
+        // suppressed and no JOINED→LEFT pair exists; if it did, the LEFT
+        // fires immediately rather than after the grace period. Either way
+        // the ghost window collapses.
+        //
+        // `observer=false` because the joiner was admitted as a real
+        // participant; the redirect flag is independent of observer-ness.
+        if redirect {
+            self.joined_sessions.remove(&session);
+            self.drop_room_receiver(&room, &session);
+            // Pass the `was_active` snapshot captured at the top of this
+            // handler. In the realistic post-cache-miss timing the KV
+            // roundtrip resolves before the client's CONNECTION packet
+            // triggers `ActivateConnection`, so `was_active` is false and
+            // `leave_rooms` correctly suppresses the spurious
+            // PARTICIPANT_LEFT for a participant nobody saw join.
+            self.leave_rooms(
+                &session,
+                Some(&room),
+                Some(&user_id),
+                Some(&display_name),
+                false,
+                was_active,
             );
             return;
         }
@@ -734,6 +788,19 @@ impl Handler<Leave> for ChatServer {
         }: Leave,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
+        // vc-9g7 follow-up: capture `was_active` BEFORE any state mutation
+        // (here it happens to be safe because Leave doesn't touch
+        // `connection_states`, but reading up-front preserves the contract
+        // expected by `leave_rooms`). Clients that issue an explicit Leave
+        // before activating (e.g. very fast Testing-state departures) will
+        // have `was_active == false` and PARTICIPANT_LEFT will be elided,
+        // matching the prior in-band behaviour.
+        let was_active = self
+            .connection_states
+            .get(&session)
+            .map(|s| *s == ConnectionState::Active)
+            .unwrap_or(false);
+
         // Cancel any pending departure for this (room, user_id) to avoid a
         // duplicate PARTICIPANT_LEFT when the grace-period timer fires later.
         // We don't need ctx.cancel_future() because ExecutePendingDeparture::handle
@@ -750,7 +817,14 @@ impl Handler<Leave> for ChatServer {
         // Leave is always a real participant, never an observer.
         // No display_name available from Leave message; leave_rooms will
         // fall back to user_id.
-        self.leave_rooms(&session, Some(&room), Some(&user_id), None, false);
+        self.leave_rooms(
+            &session,
+            Some(&room),
+            Some(&user_id),
+            None,
+            false,
+            was_active,
+        );
     }
 }
 
@@ -916,12 +990,15 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             );
             // Observer sessions bypass the grace period entirely (handled
             // directly in Disconnect), so this path is always non-observer.
+            // The `if !pending.was_active { return; }` check above proves
+            // `was_active == true` here, so pass `true` explicitly.
             self.leave_rooms(
                 &session,
                 Some(&room),
                 Some(&user_id),
                 Some(&display_name),
                 false,
+                true,
             );
         } else {
             info!(
@@ -1127,16 +1204,26 @@ impl Handler<HomeRegionResolved> for ChatServer {
             );
         }
 
-        // Synthesize a Disconnect so the normal leave path runs. We
-        // address it to ourselves rather than calling `leave_rooms`
-        // directly, so the pending-departure grace window logic in the
-        // Disconnect handler fires the same as for any other disconnect.
+        // Synthesize a Disconnect so the normal leave path runs. We address
+        // it to ourselves rather than calling `leave_rooms` directly so the
+        // Disconnect handler's session-state cleanup (sessions /
+        // connection_states / suppress_join_broadcast removal) runs in one
+        // place.
+        //
+        // vc-9g7: set `redirect: true` to BYPASS the pending-departure
+        // grace window. The client will not reconnect to this pod — it's
+        // being told to go to a different region — so the standard 2s
+        // RECONNECT_GRACE_PERIOD deferral would just produce a ghost-
+        // participant flicker for cross-region peers federated via NATS
+        // (PARTICIPANT_JOINED → PARTICIPANT_LEFT pair). The Disconnect
+        // handler's `if redirect` arm calls `leave_rooms` immediately.
         ctx.address().do_send(crate::messages::server::Disconnect {
             session,
             room,
             user_id,
             display_name,
             observer: false,
+            redirect: true,
         });
     }
 }
@@ -1373,6 +1460,12 @@ impl Handler<JoinRoom> for ChatServer {
                 // admit-then-redirect instead of an up-front redirect.
                 // The bead explicitly accepts this for v1. All subsequent
                 // joiners in this region hit the cache path above.
+                debug!(
+                    "p6-9 cache-miss: spawning home-region lookup for room {} \
+                     (session {}, user {}); session admitted locally pending \
+                     lookup result.",
+                    room, session, user_id
+                );
                 let kv = self.home_region_kv.clone();
                 let room_for_task = room.clone();
                 let user_for_task = user_id.clone();
@@ -3440,6 +3533,7 @@ mod tests {
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
+                redirect: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -3548,6 +3642,7 @@ mod tests {
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
+                redirect: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -3671,6 +3766,7 @@ mod tests {
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
+                redirect: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -4883,6 +4979,13 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // Disconnect — defers PARTICIPANT_LEFT by RECONNECT_GRACE_PERIOD.
+        // vc-9g7: `redirect: false` here is correct — this test simulates a
+        // real client-initiated disconnect (not a cross-region async
+        // redirect). The point of the test is that a *subsequent* client
+        // reconnect onto a non-owner pod (a separate redirect path, p6-5)
+        // must not drain the pending_departures entry staged below; the
+        // deferred-leave behavior must be exercised exactly as in
+        // production for that scenario.
         chat_server
             .send(Disconnect {
                 session: old_sid,
@@ -4890,6 +4993,7 @@ mod tests {
                 user_id: user_id.to_string(),
                 display_name: user_id.to_string(),
                 observer: false,
+                redirect: false,
             })
             .await
             .unwrap();
@@ -5031,6 +5135,442 @@ mod tests {
 
         std::env::remove_var("POD_NAME");
         std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST: vc-9g7 — cross-region async redirect bypasses RECONNECT_GRACE_PERIOD
+    // ==========================================================================
+    // When the JoinRoom async cache-miss path admits a non-observer joiner and
+    // the spawned KV lookup resolves to a foreign home region,
+    // `Handler<HomeRegionResolved>` sends a synthetic Disconnect to itself with
+    // `redirect: true`. The new `if redirect` arm in `Handler<Disconnect>` must
+    // call `leave_rooms` IMMEDIATELY (no 2s deferral) so cross-region peers
+    // federated via NATS do not observe a JOINED → LEFT ghost-participant pair.
+    //
+    // We drive `HomeRegionResolved` directly with `home_region != current_region`
+    // to exercise the redirect branch without needing a multi-region NATS-KV
+    // setup. After the synthetic Disconnect flows through:
+    //
+    //   1. `pending_departures` MUST NOT contain an entry for the session
+    //      (the redirect arm must NOT take the deferred path).
+    //   2. `room_members` MUST NOT contain the session (immediate leave_rooms
+    //      cleanup ran).
+    //   3. PARTICIPANT_LEFT must either fire immediately (within ~200ms) or be
+    //      suppressed entirely (if leave_rooms gates on the session having
+    //      reached Active). It MUST NOT fire 2s later.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cross_region_redirect_bypasses_grace_period() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration, Instant};
+
+        // Single-pod, default region ("local"). The HomeRegionResolved we
+        // synthesize will name "us-east" so the cross-region branch fires.
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        // Capturing session — records all Message bytes for later inspection.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let session_id: SessionId = 91_000;
+        let user_id = "redirect-bypass@example.com";
+        let room = "vc-9g7-redirect-bypass-room";
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: capturing.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom must succeed in single-region default config");
+
+        // Activate so the session reaches the state where PARTICIPANT_LEFT
+        // *would* fire on a normal disconnect — this is the worst case for
+        // the bug we are fixing (where the deferred path would produce a
+        // 2s ghost window).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Watch the system subject for PARTICIPANT_LEFT and record the time
+        // it arrived (if at all).
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let left_arrived_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let left_clone = left_arrived_at.clone();
+        let observed_any_left = Arc::new(AtomicBool::new(false));
+        let observed_clone = observed_any_left.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        tokio::spawn(async move {
+            // Watch for ~3s — long enough to detect a deferred (2s) leave
+            // if the bug were still present, plus margin.
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(3000), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                            observed_clone.store(true, Ordering::Relaxed);
+                            *left_clone.lock().unwrap() = Some(Instant::now());
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Let the JOINED publish settle.
+        sleep(Duration::from_millis(200)).await;
+
+        // Drive the redirect path directly. The HomeRegionResolved handler
+        // will (a) emit the ADMISSION_DECISION{REDIRECT} packet to the
+        // capturing session, and (b) synthesize a Disconnect with
+        // redirect=true to itself.
+        let synth_start = Instant::now();
+        chat_server
+            .send(HomeRegionResolved {
+                room: room.to_string(),
+                home_region: "us-east".to_string(),
+                session: session_id,
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+            })
+            .await
+            .expect("HomeRegionResolved delivery should succeed");
+
+        // Give actix a moment to run the synthesized Disconnect.
+        sleep(Duration::from_millis(150)).await;
+
+        // CORE ASSERTION 1: pending_departures must be empty for this room+user.
+        // If the redirect arm fell through to the deferred path, this would be
+        // Some(session_id).
+        let staged = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            staged, None,
+            "vc-9g7: redirect Disconnect MUST NOT stage a pending_departures \
+             entry — the deferred-leave grace window must be bypassed"
+        );
+
+        // CORE ASSERTION 2: room_members must not contain this session anymore.
+        // leave_rooms ran synchronously, so the row should be gone (or the
+        // entire room_members entry for this room may be gone if it was the
+        // last member).
+        let members_after = chat_server
+            .send(SnapshotRoomMembersList {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap();
+        if let Some(members) = members_after {
+            assert!(
+                !members.iter().any(|(s, _, _)| *s == session_id),
+                "vc-9g7: redirect Disconnect MUST evict the session from \
+                 room_members immediately, not after the grace period"
+            );
+        }
+
+        // CORE ASSERTION 3: if PARTICIPANT_LEFT fired at all, it fired
+        // immediately — NOT after RECONNECT_GRACE_PERIOD (2s).
+        // Wait for the watcher window to elapse so a deferred event would
+        // have a chance to be observed if the bug were present.
+        sleep(Duration::from_millis(2500)).await;
+        if observed_any_left.load(Ordering::Relaxed) {
+            let when = left_arrived_at
+                .lock()
+                .unwrap()
+                .expect("flag set implies timestamp set");
+            let delay = when.duration_since(synth_start);
+            assert!(
+                delay < Duration::from_millis(300),
+                "vc-9g7: PARTICIPANT_LEFT after redirect must fire promptly \
+                 (got {:?} after HomeRegionResolved); the synchronous \
+                 leave_rooms path should complete well under 300ms — a longer \
+                 delay indicates a regression toward the deferred-leave \
+                 timing the redirect path is supposed to bypass",
+                delay
+            );
+        }
+        // If observed_any_left == false, that's also a passing outcome: the
+        // session's PARTICIPANT_JOINED was suppressed because no peer had
+        // subscribed yet, and `leave_rooms` correctly elided the LEFT
+        // broadcast. Either way no JOINED→LEFT ghost pair was emitted with
+        // a 2s gap.
+
+        // SANITY: the ADMISSION_DECISION{REDIRECT} packet was delivered to
+        // the originating session.
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner = found.expect(
+            "ADMISSION_DECISION{REDIRECT} (wrong_region) must be delivered to redirected session",
+        );
+        assert_eq!(inner.status.enum_value_or_default(), AdmStatus::REDIRECT);
+
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST: vc-9g7 follow-up — cross-region redirect with never-activated session
+    // ==========================================================================
+    // Sibling of `test_cross_region_redirect_bypasses_grace_period`, exercising
+    // the REALISTIC post-cache-miss timing: the KV roundtrip resolves BEFORE
+    // the client's CONNECTION packet reaches `ActivateConnection`, so the
+    // joiner never reaches the `Active` state and no PARTICIPANT_JOINED was
+    // ever published.
+    //
+    // Before the leave_rooms refactor, the in-band `connection_states` lookup
+    // inside `leave_rooms` saw `None` (the Disconnect handler already removed
+    // the entry), the gate became a no-op, and PARTICIPANT_LEFT fired for a
+    // participant nobody ever saw join. After the refactor, the caller passes
+    // its captured `was_active=false` and the broadcast is suppressed.
+    //
+    // Assertions:
+    //   1. `pending_departures` is empty (grace bypassed — same as the sibling).
+    //   2. `room_members` no longer contains the session (immediate eviction).
+    //   3. NO PARTICIPANT_LEFT is published at all — wait at least 300ms after
+    //      the synthesized Disconnect, then assert nothing was observed. This
+    //      is the assertion the previous bug would have failed.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cross_region_redirect_when_session_never_activated() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let session_id: SessionId = 91_001;
+        let user_id = "redirect-never-active@example.com";
+        let room = "vc-9g7-redirect-never-active-room";
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: capturing.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom must succeed in single-region default config");
+
+        // INTENTIONALLY DO NOT call ActivateConnection — this is the
+        // realistic timing where the KV-roundtrip resolves first.
+
+        // Watch the system subject for ANY PARTICIPANT_LEFT — we expect none.
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let observed_any_left = Arc::new(AtomicBool::new(false));
+        let observed_clone = observed_any_left.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(3000), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                            observed_clone.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Let the subscription settle.
+        sleep(Duration::from_millis(200)).await;
+
+        // Drive the redirect path directly while the session is still in
+        // Testing state (never activated).
+        chat_server
+            .send(HomeRegionResolved {
+                room: room.to_string(),
+                home_region: "us-east".to_string(),
+                session: session_id,
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+            })
+            .await
+            .expect("HomeRegionResolved delivery should succeed");
+
+        // Give actix a moment to run the synthesized Disconnect.
+        sleep(Duration::from_millis(150)).await;
+
+        // ASSERTION 1: pending_departures must be empty (grace bypassed).
+        let staged = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            staged, None,
+            "vc-9g7: redirect Disconnect MUST NOT stage a pending_departures \
+             entry even for never-activated sessions"
+        );
+
+        // ASSERTION 2: room_members must not contain this session anymore.
+        let members_after = chat_server
+            .send(SnapshotRoomMembersList {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap();
+        if let Some(members) = members_after {
+            assert!(
+                !members.iter().any(|(s, _, _)| *s == session_id),
+                "vc-9g7: redirect Disconnect MUST evict the session from \
+                 room_members immediately, even when never activated"
+            );
+        }
+
+        // ASSERTION 3: NO PARTICIPANT_LEFT must be published. Wait long
+        // enough that a synchronous publish would have shown up; also longer
+        // than the (bypassed) 2s grace window so a regression to the
+        // deferred path would also be caught.
+        sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !observed_any_left.load(Ordering::Relaxed),
+            "vc-9g7: no PARTICIPANT_LEFT must be published when redirecting \
+             a session that never reached Active — the joiner was never \
+             visible to peers, so emitting LEFT creates a ghost-departed \
+             participant peers never saw join"
+        );
+
+        // SANITY: ADMISSION_DECISION{REDIRECT} was still delivered to the
+        // originating session.
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner = found.expect(
+            "ADMISSION_DECISION{REDIRECT} must be delivered to redirected \
+             session even when it never activated",
+        );
+        assert_eq!(inner.status.enum_value_or_default(), AdmStatus::REDIRECT);
+
         std::env::remove_var("SFU_TRANSPORT_KIND");
     }
 }

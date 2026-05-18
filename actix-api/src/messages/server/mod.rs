@@ -79,6 +79,11 @@ pub struct Disconnect {
     /// When true, the disconnecting session is an observer (waiting room)
     /// and should NOT trigger PARTICIPANT_LEFT notifications.
     pub observer: bool,
+    /// When true, this Disconnect is a server-synthesized leave (e.g.,
+    /// cross-region redirect) where the client will not reconnect to this
+    /// pod, so the grace-period deferral MUST be skipped to avoid a
+    /// ghost-participant window for cross-region peers.
+    pub redirect: bool,
 }
 
 #[derive(ActixMessage)]

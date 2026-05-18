@@ -552,6 +552,11 @@ impl SessionLogic {
             user_id: self.user_id.clone(),
             display_name: self.display_name.clone(),
             observer: self.observer,
+            // Real client-initiated disconnect (transport closed). The
+            // client may reconnect within RECONNECT_GRACE_PERIOD, so the
+            // standard deferred-leave path applies. vc-9g7: only the
+            // cross-region redirect path sets this true.
+            redirect: false,
         });
     }
 
