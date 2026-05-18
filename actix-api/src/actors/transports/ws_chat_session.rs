@@ -377,8 +377,8 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                             }
                         }
                     }
-                    InboundAction::Forward(bytes) => {
-                        ctx.notify(Packet { data: bytes });
+                    InboundAction::Forward(bytes, kind) => {
+                        ctx.notify(Packet { data: bytes, kind });
                     }
                     InboundAction::Processed | InboundAction::KeepAlive => {}
                 }

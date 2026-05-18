@@ -378,8 +378,8 @@ impl Handler<WtInbound> for WtChatSession {
                     }
                 }
             }
-            InboundAction::Forward(data) => {
-                ctx.notify(Packet { data });
+            InboundAction::Forward(data, kind) => {
+                ctx.notify(Packet { data, kind });
             }
             InboundAction::Processed | InboundAction::KeepAlive => {}
         }

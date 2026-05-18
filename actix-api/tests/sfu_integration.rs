@@ -56,6 +56,7 @@ use serial_test::serial;
 use tokio::time::sleep;
 
 use sec_api::actors::chat_server::ChatServer;
+use sec_api::actors::packet_handler::PacketKind;
 use sec_api::actors::session_logic::SessionId;
 use sec_api::messages::server::{ActivateConnection, ClientMessage, Connect, JoinRoom, Packet};
 use sec_api::messages::session::Message;
@@ -244,6 +245,7 @@ async fn send_media_burst(
             user: sender.user.clone(),
             msg: Packet {
                 data: Arc::new(bytes),
+                kind: PacketKind::Data,
             },
         })
         .await
@@ -341,6 +343,7 @@ async fn run_all_scenarios(mode: &str, sid_base: SessionId, nats_url: &str) -> S
         user: a2.user.clone(),
         msg: Packet {
             data: Arc::new(cong_bytes),
+            kind: PacketKind::Data,
         },
     })
     .await
@@ -598,6 +601,7 @@ async fn send_subscription_update(
         user: sender.user.clone(),
         msg: Packet {
             data: Arc::new(bytes),
+            kind: PacketKind::Data,
         },
     })
     .await

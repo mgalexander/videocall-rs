@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use crate::actors::packet_handler::PacketKind;
 use crate::actors::session_logic::{RoomId, SessionId};
 
 use super::session::Message;
@@ -62,6 +63,8 @@ pub struct Connect {
 #[rtype(result = "()")]
 pub struct Packet {
     pub data: Arc<Vec<u8>>,
+    /// Classification computed once upstream by `classify_and_inspect`.
+    pub kind: PacketKind,
 }
 
 #[derive(ActixMessage)]

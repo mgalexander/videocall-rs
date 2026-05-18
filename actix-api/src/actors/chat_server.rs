@@ -46,7 +46,9 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
-use super::packet_handler::{parse_and_inspect, should_drop_kfr_for_layer_selection, ParsedPacket};
+use super::packet_handler::{
+    parse_and_inspect, should_drop_kfr_for_layer_selection, PacketKind, ParsedPacket,
+};
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::layer_selector::LayerSelector;
@@ -902,6 +904,7 @@ impl Handler<ClientMessage> for ChatServer {
             msg,
             user: _,
         } = msg;
+        let kind = msg.kind;
         trace!("got message in server room {room} session {session}");
 
         // Check connection state - only publish to NATS if Active
@@ -950,62 +953,47 @@ impl Handler<ClientMessage> for ChatServer {
                 // `session_logic.rs` remains in force; this is an additive
                 // policy applied before the NATS publish so the named sender
                 // is never woken at all for KFRs that wouldn't help.
-                // Size gate: KEYFRAME_REQUEST is a tiny unencrypted MediaPacket
-                // (media_type + user_id + "VIDEO"/"SCREEN" tag, typically
-                // <80 B). Real audio/video MediaPackets carry encrypted payload
-                // bytes and are well over this threshold. The guard avoids a
-                // per-MEDIA-packet inner protobuf parse on the hot fan-out path
-                // for AUDIO / VIDEO / SCREEN — which all parse successfully but
-                // never match KEYFRAME_REQUEST. A follow-up will plumb the
-                // already-computed `PacketKind` through `ClientMessage` so this
-                // gate becomes unnecessary.
-                const KFR_MAX_BYTES: usize = 256;
-                if packet_wrapper.packet_type == PacketType::MEDIA.into()
-                    && packet_wrapper.data.len() <= KFR_MAX_BYTES
-                {
+                //
+                // vc-jgj: branch directly on the `PacketKind` plumbed from
+                // `SessionLogic::handle_inbound`. The inner `MediaPacket`
+                // parse only runs when we already know this is a KFR, so
+                // the AUDIO / VIDEO / SCREEN fan-out path never re-parses.
+                if kind == PacketKind::KeyframeRequest {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                        if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
-                            let members: &[(SessionId, String, String)] = self
-                                .room_members
-                                .get(&room)
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[]);
-                            // Read the cached selection under a read lock and
-                            // clone so we don't hold the lock across the
-                            // synchronous helper call. The helper itself is
-                            // cheap; cloning a typically-tiny `LayerSelection`
-                            // keeps the critical section minimal.
-                            // vc-wls: lock-free read of the cached
-                            // selection. `last_selection_for` returns an
-                            // `Arc<CachedSelection>` from a DashMap shard
-                            // lock that contends only with writes to THIS
-                            // receiver's entry. We then clone the inner
-                            // `LayerSelection` (typically tiny) so we
-                            // don't hand a clone-on-write Arc across the
-                            // helper boundary.
-                            let cached_selection = self.forwarders.get(&room).and_then(|fwd| {
-                                fwd.layer_selector()
-                                    .last_selection_for(session)
-                                    .map(|cached| cached.selection.clone())
-                            });
-                            if should_drop_kfr_for_layer_selection(
-                                &media_packet.user_id,
+                        let members: &[(SessionId, String, String)] = self
+                            .room_members
+                            .get(&room)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        // vc-wls: lock-free read of the cached selection.
+                        // `last_selection_for` returns an
+                        // `Arc<CachedSelection>` from a DashMap shard lock
+                        // that contends only with writes to THIS receiver's
+                        // entry. We then clone the inner `LayerSelection`
+                        // (typically tiny) so we don't hand a clone-on-write
+                        // Arc across the helper boundary.
+                        let cached_selection = self.forwarders.get(&room).and_then(|fwd| {
+                            fwd.layer_selector()
+                                .last_selection_for(session)
+                                .map(|cached| cached.selection.clone())
+                        });
+                        if should_drop_kfr_for_layer_selection(
+                            &media_packet.user_id,
+                            session,
+                            members,
+                            cached_selection.as_ref(),
+                        ) {
+                            crate::metrics::SFU_DROPPED_TOTAL
+                                .with_label_values(&["kfr_unsubscribed"])
+                                .inc();
+                            debug!(
+                                "Dropping KEYFRAME_REQUEST from session {} in room {} \
+                                 (target {:?} not in current layer selection)",
                                 session,
-                                members,
-                                cached_selection.as_ref(),
-                            ) {
-                                crate::metrics::SFU_DROPPED_TOTAL
-                                    .with_label_values(&["kfr_unsubscribed"])
-                                    .inc();
-                                debug!(
-                                    "Dropping KEYFRAME_REQUEST from session {} in room {} \
-                                     (target {:?} not in current layer selection)",
-                                    session,
-                                    room,
-                                    std::str::from_utf8(&media_packet.user_id).unwrap_or("<bin>"),
-                                );
-                                return;
-                            }
+                                room,
+                                std::str::from_utf8(&media_packet.user_id).unwrap_or("<bin>"),
+                            );
+                            return;
                         }
                     }
                 }
@@ -2291,6 +2279,7 @@ mod tests {
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
+                    kind: PacketKind::Data,
                 },
                 user: "test@example.com".to_string(),
             })
@@ -2378,6 +2367,7 @@ mod tests {
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
+                    kind: PacketKind::Data,
                 },
                 user: "test@example.com".to_string(),
             })

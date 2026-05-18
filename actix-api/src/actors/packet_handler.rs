@@ -627,6 +627,72 @@ mod tests {
         assert_eq!(classify_packet(&bytes), PacketKind::KeyframeRequest);
     }
 
+    /// vc-jgj: classification is **kind-driven**, not size-driven.
+    ///
+    /// The previous fan-out gate in `chat_server.rs` skipped the inner
+    /// `MediaPacket` parse for any MEDIA wrapper larger than 256 B,
+    /// assuming real KFRs were always tiny. That heuristic would have
+    /// silently misclassified an oversized KFR as `PacketKind::Data`
+    /// and bypassed the layer-selection drop policy. The plumbed
+    /// `PacketKind` from `classify_and_inspect` must continue to
+    /// identify a KEYFRAME_REQUEST as such regardless of payload size.
+    #[test]
+    fn test_classify_oversized_keyframe_request_is_kind_driven() {
+        // 1 KiB of arbitrary bytes — well above the old 256-byte size gate.
+        let padding = vec![0xABu8; 1024];
+        let media = MediaPacket {
+            media_type: MediaType::KEYFRAME_REQUEST.into(),
+            user_id: b"target-user".to_vec(),
+            // `data` is unused by KFRs in production, but a real attacker /
+            // misbehaving client could attach arbitrary bytes. The test
+            // intentionally exceeds the old 256 B size gate.
+            data: padding,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert!(
+            wrapper.data.len() > 256,
+            "test invariant: inner MediaPacket must exceed the old size gate (got {} B)",
+            wrapper.data.len()
+        );
+
+        // The new kind-driven branch must still classify this as a KFR,
+        // proving the chat_server fan-out path will enter the
+        // layer-selection drop branch rather than the AUDIO/VIDEO/SCREEN
+        // forwarding path.
+        let classified = classify_and_inspect(&bytes);
+        assert_eq!(
+            classified.kind,
+            PacketKind::KeyframeRequest,
+            "oversized KFR must be classified by media_type, not by wrapper size"
+        );
+
+        // Negative case: the SAME oversized payload but with media_type=VIDEO
+        // classifies as Data — proving the gate is media_type-driven, not size.
+        let video = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: b"target-user".to_vec(),
+            data: vec![0xABu8; 1024],
+            ..Default::default()
+        };
+        let video_wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: video.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let video_bytes = video_wrapper.write_to_bytes().unwrap();
+        assert_eq!(
+            classify_and_inspect(&video_bytes).kind,
+            PacketKind::Data,
+            "oversized VIDEO must not be classified as KeyframeRequest"
+        );
+    }
+
     #[test]
     fn test_classify_rtt_packet() {
         let media = MediaPacket {

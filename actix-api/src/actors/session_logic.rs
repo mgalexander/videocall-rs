@@ -67,8 +67,10 @@ pub enum ConnectionState {
 pub enum InboundAction {
     /// Echo the packet back to sender (RTT measurement)
     Echo(Arc<Vec<u8>>),
-    /// Forward to ChatServer for room routing
-    Forward(Arc<Vec<u8>>),
+    /// Forward to ChatServer for room routing, carrying the
+    /// pre-computed `PacketKind` so the fan-out path can branch
+    /// without re-parsing the wrapper.
+    Forward(Arc<Vec<u8>>, PacketKind),
     /// Already processed (health packet), no further action
     Processed,
     /// Keep-alive ping, no action needed
@@ -622,7 +624,7 @@ impl SessionLogic {
                     );
                     return InboundAction::Processed;
                 }
-                InboundAction::Forward(Arc::new(data.to_vec()))
+                InboundAction::Forward(Arc::new(data.to_vec()), PacketKind::KeyframeRequest)
             }
             PacketKind::Data => {
                 if self.observer {
@@ -634,7 +636,7 @@ impl SessionLogic {
                     return InboundAction::Processed;
                 }
 
-                InboundAction::Forward(Arc::new(data.to_vec()))
+                InboundAction::Forward(Arc::new(data.to_vec()), PacketKind::Data)
             }
         }
     }
@@ -1291,7 +1293,7 @@ mod tests {
         ));
         // Forward, Processed, KeepAlive should activate.
         assert!(SessionLogic::should_activate_on_action(
-            &InboundAction::Forward(Arc::new(vec![]))
+            &InboundAction::Forward(Arc::new(vec![]), PacketKind::Data)
         ));
         assert!(SessionLogic::should_activate_on_action(
             &InboundAction::Processed

@@ -75,6 +75,7 @@ use serial_test::serial;
 use tokio::time::sleep;
 
 use sec_api::actors::chat_server::ChatServer;
+use sec_api::actors::packet_handler::PacketKind;
 use sec_api::actors::session_logic::SessionId;
 use sec_api::messages::server::{ActivateConnection, ClientMessage, Connect, JoinRoom, Packet};
 use sec_api::messages::session::Message;
@@ -288,6 +289,7 @@ async fn publish_audio_video(
             user: sender.user.clone(),
             msg: Packet {
                 data: Arc::new(bytes),
+                kind: PacketKind::Data,
             },
         })
         .await
@@ -323,6 +325,7 @@ async fn send_subscription_update(
         user: sender.user.clone(),
         msg: Packet {
             data: Arc::new(bytes),
+            kind: PacketKind::Data,
         },
     })
     .await
