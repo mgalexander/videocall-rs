@@ -414,13 +414,16 @@ impl ChatServer {
             Some(s) => s,
             None => return,
         };
-        let members: HashSet<SessionId> = match self.room_states.get(room) {
+        // vc-7gc: read the cached `Arc<HashSet>` instead of allocating a
+        // fresh `HashSet` from `members.keys()`. The lock is released the
+        // moment the read scope ends.
+        let members = match self.room_states.get(room) {
             Some(state) => {
                 let guard = match state.read() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                guard.members.keys().copied().collect()
+                guard.members_snapshot()
             }
             None => return,
         };

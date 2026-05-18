@@ -26,7 +26,8 @@
 //! Capability bits are defined on the wire by the `CONNECTION` packet and
 //! must match the values in `videocall-client/src/connection/connection_manager.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use videocall_types::protos::diagnostics_packet::BandwidthEstimate;
@@ -78,10 +79,29 @@ pub struct MemberEntry {
 ///
 /// The struct does not own any synchronization primitive; wrap it in an
 /// `Arc<RwLock<RoomState>>` (or equivalent) at the caller.
+///
+/// vc-7gc: alongside the [`HashMap`] of full member entries, we cache a
+/// `members_snapshot: Arc<HashSet<SessionId>>` that is rebuilt atomically on
+/// every membership mutation (insert / remove). The Forwarder's per-packet
+/// `decide` path clones the `Arc` (one refcount bump, no allocation) instead
+/// of building a fresh `HashSet` from scratch on every packet — at 20 receivers
+/// × 1000 pps that previously meant ~20k allocs/sec/room of allocator churn.
+/// Membership changes are rare (peer join / leave), so paying the rebuild cost
+/// on the cold mutation path is a clear win.
 #[derive(Debug)]
 pub struct RoomState {
     pub room_id: String,
     pub members: HashMap<SessionId, MemberEntry>,
+    /// Cached set of current member session ids, kept in sync with
+    /// `members` by [`Self::insert_member`] and [`Self::remove_member`].
+    /// Hot readers (e.g. `Forwarder::decide`) clone this `Arc` to obtain a
+    /// stable snapshot without allocating a new `HashSet`.
+    ///
+    /// Invariant: `members_snapshot.iter().copied().collect::<HashSet<_>>()
+    /// == members.keys().copied().collect::<HashSet<_>>()`.
+    /// Maintained by routing every keyset-changing mutation through
+    /// [`Self::rebuild_members_snapshot`].
+    members_snapshot: Arc<HashSet<SessionId>>,
 }
 
 impl RoomState {
@@ -90,7 +110,31 @@ impl RoomState {
         Self {
             room_id,
             members: HashMap::new(),
+            members_snapshot: Arc::new(HashSet::new()),
         }
+    }
+
+    /// Rebuild the cached `members_snapshot` from the current `members` map.
+    ///
+    /// Called from every mutation that changes the membership keyset
+    /// ([`Self::insert_member`] / [`Self::remove_member`]). The previous
+    /// `Arc` is dropped only after the new one is published, so concurrent
+    /// readers that already hold a clone continue to observe a consistent
+    /// (if slightly stale) snapshot — exactly the contract `decide` relies
+    /// on.
+    fn rebuild_members_snapshot(&mut self) {
+        let snapshot: HashSet<SessionId> = self.members.keys().copied().collect();
+        self.members_snapshot = Arc::new(snapshot);
+    }
+
+    /// Lock-free clone of the current members snapshot.
+    ///
+    /// Returns an `Arc` so the hot path can avoid allocating a fresh
+    /// `HashSet` per call. The returned snapshot reflects membership as of
+    /// the most recent [`Self::insert_member`] / [`Self::remove_member`]
+    /// call observed by this thread.
+    pub fn members_snapshot(&self) -> Arc<HashSet<SessionId>> {
+        Arc::clone(&self.members_snapshot)
     }
 
     /// Insert (or replace) a member with the given capabilities bitmask.
@@ -109,7 +153,13 @@ impl RoomState {
             bandwidth_estimate: None,
             bandwidth_estimate_updated_at: None,
         };
-        self.members.insert(sid, entry);
+        let was_present = self.members.insert(sid, entry).is_some();
+        // Only rebuild the snapshot when the keyset actually changed.
+        // Re-inserting an existing `sid` (reconnect) keeps the same key,
+        // so the cached `Arc` remains correct and we save an allocation.
+        if !was_present {
+            self.rebuild_members_snapshot();
+        }
     }
 
     /// Update the cached bandwidth estimate for an existing member.
@@ -133,7 +183,9 @@ impl RoomState {
 
     /// Remove a member from the room. No-op if absent.
     pub fn remove_member(&mut self, sid: SessionId) {
-        self.members.remove(&sid);
+        if self.members.remove(&sid).is_some() {
+            self.rebuild_members_snapshot();
+        }
     }
 
     /// Return the capabilities bitmask for the given member, if present.
@@ -224,6 +276,56 @@ mod tests {
             "absent sid must not be auto-inserted"
         );
         assert_eq!(room.member_count(), 0);
+    }
+
+    #[test]
+    fn members_snapshot_tracks_insert_and_remove() {
+        let mut room = RoomState::new("r".into());
+        assert!(room.members_snapshot().is_empty());
+
+        room.insert_member(1, 0);
+        room.insert_member(2, 0);
+        let snap = room.members_snapshot();
+        assert_eq!(snap.len(), 2);
+        assert!(snap.contains(&1));
+        assert!(snap.contains(&2));
+
+        // Reconnect (re-insert same sid) MUST NOT change the snapshot.
+        let snap_before_reinsert = room.members_snapshot();
+        room.insert_member(1, 7);
+        let snap_after_reinsert = room.members_snapshot();
+        // Pointer-equal: no rebuild happened.
+        assert!(Arc::ptr_eq(&snap_before_reinsert, &snap_after_reinsert));
+
+        // Remove of an absent id is a no-op.
+        let snap_before_noop = room.members_snapshot();
+        room.remove_member(999);
+        let snap_after_noop = room.members_snapshot();
+        assert!(Arc::ptr_eq(&snap_before_noop, &snap_after_noop));
+
+        room.remove_member(1);
+        let snap = room.members_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(snap.contains(&2));
+    }
+
+    #[test]
+    fn members_snapshot_clone_is_stable_across_mutations() {
+        // Readers that captured a snapshot before a mutation must continue
+        // to observe their snapshot's contents — the rebuild publishes a
+        // new Arc rather than mutating the old one.
+        let mut room = RoomState::new("r".into());
+        room.insert_member(1, 0);
+        let pre = room.members_snapshot();
+        assert_eq!(pre.len(), 1);
+
+        room.insert_member(2, 0);
+        // The previously-captured snapshot is unchanged.
+        assert_eq!(pre.len(), 1);
+        assert!(pre.contains(&1));
+        assert!(!pre.contains(&2));
+        // The newly-fetched snapshot reflects both members.
+        assert_eq!(room.members_snapshot().len(), 2);
     }
 
     #[test]

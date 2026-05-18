@@ -173,10 +173,18 @@ pub const EXIT_WINDOW: Duration = Duration::from_millis(800);
 ///
 /// `top` is sorted by EWMA score descending; ordering changes count as a
 /// set change and bump [`Self::generation`] (see ADR-0002 §5).
+///
+/// vc-7gc: `top` is an `Arc<Vec<SessionId>>` so the per-packet `Forwarder::decide`
+/// path can `Arc::clone` the snapshot's speaker list (one refcount bump, no
+/// allocation) instead of `Vec::clone`-ing the underlying buffer per call.
+/// `SpeakerTick` publishes a fresh `Arc` only on actual set/order changes;
+/// quiet ticks reuse the existing one.
 #[derive(Debug, Clone)]
 pub struct ActiveSpeakerSet {
     /// Up to [`MAX_SPEAKERS`] active speakers, sorted by score descending.
-    pub top: Vec<SessionId>,
+    /// Hot readers should `Arc::clone` this field rather than dereferencing
+    /// and re-collecting.
+    pub top: Arc<Vec<SessionId>>,
     /// Monotonic counter; bumped on every membership or order change.
     pub generation: u64,
     /// Wall-clock time of the most recent change to `top`.
@@ -191,7 +199,7 @@ impl ActiveSpeakerSet {
     /// per-room tick has fired even once.
     pub fn empty() -> Self {
         Self {
-            top: Vec::new(),
+            top: Arc::new(Vec::new()),
             generation: 0,
             last_change: Instant::now(),
         }
@@ -502,15 +510,20 @@ impl SpeakerTick {
         let next_top: Vec<SessionId> = eligible.into_iter().map(|(sid, _)| sid).collect();
 
         // Set change detection: membership-or-order change bumps generation.
-        let snapshot_for_publish = if next_top != st.current.top {
+        // Compare `next_top: Vec<SessionId>` against the published
+        // `Arc<Vec<SessionId>>` via slice equality so we don't rely on any
+        // `PartialEq<Arc<Vec<T>>> for Vec<T>` impl (there isn't one).
+        let snapshot_for_publish = if next_top.as_slice() != st.current.top.as_slice() {
             let new_gen = st.current.generation.wrapping_add(1);
             st.current = ActiveSpeakerSet {
-                top: next_top,
+                top: Arc::new(next_top),
                 generation: new_gen,
                 last_change: now,
             };
             // `send` only fails if there are zero receivers; we always hold
             // one ourselves in `self.rx`, so this is infallible in practice.
+            // Cloning the snapshot bumps the `Arc` refcount; the underlying
+            // `Vec<SessionId>` is shared, not copied.
             let _ = tx.send(st.current.clone());
             Some(st.current.clone())
         } else {
@@ -954,7 +967,7 @@ mod tests {
             snap.top
         );
         // The four highest scores are 10, 20, 30, 40 (in that order).
-        assert_eq!(snap.top, vec![10, 20, 30, 40]);
+        assert_eq!(snap.top.as_slice(), &[10, 20, 30, 40][..]);
         assert!(!snap.top.contains(&50));
         assert!(!snap.top.contains(&60));
     }

@@ -304,7 +304,14 @@ impl Forwarder {
         // section, then drop the room read lock before doing any other
         // work. The lock is poison-safe: a panicked writer leaves the
         // table readable.
-        let (members_snapshot, receiver_bw_kbps): (HashSet<SessionId>, Option<u32>) = {
+        //
+        // vc-7gc: `members_snapshot` is now an `Arc<HashSet<SessionId>>`
+        // shared with the authoritative `RoomState`. Cloning the `Arc` here
+        // is a single refcount bump — at 20 receivers × 1000 pps that
+        // replaces ~20k full `HashSet` rebuilds per second per room.
+        // `SubscriptionStore::resolve` continues to accept `&HashSet`, so
+        // we deref the `Arc` at the call site.
+        let (members_snapshot, receiver_bw_kbps): (Arc<HashSet<SessionId>>, Option<u32>) = {
             let room = match self.room.read() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
@@ -312,7 +319,7 @@ impl Forwarder {
             SFU_ROOM_SIZE
                 .with_label_values(&[room.room_id.as_str()])
                 .set(room.member_count() as f64);
-            let members: HashSet<SessionId> = room.members.keys().copied().collect();
+            let members = room.members_snapshot();
             let bw = room
                 .members
                 .get(&receiver_sid)
@@ -343,15 +350,25 @@ impl Forwarder {
                     // ONCE — we reuse both the `top` slice for AllowSet
                     // resolution and the `generation` counter for the
                     // LayerSelector cache invalidation check below.
-                    let (speakers_top, speakers_generation): (Vec<SessionId>, u64) = {
+                    //
+                    // vc-7gc: `snap.top` is `Arc<Vec<SessionId>>`; cloning
+                    // it is a refcount bump rather than a full `Vec` copy.
+                    // `SpeakerTick` only publishes a fresh `Arc` on actual
+                    // set/order changes, so quiet ticks reuse the existing
+                    // allocation across every `decide` invocation.
+                    let (speakers_top, speakers_generation): (Arc<Vec<SessionId>>, u64) = {
                         let snap = self.speakers.borrow();
-                        (snap.top.clone(), snap.generation)
+                        (Arc::clone(&snap.top), snap.generation)
                     };
                     let allow = {
                         let store = match self.subscriptions.read() {
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
                         };
+                        // `resolve` accepts `&HashSet<SessionId>` and
+                        // `&[SessionId]`; deref coercion peels the
+                        // `Arc` wrappers automatically when the target
+                        // type is fixed.
                         store.resolve(receiver_sid, &members_snapshot, &speakers_top)
                     };
 

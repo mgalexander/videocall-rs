@@ -490,9 +490,11 @@ async fn top_n_cap_truncates_to_max_speakers_sorted_by_score() {
         snap.top
     );
     // The four highest-scoring senders are 10, 20, 30, 40, in that order.
+    // vc-7gc: `snap.top` is `Arc<Vec<SessionId>>`; compare via slice to
+    // avoid relying on an `Arc<Vec<T>> == Vec<T>` impl that doesn't exist.
     assert_eq!(
-        snap.top,
-        vec![10, 20, 30, 40],
+        snap.top.as_slice(),
+        &[10u64, 20, 30, 40][..],
         "top must be sorted by score descending and contain the 4 highest"
     );
     for excluded in [50, 60, 70, 80, 90, 100] {

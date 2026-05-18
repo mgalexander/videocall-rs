@@ -367,7 +367,7 @@ fn p3_5_active_speaker_is_admitted_without_explicit_pin() {
 
     // Seed the active-speaker channel with `speaker` already promoted.
     let speakers_snap = ActiveSpeakerSet {
-        top: vec![speaker],
+        top: Arc::new(vec![speaker]),
         generation: 1,
         ..ActiveSpeakerSet::empty()
     };
