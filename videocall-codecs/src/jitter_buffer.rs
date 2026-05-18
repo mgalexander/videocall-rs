@@ -181,6 +181,7 @@ impl<T> JitterBuffer<T> {
             // forward all layers, producing non-contiguous wire sequence
             // numbers on a healthy stream. The SFU's contract guarantees
             // the reference chain of any forwarded frame is intact:
+            // Under this project's VP9 L1T3 pattern:
             //   - T0 deltas reference only prior T0
             //   - T1 deltas reference only the prior T0
             //   - T2 deltas reference prior T0 + prior T1
@@ -977,6 +978,47 @@ mod tests {
         assert_eq!(queue[1].sequence_number, 3);
         assert_eq!(queue[2].sequence_number, 5);
         assert_eq!(queue[3].sequence_number, 7);
+        assert_eq!(jb.last_decoded_sequence_number, Some(7));
+    }
+
+    #[test]
+    fn delta_picked_before_later_keyframe_across_gap() {
+        // Behavioral pin (bead vc-27l): under the layer-agnostic relax,
+        // when the buffer holds BOTH an earlier delta and a later keyframe
+        // past last_decoded, the relax picks the earlier delta first
+        // (BTreeMap lowest-first). The keyframe is then picked on the next
+        // iteration, which invokes drop_frames_before to clean stragglers.
+        // This is a meaningful new behavior vs. the prior T0-only relax,
+        // which would have short-circuited straight to the keyframe.
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        // KF=1 establishes last_decoded.
+        jb.insert_frame(
+            create_test_frame_with_layer(1, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+
+        // Both buffered simultaneously: T1 delta at seq 4 and KF at seq 7.
+        jb.insert_frame(
+            create_test_frame_with_layer(4, FrameType::DeltaFrame, 1),
+            time,
+        );
+        jb.insert_frame(
+            create_test_frame_with_layer(7, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 3, "T1=4 picked first, then KF=7");
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 4);
+        assert_eq!(queue[2].sequence_number, 7);
         assert_eq!(jb.last_decoded_sequence_number, Some(7));
     }
 
