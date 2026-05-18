@@ -1108,6 +1108,67 @@ impl Handler<JoinRoom> for ChatServer {
             self.suppress_join_broadcast.insert(session);
         }
 
+        // --- Ownership redirect (bead vc-8oa / p6-5) ---
+        // Wave 3 affinity migration: each room is jump-hashed to exactly
+        // one pod ordinal in the StatefulSet. If a client connects to a
+        // non-owner pod, we emit an ADMISSION_DECISION{REDIRECT} hint
+        // pointing at the owner pod's headless DNS and decline the join.
+        // The transport actor closes the connection on JoinRoom Err
+        // (see SessionLogic::handle_join_room_result); the redirect packet
+        // delivered through the recipient mpsc just before that close is
+        // what the client uses to reconnect to the correct pod.
+        //
+        // Observers are EXEMPT — they don't participate in room ownership
+        // (no media write path, no SFU room_state membership). Forcing an
+        // observer to redirect just to listen makes the metrics/diagnostic
+        // path more fragile without any consistency benefit.
+        //
+        // The check runs BEFORE the soft/hard-cap admission accounting so
+        // a redirected client never increments the wrong pod's caps and
+        // never receives a QUEUED/REJECTED packet it would discard anyway.
+        if !observer {
+            let replicas = crate::sfu::affinity::replicas_from_env();
+            let self_ord = crate::sfu::affinity::self_ordinal_from_env().unwrap_or(0);
+            let transport_kind =
+                std::env::var("SFU_TRANSPORT_KIND").unwrap_or_else(|_| "webtransport".to_string());
+            if let Some(target) = crate::sfu::affinity::compute_redirect_target(
+                &room,
+                self_ord,
+                replicas,
+                &transport_kind,
+            ) {
+                info!(
+                    "JoinRoom redirect: room {} owned by ordinal != self ({}); \
+                     redirecting session {} (user {}) to {}",
+                    room, self_ord, session, user_id, target,
+                );
+                if let Some(recipient) = self.sessions.get(&session) {
+                    let bytes =
+                        SessionManager::build_admission_redirect_packet(&target, "wrong_owner");
+                    if let Err(e) = recipient.try_send(Message {
+                        msg: bytes::Bytes::from(bytes),
+                        session,
+                    }) {
+                        warn!(
+                            "Failed to deliver ADMISSION_DECISION{{REDIRECT}} to \
+                             session {}: {}",
+                            session, e
+                        );
+                    }
+                }
+                // Roll back the suppress_join_broadcast insertion: if the
+                // client reconnects to the correct pod (or, on failure of
+                // the redirect, retries here), it must get a fresh chance
+                // at the legitimate PARTICIPANT_JOINED broadcast.
+                if is_reconnection {
+                    self.suppress_join_broadcast.remove(&session);
+                }
+                return MessageResult(Err(format!(
+                    "Room {room} is owned by a different pod; redirecting to {target}"
+                )));
+            }
+        }
+
         // --- Admission control (bead vc-69e / p3-13) ---
         // Two-tier admission policy for non-observer joins:
         //   - count < WAITING_ROOM_THRESHOLD: admit silently (no packet emitted)
@@ -4189,5 +4250,144 @@ mod tests {
 
         std::env::remove_var(MAX_PARTICIPANTS_ENV);
         std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+    }
+
+    // ==========================================================================
+    // TEST (vc-8oa / p6-5): pod ownership redirect on JoinRoom
+    // ==========================================================================
+    // When a client joins a room whose jump-hash owner is a different pod
+    // ordinal than this pod's own ordinal, the server MUST:
+    //   1. emit ADMISSION_DECISION{REDIRECT, redirect_to=<owner DNS>}
+    //   2. return MessageResult(Err(_)) so the transport closes the conn
+    //   3. NOT add the session to room_members (no admission accounting)
+    //
+    // Env vars POD_NAME, STATEFULSET_REPLICAS, SFU_TRANSPORT_KIND are
+    // process-global; the existing admission tests in this module already
+    // gate on `#[serial]` for the same reason. We follow that pattern.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_redirects_on_pod_ownership_mismatch() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        // Configure ourselves as pod 0 in a 3-replica StatefulSet.
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        // Clear any admission-cap leakage from prior tests.
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Pick a room whose jump_hash lands on a NON-zero ordinal so the
+        // redirect path actually fires. Loop a few candidates; with 3
+        // replicas the expected miss rate is ~2/3 so we find one quickly.
+        let replicas = 3u32;
+        let (room, owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("redirect-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // Capturing recipient so we can decode the REDIRECT packet.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let sid: SessionId = 71_000;
+        chat_server
+            .send(Connect {
+                id: sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: sid,
+                room: room.clone(),
+                user_id: "wrong-pod-user@example.com".to_string(),
+                display_name: "wrong-pod-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "join on non-owner pod must be declined");
+        assert!(
+            result.unwrap_err().contains("different pod"),
+            "error message should mention pod ownership"
+        );
+
+        // Let the recipient mpsc drain.
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner =
+            found.expect("ADMISSION_DECISION{REDIRECT} must be delivered to redirected joiner");
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmStatus::REDIRECT,
+            "status must be REDIRECT for ownership mismatch"
+        );
+        assert_eq!(inner.reason, "wrong_owner");
+        let expected_dns =
+            format!("rustlemania-webtransport-{owner_ord}.webtransport-headless.svc.cluster.local");
+        assert_eq!(
+            inner.redirect_to, expected_dns,
+            "redirect_to must point at the owner pod's headless DNS"
+        );
+
+        // The redirected session must NOT have been admitted: the room
+        // either doesn't exist (no prior joiners) or doesn't contain `sid`.
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .unwrap();
+        if let Some(members) = snapshot {
+            assert!(
+                !members.iter().any(|(s, _)| *s == sid),
+                "redirected session must NOT appear in room_members"
+            );
+        }
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
     }
 }

@@ -256,6 +256,39 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build an `ADMISSION_DECISION{REDIRECT}` packet (bead vc-8oa / p6-5).
+    ///
+    /// Wave 3 affinity migration: when a client connects to a pod that does
+    /// NOT own the requested room under jump-hash room→pod assignment, the
+    /// server emits this packet and closes the connection. `redirect_to` is
+    /// the StatefulSet headless DNS name of the owner pod (no port — the
+    /// client reuses its current port); `reason` is a short, machine-readable
+    /// label (e.g. `"wrong_owner"`). `position` and `retry_after_secs` are
+    /// always zero for redirects — they are inapplicable.
+    ///
+    /// This is split out from [`Self::build_admission_decision_packet`]
+    /// rather than overloaded, so the common QUEUED/REJECTED path stays
+    /// simple and so each builder owns its own zero-defaults.
+    pub fn build_admission_redirect_packet(redirect_to: &str, reason: &str) -> Vec<u8> {
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::REDIRECT.into(),
+            position: 0,
+            reason: reason.to_string(),
+            retry_after_secs: 0,
+            redirect_to: redirect_to.to_string(),
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: decision.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {

@@ -52,6 +52,12 @@ pub struct AdmissionDecision {
     ///  Only set for REJECTED. Zero means "no hint".
     // @@protoc_insertion_point(field:videocall.AdmissionDecision.retry_after_secs)
     pub retry_after_secs: u32,
+    ///  Target pod headless DNS name. Set only for REDIRECT — format is
+    ///  `rustlemania-{transport}-{ordinal}.{transport}-headless.svc.cluster.local`,
+    ///  no port (the client reuses its current port). Empty for all other
+    ///  statuses.
+    // @@protoc_insertion_point(field:videocall.AdmissionDecision.redirect_to)
+    pub redirect_to: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:videocall.AdmissionDecision.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -69,7 +75,7 @@ impl AdmissionDecision {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut fields = ::std::vec::Vec::with_capacity(5);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "status",
@@ -90,6 +96,11 @@ impl AdmissionDecision {
             "retry_after_secs",
             |m: &AdmissionDecision| { &m.retry_after_secs },
             |m: &mut AdmissionDecision| { &mut m.retry_after_secs },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "redirect_to",
+            |m: &AdmissionDecision| { &m.redirect_to },
+            |m: &mut AdmissionDecision| { &mut m.redirect_to },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<AdmissionDecision>(
             "AdmissionDecision",
@@ -121,6 +132,9 @@ impl ::protobuf::Message for AdmissionDecision {
                 32 => {
                     self.retry_after_secs = is.read_uint32()?;
                 },
+                42 => {
+                    self.redirect_to = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -145,6 +159,9 @@ impl ::protobuf::Message for AdmissionDecision {
         if self.retry_after_secs != 0 {
             my_size += ::protobuf::rt::uint32_size(4, self.retry_after_secs);
         }
+        if !self.redirect_to.is_empty() {
+            my_size += ::protobuf::rt::string_size(5, &self.redirect_to);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -162,6 +179,9 @@ impl ::protobuf::Message for AdmissionDecision {
         }
         if self.retry_after_secs != 0 {
             os.write_uint32(4, self.retry_after_secs)?;
+        }
+        if !self.redirect_to.is_empty() {
+            os.write_string(5, &self.redirect_to)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -184,6 +204,7 @@ impl ::protobuf::Message for AdmissionDecision {
         self.position = 0;
         self.reason.clear();
         self.retry_after_secs = 0;
+        self.redirect_to.clear();
         self.special_fields.clear();
     }
 
@@ -193,6 +214,7 @@ impl ::protobuf::Message for AdmissionDecision {
             position: 0,
             reason: ::std::string::String::new(),
             retry_after_secs: 0,
+            redirect_to: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -229,6 +251,8 @@ pub mod admission_decision {
         QUEUED = 2,
         // @@protoc_insertion_point(enum_value:videocall.AdmissionDecision.Status.REJECTED)
         REJECTED = 3,
+        // @@protoc_insertion_point(enum_value:videocall.AdmissionDecision.Status.REDIRECT)
+        REDIRECT = 4,
     }
 
     impl ::protobuf::Enum for Status {
@@ -244,6 +268,7 @@ pub mod admission_decision {
                 1 => ::std::option::Option::Some(Status::ADMITTED),
                 2 => ::std::option::Option::Some(Status::QUEUED),
                 3 => ::std::option::Option::Some(Status::REJECTED),
+                4 => ::std::option::Option::Some(Status::REDIRECT),
                 _ => ::std::option::Option::None
             }
         }
@@ -254,6 +279,7 @@ pub mod admission_decision {
                 "ADMITTED" => ::std::option::Option::Some(Status::ADMITTED),
                 "QUEUED" => ::std::option::Option::Some(Status::QUEUED),
                 "REJECTED" => ::std::option::Option::Some(Status::REJECTED),
+                "REDIRECT" => ::std::option::Option::Some(Status::REDIRECT),
                 _ => ::std::option::Option::None
             }
         }
@@ -263,6 +289,7 @@ pub mod admission_decision {
             Status::ADMITTED,
             Status::QUEUED,
             Status::REJECTED,
+            Status::REDIRECT,
         ];
     }
 

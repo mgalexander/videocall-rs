@@ -142,6 +142,44 @@ pub fn is_owner(room_id: &str) -> bool {
     is_owner_for(room_id, self_ordinal_from_env(), replicas_from_env())
 }
 
+/// Pure helper: compute the redirect target headless DNS name when `me`
+/// is NOT the jump-hash owner of `room` under `replicas` replicas.
+///
+/// Returns `None` when this pod IS the owner (no redirect needed) or when
+/// `replicas == 0` (defensive — single-pod / unconfigured cluster). Returns
+/// `Some(dns)` otherwise, where `dns` follows the StatefulSet headless
+/// service DNS template documented in `sfu-update/PLAN.md` wave 3:
+///
+/// ```text
+/// rustlemania-{transport}-{owner_ord}.{transport}-headless.svc.cluster.local
+/// ```
+///
+/// `transport_kind` is the literal `"webtransport"` or `"websocket"` —
+/// it is the binary's identity within the cluster. It is the caller's
+/// responsibility to pass a value that matches the deployed StatefulSet
+/// name; this helper just splices.
+///
+/// No port is appended — the client reconnects on the same port it used
+/// for the original connection. Factored out of the JoinRoom handler so
+/// the logic can be exercised without touching process-wide env vars.
+pub fn compute_redirect_target(
+    room: &str,
+    me: u32,
+    replicas: u32,
+    transport_kind: &str,
+) -> Option<String> {
+    if replicas == 0 {
+        return None;
+    }
+    let owner = jump_hash(room, replicas);
+    if owner == me {
+        return None;
+    }
+    Some(format!(
+        "rustlemania-{transport_kind}-{owner}.{transport_kind}-headless.svc.cluster.local"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +296,61 @@ mod tests {
 
         // `None` ordinal (unparseable POD_NAME) — never the owner.
         assert!(!is_owner_for("room-x", None, 3));
+    }
+
+    /// 6. `compute_redirect_target`: returns `None` when this pod owns the
+    ///    room, and a correctly-shaped DNS name otherwise.
+    #[test]
+    fn compute_redirect_target_owner_returns_none() {
+        // Single-pod cluster: pod 0 owns everything → no redirect.
+        for i in 0..50 {
+            let room = format!("room-{i}");
+            assert_eq!(
+                compute_redirect_target(&room, 0, 1, "webtransport"),
+                None,
+                "single-pod owner must not redirect {room}"
+            );
+        }
+        // replicas == 0 is treated as "unconfigured" — never redirect.
+        assert_eq!(
+            compute_redirect_target("room-x", 0, 0, "webtransport"),
+            None
+        );
+    }
+
+    /// 7. `compute_redirect_target`: for the non-owner case, the returned
+    ///    DNS name embeds the OWNER ordinal (not `me`) and the transport.
+    #[test]
+    fn compute_redirect_target_non_owner_returns_owner_dns() {
+        let replicas = 3u32;
+        // Find a room whose jump-hash lands on a non-zero ordinal so we
+        // can test the redirect from pod 0 → pod {owner}.
+        let (room, owner) = (0..100)
+            .find_map(|i| {
+                let r = format!("room-{i}");
+                let o = jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("among 100 keys, at least one must hash to a non-zero ordinal");
+
+        let target = compute_redirect_target(&room, 0, replicas, "webtransport")
+            .expect("non-owner must produce a redirect target");
+        let expected =
+            format!("rustlemania-webtransport-{owner}.webtransport-headless.svc.cluster.local");
+        assert_eq!(target, expected, "DNS must embed owner ordinal");
+
+        // websocket variant uses the websocket headless name.
+        let target_ws = compute_redirect_target(&room, 0, replicas, "websocket")
+            .expect("non-owner must produce a redirect target (ws)");
+        let expected_ws =
+            format!("rustlemania-websocket-{owner}.websocket-headless.svc.cluster.local");
+        assert_eq!(target_ws, expected_ws);
+
+        // When `me == owner`, no redirect.
+        assert_eq!(
+            compute_redirect_target(&room, owner, replicas, "webtransport"),
+            None,
+            "pod must not redirect rooms it owns"
+        );
     }
 }

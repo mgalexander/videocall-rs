@@ -43,6 +43,15 @@ async fn main() {
 
     info!("Starting WebTransport server with actor-based session handling");
 
+    // SFU_TRANSPORT_KIND identifies this binary's transport family for the
+    // wave-3 ADMISSION_DECISION{REDIRECT} DNS template (bead vc-8oa / p6-5).
+    // Set unconditionally at startup so the JoinRoom handler doesn't have to
+    // care which binary it's hosted in; the chart can override this for
+    // non-standard deployments.
+    if std::env::var_os("SFU_TRANSPORT_KIND").is_none() {
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+    }
+
     let pod_name = std::env::var("POD_NAME").ok();
     let self_ordinal = sec_api::sfu::affinity::self_ordinal_from_env();
     let replicas = sec_api::sfu::affinity::replicas_from_env();
