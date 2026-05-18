@@ -41,12 +41,15 @@
 //! count so the receiver can return `None` once all senders have dropped.
 
 use bytes::Bytes;
+use prometheus::Counter;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::debug;
+
+use crate::metrics::{SFU_CLASS_DROPPED_TOTAL, SFU_CLASS_SENT_TOTAL};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::RoutingHeader;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -102,6 +105,19 @@ impl Class {
             Class::P3VideoBase,
             Class::P4Enhancement,
         ]
+    }
+
+    /// Static label value for Prometheus `class=` labels. Matches the
+    /// `Debug` representation so metric label values are stable across
+    /// the codebase (tests, dashboards, alerting rules).
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            Class::P0Control => "P0Control",
+            Class::P1Audio => "P1Audio",
+            Class::P2Keyframe => "P2Keyframe",
+            Class::P3VideoBase => "P3VideoBase",
+            Class::P4Enhancement => "P4Enhancement",
+        }
     }
 }
 
@@ -289,6 +305,11 @@ struct ClassInner {
     capacity: usize,
     policy: DropPolicy,
     class: Class,
+    /// Cached Prometheus counters for this class. Resolved once at
+    /// queue construction so the audio-rate `send()` hot path avoids the
+    /// `CounterVec::with_label_values` HashMap lookup per call.
+    sent_counter: Counter,
+    dropped_counter: Counter,
 }
 
 /// Producer half for a single class. Cheap to clone; multi-producer safe.
@@ -307,6 +328,7 @@ impl ClassSender {
             q.push_back(bytes);
             drop(q);
             self.inner.notify.notify_one();
+            self.inner.sent_counter.inc();
             return SendOutcome::Sent;
         }
         match self.inner.policy {
@@ -315,14 +337,21 @@ impl ClassSender {
                 q.push_back(bytes);
                 drop(q);
                 self.inner.notify.notify_one();
+                self.inner.dropped_counter.inc();
                 SendOutcome::Dropped(self.inner.class, "tail_drop_oldest")
             }
             DropPolicy::HeadDropOldest => {
                 drop(q);
+                self.inner.dropped_counter.inc();
                 SendOutcome::Dropped(self.inner.class, "head_drop_new")
             }
             DropPolicy::NeverDrop => {
                 drop(q);
+                // Refused = the producer's packet did not make it into the
+                // queue. From the operator's perspective this is the same
+                // loss signal as Dropped (P0Control should normally remain
+                // 0 — if it fires, control capacity needs to grow).
+                self.inner.dropped_counter.inc();
                 SendOutcome::Refused(SendError)
             }
         }
@@ -485,6 +514,7 @@ impl PrioritySender {
 }
 
 fn build_class(class: Class) -> (ClassSender, ClassReceiver) {
+    let label = class.metric_label();
     let inner = Arc::new(ClassInner {
         queue: Mutex::new(VecDeque::with_capacity(class.capacity())),
         notify: Notify::new(),
@@ -492,6 +522,8 @@ fn build_class(class: Class) -> (ClassSender, ClassReceiver) {
         capacity: class.capacity(),
         policy: class.drop_policy(),
         class,
+        sent_counter: SFU_CLASS_SENT_TOTAL.with_label_values(&[label]),
+        dropped_counter: SFU_CLASS_DROPPED_TOTAL.with_label_values(&[label]),
     });
     let sender = ClassSender {
         inner: Arc::clone(&inner),
@@ -767,6 +799,141 @@ mod tests {
         assert_eq!(&drained[0][..], b"1");
         // New entry is at the tail.
         assert_eq!(&drained[drained.len() - 1][..], b"new");
+    }
+
+    // The Prometheus default registry is process-global. Other tests in
+    // this module also call `PrioritySender::send` (e.g. the strict-priority
+    // drain tests fan out to every class), so the counter we read can be
+    // bumped between `before` and `after`. We therefore (a) acquire this
+    // mutex so the metric tests don't fight each other and (b) assert with
+    // `>=` deltas rather than strict equality so concurrent producers in
+    // unrelated tests don't make us flaky.
+    static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn metric_label_matches_debug_for_all_classes() {
+        // The `class` label values are advertised in metric doc-comments
+        // and dashboard rules as the `Debug` form. This test pins the link
+        // so a future variant rename updates both sides or trips CI.
+        for class in Class::all() {
+            assert_eq!(
+                class.metric_label(),
+                format!("{class:?}"),
+                "metric_label() must match Debug for {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_drop_increments_class_dropped_counter() {
+        // HeadDropOldest (P4Enhancement) — third drop policy variant. Pairs
+        // with full_p3_send_increments_class_dropped_counter (TailDropOldest)
+        // and never_drop_refused_increments_class_dropped_counter (NeverDrop)
+        // for full policy coverage of dropped-counter emission.
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let counter = SFU_CLASS_DROPPED_TOTAL.with_label_values(&["P4Enhancement"]);
+        let before = counter.get();
+
+        let (sender, _channels) = PrioritySender::new();
+        let cap = Class::P4Enhancement.capacity();
+        for i in 0..cap {
+            assert_eq!(
+                sender.send(
+                    Class::P4Enhancement,
+                    Bytes::from(format!("{i}").into_bytes())
+                ),
+                SendOutcome::Sent
+            );
+        }
+        let outcome = sender.send(Class::P4Enhancement, Bytes::from_static(b"overflow"));
+        assert!(
+            matches!(outcome, SendOutcome::Dropped(Class::P4Enhancement, _)),
+            "expected Dropped(P4Enhancement, _), got {outcome:?}"
+        );
+        assert!(
+            counter.get() >= before + 1.0,
+            "sfu_class_dropped_total{{class=P4Enhancement}} must increment on head-drop \
+             (before={before}, after={})",
+            counter.get()
+        );
+    }
+
+    #[test]
+    fn full_p3_send_increments_class_dropped_counter() {
+        // p5-10 acceptance criterion: send() to a full P3 class must
+        // increment sfu_class_dropped_total{class="P3VideoBase"}.
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let counter = SFU_CLASS_DROPPED_TOTAL.with_label_values(&["P3VideoBase"]);
+        let before = counter.get();
+
+        let (sender, _channels) = PrioritySender::new();
+        let cap = Class::P3VideoBase.capacity();
+        for i in 0..cap {
+            assert_eq!(
+                sender.send(Class::P3VideoBase, Bytes::from(format!("{i}").into_bytes())),
+                SendOutcome::Sent
+            );
+        }
+
+        let outcome = sender.send(Class::P3VideoBase, Bytes::from_static(b"overflow"));
+        assert!(
+            matches!(outcome, SendOutcome::Dropped(Class::P3VideoBase, _)),
+            "expected Dropped(P3VideoBase, _), got {outcome:?}"
+        );
+        assert!(
+            counter.get() >= before + 1.0,
+            "sfu_class_dropped_total{{class=P3VideoBase}} must increment on tail-drop \
+             (before={before}, after={})",
+            counter.get()
+        );
+    }
+
+    #[test]
+    fn successful_send_increments_class_sent_counter() {
+        // Paired sanity check: a non-overflow send increments the sent
+        // counter for its class.
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let sent = SFU_CLASS_SENT_TOTAL.with_label_values(&["P1Audio"]);
+        let sent_before = sent.get();
+
+        let (sender, _channels) = PrioritySender::new();
+        assert_eq!(
+            sender.send(Class::P1Audio, Bytes::from_static(b"audio")),
+            SendOutcome::Sent
+        );
+
+        assert!(
+            sent.get() >= sent_before + 1.0,
+            "sfu_class_sent_total{{class=P1Audio}} must increment on successful send \
+             (before={sent_before}, after={})",
+            sent.get()
+        );
+    }
+
+    #[test]
+    fn never_drop_refused_increments_class_dropped_counter() {
+        // P0Control uses NeverDrop — Refused outcomes still represent
+        // packet loss and must show up in sfu_class_dropped_total.
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let counter = SFU_CLASS_DROPPED_TOTAL.with_label_values(&["P0Control"]);
+        let before = counter.get();
+
+        let (sender, _channels) = PrioritySender::new();
+        let cap = Class::P0Control.capacity();
+        for i in 0..cap {
+            assert_eq!(
+                sender.send(Class::P0Control, Bytes::from(format!("{i}").into_bytes())),
+                SendOutcome::Sent
+            );
+        }
+        let outcome = sender.send(Class::P0Control, Bytes::from_static(b"overflow"));
+        assert_eq!(outcome, SendOutcome::Refused(SendError));
+        assert!(
+            counter.get() >= before + 1.0,
+            "sfu_class_dropped_total{{class=P0Control}} must increment on Refused \
+             (before={before}, after={})",
+            counter.get()
+        );
     }
 
     #[test]

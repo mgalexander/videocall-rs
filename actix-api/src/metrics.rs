@@ -362,6 +362,51 @@ lazy_static! {
     )
     .expect("Failed to create sfu_decide_latency_us metric");
 
+    /// Total packets dropped by `PrioritySender::send`, labeled by class.
+    ///
+    /// Companion to [`SFU_DROPPED_TOTAL`] (which labels by drop *reason* on
+    /// the forwarder decide path). This metric labels by outbound priority
+    /// *class* at the queue-admission boundary so operators can answer
+    /// "which class is bleeding under the current load?". Label values are
+    /// the `Debug` form of `priority_queue::Class`:
+    ///   - `P0Control`    — should always remain 0 (NeverDrop policy).
+    ///   - `P1Audio`
+    ///   - `P2Keyframe`
+    ///   - `P3VideoBase`
+    ///   - `P4Enhancement`
+    ///
+    /// All five label values are touched at 0 on init so they appear in
+    /// `/metrics` before the first real drop.
+    pub static ref SFU_CLASS_DROPPED_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_class_dropped_total",
+            "Total packets dropped by the SFU PrioritySender, labeled by priority class",
+            &["class"]
+        )
+        .expect("Failed to create sfu_class_dropped_total metric");
+        for label in ["P0Control", "P1Audio", "P2Keyframe", "P3VideoBase", "P4Enhancement"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
+    /// Total packets successfully enqueued by `PrioritySender::send`,
+    /// labeled by class. Mirrors [`SFU_CLASS_DROPPED_TOTAL`] for sent
+    /// outcomes so ops can compute per-class drop rate as
+    /// `dropped / (sent + dropped)`.
+    pub static ref SFU_CLASS_SENT_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_class_sent_total",
+            "Total packets successfully enqueued by the SFU PrioritySender, labeled by priority class",
+            &["class"]
+        )
+        .expect("Failed to create sfu_class_sent_total metric");
+        for label in ["P0Control", "P1Audio", "P2Keyframe", "P3VideoBase", "P4Enhancement"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
     /// Total base-layer (T0+S0) keyframes forwarded by `Forwarder::decide`.
     ///
     /// Per p4-8 invariant 1: a keyframe at `temporal_layer_id=0 AND
