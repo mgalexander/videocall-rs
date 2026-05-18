@@ -27,6 +27,7 @@
 //! Algorithm" (2014), <https://arxiv.org/abs/1406.2294>.
 
 use std::env;
+use std::sync::OnceLock;
 
 /// FNV-1a 64-bit offset basis.
 const FNV_OFFSET_64: u64 = 0xcbf2_9ce4_8422_2325;
@@ -99,6 +100,51 @@ fn parse_ordinal(pod_name: &str) -> Option<u32> {
     tail.parse::<u32>().ok()
 }
 
+/// Cached process-wide affinity config.
+///
+/// `POD_NAME` and `STATEFULSET_REPLICAS` are baked into the pod's env at
+/// startup by the K8s downward API / chart (see commit 10c865b) and do
+/// not change at runtime. We read them exactly once and cache the parsed
+/// values to avoid syscall-ish env lookups + `String` allocations on hot
+/// paths (e.g. the per-tick health-beacon loop, which calls `is_owner`
+/// O(rooms) times per second).
+#[derive(Debug, Clone, Copy)]
+struct AffinityConfig {
+    self_ordinal: Option<u32>,
+    replicas: u32,
+}
+
+static CONFIG: OnceLock<AffinityConfig> = OnceLock::new();
+
+/// Read `POD_NAME` from env and parse its trailing ordinal. See
+/// `self_ordinal_from_env` for the semantics; this is the uncached
+/// implementation used to populate the cache.
+fn read_self_ordinal_from_env() -> Option<u32> {
+    match env::var("POD_NAME") {
+        Ok(name) => parse_ordinal(&name),
+        Err(_) => Some(0),
+    }
+}
+
+/// Read `STATEFULSET_REPLICAS` from env. See `replicas_from_env` for the
+/// semantics; this is the uncached implementation used to populate the
+/// cache.
+fn read_replicas_from_env() -> u32 {
+    env::var("STATEFULSET_REPLICAS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+}
+
+/// Lazily initialize and return the cached affinity config. First call
+/// reads env vars; subsequent calls are a single relaxed atomic load.
+fn config() -> &'static AffinityConfig {
+    CONFIG.get_or_init(|| AffinityConfig {
+        self_ordinal: read_self_ordinal_from_env(),
+        replicas: read_replicas_from_env(),
+    })
+}
+
 /// Pod ordinal of the current pod, from K8s downward API env var
 /// `POD_NAME` of the form `<statefulset>-<ordinal>`. e.g.
 /// `"rustlemania-webtransport-0"` → `0`.
@@ -106,20 +152,20 @@ fn parse_ordinal(pod_name: &str) -> Option<u32> {
 /// For local/dev environments without `POD_NAME`, returns `Some(0)` by
 /// default so single-instance setups work unchanged. Returns `None` only
 /// when `POD_NAME` is set but cannot be parsed.
+///
+/// The env var is read exactly once per process and the parsed result is
+/// cached (see `AffinityConfig`).
 pub fn self_ordinal_from_env() -> Option<u32> {
-    match env::var("POD_NAME") {
-        Ok(name) => parse_ordinal(&name),
-        Err(_) => Some(0),
-    }
+    config().self_ordinal
 }
 
 /// Replicas count, from `STATEFULSET_REPLICAS` env var (set by the
 /// chart). Default `1` for non-StatefulSet deployments.
+///
+/// The env var is read exactly once per process and the parsed result is
+/// cached (see `AffinityConfig`).
 pub fn replicas_from_env() -> u32 {
-    env::var("STATEFULSET_REPLICAS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(1)
+    config().replicas
 }
 
 /// Pure helper: is `me` the owner of `room` under `replicas` replicas?
@@ -135,11 +181,12 @@ fn is_owner_for(room: &str, me: Option<u32>, replicas: u32) -> bool {
 
 /// Is this pod the owner of the room?
 ///
-/// Reads `POD_NAME` and `STATEFULSET_REPLICAS` from the environment and
-/// returns `true` when this pod's ordinal matches the jump-hash of the
-/// room.
+/// Reads `POD_NAME` and `STATEFULSET_REPLICAS` from the environment
+/// (cached after the first call) and returns `true` when this pod's
+/// ordinal matches the jump-hash of the room.
 pub fn is_owner(room_id: &str) -> bool {
-    is_owner_for(room_id, self_ordinal_from_env(), replicas_from_env())
+    let cfg = config();
+    is_owner_for(room_id, cfg.self_ordinal, cfg.replicas)
 }
 
 /// Pure helper: compute the redirect target headless DNS name when `me`
