@@ -171,6 +171,39 @@ struct RoomDispatcherExited {
     room: String,
 }
 
+/// Internal message: posted by the spawned NATS-KV lookup task once a
+/// room's home region has been resolved (bead vc-hc8 / p6-9). Carries the
+/// information needed for the actor to either:
+///   - populate the synchronous `home_region_cache` and stop (in-region), OR
+///   - emit `ADMISSION_DECISION{REDIRECT}` to the session and force a
+///     `Disconnect`, because the room's home region is elsewhere.
+///
+/// We send this message back to the actor (rather than mutating cache
+/// directly from the spawned task) so all `home_region_cache` writes
+/// happen on a single thread of execution — keeping the cache mutation
+/// path identical to the rest of `ChatServer`'s state and avoiding any
+/// need for interior locking on what is otherwise plain actor state.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct HomeRegionResolved {
+    /// Room the lookup was performed for.
+    room: String,
+    /// Resolved home region (`region` if we won the CAS, else the
+    /// previously-stored value).
+    home_region: String,
+    /// Session that triggered the lookup. If still registered AND the home
+    /// region differs from this pod's region, the handler emits the
+    /// REDIRECT packet and disconnects this session. If the session is
+    /// gone (already disconnected) the handler just populates the cache.
+    session: SessionId,
+    /// User id from the original JoinRoom — used for log breadcrumbs and
+    /// to send a `Disconnect` after the redirect packet so the pending-
+    /// departure / leave path runs identically to a normal disconnect.
+    user_id: String,
+    /// Display name from the original JoinRoom (mirrors user_id semantics).
+    display_name: String,
+}
+
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
@@ -251,6 +284,29 @@ pub struct ChatServer {
     /// all local receivers). Lazily created on the first `JoinRoom` for a
     /// room and torn down when the room drains. See [`RoomDispatch`].
     room_dispatch: HashMap<String, RoomDispatch>,
+    /// Synchronous in-actor cache of room → home-region (bead vc-hc8 / p6-9).
+    ///
+    /// On JoinRoom: if a cached entry exists, the cross-region redirect
+    /// decision is made synchronously up-front. On miss, a background
+    /// task performs the NATS-KV CAS and posts a [`HomeRegionResolved`]
+    /// message back to the actor which then populates this cache (and,
+    /// if the home region differs, emits a REDIRECT and disconnects the
+    /// session).
+    ///
+    /// Race window (acceptable per v1 / "accept 250ms RTT penalty" in the
+    /// bead): the very first joiner for a room already homed in another
+    /// region pays a brief admission-then-redirect instead of an
+    /// up-front redirect. The client handles the REDIRECT packet the same
+    /// way (see `ConnectionManager` p6-6 / vc-mv3); the visible difference
+    /// is one extra round-trip and a short admit window.
+    home_region_cache: HashMap<String, String>,
+    /// Backing store for [`Self::home_region_cache`] population. Either a
+    /// [`crate::sfu::affinity::NatsRegionKv`] when JetStream is reachable
+    /// at startup, or a [`crate::sfu::affinity::NoopRegionKv`] fallback —
+    /// the noop never returns a foreign region, so a JetStream outage
+    /// silently degrades to single-region behaviour rather than failing
+    /// every JoinRoom.
+    home_region_kv: Arc<dyn crate::sfu::affinity::RegionKv>,
 }
 
 impl ChatServer {
@@ -265,6 +321,26 @@ impl ChatServer {
             Arc::new(LinuxCpuLoad),
             beacon_publisher,
         );
+        // vc-hc8 (p6-9): try to attach to the JetStream KV bucket that
+        // tracks each room's home region. If JetStream isn't enabled on
+        // this NATS cluster (single-node dev, or a misconfigured prod),
+        // fall back to a no-op KV that effectively disables cross-region
+        // redirects — the SFU still functions in single-region mode.
+        // A failure here MUST NOT block actor startup: ChatServer is the
+        // root of the system, and refusing to start because cross-region
+        // pinning isn't available would be a strict regression vs. p6-8.
+        let home_region_kv: Arc<dyn crate::sfu::affinity::RegionKv> =
+            match crate::sfu::affinity::NatsRegionKv::connect(nats_connection.clone()).await {
+                Ok(kv) => Arc::new(kv),
+                Err(e) => {
+                    warn!(
+                        "p6-9 home-region KV unavailable ({}); cross-region \
+                         redirects DISABLED. Single-region behaviour preserved.",
+                        e
+                    );
+                    Arc::new(crate::sfu::affinity::NoopRegionKv)
+                }
+            };
         ChatServer {
             nats_connection,
             joined_sessions: HashSet::new(),
@@ -282,6 +358,8 @@ impl ChatServer {
             speaker_ticks: HashMap::new(),
             beacon_hub,
             room_dispatch: HashMap::new(),
+            home_region_cache: HashMap::new(),
+            home_region_kv,
         }
     }
 
@@ -962,6 +1040,107 @@ impl Handler<RoomDispatcherExited> for ChatServer {
     }
 }
 
+/// Apply the result of an async home-region lookup (bead vc-hc8 / p6-9).
+///
+/// Three cases:
+///
+/// 1. **In-region**: just populate the cache so subsequent joiners take
+///    the synchronous fast path in `JoinRoom`. The session that triggered
+///    the lookup remains admitted — no extra action.
+///
+/// 2. **Out-of-region, session still alive**: emit the REDIRECT packet on
+///    the session's recipient, then synthesize a `Disconnect` to itself
+///    so the normal leave path (PARTICIPANT_LEFT, pending-departure
+///    grace window, SFU cleanup) runs identically to a client-initiated
+///    disconnect. This is the v1 "accept ~250ms RTT penalty" window: the
+///    first joiner for a foreign-homed room in this region pays one
+///    admit-then-redirect round-trip; all subsequent joiners hit the
+///    synchronous cache path.
+///
+/// 3. **Out-of-region, session already gone**: still populate the cache.
+///    The session having disconnected in the meantime doesn't change the
+///    home-region binding for the room; future joiners must still be
+///    redirected. Dropping the cache update here would mean every
+///    cross-region first-joiner re-paid the async lookup.
+impl Handler<HomeRegionResolved> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        HomeRegionResolved {
+            room,
+            home_region,
+            session,
+            user_id,
+            display_name,
+        }: HomeRegionResolved,
+        ctx: &mut Self::Context,
+    ) -> Self::Result {
+        // Idempotency: a second `HomeRegionResolved` for the same room can
+        // arrive if two cache-miss joiners overlap (both spawn lookups
+        // before either finishes). The second writer's value is identical
+        // to the first (KV CAS makes the home region single-valued), so
+        // overwriting is a no-op semantically.
+        self.home_region_cache
+            .insert(room.clone(), home_region.clone());
+
+        let current_region = crate::sfu::affinity::current_region();
+        let Some(target) = crate::sfu::affinity::compute_cross_region_redirect_target(
+            &home_region,
+            current_region,
+            sfu_transport_kind(),
+            crate::sfu::affinity::region_base_domain(),
+        ) else {
+            // Same region — nothing more to do; the originating JoinRoom
+            // has already admitted the session locally.
+            return;
+        };
+
+        // Out-of-region: emit REDIRECT to the originating session if it's
+        // still alive. The session may have already disconnected (rare:
+        // would require the client to drop within the KV-roundtrip window).
+        // In that case we still kept the cache entry above so future
+        // joiners in this region take the synchronous redirect path.
+        let Some(recipient) = self.sessions.get(&session).cloned() else {
+            info!(
+                "p6-9 async redirect: session {} for user {} disappeared \
+                 before lookup completed; cache for room {} now pinned to {}",
+                session, user_id, room, home_region
+            );
+            return;
+        };
+
+        info!(
+            "JoinRoom cross-region redirect (async): room {} homed in {} but \
+             this pod is in {}; redirecting session {} (user {}) to {}",
+            room, home_region, current_region, session, user_id, target,
+        );
+        let bytes = SessionManager::build_admission_redirect_packet(&target, "wrong_region");
+        if let Err(e) = recipient.try_send(Message {
+            msg: bytes::Bytes::from(bytes),
+            session,
+        }) {
+            warn!(
+                "Failed to deliver async ADMISSION_DECISION{{REDIRECT}} \
+                 (wrong_region) to session {}: {}",
+                session, e
+            );
+        }
+
+        // Synthesize a Disconnect so the normal leave path runs. We
+        // address it to ourselves rather than calling `leave_rooms`
+        // directly, so the pending-departure grace window logic in the
+        // Disconnect handler fires the same as for any other disconnect.
+        ctx.address().do_send(crate::messages::server::Disconnect {
+            session,
+            room,
+            user_id,
+            display_name,
+            observer: false,
+        });
+    }
+}
+
 impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
@@ -1112,6 +1291,114 @@ impl Handler<JoinRoom> for ChatServer {
 
         if self.joined_sessions.contains(&session) {
             return MessageResult(Ok(()));
+        }
+
+        // --- Cross-region home-region pinning (bead vc-hc8 / p6-9) ---
+        // Each region runs its own StatefulSet. Rooms have a "home region"
+        // assigned by the first joiner via a NATS JetStream KV bucket
+        // (`rooms-home-region`) under atomic create-if-absent semantics.
+        // Out-of-region clients get redirected to the home region's load
+        // balancer BEFORE the in-region pod-ordinal redirect below — a
+        // wrong-region client must never reach the pod-ordinal check
+        // because the pod ordinal it's about to be told to use lives in
+        // the wrong cluster.
+        //
+        // Observers are EXEMPT for the same reason they're exempt from
+        // the pod-ordinal redirect: they don't participate in SFU state,
+        // and bouncing them across regions just to listen would degrade
+        // the metrics / diagnostic surface without any consistency win.
+        //
+        // ORDER MATTERS — this runs BEFORE the p6-5 pod-ordinal redirect,
+        // BEFORE the reconnection bookkeeping, BEFORE admission control.
+        // Nothing has been mutated by this point, so an Err return (or
+        // an async redirect-then-disconnect) requires no rollback.
+        //
+        // ASYNC HANDLING: the JoinRoom handler returns synchronously, but
+        // the KV lookup is async. We use a synchronous in-actor cache as
+        // the steady-state fast path; on cache miss the very first joiner
+        // is admitted locally and the lookup runs in a spawned task that
+        // posts `HomeRegionResolved` back to the actor. If the resolved
+        // home turns out to be a foreign region, that handler emits the
+        // REDIRECT packet and synthesizes a Disconnect, matching the
+        // single-round-trip "accept ~250ms RTT penalty" v1 compromise
+        // called out in the bead. Steady state (all subsequent joiners
+        // for the room) is a synchronous cache hit with the redirect
+        // decided up front — no admission of cross-region traffic.
+        if !observer {
+            let current_region = crate::sfu::affinity::current_region();
+            if let Some(cached_home) = self.home_region_cache.get(&room).cloned() {
+                if let Some(target) = crate::sfu::affinity::compute_cross_region_redirect_target(
+                    &cached_home,
+                    current_region,
+                    sfu_transport_kind(),
+                    crate::sfu::affinity::region_base_domain(),
+                ) {
+                    info!(
+                        "JoinRoom cross-region redirect (cache hit): room {} \
+                         homed in {} but this pod is in {}; redirecting \
+                         session {} (user {}) to {}",
+                        room, cached_home, current_region, session, user_id, target,
+                    );
+                    if let Some(recipient) = self.sessions.get(&session) {
+                        let bytes = SessionManager::build_admission_redirect_packet(
+                            &target,
+                            "wrong_region",
+                        );
+                        if let Err(e) = recipient.try_send(Message {
+                            msg: bytes::Bytes::from(bytes),
+                            session,
+                        }) {
+                            warn!(
+                                "Failed to deliver ADMISSION_DECISION{{REDIRECT}} \
+                                 (wrong_region) to session {}: {}",
+                                session, e
+                            );
+                        }
+                    }
+                    return MessageResult(Err(format!(
+                        "Room {room} is homed in region {cached_home}; \
+                         redirecting to {target}"
+                    )));
+                }
+                // Cache hit, same region → fall through to p6-5 below.
+            } else {
+                // Cache miss: spawn the NATS-KV lookup and let the join
+                // proceed locally for v1. The spawned task reports back
+                // via `HomeRegionResolved`, which populates the cache and
+                // (if the room is homed elsewhere) emits the REDIRECT
+                // packet plus a synthesized Disconnect.
+                //
+                // This admits a tiny window where the very first joiner
+                // for a foreign-homed room in this region pays a brief
+                // admit-then-redirect instead of an up-front redirect.
+                // The bead explicitly accepts this for v1. All subsequent
+                // joiners in this region hit the cache path above.
+                let kv = self.home_region_kv.clone();
+                let room_for_task = room.clone();
+                let user_for_task = user_id.clone();
+                let display_for_task = display_name.clone();
+                let region_for_task: &'static str = current_region;
+                let chat_addr = ctx.address();
+                tokio::spawn(async move {
+                    let home = crate::sfu::affinity::home_region(
+                        &room_for_task,
+                        kv.as_ref(),
+                        region_for_task,
+                    )
+                    .await;
+                    // Fire-and-forget: if the actor is gone, dropping the
+                    // future is the right thing.
+                    let _ = chat_addr
+                        .send(HomeRegionResolved {
+                            room: room_for_task,
+                            home_region: home,
+                            session,
+                            user_id: user_for_task,
+                            display_name: display_for_task,
+                        })
+                        .await;
+                });
+            }
         }
 
         // --- Ownership redirect (bead vc-8oa / p6-5) ---

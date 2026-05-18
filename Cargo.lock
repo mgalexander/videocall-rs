@@ -7962,6 +7962,7 @@ dependencies = [
  "actix-web-actors",
  "anyhow",
  "async-nats",
+ "async-trait",
  "base64 0.13.1",
  "bytes",
  "chrono",
