@@ -588,6 +588,9 @@ impl CameraEncoder {
             video_encoder_config
                 .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);
+            // VP9 SVC: 1 spatial layer, 3 temporal layers. Allows the SFU to
+            // drop temporal enhancement layers per-receiver without re-encoding.
+            video_encoder_config.set_scalability_mode("L1T3");
 
             if let Err(e) = video_encoder.configure(&video_encoder_config) {
                 error!("Error configuring video encoder: {e:?}");
@@ -664,6 +667,8 @@ impl CameraEncoder {
                     );
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
+                    // VP9 SVC L1T3 (1 spatial, 3 temporal layers) for SFU layer drop.
+                    new_config.set_scalability_mode("L1T3");
                     if let Err(e) = video_encoder.configure(&new_config) {
                         error!("Error reconfiguring camera encoder for tier change: {e:?}");
                     }
@@ -729,6 +734,8 @@ impl CameraEncoder {
                             );
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
+                            // VP9 SVC L1T3 (1 spatial, 3 temporal layers) for SFU layer drop.
+                            new_config.set_scalability_mode("L1T3");
                             if let Err(e) = video_encoder.configure(&new_config) {
                                 error!(
                                     "Error reconfiguring camera encoder with new dimensions: {e:?}"
