@@ -29,7 +29,10 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::constants::{KEYFRAME_REQUEST_MAX_PER_SEC, KEYFRAME_REQUEST_WINDOW_MS};
+use crate::sfu::layer_selector::LayerSelection;
 use std::time::Instant;
+
+use super::session_logic::SessionId;
 
 /// Classification of an incoming packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +240,84 @@ pub fn parse_and_inspect(data: &[u8]) -> Option<ParsedPacket> {
         wrapper,
         media_packet,
     })
+}
+
+/// Layer-aware KEYFRAME_REQUEST (KFR) routing filter (p4-10).
+///
+/// A KFR triggers the named target sender to blast a fresh (~1.5 MB) keyframe.
+/// If the requesting receiver is not currently subscribed to any layer of that
+/// sender — per its cached [`LayerSelection`] — the KFR is wasted work and, on
+/// a bandwidth-constrained downlink, can wedge the receiver's egress queue
+/// behind a keyframe burst it will never consume.
+///
+/// Returns `true` when the KFR should be **dropped** before the NATS publish.
+///
+/// Decision rules (all "absence = pass-through", matching
+/// [`crate::sfu::forwarder::Forwarder::should_drop_for_layer_budget`]):
+///
+/// * Empty `target_user_id_bytes` → forward (legacy KFRs without a populated
+///   `MediaPacket.user_id` must not regress).
+/// * `selection.is_none()` → forward (no cached selection yet; freshly-joined
+///   receivers haven't reported a bandwidth estimate and still expect legacy
+///   fan-out).
+/// * Target user is not present in `members` → forward (target not in room;
+///   the KFR will die naturally at the NATS layer — don't add a new failure
+///   mode).
+/// * Any matching sender `SessionId` for the target user_id appears in
+///   `selection.forward` at any spatial layer → forward (receiver IS getting
+///   at least T0 of this sender; the KFR is legitimately needed).
+/// * Otherwise → drop (receiver is not subscribed to any layer of this
+///   sender).
+///
+/// A receiver may briefly have multiple `SessionId`s in the room across a
+/// reconnection grace window; we treat "ANY matching session in forward" as
+/// subscribed.
+pub fn should_drop_kfr_for_layer_selection(
+    target_user_id_bytes: &[u8],
+    _requester_sid: SessionId,
+    members: &[(SessionId, String, String)],
+    selection: Option<&LayerSelection>,
+) -> bool {
+    // Empty target → legacy pass-through.
+    if target_user_id_bytes.is_empty() {
+        return false;
+    }
+    // No cached selection → legacy pass-through (the same absence-rule
+    // documented on `should_drop_for_layer_budget`).
+    let selection = match selection {
+        Some(s) => s,
+        None => return false,
+    };
+    // Resolve target user_id → matching sender SessionId(s).
+    let target_user_id = match std::str::from_utf8(target_user_id_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut any_match = false;
+    let mut any_in_forward = false;
+    for (sid, user_id, _display) in members {
+        if user_id == target_user_id {
+            any_match = true;
+            // Scan forward keys for this sender SID at any spatial layer.
+            // The HashMap is small (one entry per (sender, spatial)); a linear
+            // scan is cheaper than constructing a per-sender index.
+            if selection
+                .forward
+                .keys()
+                .any(|(sender_sid, _spatial)| sender_sid == sid)
+            {
+                any_in_forward = true;
+                break;
+            }
+        }
+    }
+    if !any_match {
+        // Target not in room → forward (let it die naturally).
+        return false;
+    }
+    // Drop iff target is in the room but no matching session appears in the
+    // current forward set.
+    !any_in_forward
 }
 
 /// Per-session rate limiter for KEYFRAME_REQUEST packets.
@@ -859,5 +940,118 @@ mod tests {
         }
         // Next one should be blocked
         assert!(!limiter.allow());
+    }
+
+    // -------------------------------------------------------------------------
+    // should_drop_kfr_for_layer_selection (p4-10)
+    // -------------------------------------------------------------------------
+
+    fn member(sid: SessionId, user_id: &str) -> (SessionId, String, String) {
+        (sid, user_id.to_string(), user_id.to_string())
+    }
+
+    fn selection_with(pairs: &[(SessionId, u32, u32)]) -> LayerSelection {
+        let mut s = LayerSelection::new();
+        for &(sid, spatial, max_t) in pairs {
+            s.forward.insert((sid, spatial), max_t);
+        }
+        s
+    }
+
+    #[test]
+    fn test_drop_kfr_empty_target_passes_through() {
+        let sel = LayerSelection::new();
+        assert!(!should_drop_kfr_for_layer_selection(
+            b"",
+            42,
+            &[member(1, "alice")],
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn test_drop_kfr_no_selection_passes_through() {
+        assert!(!should_drop_kfr_for_layer_selection(
+            b"alice",
+            42,
+            &[member(1, "alice")],
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_drop_kfr_target_not_in_members_passes_through() {
+        let sel = selection_with(&[(1, 0, 1)]);
+        assert!(!should_drop_kfr_for_layer_selection(
+            b"ghost",
+            42,
+            &[member(1, "alice")],
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn test_drop_kfr_target_in_forward_t0_only_forwards() {
+        // T0-only counts: any presence in forward (at any spatial layer)
+        // means "subscribed".
+        let sel = selection_with(&[(1, 0, 0)]); // T0 only on spatial 0
+        assert!(!should_drop_kfr_for_layer_selection(
+            b"alice",
+            42,
+            &[member(1, "alice")],
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn test_drop_kfr_target_in_forward_t0_t1_forwards() {
+        let sel = selection_with(&[(1, 0, 1)]); // T0+T1
+        assert!(!should_drop_kfr_for_layer_selection(
+            b"alice",
+            42,
+            &[member(1, "alice")],
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn test_drop_kfr_target_not_in_forward_drops() {
+        // alice (sid=1) is in the room but NOT in forward.
+        // bob (sid=2) is in forward.
+        let sel = selection_with(&[(2, 0, 1)]);
+        assert!(should_drop_kfr_for_layer_selection(
+            b"alice",
+            42,
+            &[member(1, "alice"), member(2, "bob")],
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn test_drop_kfr_multiple_sids_one_in_forward_forwards() {
+        // During reconnection grace, a single user may have two SIDs in
+        // room_members. If ANY of them appears in forward, treat as
+        // subscribed and let the KFR through.
+        let sel = selection_with(&[(2, 0, 0)]);
+        assert!(!should_drop_kfr_for_layer_selection(
+            b"alice",
+            42,
+            &[member(1, "alice"), member(2, "alice")],
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn test_drop_kfr_invalid_utf8_target_passes_through() {
+        // Defensive: non-UTF8 user_id bytes (malformed client) must not
+        // panic or wrongly drop. Treat as "can't match" → forward.
+        let sel = selection_with(&[(1, 0, 0)]);
+        let bad = [0xff, 0xfe, 0xfd];
+        assert!(!should_drop_kfr_for_layer_selection(
+            &bad,
+            42,
+            &[member(1, "alice")],
+            Some(&sel),
+        ));
     }
 }

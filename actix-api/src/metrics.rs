@@ -316,9 +316,12 @@ lazy_static! {
     ///
     /// Known label values (registered eagerly so they appear at 0 in
     /// `/metrics` even before any drop occurs):
-    ///   - `self_skip`     — sender == receiver (wave-3 / current)
-    ///   - `unsubscribed`  — placeholder, wired in P3
-    ///   - `layer_budget`  — placeholder, wired in P4
+    ///   - `self_skip`        — sender == receiver (wave-3 / current)
+    ///   - `unsubscribed`     — placeholder, wired in P3
+    ///   - `layer_budget`     — placeholder, wired in P4
+    ///   - `kfr_unsubscribed` — KEYFRAME_REQUEST whose target sender is
+    ///                          not in the requester's current
+    ///                          `LayerSelection.forward` (p4-10).
     pub static ref SFU_DROPPED_TOTAL: CounterVec = {
         let cv = register_counter_vec!(
             "sfu_dropped_total",
@@ -331,6 +334,7 @@ lazy_static! {
         cv.with_label_values(&["self_skip"]).inc_by(0.0);
         cv.with_label_values(&["unsubscribed"]).inc_by(0.0);
         cv.with_label_values(&["layer_budget"]).inc_by(0.0);
+        cv.with_label_values(&["kfr_unsubscribed"]).inc_by(0.0);
         cv
     };
 

@@ -46,7 +46,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
-use super::packet_handler::{parse_and_inspect, ParsedPacket};
+use super::packet_handler::{parse_and_inspect, should_drop_kfr_for_layer_selection, ParsedPacket};
 use super::session_logic::{ConnectionState, SessionId};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::layer_selector::LayerSelector;
@@ -56,6 +56,7 @@ use crate::sfu::subscription::SubscriptionStore;
 use crate::sfu::{SfuConfig, SfuMode};
 use tokio::sync::RwLock as TokioRwLock;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::subscription_packet::SubscriptionUpdate;
 
 /// Internal message sent via `notify_later` after the reconnection grace period
@@ -930,6 +931,60 @@ impl Handler<ClientMessage> for ChatServer {
                 if packet_wrapper.packet_type == PacketType::SUBSCRIPTION_UPDATE.into() {
                     self.apply_subscription_update(&room, session, &packet_wrapper.data);
                     return;
+                }
+                // p4-10: layer-aware KEYFRAME_REQUEST routing.
+                //
+                // A KFR triggers the named sender to blast a fresh ~1.5 MB
+                // keyframe. If the requesting receiver is not currently
+                // subscribed to any layer of that sender (per its cached
+                // `LayerSelection`), the KFR is wasted work — and on a
+                // bandwidth-constrained downlink it can wedge the receiver's
+                // egress queue behind a keyframe burst it will never consume.
+                //
+                // The existing per-session KFR rate limit in
+                // `session_logic.rs` remains in force; this is an additive
+                // policy applied before the NATS publish so the named sender
+                // is never woken at all for KFRs that wouldn't help.
+                if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+                    if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                        if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
+                            let empty_members: Vec<(SessionId, String, String)> = Vec::new();
+                            let members = self.room_members.get(&room).unwrap_or(&empty_members);
+                            // Read the cached selection under a read lock and
+                            // clone so we don't hold the lock across the
+                            // synchronous helper call. The helper itself is
+                            // cheap; cloning a typically-tiny `LayerSelection`
+                            // keeps the critical section minimal.
+                            let cached_selection = self.forwarders.get(&room).and_then(|fwd| {
+                                let ls = fwd.layer_selector();
+                                let guard = match ls.read() {
+                                    Ok(g) => g,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard
+                                    .last_selection_for(session)
+                                    .map(|cached| cached.selection.clone())
+                            });
+                            if should_drop_kfr_for_layer_selection(
+                                &media_packet.user_id,
+                                session,
+                                members,
+                                cached_selection.as_ref(),
+                            ) {
+                                crate::metrics::SFU_DROPPED_TOTAL
+                                    .with_label_values(&["kfr_unsubscribed"])
+                                    .inc();
+                                debug!(
+                                    "Dropping KEYFRAME_REQUEST from session {} in room {} \
+                                     (target {:?} not in current layer selection)",
+                                    session,
+                                    room,
+                                    std::str::from_utf8(&media_packet.user_id).unwrap_or("<bin>"),
+                                );
+                                return;
+                            }
+                        }
+                    }
                 }
                 match packet_wrapper.write_to_bytes() {
                     Ok(bytes) => bytes,
