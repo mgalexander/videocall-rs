@@ -18,29 +18,138 @@
 
 mod audio_producer;
 mod config;
+mod orchestrate;
+mod stats;
 mod video_encoder; // VP9 encoder from videocall-cli
 mod video_producer;
 mod webtransport_client;
 
-use audio_producer::AudioProducer;
-use config::{BotConfig, ClientConfig};
-// Removed unused Arc import
 use std::time::Duration;
+
+use audio_producer::AudioProducer;
+use clap::Parser;
+use config::{BotConfig, ClientConfig};
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{error, info, warn};
 use video_producer::VideoProducer;
 use webtransport_client::WebTransportClient;
 
+use crate::orchestrate::OrchestrationConfig;
+
+/// CLI for the videocall bot.
+///
+/// Two modes are supported:
+///
+/// 1. **Single-bot / config-file mode (default)**: when `--orchestrate` is
+///    not passed, the bot loads its YAML config (via `BOT_CONFIG_PATH`) or
+///    falls back to environment variables, then spawns one or more clients
+///    that publish forever until ctrl-c.
+///
+/// 2. **Load-test orchestration mode**: when `--orchestrate` is passed,
+///    spawns `--senders` publishing bots and `--listeners` subscribe-only
+///    bots in `--room` against `--server-url` for `--duration` seconds,
+///    then emits an aggregate JSON summary on stdout and exits.
+#[derive(Parser, Debug)]
+#[command(name = "bot", author, version, about = "Videocall load-test bot")]
+struct Cli {
+    /// Enable load-test orchestration mode. Requires `--room`, `--senders`,
+    /// `--listeners`, `--duration`, and `--server-url`.
+    #[arg(long)]
+    orchestrate: bool,
+
+    /// Room (meeting id) every spawned bot joins. Orchestration mode only.
+    #[arg(long)]
+    room: Option<String>,
+
+    /// Number of publishing bots (video + audio). Orchestration mode only.
+    #[arg(long)]
+    senders: Option<usize>,
+
+    /// Number of subscribe-only bots. Orchestration mode only.
+    #[arg(long)]
+    listeners: Option<usize>,
+
+    /// Duration of the load test in seconds. Orchestration mode only.
+    #[arg(long)]
+    duration: Option<u64>,
+
+    /// WebTransport server URL (e.g. `https://host:port`). Orchestration mode
+    /// only; the lobby/room path is appended automatically.
+    #[arg(long)]
+    server_url: Option<String>,
+
+    /// Skip TLS certificate verification. Orchestration mode only.
+    #[arg(long, default_value_t = false)]
+    insecure: bool,
+
+    /// Path to the WAV file senders should publish.
+    #[arg(long, default_value = "BundyBests2.wav")]
+    audio_path: String,
+
+    /// Directory containing the JPEG sequence senders should publish.
+    #[arg(long, default_value = ".")]
+    image_dir: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    // Initialize logging. The orchestration mode writes its JSON summary to
+    // stdout, so logs are intentionally left on stderr (tracing-subscriber
+    // default).
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
 
-    info!("Starting videocall synthetic client bot");
+    let cli = Cli::parse();
 
+    if cli.orchestrate {
+        let cfg = build_orchestration_config(cli)?;
+        return orchestrate::run(cfg).await;
+    }
+
+    info!("Starting videocall synthetic client bot (single-bot mode)");
+    run_single_bot_mode().await
+}
+
+fn build_orchestration_config(cli: Cli) -> anyhow::Result<OrchestrationConfig> {
+    let room = cli
+        .room
+        .ok_or_else(|| anyhow::anyhow!("--room is required in --orchestrate mode"))?;
+    let senders = cli
+        .senders
+        .ok_or_else(|| anyhow::anyhow!("--senders is required in --orchestrate mode"))?;
+    let listeners = cli
+        .listeners
+        .ok_or_else(|| anyhow::anyhow!("--listeners is required in --orchestrate mode"))?;
+    let duration_s = cli
+        .duration
+        .ok_or_else(|| anyhow::anyhow!("--duration is required in --orchestrate mode"))?;
+    let server_url = cli
+        .server_url
+        .ok_or_else(|| anyhow::anyhow!("--server-url is required in --orchestrate mode"))?;
+
+    if senders == 0 && listeners == 0 {
+        return Err(anyhow::anyhow!(
+            "--senders and --listeners cannot both be zero"
+        ));
+    }
+
+    Ok(OrchestrationConfig {
+        room,
+        senders,
+        listeners,
+        duration: Duration::from_secs(duration_s),
+        server_url: url::Url::parse(&server_url)
+            .map_err(|e| anyhow::anyhow!("Invalid --server-url: {e}"))?,
+        insecure: cli.insecure,
+        audio_path: cli.audio_path,
+        image_dir: cli.image_dir,
+    })
+}
+
+async fn run_single_bot_mode() -> anyhow::Result<()> {
     // Load configuration
     let config = BotConfig::from_env_or_default()?;
     info!("Loaded configuration for {} clients", config.clients.len());

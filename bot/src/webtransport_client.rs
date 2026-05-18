@@ -32,11 +32,13 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use web_transport_quinn::{ClientBuilder, Session};
 
 use crate::config::ClientConfig;
+use crate::stats::BotStats;
 
 pub struct WebTransportClient {
     config: ClientConfig,
     session: Option<Session>,
     quit: Arc<AtomicBool>,
+    stats: Option<Arc<BotStats>>,
 }
 
 impl WebTransportClient {
@@ -45,7 +47,16 @@ impl WebTransportClient {
             config,
             session: None,
             quit: Arc::new(AtomicBool::new(false)),
+            stats: None,
         }
+    }
+
+    /// Attach a shared stats handle. Called by the load-test orchestrator
+    /// before [`connect`](Self::connect) so the inbound consumer can update
+    /// counters as packets arrive.
+    pub fn with_stats(mut self, stats: Arc<BotStats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     pub async fn connect(&mut self, server_url: &Url, insecure: bool) -> anyhow::Result<()> {
@@ -85,6 +96,14 @@ impl WebTransportClient {
             "WebTransport session established for {}",
             self.config.user_id
         );
+
+        if let Some(stats) = &self.stats {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            stats.mark_connected(now_ms);
+        }
 
         // Send connection packet
         self.send_connection_packet().await?;
@@ -180,6 +199,7 @@ impl WebTransportClient {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
             let quit = self.quit.clone();
+            let stats = self.stats.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -191,10 +211,18 @@ impl WebTransportClient {
                         Ok(mut stream) => {
                             // Drain the stream - we don't need the data, just consume it
                             let user_id = user_id.clone();
+                            let stats = stats.clone();
                             tokio::spawn(async move {
                                 match stream.read_to_end(usize::MAX).await {
-                                    Ok(_) => {}
+                                    Ok(data) => {
+                                        if let Some(stats) = stats {
+                                            stats.record_packet(data.len() as u64);
+                                        }
+                                    }
                                     Err(e) => {
+                                        if let Some(stats) = stats {
+                                            stats.record_drop();
+                                        }
                                         debug!(
                                             "Error reading inbound unistream for {}: {}",
                                             user_id, e
