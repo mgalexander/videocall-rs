@@ -100,7 +100,7 @@ services:
       - ACTIX_UI_BACKEND_URL=
       - WEBTRANSPORT_HOST=
     ports:
-      - "8080:8080"
+      - "${HOST_WS_PORT:-8080}:8080"
     volumes:
       - type: bind
         source: ../
@@ -122,7 +122,7 @@ services:
       "/app/docker/start-dioxus.sh"
     environment:
       - NIX_CONFIG=experimental-features = nix-command flakes
-      - ACTIX_UI_BACKEND_URL=ws://localhost:8080
+      - ACTIX_UI_BACKEND_URL=ws://localhost:${HOST_WS_PORT:-8080}
       - WEBTRANSPORT_HOST=https://127.0.0.1:4433
       - TRUNK_SERVE_PORT=3001
       - ENABLE_OAUTH=false
