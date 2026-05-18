@@ -1,0 +1,93 @@
+# helm/local/manifests/load-test-job.yaml
+#
+# In-cluster load-test driver Job. The bot crate (built into
+# localhost:5000/videocall-bot:dev by helm/local/load-test.sh) runs as a
+# single-Pod Job that dials the SFU at its in-cluster headless Service DNS
+# name and emits a single JSON summary on stdout.
+#
+# Why a Job (not a Deployment): the bot exits cleanly after
+# `--duration` seconds. The Job's Pod logs are then captured by
+# helm/local/load-test.sh and piped into scripts/eval-load-test.py.
+#
+# The Job uses a ConfigMap (`load-test-config`) for parameters so we can
+# vary the bot configuration without re-rendering this manifest. The
+# ConfigMap is applied by helm/local/load-test.sh before this Job is
+# (re-)created.
+#
+# Why no JWT injection: the local SFU runs with `SFU_MODE=sfu` and the
+# test rooms used here are not gated by auth on the WebTransport path
+# (the JWT path is exercised by meeting-api endpoints, not the SFU
+# subscribe handshake). If that ever changes, plumb a JWT through the
+# load-test-config ConfigMap by adding TOKEN env and `--token "$TOKEN"`
+# to the bot args once the bot CLI grows that flag.
+#
+# Resource sizing: the requests are deliberately small so this Job can
+# co-schedule with the SFU pods on the same k3d agent. The limits are
+# generous (4 CPU / 4Gi) because 50 bots in a single process spin up a
+# lot of tokio tasks and VP9 encoder state — running into the cgroup
+# limit silently throttles audio cadence and inflates listener drops.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-test
+  namespace: default
+  labels:
+    app.kubernetes.io/name: videocall-load-test
+    app.kubernetes.io/component: bot
+spec:
+  backoffLimit: 0
+  # 15 min hard cap. The release-gate run is 5 min of steady-state plus
+  # bot ramp-up; 15 min gives us headroom while still bounding a stuck
+  # Job from blocking the gate forever.
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: videocall-load-test
+        app.kubernetes.io/component: bot
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bot
+          image: localhost:5000/videocall-bot:dev
+          imagePullPolicy: IfNotPresent
+          # The bot CLI accepts long flags; we wire them from the
+          # ConfigMap via envFrom + a shell-expanded args vector. Using
+          # `sh -lc` keeps the env expansion in a single layer and
+          # avoids shell-injection surface (every value is a numeric or
+          # a controlled string set by load-test.sh).
+          command:
+            - /bin/sh
+            - -lc
+            - >-
+              exec /usr/local/bin/bot
+              --orchestrate
+              --room "${ROOM}"
+              --senders "${SENDERS}"
+              --listeners "${LISTENERS}"
+              --duration "${DURATION_S}"
+              --server-url "${SERVER_URL}"
+              --insecure
+              --audio-path /app/BundyBests2.wav
+              --image-dir /app
+          envFrom:
+            - configMapRef:
+                name: load-test-config
+          env:
+            - name: RUST_LOG
+              value: info,quinn=warn
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
