@@ -29,6 +29,7 @@ use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
@@ -84,6 +85,19 @@ impl Display for PeerDecodeError {
         }
     }
 }
+
+/// Rolling 60s window for outbound KEYFRAME_REQUEST emission counts (per remote
+/// peer user_id). Computed lazily on each emission to avoid a background timer.
+/// A peer that stops triggering KFRs simply stops reporting, which is correct
+/// for surfacing high-rate uplink pressure.
+#[derive(Debug, Default)]
+struct KfrEmissionState {
+    window_start_ms: u64,
+    video_count: u64,
+    screen_count: u64,
+}
+
+const KFR_EMISSION_WINDOW_MS: u64 = 60_000;
 
 pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
@@ -789,6 +803,10 @@ pub struct PeerDecodeManager {
     /// reorder packets). `0` means "no update has been applied yet" and is
     /// also treated as an invalid generation when found on incoming packets.
     speaker_generation: u64,
+    /// Per-remote-peer rolling-window counters for outbound KEYFRAME_REQUEST
+    /// emissions. `RefCell` because `send_keyframe_request` takes `&self`
+    /// (called from `set_peer_screen_canvas`, which is also `&self`).
+    kfr_emission_state: RefCell<HashMap<String, KfrEmissionState>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -811,6 +829,7 @@ impl PeerDecodeManager {
             send_packet: None,
             local_user_id: String::new(),
             speaker_generation: 0,
+            kfr_emission_state: RefCell::new(HashMap::new()),
         }
     }
 
@@ -827,6 +846,7 @@ impl PeerDecodeManager {
             send_packet: None,
             local_user_id: String::new(),
             speaker_generation: 0,
+            kfr_emission_state: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1083,6 +1103,51 @@ impl PeerDecodeManager {
             requested_media_type
         );
         send_packet.emit(wrapper);
+
+        self.record_kfr_emission(peer_user_id, requested_media_type);
+    }
+
+    /// Record a successful outbound KEYFRAME_REQUEST emission and, if the
+    /// current 60s window has elapsed, broadcast a diagnostics event with the
+    /// per-class counts. Window state is computed lazily on emission — no
+    /// background timer — so quiet peers report nothing (which is correct for
+    /// a high-rate-pressure signal).
+    fn record_kfr_emission(&self, peer_user_id: &str, requested_media_type: MediaType) {
+        let now = now_ms();
+        let mut map = self.kfr_emission_state.borrow_mut();
+        let state = map
+            .entry(peer_user_id.to_string())
+            .or_insert_with(|| KfrEmissionState {
+                window_start_ms: now,
+                ..Default::default()
+            });
+        match requested_media_type {
+            MediaType::VIDEO => state.video_count += 1,
+            MediaType::SCREEN => state.screen_count += 1,
+            _ => {}
+        }
+
+        if now.saturating_sub(state.window_start_ms) >= KFR_EMISSION_WINDOW_MS {
+            let video_count = state.video_count;
+            let screen_count = state.screen_count;
+            let window_ms = now.saturating_sub(state.window_start_ms);
+            state.window_start_ms = now;
+            state.video_count = 0;
+            state.screen_count = 0;
+            drop(map);
+
+            let evt = DiagEvent {
+                subsystem: "keyframe_request",
+                stream_id: Some(peer_user_id.to_string()),
+                ts_ms: now,
+                metrics: vec![
+                    metric!("video_emitted", video_count),
+                    metric!("screen_emitted", screen_count),
+                    metric!("window_ms", window_ms),
+                ],
+            };
+            let _ = global_sender().try_broadcast(evt);
+        }
     }
 
     fn add_peer(
