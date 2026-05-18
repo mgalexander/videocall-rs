@@ -38,9 +38,9 @@ use crate::server_diagnostics::{
 use crate::session_manager::SessionManager;
 use actix::Addr;
 use protobuf::Message as ProtobufMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use videocall_types::protos::connection_packet::ConnectionPacket;
@@ -78,6 +78,84 @@ pub enum InboundAction {
 // Congestion Tracking
 // =========================================================================
 
+/// Priority class for outbound packets.
+///
+/// NOTE: This is a temporary local stub pending p5-1 (vc-3ah), which will
+/// introduce `actix-api/src/sfu/priority_queue.rs` as the canonical home for
+/// `Class`. p5-7 will migrate call sites and this stub will be removed at
+/// that time. The variants here are kept identical to the planned p5-1
+/// shape so the migration is mechanical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Class {
+    P0Control,
+    P1Audio,
+    P2Keyframe,
+    P3VideoBase,
+    P4Enhancement,
+}
+
+impl Class {
+    /// Drop-count threshold within [`Class::window`] at which a CONGESTION
+    /// notification should fire for this class.
+    ///
+    /// P0Control has a threshold of 0 because P0 packets are NeverDrop —
+    /// they are not supposed to be dropped at all. Any call into the
+    /// class-aware path for P0Control indicates an upstream bug.
+    fn threshold(self) -> u32 {
+        match self {
+            Class::P0Control => 0,
+            Class::P1Audio => 3,
+            Class::P2Keyframe => 1,
+            Class::P3VideoBase => 5,
+            Class::P4Enhancement => 10,
+        }
+    }
+
+    /// Sliding window over which drops are counted for this class.
+    ///
+    /// For P2Keyframe the window is effectively irrelevant (threshold=1
+    /// fires on the very first drop), but we still need a value for the
+    /// timestamp deque's compaction logic — 60s is generous enough that a
+    /// single stray entry will be discarded eventually without bloating
+    /// memory.
+    fn window(self) -> Duration {
+        match self {
+            // P0Control should never be dropped; window is irrelevant.
+            Class::P0Control => Duration::from_secs(1),
+            Class::P1Audio => Duration::from_millis(500),
+            Class::P2Keyframe => Duration::from_secs(60),
+            // Preserve the legacy 5-in-1s threshold for the base video layer.
+            Class::P3VideoBase => Duration::from_secs(1),
+            Class::P4Enhancement => Duration::from_secs(1),
+        }
+    }
+}
+
+/// Per-class drop tracking state for the class-aware congestion path.
+///
+/// Distinct from [`SenderDropState`] — that struct keys by sender session ID
+/// and predates the priority-queue work. p5-7 will eventually migrate
+/// callers off the per-sender path; until then both coexist.
+struct ClassDropState {
+    /// Timestamps of recent drops within the class's window. Compacted on
+    /// every call: entries older than `class.window()` before `now` are
+    /// popped from the front before the new drop is appended.
+    drops: VecDeque<Instant>,
+    /// Last time a CONGESTION notification was emitted for this class.
+    /// Rate-limits subsequent `true` returns to once per
+    /// [`CONGESTION_NOTIFY_MIN_INTERVAL`], matching the legacy per-sender path.
+    last_notify: Option<Instant>,
+}
+
+impl ClassDropState {
+    fn new() -> Self {
+        Self {
+            drops: VecDeque::new(),
+            last_notify: None,
+        }
+    }
+}
+
 /// Per-sender drop tracking state for congestion feedback.
 struct SenderDropState {
     /// Number of drops in the current window.
@@ -103,6 +181,10 @@ pub struct CongestionTracker {
     /// Total drops since the last stale-entry cleanup. Cleanup runs every
     /// [`CLEANUP_INTERVAL`] drops to amortize the cost of `retain()`.
     total_drops: u32,
+    /// Per-class drop state for the class-aware congestion path (p5-6).
+    /// Populated lazily on the first call to
+    /// [`CongestionTracker::record_drop_with_class`] for each class.
+    classes: HashMap<Class, ClassDropState>,
 }
 
 impl Default for CongestionTracker {
@@ -120,6 +202,7 @@ impl CongestionTracker {
         Self {
             senders: HashMap::new(),
             total_drops: 0,
+            classes: HashMap::new(),
         }
     }
 
@@ -175,6 +258,86 @@ impl CongestionTracker {
             Some(sender_session_id)
         } else {
             None
+        }
+    }
+
+    /// Record a dropped outbound packet of the given priority [`Class`] and
+    /// return whether a CONGESTION notification should be emitted.
+    ///
+    /// This is the class-aware companion to [`CongestionTracker::record_drop`]
+    /// introduced in p5-6 (vc-l6x). It keeps a per-class ring buffer of
+    /// drop timestamps and applies a class-specific threshold/window:
+    ///
+    /// | Class            | Threshold | Window  |
+    /// |------------------|-----------|---------|
+    /// | `P0Control`      | impossible (NeverDrop — see below) |
+    /// | `P1Audio`        | 3 drops   | 500ms   |
+    /// | `P2Keyframe`     | 1 drop    | (n/a — fires on first drop) |
+    /// | `P3VideoBase`    | 5 drops   | 1s (preserves legacy threshold) |
+    /// | `P4Enhancement`  | 10 drops  | 1s      |
+    ///
+    /// P0Control packets carry a NeverDrop policy and must not be dropped by
+    /// any transport. If this method is called with [`Class::P0Control`],
+    /// it indicates an upstream bug; we log an error and return `true` so
+    /// the caller still surfaces the congestion event.
+    ///
+    /// As with the legacy path, repeated `true` returns are rate-limited
+    /// to one per [`CONGESTION_NOTIFY_MIN_INTERVAL`] per class. The first
+    /// qualifying drop (no prior notification) always returns `true`.
+    ///
+    /// Note: this method intentionally does not subsume
+    /// [`CongestionTracker::record_drop`] — that signature must remain
+    /// stable until p5-7 migrates all call sites.
+    pub fn record_drop_with_class(&mut self, class: Class) -> bool {
+        let now = Instant::now();
+
+        // P0Control: NeverDrop. Reaching this branch indicates an upstream
+        // bug. Log and surface the event without touching the class state
+        // (P0 has no meaningful threshold).
+        if class == Class::P0Control {
+            error!(
+                "CongestionTracker: record_drop_with_class called for P0Control \
+                 (NeverDrop policy) — upstream bug"
+            );
+            return true;
+        }
+
+        let window = class.window();
+        let threshold = class.threshold();
+        let state = self
+            .classes
+            .entry(class)
+            .or_insert_with(ClassDropState::new);
+
+        // Compact: drop any timestamps older than the class's window before
+        // counting. `now - window` may be earlier than the deque front by
+        // an arbitrary amount, so iterate.
+        while let Some(&front) = state.drops.front() {
+            if now.duration_since(front) > window {
+                state.drops.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Record this drop.
+        state.drops.push_back(now);
+
+        if state.drops.len() as u32 >= threshold {
+            // Rate-limit notifications per class.
+            if let Some(last) = state.last_notify {
+                if now.duration_since(last) < CONGESTION_NOTIFY_MIN_INTERVAL {
+                    return false;
+                }
+            }
+            state.last_notify = Some(now);
+            // Clear the buffer after firing so the next notification
+            // requires a fresh accumulation of drops, matching the legacy
+            // path's "reset count after trigger" behavior.
+            state.drops.clear();
+            true
+        } else {
+            false
         }
     }
 }
@@ -914,6 +1077,167 @@ mod tests {
         // Verify Default trait works and produces an empty tracker.
         let tracker = CongestionTracker::default();
         assert!(tracker.senders.is_empty());
+    }
+
+    // =====================================================================
+    // Class-aware drop accounting (p5-6 / vc-l6x)
+    // =====================================================================
+
+    #[test]
+    fn test_record_drop_with_class_p2_keyframe_fires_on_first_drop() {
+        let mut tracker = CongestionTracker::new();
+        // P2Keyframe threshold is 1 — a single drop must fire on a fresh
+        // tracker (no prior notify => rate-limit not engaged).
+        assert!(tracker.record_drop_with_class(Class::P2Keyframe));
+    }
+
+    #[test]
+    fn test_record_drop_with_class_p4_below_threshold() {
+        let mut tracker = CongestionTracker::new();
+        // P4Enhancement threshold is 10 within 1s. 9 calls back-to-back
+        // (well within the 1s window) must all return false.
+        for i in 0..9 {
+            assert!(
+                !tracker.record_drop_with_class(Class::P4Enhancement),
+                "drop #{} (of 9) should be below threshold",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_record_drop_with_class_p4_at_threshold() {
+        let mut tracker = CongestionTracker::new();
+        // First 9 below threshold.
+        for _ in 0..9 {
+            assert!(!tracker.record_drop_with_class(Class::P4Enhancement));
+        }
+        // 10th call reaches the threshold and must fire.
+        assert!(tracker.record_drop_with_class(Class::P4Enhancement));
+    }
+
+    #[test]
+    fn test_record_drop_with_class_p4_drops_outside_window_dont_count() {
+        let mut tracker = CongestionTracker::new();
+        // Manually seed the class state with 9 timestamps from > 1s ago
+        // (P4's window is 1s). These should be compacted away on the next
+        // call, leaving the new drop as the only entry and not firing.
+        let stale = Instant::now() - Duration::from_secs(2);
+        let mut deque = VecDeque::new();
+        for _ in 0..9 {
+            deque.push_back(stale);
+        }
+        tracker.classes.insert(
+            Class::P4Enhancement,
+            ClassDropState {
+                drops: deque,
+                last_notify: None,
+            },
+        );
+
+        // Stale entries should be compacted before counting; new drop is
+        // the only one in-window => below threshold => returns false.
+        assert!(!tracker.record_drop_with_class(Class::P4Enhancement));
+        let state = tracker.classes.get(&Class::P4Enhancement).unwrap();
+        assert_eq!(
+            state.drops.len(),
+            1,
+            "stale entries should have been compacted; only the fresh drop remains"
+        );
+    }
+
+    #[test]
+    fn test_record_drop_with_class_p1_audio_threshold() {
+        let mut tracker = CongestionTracker::new();
+        // P1Audio: 3 in 500ms.
+        assert!(!tracker.record_drop_with_class(Class::P1Audio));
+        assert!(!tracker.record_drop_with_class(Class::P1Audio));
+        // 3rd call hits threshold.
+        assert!(tracker.record_drop_with_class(Class::P1Audio));
+    }
+
+    #[test]
+    fn test_record_drop_with_class_p1_audio_drops_outside_500ms_dont_count() {
+        let mut tracker = CongestionTracker::new();
+        // Seed two stale (>500ms ago) drops; the next call within the
+        // window should NOT cross the 3-drop threshold.
+        let stale = Instant::now() - Duration::from_millis(600);
+        let mut deque = VecDeque::new();
+        deque.push_back(stale);
+        deque.push_back(stale);
+        tracker.classes.insert(
+            Class::P1Audio,
+            ClassDropState {
+                drops: deque,
+                last_notify: None,
+            },
+        );
+
+        // Compaction drops the two stale entries; only the new one counts.
+        // 1 < 3 => no fire.
+        assert!(!tracker.record_drop_with_class(Class::P1Audio));
+    }
+
+    #[test]
+    fn test_record_drop_with_class_p0_control_logs_and_returns_true() {
+        let mut tracker = CongestionTracker::new();
+        // P0Control should never be dropped; if it is, treat as upstream
+        // bug — log an error and return true. State is intentionally
+        // untouched.
+        assert!(tracker.record_drop_with_class(Class::P0Control));
+        assert!(
+            !tracker.classes.contains_key(&Class::P0Control),
+            "P0Control path should not allocate per-class state"
+        );
+    }
+
+    #[test]
+    fn test_record_drop_with_class_p3_preserves_legacy_5_in_1s() {
+        let mut tracker = CongestionTracker::new();
+        // P3VideoBase preserves the legacy 5/1s threshold.
+        for i in 0..4 {
+            assert!(
+                !tracker.record_drop_with_class(Class::P3VideoBase),
+                "drop #{} should be below threshold",
+                i + 1
+            );
+        }
+        // 5th call fires.
+        assert!(tracker.record_drop_with_class(Class::P3VideoBase));
+    }
+
+    #[test]
+    fn test_record_drop_with_class_rate_limited_after_fire() {
+        let mut tracker = CongestionTracker::new();
+        // Drive P4Enhancement to fire once.
+        for _ in 0..9 {
+            tracker.record_drop_with_class(Class::P4Enhancement);
+        }
+        assert!(tracker.record_drop_with_class(Class::P4Enhancement));
+
+        // Drive it again immediately. last_notify is fresh so even if we
+        // re-cross the threshold, the rate limiter must suppress the
+        // notification.
+        for _ in 0..10 {
+            assert!(
+                !tracker.record_drop_with_class(Class::P4Enhancement),
+                "follow-up notifications must be rate-limited within \
+                 CONGESTION_NOTIFY_MIN_INTERVAL"
+            );
+        }
+    }
+
+    #[test]
+    fn test_record_drop_with_class_independent_per_class() {
+        // Drops in one class must not affect another class's count.
+        let mut tracker = CongestionTracker::new();
+        for _ in 0..2 {
+            assert!(!tracker.record_drop_with_class(Class::P1Audio));
+        }
+        // P4Enhancement count is independent; 1 drop is still below 10.
+        assert!(!tracker.record_drop_with_class(Class::P4Enhancement));
+        // P1Audio's 3rd call still fires (the P4 drop did not consume it).
+        assert!(tracker.record_drop_with_class(Class::P1Audio));
     }
 
     #[test]
