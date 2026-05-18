@@ -475,13 +475,10 @@ impl LayerSelector {
     ///
     /// # Concurrency
     ///
-    /// This method takes `&mut self` because it mutates the per-receiver
-    /// hysteresis map. Within a single room the surrounding actor model
-    /// already serializes calls, so an owned `LayerSelector` is fine.
-    /// Sharing one instance across rooms (e.g. via `Arc<LayerSelector>`)
-    /// is **no longer safe** once hysteresis is in play — cross-room
-    /// sharing requires external synchronization such as
-    /// `Arc<Mutex<LayerSelector>>`.
+    /// Takes `&self`; the per-receiver hysteresis map is guarded by an
+    /// internal `Mutex` and the published-selection cache is a `DashMap`.
+    /// `Arc<LayerSelector>` is the supported sharing shape — see the
+    /// type-level concurrency notes.
     pub fn pick_with_hysteresis(
         &self,
         receiver_sid: SessionId,
