@@ -195,6 +195,7 @@ pub mod diagnostics;
 pub mod encode;
 pub mod health_reporter;
 mod media_devices;
+pub(crate) mod sfu_client;
 pub mod utils;
 mod wrappers;
 pub use client::{VideoCallClient, VideoCallClientOptions};

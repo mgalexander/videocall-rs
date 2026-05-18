@@ -855,6 +855,32 @@ impl VideoCallClient {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner.peer_decode_manager.set_peer_visibility(sid, visible);
         }
+        self.emit_stub_subscription_update();
+    }
+
+    /// Fire-and-forget subscription update with wave-1 stub content. Wave-3
+    /// (p3-8) will replace the fixed payload with real per-peer visibility
+    /// state. Failures are logged but never propagated — the SFU treats
+    /// missing subscription packets as "use defaults", so a dropped update
+    /// is a quality degradation, not a correctness bug.
+    fn emit_stub_subscription_update(&self) {
+        let sfu = crate::sfu_client::SfuClient::new(
+            self.options.user_id.clone(),
+            self.connection_controller.clone(),
+        );
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = sfu
+                .emit_subscription_update(
+                    vec![],
+                    vec![],
+                    crate::sfu_client::DEFAULT_MAX_VIDEO_KBPS,
+                    true,
+                )
+                .await
+            {
+                debug!("Failed to emit SubscriptionUpdate: {e}");
+            }
+        });
     }
 
     pub fn get_peer_fps(&self, peer_id: &str, media_type: MediaType) -> f64 {
