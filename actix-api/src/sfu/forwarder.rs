@@ -28,7 +28,8 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::actors::session_logic::SessionId;
 use crate::metrics::{
-    SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL, SFU_ROOM_SIZE,
+    SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL, SFU_KEYFRAME_FORWARDED_TOTAL,
+    SFU_ROOM_SIZE,
 };
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
@@ -175,14 +176,20 @@ impl Forwarder {
     ///    * Other media types (HEARTBEAT, RTT, KEYFRAME_REQUEST) and unknown
     ///      values pass through — they are control / signalling streams that
     ///      are not subject to subscription filtering.
-    /// 3. **VP9 SVC layer-drop** (p4-7) — only for MEDIA `VIDEO`/`SCREEN`
-    ///    packets that carry a `RoutingHeader` and are NOT keyframes:
+    /// 3. **VP9 SVC layer-drop** (p4-7, tightened in p4-8) — only for MEDIA
+    ///    `VIDEO`/`SCREEN` packets that carry a `RoutingHeader`:
+    ///    * `routing_header.is_keyframe == true` AND `temporal_layer_id == 0`
+    ///      AND `spatial_layer_id == 0` ALWAYS passes through and bumps
+    ///      `sfu_keyframe_forwarded_total` — invariant 1, dropping a
+    ///      base-layer keyframe breaks the entire reference chain for
+    ///      every subsequent frame until the next keyframe arrives.
+    ///    * Higher-layer keyframes (T>0 or S>0) are NOT load-bearing for
+    ///      decode in the same way — they only restart the dependent
+    ///      enhancement chain and can be dropped under budget pressure
+    ///      just like P-frames.
     ///    * Consult the cached [`crate::sfu::layer_selector::LayerSelection`]
     ///      for this receiver (lazily refreshed when the active-speaker
     ///      generation moves forward).
-    ///    * `routing_header.is_keyframe == true` ALWAYS passes through —
-    ///      keyframes are invariant 1; dropping one breaks the entire
-    ///      reference chain.
     ///    * Sender's spatial layer not selected → drop (`layer_budget`).
     ///    * `routing_header.temporal_layer_id` exceeds the selected
     ///      `max_temporal_layer_id` → drop (`layer_budget`).
@@ -277,26 +284,32 @@ impl Forwarder {
                         return ForwardDecision::Drop;
                     }
 
-                    // p4-7: VP9 SVC enhancement-layer drop. Keyframes
-                    // ALWAYS forward (invariant 1 — dropping one breaks
-                    // every dependent frame in the reference chain).
-                    // Legacy clients (no RoutingHeader) pass through.
-                    // VIDEO/SCREEN only — audio has no SVC layers in
-                    // this codebase today.
+                    // p4-7/p4-8: VP9 SVC enhancement-layer drop. The
+                    // base-layer keyframe (T0+S0) ALWAYS forwards —
+                    // invariant 1 (dropping it breaks every dependent
+                    // frame until the next keyframe). Higher-layer
+                    // keyframes (T>0 or S>0) restart only the enhancement
+                    // chain and are subject to the same budget check as
+                    // P-frames. Legacy clients (no RoutingHeader) pass
+                    // through. VIDEO/SCREEN only — audio has no SVC
+                    // layers in this codebase today.
                     if matches!(media_type, MediaType::VIDEO | MediaType::SCREEN) {
                         if let Some(rh) = mp.routing_header.as_ref() {
-                            if !rh.is_keyframe
-                                && self.should_drop_for_layer_budget(
-                                    receiver_sid,
-                                    sender_sid,
-                                    rh.spatial_layer_id,
-                                    rh.temporal_layer_id,
-                                    &allow,
-                                    &speakers_top,
-                                    speakers_generation,
-                                    receiver_bw_kbps,
-                                )
-                            {
+                            let is_base_keyframe = rh.is_keyframe
+                                && rh.temporal_layer_id == 0
+                                && rh.spatial_layer_id == 0;
+                            if is_base_keyframe {
+                                SFU_KEYFRAME_FORWARDED_TOTAL.inc();
+                            } else if self.should_drop_for_layer_budget(
+                                receiver_sid,
+                                sender_sid,
+                                rh.spatial_layer_id,
+                                rh.temporal_layer_id,
+                                &allow,
+                                &speakers_top,
+                                speakers_generation,
+                                receiver_bw_kbps,
+                            ) {
                                 SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).inc();
                                 observe_decide_latency(start);
                                 return ForwardDecision::Drop;

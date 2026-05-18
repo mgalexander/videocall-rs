@@ -35,7 +35,9 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::subscription_packet::SubscriptionUpdate;
 
 use crate::actors::session_logic::SessionId;
-use crate::metrics::{SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL};
+use crate::metrics::{
+    SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL, SFU_KEYFRAME_FORWARDED_TOTAL,
+};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
@@ -560,16 +562,19 @@ fn p4_7_layer_drop_three_receivers_distinct_budgets() {
         );
     }
 
-    // --- Keyframes always pass through, even on the tightest receiver. ---
-    // A T2 KEYFRAME from the sender goes to r_tight (whose layer budget
-    // would normally drop T2): assert Forward, asserting invariant 1.
-    let (pw_kf, mp_kf) = build_video_with_layer(sender, 0, 2, true);
+    // --- Base-layer (T0+S0) keyframes always pass through, even on the
+    //     tightest receiver — invariant 1. A T0+S0 KEYFRAME from the
+    //     sender goes to r_tight: must Forward regardless of budget,
+    //     because dropping it would break the entire reference chain.
+    //     Higher-layer keyframes are tested in `p4_8_*` below — they
+    //     are NOT load-bearing for decode and follow the normal budget.
+    let (pw_kf_base, mp_kf_base) = build_video_with_layer(sender, 0, 0, true);
     assert!(
         matches!(
-            fwd.decide(r_tight, &pw_kf, Some(&mp_kf)),
+            fwd.decide(r_tight, &pw_kf_base, Some(&mp_kf_base)),
             ForwardDecision::Forward
         ),
-        "keyframes ALWAYS pass through regardless of layer budget (invariant 1)"
+        "base-layer (T0+S0) keyframes ALWAYS pass through regardless of layer budget (invariant 1)"
     );
 }
 
@@ -636,4 +641,140 @@ fn p4_7_legacy_no_routing_header_forwards() {
         fwd.decide(receiver, &pw, Some(&mp)),
         ForwardDecision::Forward
     ));
+}
+
+// ===========================================================================
+// p4-8: always forward keyframe+T0+S0 regardless of budget
+// ===========================================================================
+//
+// p4-7 had a blanket carve-out: ANY keyframe (at any spatial/temporal layer)
+// bypassed the layer-budget check. p4-8 tightens that to the base-layer
+// keyframe only — T0+S0. Higher-layer keyframes only restart the dependent
+// enhancement chain and are not load-bearing for decode, so they go through
+// the same budget check as P-frames.
+//
+// The T0+S0 keyframe is the root of every dependent reference chain. Dropping
+// one breaks decode for every subsequent frame until the next keyframe arrives.
+// We forward it even when the receiver's bandwidth budget would not otherwise
+// admit a packet at all — burning the budget once is the lesser evil.
+
+/// Acceptance: a receiver whose bandwidth estimate is BELOW the T0 budget
+/// (10 kbps — well under the 128 kbps T0 cost at default headroom) still
+/// receives the base-layer (T0+S0) keyframe. The `sfu_keyframe_forwarded_total`
+/// counter must increment so operators can verify keyframes reach receivers.
+#[test]
+fn p4_8_base_keyframe_forwards_below_t0_budget() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    let room = Arc::new(RwLock::new(RoomState::new("p4-8-base-kf".to_string())));
+    {
+        let mut w = room.write().unwrap();
+        w.insert_member(sender, 0);
+        w.insert_member(receiver, 0);
+    }
+    let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
+    {
+        let members = [sender, receiver].into_iter().collect();
+        let mut s = subs.write().unwrap();
+        s.apply_update(receiver, sub_update(&[sender], true), &members);
+    }
+    let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
+    std::mem::forget(tx);
+    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let fwd = Arc::new(Forwarder::new(
+        room.clone(),
+        subs.clone(),
+        rx,
+        layer_selector,
+    ));
+    // 10 kbps is well below the T0 budget (128 kbps cumulative cost,
+    // 0.85 headroom → would need ~150 kbps downlink). Even a T0 delta
+    // frame would drop under this budget; the base-layer KEYFRAME must
+    // still forward (invariant 1).
+    set_receiver_bandwidth(&room, receiver, 10);
+
+    let before = SFU_KEYFRAME_FORWARDED_TOTAL.get();
+    let (pw_kf_base, mp_kf_base) = build_video_with_layer(sender, 0, 0, true);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_kf_base, Some(&mp_kf_base)),
+            ForwardDecision::Forward
+        ),
+        "T0+S0 keyframe must forward even at 10kbps budget (invariant 1)"
+    );
+    let after = SFU_KEYFRAME_FORWARDED_TOTAL.get();
+    assert!(
+        after > before,
+        "sfu_keyframe_forwarded_total must increment on base-layer keyframe forward (before={before}, after={after})"
+    );
+
+    // Sanity: a T0 DELTA frame at the same 10 kbps budget MUST drop —
+    // confirming the budget is actually tight enough to trigger the
+    // drop path, and that the keyframe-pass is specifically due to
+    // the invariant-1 carve-out, not a hole in the budget logic.
+    let (pw_t0_delta, mp_t0_delta) = build_video_with_layer(sender, 0, 0, false);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_t0_delta, Some(&mp_t0_delta)),
+            ForwardDecision::Drop
+        ),
+        "T0 delta frame must drop at 10kbps budget (confirms the carve-out is keyframe-specific)"
+    );
+}
+
+/// A keyframe at a HIGHER layer (T>0 or S>0) is NOT load-bearing for
+/// decode in the same way as the T0+S0 root — it only restarts the
+/// dependent enhancement chain. p4-8 narrows the always-forward carve-out
+/// so higher-layer keyframes follow the same budget rules as P-frames.
+#[test]
+fn p4_8_higher_layer_keyframe_obeys_budget() {
+    let sender: SessionId = 200;
+    let receiver: SessionId = 100;
+
+    let room = Arc::new(RwLock::new(RoomState::new("p4-8-higher-kf".to_string())));
+    {
+        let mut w = room.write().unwrap();
+        w.insert_member(sender, 0);
+        w.insert_member(receiver, 0);
+    }
+    let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
+    {
+        let members = [sender, receiver].into_iter().collect();
+        let mut s = subs.write().unwrap();
+        s.apply_update(receiver, sub_update(&[sender], true), &members);
+    }
+    let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
+    std::mem::forget(tx);
+    let layer_selector = Arc::new(RwLock::new(LayerSelector::new()));
+    let fwd = Arc::new(Forwarder::new(
+        room.clone(),
+        subs.clone(),
+        rx,
+        layer_selector,
+    ));
+    // 200 kbps → effective 170 kbps after default headroom → only T0
+    // (128 kbps cumulative) fits.
+    set_receiver_bandwidth(&room, receiver, 200);
+
+    let before_kf = SFU_KEYFRAME_FORWARDED_TOTAL.get();
+    let before_lb = SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).get();
+    let (pw_kf_t2, mp_kf_t2) = build_video_with_layer(sender, 0, 2, true);
+    assert!(
+        matches!(
+            fwd.decide(receiver, &pw_kf_t2, Some(&mp_kf_t2)),
+            ForwardDecision::Drop
+        ),
+        "T2 keyframe must drop at tight budget — only T0+S0 keyframes are invariant 1"
+    );
+    let after_kf = SFU_KEYFRAME_FORWARDED_TOTAL.get();
+    let after_lb = SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).get();
+    assert_eq!(
+        after_kf, before_kf,
+        "sfu_keyframe_forwarded_total counts only T0+S0 keyframes — must not increment for T2 keyframe"
+    );
+    assert!(
+        after_lb > before_lb,
+        "sfu_dropped_total{{reason=\"layer_budget\"}} must increment on higher-layer keyframe drop"
+    );
 }

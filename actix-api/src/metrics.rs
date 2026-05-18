@@ -357,4 +357,19 @@ lazy_static! {
         vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0]
     )
     .expect("Failed to create sfu_decide_latency_us metric");
+
+    /// Total base-layer (T0+S0) keyframes forwarded by `Forwarder::decide`.
+    ///
+    /// Per p4-8 invariant 1: a keyframe at `temporal_layer_id=0 AND
+    /// spatial_layer_id=0` is the root of every dependent reference
+    /// chain — dropping one breaks decode for every subsequent frame
+    /// until the next keyframe arrives. The forwarder always passes
+    /// these through regardless of the receiver's layer budget. This
+    /// counter exposes the invariant in metrics so operators can verify
+    /// keyframes are reaching every receiver.
+    pub static ref SFU_KEYFRAME_FORWARDED_TOTAL: Counter = register_counter!(
+        "sfu_keyframe_forwarded_total",
+        "Base-layer (T0+S0) keyframes forwarded by the SFU forwarder (always forwarded, invariant 1)"
+    )
+    .expect("Failed to create sfu_keyframe_forwarded_total metric");
 }
