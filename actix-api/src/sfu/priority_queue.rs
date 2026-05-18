@@ -16,22 +16,20 @@
  * conditions.
  */
 
-//! Outbound priority queue wrapper for SFU egress (P5 wave-1).
+//! Outbound priority queue wrapper for SFU egress (P5 wave-1 + wave-2).
 //!
 //! Defines the five outbound classes (P0 Control, P1 Audio, P2 Keyframe + base
 //! T0 video, P3 base spatial P-frames, P4 enhancement + screen), their bounded
 //! capacities, and their drop policies — per `sfu-update/PLAN.md` Phase 5.
 //!
-//! This module is intentionally just the wrapper:
-//!   * classification (`PacketWrapper -> Class`) is p5-3,
-//!   * consumer-side strict-priority + fairness quantum select is p5-2,
+//! Wave-1 (p5-1) shipped the [`PrioritySender`] + [`PriorityChannels`] producer
+//! side; wave-2 (p5-2) adds the [`PriorityReceiver`] consumer task that drains
+//! the five channels using strict-priority order with an 8-packet fairness
+//! quantum to bound starvation of lower classes when higher classes are
+//! continuously loaded. Still pending:
 //!   * transport wiring (replacing the single `mpsc::channel::<WtOutbound>(256)`
 //!     in `webtransport/mod.rs`) is p5-4 / p5-5,
 //!   * metrics / CongestionTracker hooks are p5-6.
-//!
-//! The five `ClassReceiver` halves are exposed as public fields on
-//! `PriorityChannels` so p5-2 can build its own select loop directly on top
-//! of them without further plumbing here.
 //!
 //! ## Why a custom bounded queue (not `tokio::sync::mpsc`)
 //!
@@ -502,6 +500,211 @@ fn build_class(class: Class) -> (ClassSender, ClassReceiver) {
     (sender, receiver)
 }
 
+/// Maximum consecutive drains from a single class before the consumer must
+/// give a lower-priority class one turn. Per `sfu-update/PLAN.md` Phase 5 —
+/// balances priority inversion (too low → control packets sit behind a long
+/// burst of lower-class drains) against starvation (too high → enhancement /
+/// screen layers never get scheduled under continuous audio + base-video
+/// load).
+pub const FAIRNESS_QUANTUM: u8 = 8;
+
+/// Strict-priority consumer of a [`PriorityChannels`] bundle with an 8-packet
+/// fairness quantum (p5-2).
+///
+/// Drains the five class queues in priority order (P0 → P4). When the consumer
+/// has produced `FAIRNESS_QUANTUM` consecutive packets from one class, that
+/// class is *skipped* on the next pass so a lower-priority class may take one
+/// turn; once a lower class is served, the higher classes' quanta are reset so
+/// strict priority resumes. This bounds starvation of P3/P4 when P0/P1/P2 are
+/// continuously loaded without sacrificing strict-priority ordering in the
+/// common case.
+///
+/// ## Deviation from bead vc-244 spec
+///
+/// The bead's pseudocode references `tokio::sync::mpsc::Receiver<Bytes>` for
+/// each class, but the wave-1 ([`PrioritySender`] / [`ClassReceiver`])
+/// implementation that actually landed uses a custom bounded queue (so the
+/// producer side can implement `TailDropOldest` / `HeadDropOldest` policies
+/// that `mpsc` can't express). `PriorityReceiver` therefore wraps
+/// [`ClassReceiver`]s, not `mpsc::Receiver`s. The algorithm — strict priority +
+/// 8-packet fairness quantum — is unchanged.
+///
+/// The bead's pseudocode also asks "If got a packet AND drain_count == 8 →
+/// put back?". With `mpsc` you can't put back; the wave-1 [`ClassReceiver`]
+/// has the same constraint. Resolved by checking the quantum *before*
+/// `try_recv` (peek-by-trying-other-classes-first): the higher-priority
+/// per-class drain counter is consulted before any pop, so we never have to
+/// un-pop.
+pub struct PriorityReceiver {
+    control: ClassReceiver,
+    audio: ClassReceiver,
+    keyframe: ClassReceiver,
+    video_base: ClassReceiver,
+    enhancement: ClassReceiver,
+
+    /// Per-class consecutive drain count. Index matches `Class::all()` order
+    /// (0 = P0Control … 4 = P4Enhancement). Saturates at `FAIRNESS_QUANTUM`
+    /// — once a class hits the quantum it is skipped until lower-priority
+    /// classes get a turn, at which point higher-priority quanta are reset.
+    drain_count_by_class: [u8; 5],
+
+    /// Per-class "we observed the recv() future return None" flag. Used only
+    /// on the await path to skip closed branches in the `tokio::select!`, so
+    /// we don't busy-loop on a permanently-ready None future. Sync-drain
+    /// `try_recv` does not need to consult this — it returns `None` naturally
+    /// for closed-and-empty queues, and the empty-branch reset handles it.
+    closed: [bool; 5],
+}
+
+impl PriorityReceiver {
+    /// Wrap a [`PriorityChannels`] bundle into a single-consumer task that
+    /// drains it with strict-priority + 8-packet fairness.
+    pub fn new(channels: PriorityChannels) -> Self {
+        Self {
+            control: channels.p0_control,
+            audio: channels.p1_audio,
+            keyframe: channels.p2_keyframe,
+            video_base: channels.p3_video_base,
+            enhancement: channels.p4_enhancement,
+            drain_count_by_class: [0; 5],
+            closed: [false; 5],
+        }
+    }
+
+    /// Receive the next packet to send, honoring strict priority + 8-packet
+    /// fairness quantum. Returns `None` only after every class queue has been
+    /// fully drained AND every producer has dropped.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        loop {
+            // Step 1: synchronous priority drain with quantum check.
+            if let Some(b) = self.poll_priority() {
+                return Some(b);
+            }
+
+            // Step 2: full pass with no serve. If any class is quantum-
+            // exhausted (count > 0), reset all quanta — we've given every
+            // class a peek opportunity — and retry the sync pass. This is
+            // what lets a backlogged lower class resume draining once higher
+            // classes are confirmed empty.
+            if self.drain_count_by_class.iter().any(|&c| c > 0) {
+                self.drain_count_by_class = [0; 5];
+                continue;
+            }
+
+            // Step 3: every queue is genuinely empty. If all senders have
+            // dropped we can terminate; otherwise await the next packet.
+            if self.closed.iter().all(|&c| c) {
+                return None;
+            }
+
+            // Step 4: await on whichever class wakes first, with biased
+            // priority. On wake we serve the awoken packet directly (with
+            // the same drain-counter + higher-quanta-reset bookkeeping as
+            // the sync path) and return. A closed-signal wake (`recv`
+            // returned `None`) sets the per-class closed flag and loops
+            // back to re-check liveness.
+            if let Some((idx, bytes)) = self.await_any().await {
+                self.drain_count_by_class[idx] = self.drain_count_by_class[idx].saturating_add(1);
+                for c in 0..idx {
+                    self.drain_count_by_class[c] = 0;
+                }
+                return Some(bytes);
+            }
+        }
+    }
+
+    /// Walk classes in priority order, returning the first packet from a
+    /// class that has data AND is below its fairness quantum. Resets the
+    /// drain counter of any class observed empty on this pass; increments
+    /// the drain counter of the class served and resets all higher-priority
+    /// counters (since serving a lower class means higher classes either had
+    /// nothing to offer or were quantum-exhausted — either way they get a
+    /// fresh round on the next iteration).
+    fn poll_priority(&mut self) -> Option<Bytes> {
+        for class_idx in 0..5 {
+            if self.drain_count_by_class[class_idx] >= FAIRNESS_QUANTUM {
+                continue;
+            }
+            let maybe = self.try_recv_class(class_idx);
+            match maybe {
+                Some(bytes) => {
+                    self.drain_count_by_class[class_idx] =
+                        self.drain_count_by_class[class_idx].saturating_add(1);
+                    // Reset higher-priority quanta so strict priority resumes
+                    // immediately on the next call. Without this, a
+                    // continuously-loaded P0 that had hit count=8 would stay
+                    // skipped indefinitely after a single lower-class serve.
+                    for c in 0..class_idx {
+                        self.drain_count_by_class[c] = 0;
+                    }
+                    return Some(bytes);
+                }
+                None => {
+                    self.drain_count_by_class[class_idx] = 0;
+                }
+            }
+        }
+        None
+    }
+
+    fn try_recv_class(&mut self, class_idx: usize) -> Option<Bytes> {
+        match class_idx {
+            0 => self.control.try_recv(),
+            1 => self.audio.try_recv(),
+            2 => self.keyframe.try_recv(),
+            3 => self.video_base.try_recv(),
+            4 => self.enhancement.try_recv(),
+            _ => unreachable!("class_idx in 0..5"),
+        }
+    }
+
+    /// Await the first class to produce a packet (or signal closed). Uses
+    /// `tokio::select!` with `biased;` so when multiple branches are ready
+    /// simultaneously we still pick the highest-priority class.
+    ///
+    /// Returns `Some((class_idx, bytes))` when a packet was received, or
+    /// `None` when the awoken branch reported the class closed (in which
+    /// case `self.closed[idx]` has been set so the outer loop can re-check
+    /// terminal conditions).
+    async fn await_any(&mut self) -> Option<(usize, Bytes)> {
+        // Borrow each receiver disjointly so `tokio::select!` can poll all
+        // five concurrently without conflicting `&mut self` reborrows.
+        let Self {
+            control,
+            audio,
+            keyframe,
+            video_base,
+            enhancement,
+            closed,
+            ..
+        } = self;
+
+        tokio::select! {
+            biased;
+            res = control.recv(), if !closed[0] => match res {
+                Some(b) => Some((0, b)),
+                None => { closed[0] = true; None }
+            },
+            res = audio.recv(), if !closed[1] => match res {
+                Some(b) => Some((1, b)),
+                None => { closed[1] = true; None }
+            },
+            res = keyframe.recv(), if !closed[2] => match res {
+                Some(b) => Some((2, b)),
+                None => { closed[2] = true; None }
+            },
+            res = video_base.recv(), if !closed[3] => match res {
+                Some(b) => Some((3, b)),
+                None => { closed[3] = true; None }
+            },
+            res = enhancement.recv(), if !closed[4] => match res {
+                Some(b) => Some((4, b)),
+                None => { closed[4] = true; None }
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,5 +1006,201 @@ mod tests {
     fn classify_outbound_capability_announce_is_p0_control() {
         let w = wrapper_with(PacketType::CAPABILITY_ANNOUNCE);
         assert_eq!(classify_outbound(&w, None, None), Class::P0Control);
+    }
+
+    // --- p5-2: PriorityReceiver --------------------------------------------
+
+    fn b(s: &str) -> Bytes {
+        Bytes::from(s.to_owned().into_bytes())
+    }
+
+    /// Tag a payload with its class so a drain assertion can verify the class
+    /// order without needing access to private receiver internals.
+    fn tag(class: Class, n: usize) -> Bytes {
+        b(&format!("{class:?}#{n}"))
+    }
+
+    #[tokio::test]
+    async fn priority_receiver_strict_priority_drains_p0_first() {
+        // Fill all 5 channels with the same count, then verify drain order
+        // is P0Control → P1Audio → P2Keyframe → P3VideoBase → P4Enhancement.
+        // We use a per-class count of 3 (< FAIRNESS_QUANTUM=8) so the
+        // quantum never kicks in — this isolates strict priority.
+        let per_class = 3;
+        let (sender, channels) = PrioritySender::new();
+        for class in Class::all() {
+            for i in 0..per_class {
+                assert_eq!(sender.send(class, tag(class, i)), SendOutcome::Sent);
+            }
+        }
+        let mut rx = PriorityReceiver::new(channels);
+
+        for class in Class::all() {
+            for i in 0..per_class {
+                let got = rx.recv().await.expect("packet must be available");
+                assert_eq!(
+                    got,
+                    tag(class, i),
+                    "expected {class:?}#{i} next under strict priority"
+                );
+            }
+        }
+
+        // After the last packet drains and the producer is dropped, recv
+        // returns None.
+        drop(sender);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn priority_receiver_fairness_quantum_returns_to_p4_when_p0_empty() {
+        // Load P4 with 100 packets; leave P0/P1/P2/P3 empty. After 8 P4
+        // drains, the consumer must peek the higher classes (find them
+        // empty), then proceed back to P4 — i.e., the quantum doesn't
+        // deadlock when nothing is higher-priority.
+        let (sender, channels) = PrioritySender::new();
+        let total = 100;
+        for i in 0..total {
+            assert_eq!(
+                sender.send(Class::P4Enhancement, tag(Class::P4Enhancement, i)),
+                SendOutcome::Sent
+            );
+        }
+        let mut rx = PriorityReceiver::new(channels);
+
+        // All 100 packets should drain in FIFO order despite the quantum
+        // boundary that forces a peek of higher classes every 8 drains.
+        for i in 0..total {
+            let got = rx.recv().await.expect("packet must be available");
+            assert_eq!(got, tag(Class::P4Enhancement, i));
+        }
+
+        drop(sender);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn priority_receiver_p0_preempts_mid_p4_drain() {
+        // While the consumer is partway through a P4 backlog, push a P0
+        // packet. The next recv must return P0 (strict priority), then
+        // resume P4.
+        let (sender, channels) = PrioritySender::new();
+        for i in 0..20 {
+            assert_eq!(
+                sender.send(Class::P4Enhancement, tag(Class::P4Enhancement, i)),
+                SendOutcome::Sent
+            );
+        }
+        let mut rx = PriorityReceiver::new(channels);
+
+        // Drain a few P4 packets first (well below the quantum).
+        for i in 0..3 {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                tag(Class::P4Enhancement, i),
+                "P4 drain prefix"
+            );
+        }
+
+        // Now inject a P0 control packet. The producer half is non-async,
+        // so we don't need to yield — the packet is immediately visible
+        // via try_recv on the consumer's next call.
+        assert_eq!(
+            sender.send(Class::P0Control, tag(Class::P0Control, 0)),
+            SendOutcome::Sent
+        );
+
+        let preempt = rx.recv().await.expect("P0 packet must preempt P4");
+        assert_eq!(
+            preempt,
+            tag(Class::P0Control, 0),
+            "P0 must win strict priority over remaining P4 backlog"
+        );
+
+        // After the P0 packet, the remaining 17 P4 packets drain in order.
+        for i in 3..20 {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                tag(Class::P4Enhancement, i),
+                "P4 backlog should resume after P0 preempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_receiver_continuous_p0_yields_to_p4_every_quantum() {
+        // The "real" starvation-prevention case: P0 has more than enough
+        // backlog to starve P4 under pure strict priority. Verify that
+        // after exactly FAIRNESS_QUANTUM P0 drains, the consumer serves
+        // one P4 packet, then resumes P0.
+        let (sender, channels) = PrioritySender::new();
+        let p0_count = (FAIRNESS_QUANTUM as usize) * 2; // 16
+        for i in 0..p0_count {
+            assert_eq!(
+                sender.send(Class::P0Control, tag(Class::P0Control, i)),
+                SendOutcome::Sent
+            );
+        }
+        for i in 0..2 {
+            assert_eq!(
+                sender.send(Class::P4Enhancement, tag(Class::P4Enhancement, i)),
+                SendOutcome::Sent
+            );
+        }
+        let mut rx = PriorityReceiver::new(channels);
+
+        // Expect: 8 P0, 1 P4, 8 P0, 1 P4.
+        let q = FAIRNESS_QUANTUM as usize;
+        for i in 0..q {
+            assert_eq!(rx.recv().await.unwrap(), tag(Class::P0Control, i));
+        }
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            tag(Class::P4Enhancement, 0),
+            "after {q} P0 drains, one P4 must be served"
+        );
+        for i in q..(2 * q) {
+            assert_eq!(rx.recv().await.unwrap(), tag(Class::P0Control, i));
+        }
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            tag(Class::P4Enhancement, 1),
+            "after another {q} P0 drains, the second P4 must be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_receiver_awaits_when_all_empty() {
+        // recv must block (not return None) when queues are empty but
+        // senders are alive. We verify by racing recv against a delayed
+        // producer; the recv future should resolve only after the producer
+        // sends.
+        let (sender, channels) = PrioritySender::new();
+        let mut rx = PriorityReceiver::new(channels);
+
+        let h = tokio::spawn(async move { rx.recv().await });
+
+        // Yield to let the receiver task park itself on the await path.
+        tokio::task::yield_now().await;
+        assert!(!h.is_finished(), "recv must await when all queues empty");
+
+        assert_eq!(sender.send(Class::P2Keyframe, b("kf-1")), SendOutcome::Sent);
+        let got = h.await.unwrap().expect("packet must be delivered");
+        assert_eq!(got, b("kf-1"));
+    }
+
+    #[tokio::test]
+    async fn priority_receiver_returns_none_after_all_senders_drop() {
+        // Drain remaining packets then signal closure by dropping the
+        // (single) sender; recv must eventually return None.
+        let (sender, channels) = PrioritySender::new();
+        sender.send(Class::P1Audio, b("a"));
+        sender.send(Class::P1Audio, b("b"));
+        drop(sender);
+
+        let mut rx = PriorityReceiver::new(channels);
+        assert_eq!(rx.recv().await.unwrap(), b("a"));
+        assert_eq!(rx.recv().await.unwrap(), b("b"));
+        assert!(rx.recv().await.is_none());
     }
 }
