@@ -273,8 +273,9 @@ impl Actor for WtChatSession {
 /// Routes packets into the per-session [`PrioritySender`] (p5-4 swap).
 /// `parse_and_inspect` produces the outer wrapper and (for MEDIA) the inner
 /// `MediaPacket` in a single pass so `classify_outbound` can read the routing
-/// header without a second parse. Drops feed the legacy per-sender
-/// `CongestionTracker`; p5-7 will introduce per-class drop wiring on top.
+/// header without a second parse. Per-class drops feed
+/// [`SessionLogic::on_outbound_drop_class`] (p5-7), which routes through the
+/// class-aware [`CongestionTracker`] to emit CONGESTION on threshold trip.
 ///
 /// Note: `msg.session` is the **receiver's** session ID (set by
 /// `chat_server::handle_msg`), NOT the sender's. The sender's session ID
@@ -300,13 +301,17 @@ impl Handler<Message> for WtChatSession {
 
         match self.outbound_tx.send(class, bytes) {
             SendOutcome::Sent => {}
-            SendOutcome::Dropped(_class, _reason) => {
+            SendOutcome::Dropped(dropped_class, _reason) => {
                 // Priority queue dropped a packet under its per-class
-                // policy. Preserve legacy CONGESTION feedback by reporting
-                // the drop against the original sender's session id.
-                // Per-class drop wiring (p5-7) will refine this.
+                // policy. Route the drop through the class-aware
+                // CongestionTracker path (p5-7) so a class-specific drop
+                // fires a class-specific CONGESTION signal back to the
+                // sender. `sender_session_id == 0` means we couldn't parse
+                // the wrapper (e.g. a server-originated frame) — skip
+                // attribution in that case.
                 if sender_session_id != 0 {
-                    self.logic.on_outbound_drop(sender_session_id);
+                    self.logic
+                        .on_outbound_drop_class(sender_session_id, dropped_class);
                 }
             }
             SendOutcome::Refused(_) => {

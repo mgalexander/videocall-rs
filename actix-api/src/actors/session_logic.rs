@@ -36,6 +36,7 @@ use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
 };
 use crate::session_manager::SessionManager;
+use crate::sfu::priority_queue::Class;
 use actix::Addr;
 use protobuf::Message as ProtobufMessage;
 use std::collections::{HashMap, VecDeque};
@@ -78,56 +79,38 @@ pub enum InboundAction {
 // Congestion Tracking
 // =========================================================================
 
-/// Priority class for outbound packets.
+/// Drop-count threshold within [`class_window`] at which a CONGESTION
+/// notification should fire for this class.
 ///
-/// NOTE: This is a temporary local stub pending p5-1 (vc-3ah), which will
-/// introduce `actix-api/src/sfu/priority_queue.rs` as the canonical home for
-/// `Class`. p5-7 will migrate call sites and this stub will be removed at
-/// that time. The variants here are kept identical to the planned p5-1
-/// shape so the migration is mechanical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Class {
-    P0Control,
-    P1Audio,
-    P2Keyframe,
-    P3VideoBase,
-    P4Enhancement,
+/// P0Control has a threshold of 0 because P0 packets are NeverDrop —
+/// they are not supposed to be dropped at all. Any call into the
+/// class-aware path for P0Control indicates an upstream bug.
+fn class_threshold(class: Class) -> u32 {
+    match class {
+        Class::P0Control => 0,
+        Class::P1Audio => 3,
+        Class::P2Keyframe => 1,
+        Class::P3VideoBase => 5,
+        Class::P4Enhancement => 10,
+    }
 }
 
-impl Class {
-    /// Drop-count threshold within [`Class::window`] at which a CONGESTION
-    /// notification should fire for this class.
-    ///
-    /// P0Control has a threshold of 0 because P0 packets are NeverDrop —
-    /// they are not supposed to be dropped at all. Any call into the
-    /// class-aware path for P0Control indicates an upstream bug.
-    fn threshold(self) -> u32 {
-        match self {
-            Class::P0Control => 0,
-            Class::P1Audio => 3,
-            Class::P2Keyframe => 1,
-            Class::P3VideoBase => 5,
-            Class::P4Enhancement => 10,
-        }
-    }
-
-    /// Sliding window over which drops are counted for this class.
-    ///
-    /// For P2Keyframe the window is effectively irrelevant (threshold=1
-    /// fires on the very first drop), but we still need a value for the
-    /// timestamp deque's compaction logic — 60s is generous enough that a
-    /// single stray entry will be discarded eventually without bloating
-    /// memory.
-    fn window(self) -> Duration {
-        match self {
-            // P0Control should never be dropped; window is irrelevant.
-            Class::P0Control => Duration::from_secs(1),
-            Class::P1Audio => Duration::from_millis(500),
-            Class::P2Keyframe => Duration::from_secs(60),
-            // Preserve the legacy 5-in-1s threshold for the base video layer.
-            Class::P3VideoBase => Duration::from_secs(1),
-            Class::P4Enhancement => Duration::from_secs(1),
-        }
+/// Sliding window over which drops are counted for this class.
+///
+/// For P2Keyframe the window is effectively irrelevant (threshold=1
+/// fires on the very first drop), but we still need a value for the
+/// timestamp deque's compaction logic — 60s is generous enough that a
+/// single stray entry will be discarded eventually without bloating
+/// memory.
+fn class_window(class: Class) -> Duration {
+    match class {
+        // P0Control should never be dropped; window is irrelevant.
+        Class::P0Control => Duration::from_secs(1),
+        Class::P1Audio => Duration::from_millis(500),
+        Class::P2Keyframe => Duration::from_secs(60),
+        // Preserve the legacy 5-in-1s threshold for the base video layer.
+        Class::P3VideoBase => Duration::from_secs(1),
+        Class::P4Enhancement => Duration::from_secs(1),
     }
 }
 
@@ -302,8 +285,8 @@ impl CongestionTracker {
             return true;
         }
 
-        let window = class.window();
-        let threshold = class.threshold();
+        let window = class_window(class);
+        let threshold = class_threshold(class);
         let state = self
             .classes
             .entry(class)
@@ -677,42 +660,71 @@ impl SessionLogic {
     /// If the drop threshold is exceeded, a CONGESTION `PacketWrapper` is
     /// published to NATS so the sender's client can step down its quality
     /// tier. The notification is rate-limited per sender session.
+    ///
+    /// This is the legacy per-sender path. Prefer
+    /// [`SessionLogic::on_outbound_drop_class`] for new call sites — it routes
+    /// the drop through the class-aware [`CongestionTracker::record_drop_with_class`]
+    /// path so a class-specific drop fires a class-specific CONGESTION signal.
     pub fn on_outbound_drop(&mut self, sender_session_id: u64) {
         if let Some(sender_sid) = self.congestion_tracker.record_drop(sender_session_id) {
-            warn!(
-                "Congestion: session {} dropping packets from sender {}, sending CONGESTION signal",
-                self.id, sender_sid,
-            );
+            self.emit_congestion(sender_sid);
+        }
+    }
 
-            // Build a CONGESTION PacketWrapper targeted at the sender.
-            // The `user_id` is set to our session's user_id so the sender
-            // knows which receiver is congested. The `session_id` is set to
-            // the sender's session_id so NATS routing delivers it there.
-            let congestion_packet = PacketWrapper {
-                packet_type: PacketType::CONGESTION.into(),
-                user_id: self.user_id.as_bytes().to_vec(),
-                session_id: sender_sid,
-                ..Default::default()
-            };
+    /// Class-aware companion to [`SessionLogic::on_outbound_drop`].
+    ///
+    /// Records the drop into the per-class [`CongestionTracker`] state and, if
+    /// the class-specific threshold has been exceeded, publishes a CONGESTION
+    /// signal targeted at the sender. This is the wire-up that closes the
+    /// loop from `PrioritySender::send()`'s `SendOutcome::Dropped(class, _)`
+    /// back to the originating sender (p5-7).
+    pub fn on_outbound_drop_class(&mut self, sender_session_id: u64, class: Class) {
+        if self.congestion_tracker.record_drop_with_class(class) {
+            self.emit_congestion(sender_session_id);
+        }
+    }
 
-            match congestion_packet.write_to_bytes() {
-                Ok(bytes) => {
-                    // Publish to the sender's NATS subject so only the
-                    // targeted sender receives the CONGESTION signal.
-                    // The sender's subscription filter (`room.{room}.*`)
-                    // matches `room.{room}.{sender_sid}`.
-                    let subject = format!("room.{}.{}", self.room.replace(' ', "_"), sender_sid);
-                    let nc = self.nats_client.clone();
-                    let bytes = bytes::Bytes::from(bytes);
-                    tokio::spawn(async move {
-                        if let Err(e) = nc.publish(subject, bytes).await {
-                            error!("Failed to publish CONGESTION signal: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to serialize CONGESTION packet: {}", e);
-                }
+    /// Publish a CONGESTION `PacketWrapper` targeted at `sender_sid` via NATS.
+    ///
+    /// Shared helper for the legacy per-sender path
+    /// ([`SessionLogic::on_outbound_drop`]) and the class-aware path
+    /// ([`SessionLogic::on_outbound_drop_class`]). The receiver's session
+    /// emits the signal; routing delivers it to the sender's NATS subject so
+    /// only the targeted sender receives it.
+    fn emit_congestion(&self, sender_sid: u64) {
+        warn!(
+            "Congestion: session {} dropping packets from sender {}, sending CONGESTION signal",
+            self.id, sender_sid,
+        );
+
+        // Build a CONGESTION PacketWrapper targeted at the sender.
+        // The `user_id` is set to our session's user_id so the sender
+        // knows which receiver is congested. The `session_id` is set to
+        // the sender's session_id so NATS routing delivers it there.
+        let congestion_packet = PacketWrapper {
+            packet_type: PacketType::CONGESTION.into(),
+            user_id: self.user_id.as_bytes().to_vec(),
+            session_id: sender_sid,
+            ..Default::default()
+        };
+
+        match congestion_packet.write_to_bytes() {
+            Ok(bytes) => {
+                // Publish to the sender's NATS subject so only the
+                // targeted sender receives the CONGESTION signal.
+                // The sender's subscription filter (`room.{room}.*`)
+                // matches `room.{room}.{sender_sid}`.
+                let subject = format!("room.{}.{}", self.room.replace(' ', "_"), sender_sid);
+                let nc = self.nats_client.clone();
+                let bytes = bytes::Bytes::from(bytes);
+                tokio::spawn(async move {
+                    if let Err(e) = nc.publish(subject, bytes).await {
+                        error!("Failed to publish CONGESTION signal: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to serialize CONGESTION packet: {}", e);
             }
         }
     }
@@ -1204,6 +1216,37 @@ mod tests {
         }
         // 5th call fires.
         assert!(tracker.record_drop_with_class(Class::P3VideoBase));
+    }
+
+    /// p5-7 wire-up: a synthetic burst of 5 P3VideoBase drops within the 1s
+    /// window must cross the class-specific threshold and surface as a
+    /// `true` return from `CongestionTracker::record_drop_with_class`, which
+    /// is the boolean that `SessionLogic::on_outbound_drop_class` (added in
+    /// p5-7) routes into the CONGESTION emit path.
+    ///
+    /// The wire-up itself (`on_outbound_drop_class` → tracker → NATS publish)
+    /// is exercised end-to-end by the transport Handler<Message> arms in
+    /// `wt_chat_session.rs` and `ws_chat_session.rs`. Constructing a full
+    /// `SessionLogic` here would require a live NATS client and chat-server
+    /// addr, so this test verifies the tracker boundary the transports call
+    /// through. Greppable by the bead id.
+    #[test]
+    fn test_p5_7_p3videobase_burst_fires_congestion() {
+        let mut tracker = CongestionTracker::new();
+        // First 4 drops in a tight burst stay below the 5/1s threshold.
+        for i in 0..4 {
+            assert!(
+                !tracker.record_drop_with_class(Class::P3VideoBase),
+                "p5-7: drop #{} should be below threshold",
+                i + 1
+            );
+        }
+        // 5th drop within the 1s window crosses the threshold — this is the
+        // boolean `on_outbound_drop_class` consumes to fire CONGESTION.
+        assert!(
+            tracker.record_drop_with_class(Class::P3VideoBase),
+            "p5-7: 5th P3VideoBase drop within 1s must fire CONGESTION"
+        );
     }
 
     #[test]

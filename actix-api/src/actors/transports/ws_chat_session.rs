@@ -247,8 +247,8 @@ impl Handler<Message> for WsChatSession {
         let bytes = self.logic.handle_outbound(&msg);
 
         // Parse the wrapper once for classification AND sender-session-id
-        // attribution (the latter is what `on_outbound_drop` keys congestion
-        // tracking off of, matching the WT-side `Handler<Message>`).
+        // attribution (the latter is what `on_outbound_drop_class` keys
+        // CONGESTION emission off of, matching the WT-side `Handler<Message>`).
         let parsed = parse_and_inspect(bytes.as_ref());
         let class = match &parsed {
             Some(p) => {
@@ -273,15 +273,15 @@ impl Handler<Message> for WsChatSession {
                     dropped_class,
                     reason
                 );
-                // Preserve legacy CONGESTION attribution: surface the drop to
-                // the sender's CongestionTracker so the threshold-based
-                // CONGESTION signal still fires while p5-7/p5-10 wire per-class
-                // accounting in. Upstream filters (CONGESTION carve-out
-                // p2-5/vc-b95, self-skip p2-3, AllowSet p3-5, layer-drop p4-7)
-                // all run BEFORE this send, so only already-eligible packets
-                // reach this drop point.
+                // Route the drop through the class-aware CongestionTracker
+                // path (p5-7) so a class-specific drop fires a class-specific
+                // CONGESTION signal back to the sender. Upstream filters
+                // (CONGESTION carve-out p2-5/vc-b95, self-skip p2-3,
+                // AllowSet p3-5, layer-drop p4-7) all run BEFORE this send,
+                // so only already-eligible packets reach this drop point.
                 if sender_session_id != 0 {
-                    self.logic.on_outbound_drop(sender_session_id);
+                    self.logic
+                        .on_outbound_drop_class(sender_session_id, dropped_class);
                 }
             }
             SendOutcome::Refused(_) => {
