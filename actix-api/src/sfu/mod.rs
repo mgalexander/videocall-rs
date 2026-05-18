@@ -19,6 +19,7 @@
 pub mod config;
 pub use config::{SfuConfig, SfuMode};
 
+pub mod affinity;
 pub mod forwarder;
 pub mod layer_selector;
 pub mod priority_queue;
