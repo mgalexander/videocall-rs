@@ -39,11 +39,6 @@ const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_3_7_1;
 #[derive(PartialEq,Clone,Default,Debug)]
 pub struct HealthBeaconPacket {
     // message fields
-    ///  Room this beacon applies to. Redundant with the NATS subject
-    ///  (`room.{room_id}.system`) but kept inline so the consumer can
-    ///  validate decoded payloads against their subscription routing.
-    // @@protoc_insertion_point(field:videocall.HealthBeaconPacket.room_id)
-    pub room_id: ::std::string::String,
     ///  Number of members currently tracked in the owner pod's RoomState
     ///  (senders + observers). Drives the participant soft-cap check.
     // @@protoc_insertion_point(field:videocall.HealthBeaconPacket.participant_count)
@@ -76,13 +71,8 @@ impl HealthBeaconPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut fields = ::std::vec::Vec::with_capacity(3);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "room_id",
-            |m: &HealthBeaconPacket| { &m.room_id },
-            |m: &mut HealthBeaconPacket| { &mut m.room_id },
-        ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "participant_count",
             |m: &HealthBeaconPacket| { &m.participant_count },
@@ -116,9 +106,6 @@ impl ::protobuf::Message for HealthBeaconPacket {
     fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
         while let Some(tag) = is.read_raw_tag_or_eof()? {
             match tag {
-                10 => {
-                    self.room_id = is.read_string()?;
-                },
                 16 => {
                     self.participant_count = is.read_uint32()?;
                 },
@@ -140,9 +127,6 @@ impl ::protobuf::Message for HealthBeaconPacket {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if !self.room_id.is_empty() {
-            my_size += ::protobuf::rt::string_size(1, &self.room_id);
-        }
         if self.participant_count != 0 {
             my_size += ::protobuf::rt::uint32_size(2, self.participant_count);
         }
@@ -158,9 +142,6 @@ impl ::protobuf::Message for HealthBeaconPacket {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if !self.room_id.is_empty() {
-            os.write_string(1, &self.room_id)?;
-        }
         if self.participant_count != 0 {
             os.write_uint32(2, self.participant_count)?;
         }
@@ -187,7 +168,6 @@ impl ::protobuf::Message for HealthBeaconPacket {
     }
 
     fn clear(&mut self) {
-        self.room_id.clear();
         self.participant_count = 0;
         self.cpu_load = 0.;
         self.reported_at_ms = 0;
@@ -196,7 +176,6 @@ impl ::protobuf::Message for HealthBeaconPacket {
 
     fn default_instance() -> &'static HealthBeaconPacket {
         static instance: HealthBeaconPacket = HealthBeaconPacket {
-            room_id: ::std::string::String::new(),
             participant_count: 0,
             cpu_load: 0.,
             reported_at_ms: 0,
@@ -224,54 +203,56 @@ impl ::protobuf::reflect::ProtobufValue for HealthBeaconPacket {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x20types/health_beacon_packet.proto\x12\tvideocall\"\x9b\x01\n\x12Hea\
-    lthBeaconPacket\x12\x17\n\x07room_id\x18\x01\x20\x01(\tR\x06roomId\x12+\
-    \n\x11participant_count\x18\x02\x20\x01(\rR\x10participantCount\x12\x19\
-    \n\x08cpu_load\x18\x03\x20\x01(\x02R\x07cpuLoad\x12$\n\x0ereported_at_ms\
-    \x18\x04\x20\x01(\x04R\x0creportedAtMsJ\xfd\x0c\n\x06\x12\x04\0\0#\x01\n\
-    \x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x12\n\xd6\
-    \x04\n\x02\x04\0\x12\x04\x0f\0#\x01\x1a\xc9\x04\x20HealthBeaconPacket\
-    \x20\xe2\x80\x94\x20owner-pod\x20liveness\x20signal\x20for\x20the\x20SFU\
-    \x20spillover\n\x20controller\x20(P6\x20wave-2\x20bead\x20vc-kol\x20/\
-    \x20p6-7).\n\n\x20The\x20owner\x20pod\x20for\x20a\x20given\x20room\x20(d\
-    etermined\x20by\x20`affinity::is_owner`)\n\x20publishes\x20one\x20of\x20\
-    these\x20every\x205\x20seconds\x20to\x20`room.{room_id}.system`\n\x20wra\
-    pped\x20in\x20a\x20PacketWrapper\x20with\x20`packet_type\x20=\x20HEALTH_\
-    BEACON`\x20and\n\x20`user_id\x20=\x20SYSTEM_USER_ID`.\x20Spill\x20pods\
-    \x20(p6-8)\x20consume\x20the\x20beacon\n\x20stream\x20to\x20decide\x20wh\
-    ether\x20to\x20accept\x20additional\x20joiners\x20for\x20the\x20room.\n\
-    \n\x20All\x20fields\x20are\x20small\x20primitives\x20\xe2\x80\x94\x20kee\
-    p\x20the\x20payload\x20tiny\x20so\x20beacons\n\x20stay\x20cheap\x20at\
-    \x20fleet\x20scale\x20(many\x20rooms\x20\xc3\x97\x200.2\x20Hz\x20cadence\
-    ).\n\n\n\n\x03\x04\0\x01\x12\x03\x0f\x08\x1a\n\xca\x01\n\x04\x04\0\x02\0\
-    \x12\x03\x13\x02\x15\x1a\xbc\x01\x20Room\x20this\x20beacon\x20applies\
-    \x20to.\x20Redundant\x20with\x20the\x20NATS\x20subject\n\x20(`room.{room\
-    _id}.system`)\x20but\x20kept\x20inline\x20so\x20the\x20consumer\x20can\n\
-    \x20validate\x20decoded\x20payloads\x20against\x20their\x20subscription\
-    \x20routing.\n\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x13\x02\x08\n\x0c\n\
-    \x05\x04\0\x02\0\x01\x12\x03\x13\t\x10\n\x0c\n\x05\x04\0\x02\0\x03\x12\
-    \x03\x13\x13\x14\n\x8f\x01\n\x04\x04\0\x02\x01\x12\x03\x17\x02\x1f\x1a\
-    \x81\x01\x20Number\x20of\x20members\x20currently\x20tracked\x20in\x20the\
-    \x20owner\x20pod's\x20RoomState\n\x20(senders\x20+\x20observers).\x20Dri\
-    ves\x20the\x20participant\x20soft-cap\x20check.\n\n\x0c\n\x05\x04\0\x02\
-    \x01\x05\x12\x03\x17\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x17\t\
-    \x1a\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x17\x1d\x1e\n\x96\x02\n\x04\
-    \x04\0\x02\x02\x12\x03\x1d\x02\x15\x1a\x88\x02\x20Estimated\x20CPU\x20lo\
+    \n\x20types/health_beacon_packet.proto\x12\tvideocall\"\x91\x01\n\x12Hea\
+    lthBeaconPacket\x12+\n\x11participant_count\x18\x02\x20\x01(\rR\x10parti\
+    cipantCount\x12\x19\n\x08cpu_load\x18\x03\x20\x01(\x02R\x07cpuLoad\x12$\
+    \n\x0ereported_at_ms\x18\x04\x20\x01(\x04R\x0creportedAtMsJ\x04\x08\x01\
+    \x10\x02R\x07room_idJ\xd7\r\n\x06\x12\x04\0\0%\x01\n\x08\n\x01\x0c\x12\
+    \x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x12\n\xd6\x04\n\x02\x04\0\x12\
+    \x04\x0f\0%\x01\x1a\xc9\x04\x20HealthBeaconPacket\x20\xe2\x80\x94\x20own\
+    er-pod\x20liveness\x20signal\x20for\x20the\x20SFU\x20spillover\n\x20cont\
+    roller\x20(P6\x20wave-2\x20bead\x20vc-kol\x20/\x20p6-7).\n\n\x20The\x20o\
+    wner\x20pod\x20for\x20a\x20given\x20room\x20(determined\x20by\x20`affini\
+    ty::is_owner`)\n\x20publishes\x20one\x20of\x20these\x20every\x205\x20sec\
+    onds\x20to\x20`room.{room_id}.system`\n\x20wrapped\x20in\x20a\x20PacketW\
+    rapper\x20with\x20`packet_type\x20=\x20HEALTH_BEACON`\x20and\n\x20`user_\
+    id\x20=\x20SYSTEM_USER_ID`.\x20Spill\x20pods\x20(p6-8)\x20consume\x20the\
+    \x20beacon\n\x20stream\x20to\x20decide\x20whether\x20to\x20accept\x20add\
+    itional\x20joiners\x20for\x20the\x20room.\n\n\x20All\x20fields\x20are\
+    \x20small\x20primitives\x20\xe2\x80\x94\x20keep\x20the\x20payload\x20tin\
+    y\x20so\x20beacons\n\x20stay\x20cheap\x20at\x20fleet\x20scale\x20(many\
+    \x20rooms\x20\xc3\x97\x200.2\x20Hz\x20cadence).\n\n\n\n\x03\x04\0\x01\
+    \x12\x03\x0f\x08\x1a\n\x8c\x02\n\x03\x04\0\t\x12\x03\x14\x02\r\x1a\xff\
+    \x01\x20Field\x201\x20previously\x20held\x20a\x20redundant\x20`room_id`\
+    \x20string.\x20The\x20room\x20id\n\x20is\x20already\x20encoded\x20in\x20\
+    the\x20NATS\x20subject\x20(`room.{room_id}.system`),\n\x20so\x20embeddin\
+    g\x20a\x2036-byte\x20UUID\x20per\x20beacon\x20doubled\x20wire\x20size\
+    \x20for\x20no\n\x20benefit.\x20Reserve\x20to\x20prevent\x20accidental\
+    \x20reuse\x20(vc-4le).\n\n\x0b\n\x04\x04\0\t\0\x12\x03\x14\x0b\x0c\n\x0c\
+    \n\x05\x04\0\t\0\x01\x12\x03\x14\x0b\x0c\n\x0c\n\x05\x04\0\t\0\x02\x12\
+    \x03\x14\x0b\x0c\n\n\n\x03\x04\0\n\x12\x03\x15\x02\x15\n\x0b\n\x04\x04\0\
+    \n\0\x12\x03\x15\x0b\x14\n\x8f\x01\n\x04\x04\0\x02\0\x12\x03\x19\x02\x1f\
+    \x1a\x81\x01\x20Number\x20of\x20members\x20currently\x20tracked\x20in\
+    \x20the\x20owner\x20pod's\x20RoomState\n\x20(senders\x20+\x20observers).\
+    \x20Drives\x20the\x20participant\x20soft-cap\x20check.\n\n\x0c\n\x05\x04\
+    \0\x02\0\x05\x12\x03\x19\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x19\
+    \t\x1a\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x19\x1d\x1e\n\x96\x02\n\x04\
+    \x04\0\x02\x01\x12\x03\x1f\x02\x15\x1a\x88\x02\x20Estimated\x20CPU\x20lo\
     ad\x20on\x20the\x20emitting\x20pod,\x20normalised\x20to\x20`[0,\x201]`.\
     \n\x20Currently\x20sourced\x20from\x20`/proc/loadavg`\x201-min\x20averag\
     e\x20divided\x20by\n\x20online\x20CPU\x20count\x20on\x20Linux;\x20falls\
     \x20back\x20to\x200.0\x20if\x20the\x20read\x20fails.\n\x200..1\x20is\x20\
     the\x20contract\x20the\x20consumer\x20relies\x20on\x20for\x20the\x20soft\
-    -cap\x20check.\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x1d\x02\x07\n\x0c\
-    \n\x05\x04\0\x02\x02\x01\x12\x03\x1d\x08\x10\n\x0c\n\x05\x04\0\x02\x02\
-    \x03\x12\x03\x1d\x13\x14\n\xd9\x01\n\x04\x04\0\x02\x03\x12\x03\"\x02\x1c\
+    -cap\x20check.\n\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x1f\x02\x07\n\x0c\
+    \n\x05\x04\0\x02\x01\x01\x12\x03\x1f\x08\x10\n\x0c\n\x05\x04\0\x02\x01\
+    \x03\x12\x03\x1f\x13\x14\n\xd9\x01\n\x04\x04\0\x02\x02\x12\x03$\x02\x1c\
     \x1a\xcb\x01\x20Owner\x20pod's\x20wall-clock\x20time\x20at\x20the\x20mom\
     ent\x20the\x20beacon\x20was\x20assembled,\n\x20expressed\x20as\x20UNIX\
     \x20milliseconds.\x20Lets\x20the\x20consumer\x20estimate\x20the\x20age\n\
     \x20of\x20a\x20beacon\x20against\x20its\x20own\x20clock\x20(and\x20detec\
-    t\x20stalled\x20emitters).\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\"\x02\
-    \x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\"\t\x17\n\x0c\n\x05\x04\0\x02\
-    \x03\x03\x12\x03\"\x1a\x1bb\x06proto3\
+    t\x20stalled\x20emitters).\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03$\x02\
+    \x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03$\t\x17\n\x0c\n\x05\x04\0\x02\
+    \x02\x03\x12\x03$\x1a\x1bb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

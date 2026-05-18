@@ -351,7 +351,6 @@ fn health_beacon_dropped_for_all_receivers_in_both_modes() {
     // `build_health_beacon_payload` emits in production.
     fn build_beacon_payload() -> Bytes {
         let beacon = HealthBeaconPacket {
-            room_id: TEST_ROOM.to_string(),
             participant_count: 4,
             cpu_load: 0.25,
             reported_at_ms: 1_700_000_000_000,

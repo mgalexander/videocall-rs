@@ -170,12 +170,14 @@ pub(crate) fn system_subject(room_id: &str) -> String {
 
 /// Build the wire payload for a single beacon tick.
 ///
-/// Pure function: takes the per-tick inputs (room id, member count, cpu
-/// load, wall-clock instant) and returns the serialized
-/// `PacketWrapper(HealthBeaconPacket)` bytes. Extracted so unit tests can
-/// assert the bytes round-trip without standing up the full task loop.
+/// Pure function: takes the per-tick inputs (member count, cpu load,
+/// wall-clock instant) and returns the serialized
+/// `PacketWrapper(HealthBeaconPacket)` bytes. The room id is encoded in
+/// the NATS subject (`room.{room_id}.system`) — embedding it in the
+/// payload would double wire size for no benefit (vc-4le). Extracted so
+/// unit tests can assert the bytes round-trip without standing up the
+/// full task loop.
 pub fn build_health_beacon_payload(
-    room_id: &str,
     participant_count: u32,
     cpu_load: f32,
     reported_at: SystemTime,
@@ -185,10 +187,9 @@ pub fn build_health_beacon_payload(
         .map(|d| d.as_millis() as u64)
         // Pre-UNIX-epoch clocks are pathological; emit 0 rather than
         // failing the beacon. Consumers can detect this via the rest of
-        // the payload (room_id, participant_count) staying valid.
+        // the payload (participant_count) staying valid.
         .unwrap_or(0);
     let beacon = HealthBeaconPacket {
-        room_id: room_id.to_string(),
         participant_count,
         cpu_load: cpu_load.clamp(0.0, 1.0),
         reported_at_ms,
@@ -342,8 +343,7 @@ pub fn spawn_health_beacon_loop_with_interval(
                 Err(poisoned) => poisoned.into_inner().member_count() as u32,
             };
             let cpu = cpu_load.load();
-            let payload =
-                build_health_beacon_payload(&room_id, participant_count, cpu, SystemTime::now());
+            let payload = build_health_beacon_payload(participant_count, cpu, SystemTime::now());
             publisher.publish(subject.clone(), payload);
         }
     });
@@ -438,17 +438,15 @@ mod tests {
         HealthBeaconPacket::parse_from_bytes(&wrapper.data).expect("decode beacon")
     }
 
-    /// `build_health_beacon_payload` round-trips room id, count, and cpu.
+    /// `build_health_beacon_payload` round-trips count, cpu, and timestamp.
     #[test]
     fn payload_round_trips_fields() {
         let payload = build_health_beacon_payload(
-            "demo-room",
             7,
             0.42,
             UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
         );
         let beacon = decode(&payload);
-        assert_eq!(beacon.room_id, "demo-room");
         assert_eq!(beacon.participant_count, 7);
         assert!((beacon.cpu_load - 0.42).abs() < 1e-6);
         assert_eq!(beacon.reported_at_ms, 1_700_000_000_000);
@@ -457,10 +455,10 @@ mod tests {
     /// Out-of-range CPU load is clamped to `[0, 1]` on the wire.
     #[test]
     fn payload_clamps_cpu_load() {
-        let high = build_health_beacon_payload("r", 0, 2.5, UNIX_EPOCH);
+        let high = build_health_beacon_payload(0, 2.5, UNIX_EPOCH);
         assert!((decode(&high).cpu_load - 1.0).abs() < 1e-6);
 
-        let low = build_health_beacon_payload("r", 0, -0.7, UNIX_EPOCH);
+        let low = build_health_beacon_payload(0, -0.7, UNIX_EPOCH);
         assert!(decode(&low).cpu_load.abs() < 1e-6);
     }
 
@@ -500,7 +498,6 @@ mod tests {
         assert_eq!(subject, "room.room-5.system");
         let beacon = decode(payload);
         assert_eq!(beacon.participant_count, 5);
-        assert_eq!(beacon.room_id, "room-5");
         assert!((beacon.cpu_load - 0.25).abs() < 1e-6);
         assert!(beacon.reported_at_ms > 0, "reported_at_ms should be set");
 

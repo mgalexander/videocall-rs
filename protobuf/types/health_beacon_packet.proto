@@ -14,10 +14,12 @@ package videocall;
 // All fields are small primitives — keep the payload tiny so beacons
 // stay cheap at fleet scale (many rooms × 0.2 Hz cadence).
 message HealthBeaconPacket {
-  // Room this beacon applies to. Redundant with the NATS subject
-  // (`room.{room_id}.system`) but kept inline so the consumer can
-  // validate decoded payloads against their subscription routing.
-  string room_id = 1;
+  // Field 1 previously held a redundant `room_id` string. The room id
+  // is already encoded in the NATS subject (`room.{room_id}.system`),
+  // so embedding a 36-byte UUID per beacon doubled wire size for no
+  // benefit. Reserve to prevent accidental reuse (vc-4le).
+  reserved 1;
+  reserved "room_id";
 
   // Number of members currently tracked in the owner pod's RoomState
   // (senders + observers). Drives the participant soft-cap check.
