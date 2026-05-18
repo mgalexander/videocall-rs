@@ -37,6 +37,7 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::EncodedVideoChunkMetadata;
 use web_sys::HtmlVideoElement;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
@@ -54,6 +55,7 @@ use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
+use super::routing::extract_temporal_layer_id;
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
@@ -352,7 +354,15 @@ impl CameraEncoder {
             let mut last_chunk_time = window().performance().unwrap().now();
             let mut chunks_in_last_second = 0;
 
-            Box::new(move |chunk: JsValue| {
+            // WebCodecs `VideoEncoder.output(chunk, metadata)` — the 2nd
+            // argument carries SVC layer info when the encoder is configured
+            // with `scalability_mode = "L1T3"` (bead p4-1). We type the
+            // closure as `FnMut(JsValue, JsValue)` so JS calls land in Rust
+            // with both args; web-sys' typed `EncodedVideoChunkMetadata`
+            // wrapper handles the field access. A missing/undefined `svc`
+            // field degrades to `temporal_layer_id = 0` (see
+            // `extract_temporal_layer_id`), which is safe for the SFU.
+            Box::new(move |chunk: JsValue, metadata: JsValue| {
                 let now = window().performance().unwrap().now();
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
@@ -372,6 +382,16 @@ impl CameraEncoder {
                     buffer.resize(byte_length, 0);
                 }
 
+                // Extract VP9 SVC temporal layer id from the L1T3 metadata.
+                // `JsValue::is_undefined()` guards against UAs that omit the
+                // 2nd argument; in that case we treat the frame as T0.
+                let temporal_layer_id = if metadata.is_undefined() || metadata.is_null() {
+                    0u8
+                } else {
+                    let meta: EncodedVideoChunkMetadata = metadata.unchecked_into();
+                    extract_temporal_layer_id(&meta)
+                };
+
                 // `fetch_add` returns the value BEFORE the increment, matching
                 // the prior semantics of `transform_video_chunk(... sequence_number ...);
                 // sequence_number += 1;`. Relaxed ordering is sufficient: there
@@ -382,6 +402,7 @@ impl CameraEncoder {
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,
+                    temporal_layer_id,
                     buffer.as_mut_slice(),
                     &userid,
                     aes.clone(),
@@ -553,8 +574,11 @@ impl CameraEncoder {
                 error!("error_handler error {e:?}");
             }) as Box<dyn FnMut(JsValue)>);
 
+            // 2-arg closure: WebCodecs `VideoEncoder.output(chunk, metadata)`.
+            // We need both arguments to read `metadata.svc.temporalLayerId`
+            // for the L1T3 RoutingHeader (bead vc-2nh).
             let video_output_handler =
-                Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
+                Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue, JsValue)>);
 
             let video_encoder_init = VideoEncoderInit::new(
                 video_error_handler.as_ref().unchecked_ref(),
