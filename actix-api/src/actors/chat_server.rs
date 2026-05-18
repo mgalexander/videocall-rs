@@ -945,7 +945,19 @@ impl Handler<ClientMessage> for ChatServer {
                 // `session_logic.rs` remains in force; this is an additive
                 // policy applied before the NATS publish so the named sender
                 // is never woken at all for KFRs that wouldn't help.
-                if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+                // Size gate: KEYFRAME_REQUEST is a tiny unencrypted MediaPacket
+                // (media_type + user_id + "VIDEO"/"SCREEN" tag, typically
+                // <80 B). Real audio/video MediaPackets carry encrypted payload
+                // bytes and are well over this threshold. The guard avoids a
+                // per-MEDIA-packet inner protobuf parse on the hot fan-out path
+                // for AUDIO / VIDEO / SCREEN — which all parse successfully but
+                // never match KEYFRAME_REQUEST. A follow-up will plumb the
+                // already-computed `PacketKind` through `ClientMessage` so this
+                // gate becomes unnecessary.
+                const KFR_MAX_BYTES: usize = 256;
+                if packet_wrapper.packet_type == PacketType::MEDIA.into()
+                    && packet_wrapper.data.len() <= KFR_MAX_BYTES
+                {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
                         if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
                             let members: &[(SessionId, String, String)] = self
