@@ -656,11 +656,19 @@ fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
     // recover from poisoning: decoder ctor on another thread may have panicked, the map state itself is still valid
     let mut map = pool.video.lock().unwrap_or_else(|p| p.into_inner());
     let decoder = map.entry(publisher.to_string()).or_insert_with(|| {
-        let stats = pool.stats.clone();
-        NativeDecoder::new(
+        // Hand the decoder two stats handles: one for successful decodes and
+        // one for frames the bounded input channel had to drop because the
+        // decoder thread fell behind (vc-35t). Both reuse `record_decode_error`
+        // / `record_video_decoded` so the summary JSON schema stays stable.
+        let decoded_stats = pool.stats.clone();
+        let dropped_stats = pool.stats.clone();
+        NativeDecoder::with_drop_callback(
             DecVideoCodec::Vp9Profile0Level10Bit8,
             Box::new(move |_decoded| {
-                stats.record_video_decoded();
+                decoded_stats.record_video_decoded();
+            }),
+            Box::new(move || {
+                dropped_stats.record_decode_error();
             }),
         )
     });

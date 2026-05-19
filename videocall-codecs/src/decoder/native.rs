@@ -22,12 +22,22 @@ use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use vpx_sys::{
     vpx_codec_ctx_t, vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy,
     vpx_codec_get_frame, vpx_codec_vp9_dx, VPX_CODEC_OK, VPX_DECODER_ABI_VERSION,
 };
+
+/// Upper bound on the number of in-flight encoded frames buffered per
+/// [`NativeDecoder`] before the producer starts dropping (vc-35t / vc-2x8).
+///
+/// Steady-state load for the bot listener is roughly 30 frames/s per
+/// publisher, so a bound of 32 absorbs short bursts (~1s at line rate) while
+/// capping worst-case memory at ~32 × ~60 KiB ≈ 2 MiB per decoder. With ~500
+/// decoders (100 listeners × ~5 publishers) the ceiling is ~1 GiB instead of
+/// unbounded growth that previously OOM'd 4 GiB pods.
+const NATIVE_DECODER_CHANNEL_BOUND: usize = 32;
 
 // --- Vp9Decoder implementation, now living inside the native module ---
 
@@ -187,11 +197,10 @@ unsafe fn copy_plane_to_buffer(
 }
 
 impl ThreadDecodable for MockDecoder {
-    fn decode_frame(&mut self, frame_buffer: &FrameBuffer) -> Result<Vec<DecodedFrame>, String> {
-        println!(
-            "[MOCK_DECODER] Pretending to decode frame {}",
-            frame_buffer.sequence_number()
-        );
+    fn decode_frame(&mut self, _frame_buffer: &FrameBuffer) -> Result<Vec<DecodedFrame>, String> {
+        // Intentionally silent: this runs once per frame in the bot's listener
+        // path. Per-frame stdout writes flood the orchestrator's JSON parser
+        // at scale (vc-35t / vc-4tl).
         Ok(Vec::new())
     }
 }
@@ -206,18 +215,37 @@ enum DecoderMessage {
 
 pub struct NativeDecoder {
     thread_handle: Option<JoinHandle<()>>,
-    sender: Sender<DecoderMessage>,
+    sender: SyncSender<DecoderMessage>,
+    /// Invoked from the producer side of the bounded channel whenever a frame
+    /// cannot be enqueued (channel full or decoder thread gone). Used by the
+    /// bot listener to attribute backpressure-induced drops.
+    on_dropped: Box<dyn Fn() + Send + Sync>,
 }
 
-impl Decodable for NativeDecoder {
-    /// The decoded frame type for native decoding.
-    type Frame = DecodedFrame;
-
-    fn new(
+impl NativeDecoder {
+    /// Construct a decoder with both the standard decoded-frame callback and a
+    /// `on_dropped` callback that is invoked when a frame is discarded because
+    /// the decoder's bounded input channel is full or the decoder thread has
+    /// terminated. The on_dropped callback runs synchronously on the producer
+    /// thread, so it must be cheap and non-blocking (an atomic counter bump is
+    /// the intended use; see `bot/src/stats.rs`).
+    pub fn with_drop_callback(
         codec: crate::decoder::VideoCodec,
-        on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
+        on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+        on_dropped: Box<dyn Fn() + Send + Sync>,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        Self::build(codec, on_decoded_frame, on_dropped)
+    }
+
+    fn build(
+        codec: crate::decoder::VideoCodec,
+        on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+        on_dropped: Box<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        // Bounded channel: a full queue means the decoder thread is behind
+        // real-time. The producer drops the frame rather than blocking the
+        // tokio blocking-pool worker that called `decode` (vc-35t).
+        let (sender, receiver) = mpsc::sync_channel(NATIVE_DECODER_CHANNEL_BOUND);
 
         let thread_handle = Some(thread::spawn(move || {
             let mut decoder: Box<dyn ThreadDecodable> = match codec {
@@ -240,24 +268,18 @@ impl Decodable for NativeDecoder {
             while let Ok(message) = receiver.recv() {
                 match message {
                     DecoderMessage::Frame(frame_buffer) => {
-                        println!(
-                            "[DECODER_THREAD] Decoding frame {}",
-                            frame_buffer.sequence_number()
-                        );
-
-                        match decoder.decode_frame(&frame_buffer) {
-                            Ok(images) => {
-                                for img in images {
-                                    on_decoded_frame(img);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[DECODER_THREAD] Decode error: {}", e);
+                        // Per-frame logging was removed (vc-35t / vc-4tl): at
+                        // bot-scale (100+ listeners × multiple publishers) the
+                        // stdout volume crowds out the orchestrator's summary
+                        // JSON. Decode errors are surfaced via the bot's stats
+                        // counters instead of stderr.
+                        if let Ok(images) = decoder.decode_frame(&frame_buffer) {
+                            for img in images {
+                                on_decoded_frame(img);
                             }
                         }
                     }
                     DecoderMessage::Shutdown => {
-                        println!("[DECODER_THREAD] Shutting down.");
                         break;
                     }
                 }
@@ -267,30 +289,130 @@ impl Decodable for NativeDecoder {
         NativeDecoder {
             thread_handle,
             sender,
+            on_dropped,
         }
+    }
+}
+
+impl Decodable for NativeDecoder {
+    /// The decoded frame type for native decoding.
+    type Frame = DecodedFrame;
+
+    fn new(
+        codec: crate::decoder::VideoCodec,
+        on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
+    ) -> Self {
+        // Default drop callback is a no-op; callers that care about backpressure
+        // should use `NativeDecoder::with_drop_callback` directly.
+        Self::build(codec, on_decoded_frame, Box::new(|| {}))
     }
 
     fn decode(&self, frame: FrameBuffer) {
-        if let Err(e) = self.sender.send(DecoderMessage::Frame(frame)) {
-            eprintln!(
-                "[NativeDecoder] Failed to send frame to decoder thread: {}",
-                e
-            );
+        // `try_send` keeps this non-blocking even on a tokio blocking-pool
+        // worker. The decoder thread falling behind must not back up onto the
+        // network read loop.
+        match self.sender.try_send(DecoderMessage::Frame(frame)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                // Channel is at capacity: the decoder thread is behind. Drop
+                // the frame and bump the drop counter so the bot can attribute
+                // the loss.
+                (self.on_dropped)();
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Decoder thread has terminated (panicked at startup, or we're
+                // racing Drop). Same accounting as Full.
+                (self.on_dropped)();
+            }
         }
     }
 }
 
 impl Drop for NativeDecoder {
     fn drop(&mut self) {
-        println!("[NativeDecoder] Dropping decoder. Signaling shutdown.");
-        // Signal the thread to shut down.
-        if self.sender.send(DecoderMessage::Shutdown).is_err() {
-            eprintln!("[NativeDecoder] Decoder thread already shut down.");
-        }
+        // Best-effort shutdown signal: ignore Full/Disconnected errors. The
+        // recv loop will exit when the sender drops anyway.
+        let _ = self.sender.try_send(DecoderMessage::Shutdown);
 
         // Wait for the thread to finish.
         if let Some(handle) = self.thread_handle.take() {
-            handle.join().expect("Decoder thread failed to join");
+            let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::VideoCodec;
+    use crate::frame::{FrameCodec, FrameType, VideoFrame};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn make_frame(seq: u64) -> FrameBuffer {
+        FrameBuffer::new(
+            VideoFrame {
+                sequence_number: seq,
+                frame_type: FrameType::DeltaFrame,
+                codec: FrameCodec::Vp9Profile0Level10Bit8,
+                temporal_layer_id: 0,
+                // The Mock decoder ignores the payload entirely; an empty
+                // buffer keeps the test cheap and avoids real codec work.
+                data: Vec::new(),
+                timestamp: 0.0,
+            },
+            0,
+        )
+    }
+
+    /// vc-35t: a full bounded channel must drop the frame on the producer side
+    /// and invoke the `on_dropped` callback rather than block the caller. We
+    /// use the Mock decoder backed by a slow consumer-side sleep to wedge the
+    /// channel.
+    #[test]
+    fn full_channel_drops_and_reports() {
+        let decoded = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let decoded_clone = decoded.clone();
+        let dropped_clone = dropped.clone();
+
+        let decoder = NativeDecoder::with_drop_callback(
+            VideoCodec::Mock,
+            Box::new(move |_| {
+                // Simulate a slow consumer so the queue fills up. The blocking
+                // sleep runs on the dedicated decoder thread and does not
+                // affect the producer.
+                std::thread::sleep(Duration::from_millis(20));
+                decoded_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+            Box::new(move || {
+                dropped_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        // The Mock decoder produces no frames, so `on_decoded_frame` will not
+        // actually fire — that's fine; the point of this test is the producer
+        // side. Push significantly more frames than the channel bound; the
+        // overflow must hit `on_dropped`.
+        let total = NATIVE_DECODER_CHANNEL_BOUND * 4;
+        for i in 0..total as u64 {
+            decoder.decode(make_frame(i));
+        }
+
+        // At least some frames must have been dropped, and the producer must
+        // not have blocked unboundedly.
+        let dropped_total = dropped.load(Ordering::Relaxed);
+        assert!(
+            dropped_total > 0,
+            "expected the bounded channel to drop frames, dropped={dropped_total}, bound={NATIVE_DECODER_CHANNEL_BOUND}, total_sent={total}"
+        );
+        // Sanity: we shouldn't have dropped every frame — the channel does
+        // hold NATIVE_DECODER_CHANNEL_BOUND entries.
+        assert!(
+            dropped_total < total,
+            "expected at least some frames to enqueue, but all {total} were dropped"
+        );
     }
 }
