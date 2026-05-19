@@ -73,6 +73,9 @@ struct Totals {
     bytes_received: u64,
     drops: u64,
     avg_bandwidth_bps: u64,
+    video_frames_decoded: u64,
+    audio_frames_decoded: u64,
+    decode_errors: u64,
 }
 
 /// Final summary JSON emitted to stdout.
@@ -227,6 +230,9 @@ fn empty_totals() -> Totals {
         bytes_received: 0,
         drops: 0,
         avg_bandwidth_bps: 0,
+        video_frames_decoded: 0,
+        audio_frames_decoded: 0,
+        decode_errors: 0,
     }
 }
 
@@ -237,6 +243,9 @@ fn accumulate(t: &mut Totals, snap: &BotStatsSnapshot) {
     t.packets_received += snap.packets_received;
     t.bytes_received += snap.bytes_received;
     t.drops += snap.drops;
+    t.video_frames_decoded += snap.video_frames_decoded.unwrap_or(0);
+    t.audio_frames_decoded += snap.audio_frames_decoded.unwrap_or(0);
+    t.decode_errors += snap.decode_errors.unwrap_or(0);
 }
 
 fn finalise_avg(t: &mut Totals, duration_s: f64) {
@@ -297,7 +306,11 @@ async fn run_listener(
     let user_id = config.user_id.clone();
     info!("Initialising listener {}", user_id);
 
-    let mut client = WebTransportClient::new(config).with_stats(stats);
+    // Listeners decode by default (vc-86j) so the 200-bot harness exerts
+    // representative client CPU; senders never decode.
+    let mut client = WebTransportClient::new(config)
+        .with_stats(stats)
+        .with_decode(true);
     client.connect(&server_url, insecure).await?;
 
     // Listeners don't run audio/video producers. The inbound consumer started

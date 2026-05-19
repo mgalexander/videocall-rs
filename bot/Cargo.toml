@@ -18,6 +18,7 @@ tokio = { version = "1.28.1", features = ["full"] }
 web-transport-quinn = { workspace = true }
 futures = "0.3.16"
 videocall-types = { path= "../videocall-types", version = "5.0.0" }
+videocall-codecs = { path = "../videocall-codecs", features = ["native"] }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"

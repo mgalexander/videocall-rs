@@ -72,6 +72,16 @@ pub struct BotStats {
     /// packet drained after `disconnect_at_ms`. `0` if no successful packet
     /// has arrived post-gap. Sticky: only the first reconnect is recorded.
     pub reconnect_at_ms: AtomicU64,
+    /// Listener-decode bookkeeping (vc-86j): total VP9 video frames the
+    /// listener successfully decoded. `0` for senders and for listeners with
+    /// decode disabled.
+    pub video_frames_decoded: AtomicU64,
+    /// Listener-decode bookkeeping (vc-86j): total Opus audio frames the
+    /// listener successfully decoded.
+    pub audio_frames_decoded: AtomicU64,
+    /// Listener-decode bookkeeping (vc-86j): wrapper/media parse failures and
+    /// codec decode errors observed while servicing the inbound stream.
+    pub decode_errors: AtomicU64,
 }
 
 impl BotStats {
@@ -133,6 +143,21 @@ impl BotStats {
         self.drops.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one successfully decoded VP9 video frame.
+    pub fn record_video_decoded(&self) {
+        self.video_frames_decoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one successfully decoded Opus audio frame.
+    pub fn record_audio_decoded(&self) {
+        self.audio_frames_decoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a parse or decode failure observed on the inbound path.
+    pub fn record_decode_error(&self) {
+        self.decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Capture a serializable snapshot of the current counters.
     pub fn snapshot(&self, duration_s: f64) -> BotStatsSnapshot {
         let bytes = self.bytes_received.load(Ordering::Relaxed);
@@ -151,6 +176,9 @@ impl BotStats {
             // than reporting a negative downtime.
             _ => Some(0),
         };
+        let video_frames_decoded = self.video_frames_decoded.load(Ordering::Relaxed);
+        let audio_frames_decoded = self.audio_frames_decoded.load(Ordering::Relaxed);
+        let decode_errors = self.decode_errors.load(Ordering::Relaxed);
         BotStatsSnapshot {
             user_id: self.user_id.clone(),
             role: self.role,
@@ -170,6 +198,21 @@ impl BotStats {
                 Some(reconnect_at_ms)
             },
             downtime_ms,
+            video_frames_decoded: if video_frames_decoded == 0 {
+                None
+            } else {
+                Some(video_frames_decoded)
+            },
+            audio_frames_decoded: if audio_frames_decoded == 0 {
+                None
+            } else {
+                Some(audio_frames_decoded)
+            },
+            decode_errors: if decode_errors == 0 {
+                None
+            } else {
+                Some(decode_errors)
+            },
         }
     }
 }
@@ -195,4 +238,10 @@ pub struct BotStatsSnapshot {
     pub reconnect_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downtime_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_frames_decoded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_frames_decoded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_errors: Option<u64>,
 }

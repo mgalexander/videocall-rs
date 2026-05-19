@@ -17,6 +17,7 @@
  */
 
 use protobuf::Message;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,6 +26,8 @@ use tokio::sync::Notify;
 use tokio::time;
 use tracing::{debug, info, warn};
 use url::Url;
+use videocall_codecs::decoder::{Decodable, Decoder as NativeDecoder, VideoCodec as DecVideoCodec};
+use videocall_codecs::frame::{FrameBuffer, FrameCodec, FrameType, VideoFrame};
 use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
 use videocall_types::protos::admission_decision_packet::AdmissionDecision;
 use videocall_types::protos::connection_packet::ConnectionPacket;
@@ -36,6 +39,16 @@ use web_transport_quinn::{ClientBuilder, Session};
 
 use crate::config::ClientConfig;
 use crate::stats::BotStats;
+
+/// Per-publisher decoder state owned by a listener. VP9 is stateful across
+/// frames, so each remote sender needs its own decoder context keyed by
+/// `media_packet.user_id`. Opus is similarly stateful (carries jitter buffer
+/// / PLC state internally) so we key those by publisher too.
+struct DecoderPool {
+    video: Mutex<HashMap<String, NativeDecoder>>,
+    audio: Mutex<HashMap<String, opus::Decoder>>,
+    stats: Arc<BotStats>,
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -87,6 +100,10 @@ pub struct WebTransportClient {
     /// via [`with_session_end_signal`](Self::with_session_end_signal) before
     /// [`connect`](Self::connect). `None` for default runs.
     session_end: Option<Arc<SessionEndSignal>>,
+    /// When true, the inbound consumer parses each unistream as a media
+    /// packet and runs real VP9 / Opus decode so the bot exerts client-side
+    /// CPU comparable to a real browser participant (vc-86j).
+    decode: bool,
 }
 
 impl WebTransportClient {
@@ -97,6 +114,7 @@ impl WebTransportClient {
             quit: Arc::new(AtomicBool::new(false)),
             stats: None,
             session_end: None,
+            decode: false,
         }
     }
 
@@ -113,6 +131,14 @@ impl WebTransportClient {
     /// reconnect attempt. No-op for default runs.
     pub fn with_session_end_signal(mut self, signal: Arc<SessionEndSignal>) -> Self {
         self.session_end = Some(signal);
+        self
+    }
+
+    /// Enable real VP9 + Opus decode on the inbound path (vc-86j). The 200-
+    /// bot harness relies on this so listeners exert representative client
+    /// CPU. Senders should leave this disabled — they don't subscribe.
+    pub fn with_decode(mut self, decode: bool) -> Self {
+        self.decode = decode;
         self
     }
 
@@ -267,6 +293,19 @@ impl WebTransportClient {
             let quit = self.quit.clone();
             let stats = self.stats.clone();
             let session_end = self.session_end.clone();
+            // Decoders only meaningful when both `decode` is on and we have a
+            // stats handle to publish counters into.
+            let decoders = if self.decode {
+                stats.as_ref().map(|s| {
+                    Arc::new(DecoderPool {
+                        video: Mutex::new(HashMap::new()),
+                        audio: Mutex::new(HashMap::new()),
+                        stats: s.clone(),
+                    })
+                })
+            } else {
+                None
+            };
 
             tokio::spawn(async move {
                 loop {
@@ -302,6 +341,16 @@ impl WebTransportClient {
                                             *signal_handle.redirect_to.lock().unwrap() =
                                                 Some(target);
                                         }
+                                        if let Some(pool) = &decoders {
+                                            // Same off-thread decode as the
+                                            // default path; keeps failover-test
+                                            // bots aligned with the 200-bot
+                                            // workload shape.
+                                            let pool_clone = pool.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                decode_packet(&pool_clone, &data);
+                                            });
+                                        }
                                     }
                                     Err(e) => {
                                         if let Some(stats) = &stats {
@@ -316,11 +365,23 @@ impl WebTransportClient {
                             } else {
                                 let stats_spawn = stats.clone();
                                 let user_id_spawn = user_id.clone();
+                                let decoders_spawn = decoders.clone();
                                 tokio::spawn(async move {
                                     match stream.read_to_end(usize::MAX).await {
                                         Ok(data) => {
                                             if let Some(stats) = stats_spawn {
                                                 stats.record_packet(data.len() as u64);
+                                            }
+                                            if let Some(pool) = decoders_spawn {
+                                                // Move decode (protobuf parse +
+                                                // VP9/Opus) onto the blocking
+                                                // pool: opus::decode_float is
+                                                // pure-CPU and would starve
+                                                // accept_uni at 200 colocated
+                                                // bots otherwise.
+                                                tokio::task::spawn_blocking(move || {
+                                                    decode_packet(&pool, &data);
+                                                });
                                             }
                                         }
                                         Err(e) => {
@@ -351,6 +412,9 @@ impl WebTransportClient {
                 if let Some(signal) = &session_end {
                     signal.fire(None);
                 }
+                // Dropping `decoders` here joins the per-publisher VP9
+                // decoder threads (NativeDecoder::Drop sends Shutdown).
+                drop(decoders);
                 info!("Inbound consumer stopped for {}", user_id);
             });
         }
@@ -418,6 +482,98 @@ fn try_extract_redirect_target(data: &[u8]) -> Option<String> {
     Some(decision.redirect_to)
 }
 
+/// Parse `data` as a `PacketWrapper` containing a `MediaPacket`, then route
+/// VIDEO frames to a libvpx VP9 decoder and AUDIO frames to an Opus decoder.
+/// Per-publisher decoders are created lazily and reused across calls because
+/// both codecs maintain state across frames.
+fn decode_packet(pool: &DecoderPool, data: &[u8]) {
+    let wrapper = match PacketWrapper::parse_from_bytes(data) {
+        Ok(w) => w,
+        Err(_) => {
+            pool.stats.record_decode_error();
+            return;
+        }
+    };
+    if wrapper.packet_type != PacketType::MEDIA.into() {
+        return;
+    }
+    let media = match MediaPacket::parse_from_bytes(&wrapper.data) {
+        Ok(m) => m,
+        Err(_) => {
+            pool.stats.record_decode_error();
+            return;
+        }
+    };
+
+    let publisher = String::from_utf8_lossy(&media.user_id).into_owned();
+    let media_type = media.media_type.enum_value_or(MediaType::HEARTBEAT);
+
+    match media_type {
+        MediaType::VIDEO => decode_video(pool, &publisher, &media),
+        MediaType::AUDIO => decode_audio(pool, &publisher, &media),
+        _ => {}
+    }
+}
+
+fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
+    let frame_type = if media.frame_type == "key" {
+        FrameType::KeyFrame
+    } else {
+        FrameType::DeltaFrame
+    };
+    let sequence_number = media
+        .video_metadata
+        .as_ref()
+        .map(|m| m.sequence)
+        .unwrap_or(0);
+
+    // recover from poisoning: decoder ctor on another thread may have panicked, the map state itself is still valid
+    let mut map = pool.video.lock().unwrap_or_else(|p| p.into_inner());
+    let decoder = map.entry(publisher.to_string()).or_insert_with(|| {
+        let stats = pool.stats.clone();
+        NativeDecoder::new(
+            DecVideoCodec::Vp9Profile0Level10Bit8,
+            Box::new(move |_decoded| {
+                stats.record_video_decoded();
+            }),
+        )
+    });
+
+    let frame = VideoFrame {
+        sequence_number,
+        frame_type,
+        codec: FrameCodec::Vp9Profile0Level10Bit8,
+        temporal_layer_id: 0,
+        data: media.data.clone(),
+        timestamp: media.timestamp,
+    };
+    decoder.decode(FrameBuffer::new(frame, 0));
+}
+
+fn decode_audio(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
+    let mut map = pool.audio.lock().unwrap_or_else(|p| p.into_inner());
+    let decoder = match map.entry(publisher.to_string()) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            // matches sender config in audio_producer.rs
+            match opus::Decoder::new(48000, opus::Channels::Mono) {
+                Ok(dec) => e.insert(dec),
+                Err(_) => {
+                    pool.stats.record_decode_error();
+                    return;
+                }
+            }
+        }
+    };
+
+    // 20 ms at 48 kHz mono = 960 samples; oversize buffer is fine.
+    let mut pcm = [0.0f32; 5760];
+    match decoder.decode_float(&media.data, &mut pcm, false) {
+        Ok(_) => pool.stats.record_audio_decoded(),
+        Err(_) => pool.stats.record_decode_error(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +631,60 @@ mod tests {
     #[test]
     fn try_extract_redirect_target_ignores_garbage() {
         assert!(try_extract_redirect_target(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    use crate::stats::{BotRole, BotStats};
+    use std::sync::atomic::Ordering;
+
+    fn empty_pool() -> DecoderPool {
+        DecoderPool {
+            video: Mutex::new(HashMap::new()),
+            audio: Mutex::new(HashMap::new()),
+            stats: BotStats::new("test".into(), BotRole::Listener),
+        }
+    }
+
+    #[test]
+    fn decode_packet_counts_garbage_as_error() {
+        let pool = empty_pool();
+        decode_packet(&pool, &[0xff, 0xff, 0xff]);
+        assert_eq!(pool.stats.decode_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.stats.video_frames_decoded.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.stats.audio_frames_decoded.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn decode_packet_ignores_non_media() {
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::QUEUED.into(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            data: decision.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let pool = empty_pool();
+        decode_packet(&pool, &wrapper.write_to_bytes().unwrap());
+        assert_eq!(pool.stats.decode_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.stats.video_frames_decoded.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.stats.audio_frames_decoded.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn decode_packet_skips_heartbeat() {
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: b"sender-0".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let pool = empty_pool();
+        decode_packet(&pool, &wrapper.write_to_bytes().unwrap());
+        assert_eq!(pool.stats.decode_errors.load(Ordering::Relaxed), 0);
     }
 }
