@@ -91,6 +91,21 @@ pub struct BotStats {
     /// MediaPackets the listener emitted (rate-limited per publisher to
     /// match `KEYFRAME_REQUEST_MIN_INTERVAL_MS`).
     pub keyframe_requests_sent: AtomicU64,
+    /// Producer-side bookkeeping (vc-xpf): total packets the audio/video
+    /// producers successfully enqueued onto the producer→sender mpsc
+    /// channel via `try_send`. Counts both audio and video paths.
+    pub tx_packets_enqueued: AtomicU64,
+    /// Producer-side bookkeeping (vc-xpf): total packets dropped at the
+    /// producer because the bounded producer→sender mpsc channel was full
+    /// (`TrySendError::Full`). Expected to grow during the staircase test
+    /// when the WebTransport writer can't keep up with offered load.
+    pub tx_drops_channel_full: AtomicU64,
+    /// Producer-side bookkeeping (vc-xpf): total packets dropped at the
+    /// WebTransport writer because `send_via_session` returned an error
+    /// (open_uni / write_all / finish failure). Distinct from
+    /// `tx_drops_channel_full` so the staircase test can attribute drops to
+    /// either the local queue or the wire.
+    pub tx_drops_send_error: AtomicU64,
 }
 
 impl BotStats {
@@ -177,6 +192,25 @@ impl BotStats {
         self.keyframe_requests_sent.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one packet successfully enqueued onto the producer→sender
+    /// channel (vc-xpf). Called from both `AudioProducer` and `VideoProducer`
+    /// on the `try_send` success path.
+    pub fn record_tx_packet_enqueued(&self) {
+        self.tx_packets_enqueued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one packet dropped at the producer because the
+    /// producer→sender channel was full (vc-xpf, `TrySendError::Full`).
+    pub fn record_tx_drop_channel_full(&self) {
+        self.tx_drops_channel_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one packet dropped at the WebTransport writer because
+    /// `send_via_session` failed (vc-xpf).
+    pub fn record_tx_drop_send_error(&self) {
+        self.tx_drops_send_error.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Capture a serializable snapshot of the current counters.
     pub fn snapshot(&self, duration_s: f64) -> BotStatsSnapshot {
         let bytes = self.bytes_received.load(Ordering::Relaxed);
@@ -200,6 +234,9 @@ impl BotStats {
         let decode_errors = self.decode_errors.load(Ordering::Relaxed);
         let diagnostics_sent = self.diagnostics_sent.load(Ordering::Relaxed);
         let keyframe_requests_sent = self.keyframe_requests_sent.load(Ordering::Relaxed);
+        let tx_packets_enqueued = self.tx_packets_enqueued.load(Ordering::Relaxed);
+        let tx_drops_channel_full = self.tx_drops_channel_full.load(Ordering::Relaxed);
+        let tx_drops_send_error = self.tx_drops_send_error.load(Ordering::Relaxed);
         BotStatsSnapshot {
             user_id: self.user_id.clone(),
             role: self.role,
@@ -244,6 +281,21 @@ impl BotStats {
             } else {
                 Some(keyframe_requests_sent)
             },
+            tx_packets_enqueued: if tx_packets_enqueued == 0 {
+                None
+            } else {
+                Some(tx_packets_enqueued)
+            },
+            tx_drops_channel_full: if tx_drops_channel_full == 0 {
+                None
+            } else {
+                Some(tx_drops_channel_full)
+            },
+            tx_drops_send_error: if tx_drops_send_error == 0 {
+                None
+            } else {
+                Some(tx_drops_send_error)
+            },
         }
     }
 }
@@ -279,4 +331,72 @@ pub struct BotStatsSnapshot {
     pub diagnostics_sent: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyframe_requests_sent: Option<u64>,
+    /// Producer-side bookkeeping (vc-xpf). `None` for prior runs / when no
+    /// packets were enqueued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_packets_enqueued: Option<u64>,
+    /// Producer-side bookkeeping (vc-xpf). `None` when no producer queue
+    /// drops occurred (the channel never filled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_drops_channel_full: Option<u64>,
+    /// Producer-side bookkeeping (vc-xpf). `None` when no WebTransport send
+    /// failures occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_drops_send_error: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// vc-xpf: the producer-side counters must follow the same "omit when 0"
+    /// pattern as the existing optional fields so historical JSON consumers
+    /// don't see new keys appear in runs that don't exercise them.
+    #[test]
+    fn tx_counters_omitted_when_zero() {
+        let stats = BotStats::new("sender-0".into(), BotRole::Sender);
+        let snap = stats.snapshot(1.0);
+        assert_eq!(snap.tx_packets_enqueued, None);
+        assert_eq!(snap.tx_drops_channel_full, None);
+        assert_eq!(snap.tx_drops_send_error, None);
+
+        // And the JSON shape must omit them entirely (forward-compat).
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        assert!(
+            !json.contains("tx_packets_enqueued"),
+            "tx_packets_enqueued must be omitted when zero, got: {json}"
+        );
+        assert!(
+            !json.contains("tx_drops_channel_full"),
+            "tx_drops_channel_full must be omitted when zero, got: {json}"
+        );
+        assert!(
+            !json.contains("tx_drops_send_error"),
+            "tx_drops_send_error must be omitted when zero, got: {json}"
+        );
+    }
+
+    /// vc-xpf: each `record_tx_*` helper must update its own counter and
+    /// surface a `Some` value in the snapshot. This is the inverse of
+    /// `tx_counters_omitted_when_zero`.
+    #[test]
+    fn tx_counters_surface_when_nonzero() {
+        let stats = BotStats::new("sender-0".into(), BotRole::Sender);
+        stats.record_tx_packet_enqueued();
+        stats.record_tx_packet_enqueued();
+        stats.record_tx_drop_channel_full();
+        stats.record_tx_drop_send_error();
+        stats.record_tx_drop_send_error();
+        stats.record_tx_drop_send_error();
+
+        let snap = stats.snapshot(1.0);
+        assert_eq!(snap.tx_packets_enqueued, Some(2));
+        assert_eq!(snap.tx_drops_channel_full, Some(1));
+        assert_eq!(snap.tx_drops_send_error, Some(3));
+
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        assert!(json.contains("\"tx_packets_enqueued\":2"));
+        assert!(json.contains("\"tx_drops_channel_full\":1"));
+        assert!(json.contains("\"tx_drops_send_error\":3"));
+    }
 }

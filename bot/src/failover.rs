@@ -245,14 +245,18 @@ async fn run_sender(
     let user_id = config.user_id.clone();
     info!("Initialising sender {} (failover-test)", user_id);
 
-    let mut client = WebTransportClient::new(config.clone()).with_stats(stats);
+    let mut client = WebTransportClient::new(config.clone()).with_stats(stats.clone());
     client.connect(&server_url, insecure).await?;
 
     let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
     client.start_packet_sender(packet_rx).await;
 
-    let _audio = match AudioProducer::from_wav_file(user_id.clone(), &audio_path, packet_tx.clone())
-    {
+    let _audio = match AudioProducer::from_wav_file(
+        user_id.clone(),
+        &audio_path,
+        packet_tx.clone(),
+        Some(stats.clone()),
+    ) {
         Ok(p) => Some(p),
         Err(e) => {
             warn!("Sender {} failed to start audio producer: {}", user_id, e);
@@ -260,14 +264,18 @@ async fn run_sender(
         }
     };
 
-    let _video =
-        match VideoProducer::from_image_sequence(user_id.clone(), &image_dir, packet_tx.clone()) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                warn!("Sender {} failed to start video producer: {}", user_id, e);
-                None
-            }
-        };
+    let _video = match VideoProducer::from_image_sequence(
+        user_id.clone(),
+        &image_dir,
+        packet_tx.clone(),
+        Some(stats.clone()),
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            warn!("Sender {} failed to start video producer: {}", user_id, e);
+            None
+        }
+    };
 
     std::future::pending::<()>().await;
     Ok(())

@@ -543,6 +543,11 @@ impl WebTransportClient {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
             let quit = self.quit.clone();
+            // vc-xpf: thread the shared stats handle in so wire-level send
+            // failures land on `tx_drops_send_error`. Distinct from
+            // `tx_drops_channel_full` (producer enqueue side) so the
+            // staircase test can attribute drops to either bucket.
+            let stats = self.stats.clone();
 
             tokio::spawn(async move {
                 while let Some(packet_data) = packet_receiver.recv().await {
@@ -551,7 +556,10 @@ impl WebTransportClient {
                     }
 
                     if let Err(e) = Self::send_via_session(&session, packet_data).await {
-                        warn!("Failed to send media packet for {}: {}", user_id, e);
+                        if let Some(s) = &stats {
+                            s.record_tx_drop_send_error();
+                        }
+                        debug!("Failed to send media packet for {}: {}", user_id, e);
                     }
                 }
                 info!("Packet sender stopped for {}", user_id);

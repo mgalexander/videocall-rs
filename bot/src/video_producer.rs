@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::stats::BotStats;
 use crate::video_encoder::VideoEncoderBuilder;
 use image::imageops::FilterType;
 use image::{ImageBuffer, ImageReader, Rgb};
@@ -24,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -45,6 +47,7 @@ impl VideoProducer {
         user_id: String,
         image_dir: &str,
         packet_sender: Sender<Vec<u8>>,
+        stats: Option<Arc<BotStats>>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -52,7 +55,9 @@ impl VideoProducer {
         let image_dir = image_dir.to_string();
 
         let handle = thread::spawn(move || {
-            if let Err(e) = Self::video_loop(user_id_clone, &image_dir, packet_sender, quit_clone) {
+            if let Err(e) =
+                Self::video_loop(user_id_clone, &image_dir, packet_sender, quit_clone, stats)
+            {
                 error!("Video producer error: {}", e);
             }
         });
@@ -69,6 +74,7 @@ impl VideoProducer {
         image_dir: &str,
         packet_sender: Sender<Vec<u8>>,
         quit: Arc<AtomicBool>,
+        stats: Option<Arc<BotStats>>,
     ) -> anyhow::Result<()> {
         // Video configuration - targeting 30fps (~33ms packets)
         let width = 1280u32;
@@ -157,18 +163,39 @@ impl VideoProducer {
                     ..Default::default()
                 };
 
-                // Send packet
+                // Send packet. Same bounded-channel drop semantics as the
+                // audio producer (vc-xpf): try_send + per-bucket counters,
+                // and the channel-full path is logged at `debug!` so a
+                // sustained drop storm (30fps × N bots) doesn't spam the
+                // shared log stream. `Closed` keeps a single `warn!` because
+                // it signals the consumer is gone.
                 let packet_data = packet_wrapper.write_to_bytes()?;
-                if let Err(e) = packet_sender.try_send(packet_data) {
-                    warn!("Failed to send video packet for {}: {}", user_id, e);
-                } else {
-                    trace!(
-                        "Sent VP9 frame {} ({} bytes, {}) for {}",
-                        sequence,
-                        frame.data.len(),
-                        if frame.key { "key" } else { "delta" },
-                        user_id
-                    );
+                match packet_sender.try_send(packet_data) {
+                    Ok(()) => {
+                        if let Some(s) = &stats {
+                            s.record_tx_packet_enqueued();
+                        }
+                        trace!(
+                            "Sent VP9 frame {} ({} bytes, {}) for {}",
+                            sequence,
+                            frame.data.len(),
+                            if frame.key { "key" } else { "delta" },
+                            user_id
+                        );
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        if let Some(s) = &stats {
+                            s.record_tx_drop_channel_full();
+                        }
+                        debug!(
+                            "video producer dropped frame (channel full) for {}",
+                            user_id
+                        );
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        warn!("video producer channel closed for {}; stopping", user_id);
+                        return Ok(());
+                    }
                 }
             }
 

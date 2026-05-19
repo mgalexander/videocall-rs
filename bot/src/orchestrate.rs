@@ -78,6 +78,15 @@ struct Totals {
     decode_errors: u64,
     diagnostics_sent: u64,
     keyframe_requests_sent: u64,
+    /// vc-xpf: aggregate of `tx_packets_enqueued` across all bots — total
+    /// successful producer→sender enqueues this run.
+    tx_packets_enqueued: u64,
+    /// vc-xpf: aggregate of `tx_drops_channel_full` — drops attributed to a
+    /// full producer→sender channel.
+    tx_drops_channel_full: u64,
+    /// vc-xpf: aggregate of `tx_drops_send_error` — drops attributed to a
+    /// WebTransport send failure.
+    tx_drops_send_error: u64,
 }
 
 /// Final summary JSON emitted to stdout.
@@ -237,6 +246,9 @@ fn empty_totals() -> Totals {
         decode_errors: 0,
         diagnostics_sent: 0,
         keyframe_requests_sent: 0,
+        tx_packets_enqueued: 0,
+        tx_drops_channel_full: 0,
+        tx_drops_send_error: 0,
     }
 }
 
@@ -252,6 +264,9 @@ fn accumulate(t: &mut Totals, snap: &BotStatsSnapshot) {
     t.decode_errors += snap.decode_errors.unwrap_or(0);
     t.diagnostics_sent += snap.diagnostics_sent.unwrap_or(0);
     t.keyframe_requests_sent += snap.keyframe_requests_sent.unwrap_or(0);
+    t.tx_packets_enqueued += snap.tx_packets_enqueued.unwrap_or(0);
+    t.tx_drops_channel_full += snap.tx_drops_channel_full.unwrap_or(0);
+    t.tx_drops_send_error += snap.tx_drops_send_error.unwrap_or(0);
 }
 
 fn finalise_avg(t: &mut Totals, duration_s: f64) {
@@ -271,15 +286,19 @@ async fn run_sender(
     let user_id = config.user_id.clone();
     info!("Initialising sender {}", user_id);
 
-    let mut client = WebTransportClient::new(config.clone()).with_stats(stats);
+    let mut client = WebTransportClient::new(config.clone()).with_stats(stats.clone());
     client.connect(&server_url, insecure).await?;
 
     let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
     client.start_packet_sender(packet_rx).await;
 
     // Audio
-    let _audio = match AudioProducer::from_wav_file(user_id.clone(), &audio_path, packet_tx.clone())
-    {
+    let _audio = match AudioProducer::from_wav_file(
+        user_id.clone(),
+        &audio_path,
+        packet_tx.clone(),
+        Some(stats.clone()),
+    ) {
         Ok(p) => Some(p),
         Err(e) => {
             warn!("Sender {} failed to start audio producer: {}", user_id, e);
@@ -288,14 +307,18 @@ async fn run_sender(
     };
 
     // Video
-    let _video =
-        match VideoProducer::from_image_sequence(user_id.clone(), &image_dir, packet_tx.clone()) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                warn!("Sender {} failed to start video producer: {}", user_id, e);
-                None
-            }
-        };
+    let _video = match VideoProducer::from_image_sequence(
+        user_id.clone(),
+        &image_dir,
+        packet_tx.clone(),
+        Some(stats.clone()),
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            warn!("Sender {} failed to start video producer: {}", user_id, e);
+            None
+        }
+    };
 
     // Block forever; the orchestrator aborts this task when the duration
     // elapses. The `Drop` impls on the producers stop their background work.
