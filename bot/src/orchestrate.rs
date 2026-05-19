@@ -24,6 +24,7 @@
 //!
 //! Invoked from `main.rs` when the `--orchestrate` flag is set.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +39,16 @@ use crate::audio_producer::AudioProducer;
 use crate::config::ClientConfig;
 use crate::stats::{BotRole, BotStats, BotStatsSnapshot};
 use crate::video_producer::VideoProducer;
-use crate::webtransport_client::WebTransportClient;
+use crate::webtransport_client::{SessionEndSignal, WebTransportClient};
+
+/// Maximum number of `ADMISSION_DECISION{REDIRECT}` hops a single bot will
+/// follow in one orchestrate run before falling back to idle (vc-kni). The
+/// wave-3 jump-hash room→ordinal mapping is deterministic, so a healthy
+/// cluster needs at most one redirect per bot; the cap exists purely to
+/// defend against pathological redirect loops (e.g. a misconfigured
+/// affinity map). On exceeded, we log a warning and `pending` until the
+/// orchestrator aborts the task at duration-end.
+const MAX_REDIRECT_HOPS: u32 = 5;
 
 /// Orchestration parameters. Built from the CLI flags in `main.rs`.
 #[derive(Debug, Clone)]
@@ -87,6 +97,12 @@ struct Totals {
     /// vc-xpf: aggregate of `tx_drops_send_error` — drops attributed to a
     /// WebTransport send failure.
     tx_drops_send_error: u64,
+    /// vc-kni: aggregate of `redirects_followed` across all bots — total
+    /// `ADMISSION_DECISION{REDIRECT}` hops successfully followed during the
+    /// run. Non-zero values indicate at least one bot landed on a
+    /// non-owner pod under the room→ordinal jump-hash mapping and migrated
+    /// to the correct owner. Stays at `0` for healthy single-pod runs.
+    redirects_followed: u64,
 }
 
 /// Final summary JSON emitted to stdout.
@@ -114,6 +130,13 @@ struct OrchestrationSummary {
     /// `tx_packets_enqueued` above for the schema-parity rationale and
     /// [`crate::failover::FailoverSummary`] for the matching field.
     tx_drops_send_error: u64,
+    /// vc-kni: aggregate of `redirects_followed` across all bots, surfaced
+    /// at the top level so dashboards / jq filters can use the same path
+    /// (`.redirects_followed`) without descending into `totals`. Non-zero
+    /// indicates at least one bot followed an `ADMISSION_DECISION{REDIRECT}`
+    /// to a different owner pod during the run. Always serialized — never
+    /// gated by `skip_serializing_if`.
+    redirects_followed: u64,
     totals: Totals,
     sender_totals: Totals,
     listener_totals: Totals,
@@ -219,6 +242,7 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
     let tx_packets_enqueued = totals.tx_packets_enqueued;
     let tx_drops_channel_full = totals.tx_drops_channel_full;
     let tx_drops_send_error = totals.tx_drops_send_error;
+    let redirects_followed = totals.redirects_followed;
 
     let summary = OrchestrationSummary {
         senders: cfg.senders,
@@ -229,6 +253,7 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
         tx_packets_enqueued,
         tx_drops_channel_full,
         tx_drops_send_error,
+        redirects_followed,
         totals,
         sender_totals,
         listener_totals,
@@ -277,6 +302,7 @@ fn empty_totals() -> Totals {
         tx_packets_enqueued: 0,
         tx_drops_channel_full: 0,
         tx_drops_send_error: 0,
+        redirects_followed: 0,
     }
 }
 
@@ -295,12 +321,32 @@ fn accumulate(t: &mut Totals, snap: &BotStatsSnapshot) {
     t.tx_packets_enqueued += snap.tx_packets_enqueued.unwrap_or(0);
     t.tx_drops_channel_full += snap.tx_drops_channel_full.unwrap_or(0);
     t.tx_drops_send_error += snap.tx_drops_send_error.unwrap_or(0);
+    t.redirects_followed += snap.redirects_followed.unwrap_or(0);
 }
 
 fn finalise_avg(t: &mut Totals, duration_s: f64) {
     if duration_s > 0.0 {
         t.avg_bandwidth_bps = (t.bytes_received as f64 * 8.0 / duration_s).round() as u64;
     }
+}
+
+/// Replace the host of `original` with `redirect_target`, preserving the
+/// scheme, port, and path (vc-kni).
+///
+/// The SFU's `ADMISSION_DECISION{REDIRECT}` payload carries only the host
+/// (e.g. `rustlemania-webtransport-2.webtransport-headless.svc.cluster.local`),
+/// not a full URL. The orchestrate reconnect loop needs the full URL the
+/// caller passed in for the original connect attempt with just the host
+/// swapped — same scheme (https), same port (8443), same path prefix the
+/// `WebTransportClient::connect` consumer adds (`/lobby/...`).
+///
+/// Returns `Err` if the target string is not a valid host. Empty targets
+/// are rejected by `Url::set_host`'s validation.
+pub(crate) fn compute_redirect_url(original: &Url, redirect_target: &str) -> anyhow::Result<Url> {
+    let mut url = original.clone();
+    url.set_host(Some(redirect_target))
+        .map_err(|e| anyhow::anyhow!("invalid redirect host {redirect_target:?}: {e}"))?;
+    Ok(url)
 }
 
 async fn run_sender(
@@ -314,42 +360,116 @@ async fn run_sender(
     let user_id = config.user_id.clone();
     info!("Initialising sender {}", user_id);
 
-    let mut client = WebTransportClient::new(config.clone()).with_stats(stats.clone());
-    client.connect(&server_url, insecure).await?;
+    // vc-kni: drive connect+publish inside a reconnect-on-REDIRECT loop. The
+    // SFU emits `ADMISSION_DECISION{REDIRECT}` when this bot lands on a
+    // non-owner pod under the room→ordinal jump-hash mapping; without
+    // following it the bot silently drops out of the test and corrupts
+    // staircase shard ratios. We follow it by tearing down the client +
+    // producers (Drop stops the producer threads) and reconnecting at the
+    // redirect target, capped at `MAX_REDIRECT_HOPS` to defend against
+    // pathological loops.
+    let original_url = server_url.clone();
+    let mut current_url = server_url;
+    let mut hops: u32 = 0;
+    loop {
+        let signal = Arc::new(SessionEndSignal::default());
+        let mut client = WebTransportClient::new(config.clone())
+            .with_stats(stats.clone())
+            .with_session_end_signal(signal.clone());
+        client.connect(&current_url, insecure).await?;
 
-    let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
-    client.start_packet_sender(packet_rx).await;
+        let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
+        client.start_packet_sender(packet_rx).await;
 
-    // Audio
-    let _audio = match AudioProducer::from_wav_file(
-        user_id.clone(),
-        &audio_path,
-        packet_tx.clone(),
-        Some(stats.clone()),
-    ) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            warn!("Sender {} failed to start audio producer: {}", user_id, e);
-            None
+        // Audio
+        let _audio = match AudioProducer::from_wav_file(
+            user_id.clone(),
+            &audio_path,
+            packet_tx.clone(),
+            Some(stats.clone()),
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("Sender {} failed to start audio producer: {}", user_id, e);
+                None
+            }
+        };
+
+        // Video
+        let _video = match VideoProducer::from_image_sequence(
+            user_id.clone(),
+            &image_dir,
+            packet_tx.clone(),
+            Some(stats.clone()),
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("Sender {} failed to start video producer: {}", user_id, e);
+                None
+            }
+        };
+
+        // Wait for the inbound consumer to signal session-end. If it has
+        // already fired (race between connect and the signal firing) we
+        // observe the sticky `ended` flag and skip the notify. Mirrors the
+        // failover.rs reconnect loop.
+        let notified = signal.notify.notified();
+        tokio::pin!(notified);
+        if !signal.ended.load(Ordering::Relaxed) {
+            notified.await;
         }
-    };
 
-    // Video
-    let _video = match VideoProducer::from_image_sequence(
-        user_id.clone(),
-        &image_dir,
-        packet_tx.clone(),
-        Some(stats.clone()),
-    ) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            warn!("Sender {} failed to start video producer: {}", user_id, e);
-            None
+        // Was this a REDIRECT? If yes, follow it; otherwise stay idle for
+        // the rest of the run (orchestrate aborts the task at duration-end).
+        let redirect = signal.redirect_to.lock().unwrap().clone();
+        match redirect {
+            Some(target) if hops < MAX_REDIRECT_HOPS => {
+                hops += 1;
+                match compute_redirect_url(&original_url, &target) {
+                    Ok(next) => {
+                        info!(
+                            "Sender {} following ADMISSION_DECISION REDIRECT to {} (hop {}/{})",
+                            user_id, next, hops, MAX_REDIRECT_HOPS
+                        );
+                        stats.record_redirect_followed();
+                        current_url = next;
+                        client.stop();
+                        // Drop client + producers explicitly: producers stop
+                        // on Drop (see audio_producer.rs / video_producer.rs)
+                        // so their background threads exit before we open a
+                        // fresh session.
+                        drop(_audio);
+                        drop(_video);
+                        drop(client);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Sender {} could not parse redirect target {:?}: {}; staying idle",
+                            user_id, target, e
+                        );
+                        break;
+                    }
+                }
+            }
+            Some(target) => {
+                warn!(
+                    "Sender {} exhausted redirect budget ({} hops); last target was {}; staying idle",
+                    user_id, MAX_REDIRECT_HOPS, target
+                );
+                break;
+            }
+            None => {
+                // Plain disconnect (not a REDIRECT). Preserve the
+                // pre-vc-kni behaviour: do NOT reconnect — fall through to
+                // `pending` and let the orchestrator abort us at
+                // duration-end. Introducing reconnect-on-plain-disconnect
+                // is out of scope for vc-kni.
+                break;
+            }
         }
-    };
+    }
 
-    // Block forever; the orchestrator aborts this task when the duration
-    // elapses. The `Drop` impls on the producers stop their background work.
     std::future::pending::<()>().await;
     Ok(())
 }
@@ -363,15 +483,63 @@ async fn run_listener(
     let user_id = config.user_id.clone();
     info!("Initialising listener {}", user_id);
 
-    // Listeners decode by default (vc-86j) so the 200-bot harness exerts
-    // representative client CPU; senders never decode.
-    let mut client = WebTransportClient::new(config)
-        .with_stats(stats)
-        .with_decode(true);
-    client.connect(&server_url, insecure).await?;
+    // vc-kni: same reconnect-on-REDIRECT loop as `run_sender`. Listeners
+    // decode by default (vc-86j) so each iteration also re-arms the per-
+    // publisher decoder pool inside the new `WebTransportClient`. Plain
+    // disconnects keep the pre-vc-kni "stay idle" behaviour.
+    let original_url = server_url.clone();
+    let mut current_url = server_url;
+    let mut hops: u32 = 0;
+    loop {
+        let signal = Arc::new(SessionEndSignal::default());
+        let mut client = WebTransportClient::new(config.clone())
+            .with_stats(stats.clone())
+            .with_session_end_signal(signal.clone())
+            .with_decode(true);
+        client.connect(&current_url, insecure).await?;
 
-    // Listeners don't run audio/video producers. The inbound consumer started
-    // by `connect` records packets_received for us.
+        let notified = signal.notify.notified();
+        tokio::pin!(notified);
+        if !signal.ended.load(Ordering::Relaxed) {
+            notified.await;
+        }
+
+        let redirect = signal.redirect_to.lock().unwrap().clone();
+        match redirect {
+            Some(target) if hops < MAX_REDIRECT_HOPS => {
+                hops += 1;
+                match compute_redirect_url(&original_url, &target) {
+                    Ok(next) => {
+                        info!(
+                            "Listener {} following ADMISSION_DECISION REDIRECT to {} (hop {}/{})",
+                            user_id, next, hops, MAX_REDIRECT_HOPS
+                        );
+                        stats.record_redirect_followed();
+                        current_url = next;
+                        client.stop();
+                        drop(client);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Listener {} could not parse redirect target {:?}: {}; staying idle",
+                            user_id, target, e
+                        );
+                        break;
+                    }
+                }
+            }
+            Some(target) => {
+                warn!(
+                    "Listener {} exhausted redirect budget ({} hops); last target was {}; staying idle",
+                    user_id, MAX_REDIRECT_HOPS, target
+                );
+                break;
+            }
+            None => break,
+        }
+    }
+
     std::future::pending::<()>().await;
     Ok(())
 }
@@ -402,6 +570,7 @@ mod tests {
         let tx_packets_enqueued = totals.tx_packets_enqueued;
         let tx_drops_channel_full = totals.tx_drops_channel_full;
         let tx_drops_send_error = totals.tx_drops_send_error;
+        let redirects_followed = totals.redirects_followed;
 
         let summary = OrchestrationSummary {
             senders: 0,
@@ -412,6 +581,7 @@ mod tests {
             tx_packets_enqueued,
             tx_drops_channel_full,
             tx_drops_send_error,
+            redirects_followed,
             totals,
             sender_totals,
             listener_totals,
@@ -452,5 +622,53 @@ mod tests {
             root_tx_idx < totals_idx,
             "tx_packets_enqueued must appear at the root (before \"totals\"), got: {json}"
         );
+    }
+
+    /// vc-kni: swapping the host of the orchestrate URL with the SFU's
+    /// redirect target must preserve the scheme, port, and path. This is
+    /// the path the orchestrate reconnect loop uses to point the next
+    /// `WebTransportClient::connect` at the owner pod identified by
+    /// `ADMISSION_DECISION{REDIRECT}.redirect_to`.
+    #[test]
+    fn compute_redirect_url_swaps_host_and_preserves_rest() {
+        let original = Url::parse("https://lb-host:8443/").expect("parse original");
+        let target = "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local";
+        let got = compute_redirect_url(&original, target).expect("compute redirect");
+        assert_eq!(got.scheme(), "https");
+        assert_eq!(got.host_str(), Some(target));
+        assert_eq!(got.port(), Some(8443));
+        assert_eq!(got.path(), "/");
+        assert_eq!(
+            got.as_str(),
+            "https://rustlemania-webtransport-2.webtransport-headless.svc.cluster.local:8443/"
+        );
+    }
+
+    /// vc-kni: a URL that already carries a non-trivial path (e.g. the
+    /// caller passed in a base URL including a prefix) must survive the
+    /// host swap unchanged. The orchestrate consumer appends
+    /// `/lobby/<user>/<room>` inside `WebTransportClient::connect`, so a
+    /// loss of path data would manifest as a 404 / lobby mismatch on the
+    /// reconnect attempt.
+    #[test]
+    fn compute_redirect_url_preserves_path_and_default_port() {
+        let original = Url::parse("https://lb-host/api").expect("parse original");
+        let target = "owner-pod.cluster.local";
+        let got = compute_redirect_url(&original, target).expect("compute redirect");
+        assert_eq!(got.host_str(), Some(target));
+        assert_eq!(got.scheme(), "https");
+        assert_eq!(got.path(), "/api");
+        // Default https port was implicit in the source; it stays implicit.
+        assert_eq!(got.port(), None);
+    }
+
+    /// vc-kni: an empty or syntactically invalid target must NOT crash the
+    /// bot — the orchestrate loop instead logs a warning and falls through
+    /// to `pending`. Empty hosts are rejected by `Url::set_host`, which
+    /// gives us this behaviour for free.
+    #[test]
+    fn compute_redirect_url_rejects_empty_target() {
+        let original = Url::parse("https://lb-host:8443/").unwrap();
+        assert!(compute_redirect_url(&original, "").is_err());
     }
 }

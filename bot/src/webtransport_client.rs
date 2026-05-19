@@ -142,9 +142,11 @@ fn now_ms() -> u64 {
 /// the orchestrator that the session has ended (either cleanly, by error, or
 /// by an `ADMISSION_DECISION{REDIRECT}` arriving just before the close).
 ///
-/// Used only in failover-test mode. Ordinary `--orchestrate` runs never look
-/// at this; the bot loops via `std::future::pending` and is task-aborted at
-/// duration end.
+/// Used by both the failover-test orchestrator (`failover.rs`) and the
+/// default orchestrate path (`orchestrate.rs`) since vc-kni — the latter
+/// drives a reconnect-on-REDIRECT loop so a bot that lands on a non-owner
+/// pod follows the SFU's redirect to the correct owner instead of silently
+/// dropping out of the test.
 #[derive(Default)]
 pub struct SessionEndSignal {
     /// Fires when the inbound consumer exits. Multi-consumer-safe via
@@ -356,7 +358,9 @@ impl WebTransportClient {
     /// Start a task to consume all inbound unistreams to avoid being a slow
     /// consumer.
     ///
-    /// Failover-test mode (p6-11) layers two extra behaviours on top:
+    /// When a [`SessionEndSignal`] is attached (failover.rs since p6-11,
+    /// orchestrate.rs since vc-kni) the consumer layers two extra
+    /// behaviours on top:
     ///
     /// 1. Each drained stream is parsed as a `PacketWrapper`. If we see an
     ///    `ADMISSION_DECISION{REDIRECT}`, we stash `redirect_to` on the
@@ -364,6 +368,13 @@ impl WebTransportClient {
     ///    reconnect attempt. The redirect packet arrives **immediately
     ///    before** the SFU closes the session, so we must capture it before
     ///    treating the subsequent `accept_uni` error as a plain disconnect.
+    ///    For reliability we drain inline (rather than spawn-per-stream) so
+    ///    `read_to_end` and `try_extract_redirect_target` complete before
+    ///    the next `accept_uni` returns an error. Perf trade-off: at the
+    ///    orchestrate workload shape (~12 publishers × ~80 streams/sec/
+    ///    publisher ≈ 1000 streams/sec/listener) `read_to_end` for small
+    ///    media packets returns quickly and decode is already offloaded to
+    ///    `spawn_blocking`, so the marginal latency is acceptable.
     /// 2. On any terminal condition (accept-uni error, quit flag) we mark
     ///    the bot as disconnected (sticky first-gap timestamp) and fire the
     ///    session-end notification.

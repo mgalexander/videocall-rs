@@ -111,6 +111,13 @@ pub struct BotStats {
     /// `tx_drops_channel_full` so the staircase test can attribute drops to
     /// either the local queue or the wire.
     pub tx_drops_send_error: AtomicU64,
+    /// Redirect bookkeeping (vc-kni): total `ADMISSION_DECISION{REDIRECT}`
+    /// targets this bot successfully followed via the orchestrate reconnect
+    /// loop. Increments once per loop iteration that captured a redirect
+    /// target and rebuilt the WebTransport client at the new host. `0` for
+    /// failover-test mode (which logs but does not follow redirects) and for
+    /// any bot that never received a redirect.
+    pub redirects_followed: AtomicU64,
 }
 
 impl BotStats {
@@ -216,6 +223,14 @@ impl BotStats {
         self.tx_drops_send_error.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one successfully followed `ADMISSION_DECISION{REDIRECT}`
+    /// target (vc-kni). Called by the orchestrate reconnect loop after it
+    /// captures `redirect_to` from the session-end signal and rebuilds the
+    /// `WebTransportClient` against the new host.
+    pub fn record_redirect_followed(&self) {
+        self.redirects_followed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Capture a serializable snapshot of the current counters.
     pub fn snapshot(&self, duration_s: f64) -> BotStatsSnapshot {
         let bytes = self.bytes_received.load(Ordering::Relaxed);
@@ -242,6 +257,7 @@ impl BotStats {
         let tx_packets_enqueued = self.tx_packets_enqueued.load(Ordering::Relaxed);
         let tx_drops_channel_full = self.tx_drops_channel_full.load(Ordering::Relaxed);
         let tx_drops_send_error = self.tx_drops_send_error.load(Ordering::Relaxed);
+        let redirects_followed = self.redirects_followed.load(Ordering::Relaxed);
         BotStatsSnapshot {
             user_id: self.user_id.clone(),
             role: self.role,
@@ -301,6 +317,11 @@ impl BotStats {
             } else {
                 Some(tx_drops_send_error)
             },
+            redirects_followed: if redirects_followed == 0 {
+                None
+            } else {
+                Some(redirects_followed)
+            },
         }
     }
 }
@@ -348,6 +369,10 @@ pub struct BotStatsSnapshot {
     /// failures occurred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_drops_send_error: Option<u64>,
+    /// Redirect bookkeeping (vc-kni). `None` when the bot never followed an
+    /// `ADMISSION_DECISION{REDIRECT}` target during the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirects_followed: Option<u64>,
 }
 
 #[cfg(test)]
@@ -379,6 +404,32 @@ mod tests {
             !json.contains("tx_drops_send_error"),
             "tx_drops_send_error must be omitted when zero, got: {json}"
         );
+    }
+
+    /// vc-kni: the `redirects_followed` counter follows the same "omit when
+    /// 0" pattern as the existing optional fields. Guards against the field
+    /// leaking into 200-bot runs that never trigger a REDIRECT (the common
+    /// case on a healthy cluster).
+    #[test]
+    fn redirects_followed_counter_omitted_when_zero_and_surfaces_when_nonzero_vc_kni() {
+        let stats = BotStats::new("listener-0".into(), BotRole::Listener);
+        let snap = stats.snapshot(1.0);
+        assert_eq!(snap.redirects_followed, None);
+
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        assert!(
+            !json.contains("redirects_followed"),
+            "redirects_followed must be omitted when zero, got: {json}"
+        );
+
+        // Recording the helper bumps the counter and surfaces it.
+        stats.record_redirect_followed();
+        stats.record_redirect_followed();
+        let snap = stats.snapshot(1.0);
+        assert_eq!(snap.redirects_followed, Some(2));
+
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        assert!(json.contains("\"redirects_followed\":2"));
     }
 
     /// vc-xpf: each `record_tx_*` helper must update its own counter and
