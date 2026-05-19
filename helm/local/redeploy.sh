@@ -286,8 +286,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 upgrade_and_tail() {
-    # upgrade_and_tail <release> <chart-dir> <deployment> <values-file>
-    local release="$1" chart="$2" deployment="$3" values_file="$4"
+    # upgrade_and_tail <release> <chart-dir> <kind> <workload> <values-file>
+    # <kind> is the kubectl resource kind (deployment or statefulset) that the
+    # chart renders; rustlemania-{websocket,webtransport} render StatefulSets,
+    # meeting-api renders a Deployment.
+    local release="$1" chart="$2" kind="$3" workload="$4" values_file="$5"
 
     log "helm upgrade ${release} (chart: ${chart}, tag: ${TAG})"
     # We deliberately re-render from values-local.yaml (no --reuse-values) so
@@ -299,22 +302,22 @@ upgrade_and_tail() {
         --values "${values_file}" \
         --set "image.tag=${TAG}"
 
-    log "waiting up to ${ROLLOUT_TIMEOUT}s for deployment/${deployment} to roll out"
+    log "waiting up to ${ROLLOUT_TIMEOUT}s for ${kind}/${workload} to roll out"
     kubectl --context "${KUBECONTEXT}" -n default rollout status \
-        "deployment/${deployment}" --timeout="${ROLLOUT_TIMEOUT}s"
+        "${kind}/${workload}" --timeout="${ROLLOUT_TIMEOUT}s"
 
-    log "tailing deployment/${deployment} logs for ${LOG_TAIL_SECONDS}s (prefix: [${deployment} logs])"
+    log "tailing ${kind}/${workload} logs for ${LOG_TAIL_SECONDS}s (prefix: [${workload} logs])"
     # Use a subshell so we can prefix every log line for readable multi-
-    # component runs. `kubectl logs -f` on a Deployment streams from all
-    # matching pods; --tail=50 caps the initial backlog. Stderr is folded
-    # in via 2>&1 so panics show up under the same prefix.
+    # component runs. `kubectl logs -f` on a Deployment/StatefulSet streams
+    # from all matching pods; --tail=50 caps the initial backlog. Stderr is
+    # folded in via 2>&1 so panics show up under the same prefix.
     #
     # awk + fflush (not `sed -u`) for the line-prefix: BSD sed on macOS
     # rejects -u and we ship to macOS dev boxes as the primary platform.
     (
         kubectl --context "${KUBECONTEXT}" -n default logs \
-            "deployment/${deployment}" -f --tail=50 2>&1 \
-            | awk -v p="[${deployment} logs] " '{ print p $0; fflush(); }'
+            "${kind}/${workload}" -f --tail=50 2>&1 \
+            | awk -v p="[${workload} logs] " '{ print p $0; fflush(); }'
     ) &
     TAIL_PID=$!
 
@@ -333,6 +336,7 @@ for component in "${SELECTED[@]}"; do
             upgrade_and_tail \
                 meeting-api \
                 "${HELM_DIR}/meeting-api" \
+                deployment \
                 meeting-api \
                 "${HELM_DIR}/meeting-api/values-local.yaml"
             ;;
@@ -340,6 +344,7 @@ for component in "${SELECTED[@]}"; do
             upgrade_and_tail \
                 rustlemania-websocket \
                 "${HELM_DIR}/rustlemania-websocket" \
+                statefulset \
                 rustlemania-websocket \
                 "${HELM_DIR}/rustlemania-websocket/values-local.yaml"
             ;;
@@ -347,6 +352,7 @@ for component in "${SELECTED[@]}"; do
             upgrade_and_tail \
                 rustlemania-webtransport \
                 "${HELM_DIR}/rustlemania-webtransport" \
+                statefulset \
                 rustlemania-webtransport \
                 "${HELM_DIR}/rustlemania-webtransport/values-local.yaml"
             ;;
