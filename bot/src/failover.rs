@@ -96,6 +96,21 @@ struct FailoverSummary {
     /// Count of listeners that observed a gap AND recovered (received at
     /// least one packet post-gap before the run ended).
     listeners_recovered: usize,
+    /// vc-6hu: aggregate of `tx_packets_enqueued` across all bots — total
+    /// successful producer→sender enqueues this run. Mirrors the
+    /// `Totals.tx_packets_enqueued` field on [`crate::orchestrate`] so the
+    /// failover summary exposes the same producer-side visibility at the
+    /// top level (per-bot values are `Option<u64>` and disappear when zero,
+    /// which broke staircase dashboards that grep the summary for
+    /// `tx_drops_*` regardless of whether any bot tripped a drop).
+    tx_packets_enqueued: u64,
+    /// vc-6hu: aggregate of `tx_drops_channel_full` — drops attributed to a
+    /// full producer→sender channel. Always present so dashboards / jq
+    /// filters get a stable schema.
+    tx_drops_channel_full: u64,
+    /// vc-6hu: aggregate of `tx_drops_send_error` — drops attributed to a
+    /// WebTransport send failure. Always present.
+    tx_drops_send_error: u64,
     per_bot: Vec<BotStatsSnapshot>,
 }
 
@@ -197,6 +212,7 @@ pub async fn run(cfg: FailoverConfig) -> anyhow::Result<()> {
         .collect();
 
     let (max_downtime_ms, listeners_with_gap, listeners_recovered) = aggregate_failover(&per_bot);
+    let tx_totals = aggregate_tx_totals(&per_bot);
 
     let summary = FailoverSummary {
         senders: cfg.senders,
@@ -207,6 +223,9 @@ pub async fn run(cfg: FailoverConfig) -> anyhow::Result<()> {
         max_downtime_ms,
         listeners_with_gap,
         listeners_recovered,
+        tx_packets_enqueued: tx_totals.tx_packets_enqueued,
+        tx_drops_channel_full: tx_totals.tx_drops_channel_full,
+        tx_drops_send_error: tx_totals.tx_drops_send_error,
         per_bot,
     };
 
@@ -232,6 +251,30 @@ fn aggregate_failover(per_bot: &[BotStatsSnapshot]) -> (Option<u64>, usize, usiz
         }
     }
     (max_dt, with_gap, recovered)
+}
+
+/// vc-6hu: per-bot tx_* counters collapsed into a single run-wide tuple.
+///
+/// The per-bot snapshot stores `tx_packets_enqueued`, `tx_drops_channel_full`,
+/// and `tx_drops_send_error` as `Option<u64>` (omitted from JSON when zero,
+/// matching the orchestrate-side schema), so dashboards scraping the failover
+/// summary cannot rely on the per-bot keys being present. The aggregator
+/// produces top-level plain `u64`s that are always serialized.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TxTotals {
+    tx_packets_enqueued: u64,
+    tx_drops_channel_full: u64,
+    tx_drops_send_error: u64,
+}
+
+fn aggregate_tx_totals(per_bot: &[BotStatsSnapshot]) -> TxTotals {
+    let mut totals = TxTotals::default();
+    for snap in per_bot {
+        totals.tx_packets_enqueued += snap.tx_packets_enqueued.unwrap_or(0);
+        totals.tx_drops_channel_full += snap.tx_drops_channel_full.unwrap_or(0);
+        totals.tx_drops_send_error += snap.tx_drops_send_error.unwrap_or(0);
+    }
+    totals
 }
 
 async fn run_sender(
@@ -388,4 +431,103 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::{BotRole, BotStats};
+
+    /// Build a per-bot snapshot with a configurable tx_* counter mix. Uses
+    /// the real `BotStats` recorder helpers (rather than constructing the
+    /// snapshot literal) so the test stays robust to future field additions
+    /// on `BotStatsSnapshot`.
+    fn snap_with_tx(
+        user_id: &str,
+        role: BotRole,
+        enqueued: u64,
+        ch_full: u64,
+        send_err: u64,
+    ) -> BotStatsSnapshot {
+        let stats = BotStats::new(user_id.to_string(), role);
+        for _ in 0..enqueued {
+            stats.record_tx_packet_enqueued();
+        }
+        for _ in 0..ch_full {
+            stats.record_tx_drop_channel_full();
+        }
+        for _ in 0..send_err {
+            stats.record_tx_drop_send_error();
+        }
+        stats.snapshot(1.0)
+    }
+
+    /// vc-6hu: the aggregator must sum across every bot, treating `None`
+    /// (omitted-when-zero) as 0 and including senders, listeners, and the
+    /// rare unroled snapshot. The result is what gets surfaced at the top
+    /// level of the failover JSON.
+    #[test]
+    fn aggregate_tx_totals_sums_mixed_some_and_none() {
+        let per_bot = vec![
+            // Sender with all three counters active.
+            snap_with_tx("sender-0", BotRole::Sender, 100, 5, 2),
+            // Sender that never tripped channel-full nor send-error -> None.
+            snap_with_tx("sender-1", BotRole::Sender, 200, 0, 0),
+            // Listener: producers don't run, so all three are None.
+            snap_with_tx("listener-0", BotRole::Listener, 0, 0, 0),
+            // Sender with only send-errors.
+            snap_with_tx("sender-2", BotRole::Sender, 50, 0, 7),
+        ];
+
+        let totals = aggregate_tx_totals(&per_bot);
+        assert_eq!(
+            totals,
+            TxTotals {
+                tx_packets_enqueued: 350,
+                tx_drops_channel_full: 5,
+                tx_drops_send_error: 9,
+            }
+        );
+    }
+
+    /// vc-6hu: when no bot tripped any tx_* counter, the aggregate must be
+    /// all zeros — and crucially, the fields must still be present in the
+    /// JSON (unlike the per-bot `Option<u64>` fields). This guards against
+    /// a future regression where someone adds `skip_serializing_if = "..."`
+    /// to the FailoverSummary fields.
+    #[test]
+    fn failover_summary_serializes_zero_tx_totals() {
+        let per_bot = vec![snap_with_tx("listener-0", BotRole::Listener, 0, 0, 0)];
+        let totals = aggregate_tx_totals(&per_bot);
+        assert_eq!(totals, TxTotals::default());
+
+        let summary = FailoverSummary {
+            senders: 0,
+            listeners: 1,
+            duration_s: 30,
+            room: "room-a".into(),
+            server_url: "https://example".into(),
+            max_downtime_ms: None,
+            listeners_with_gap: 0,
+            listeners_recovered: 0,
+            tx_packets_enqueued: totals.tx_packets_enqueued,
+            tx_drops_channel_full: totals.tx_drops_channel_full,
+            tx_drops_send_error: totals.tx_drops_send_error,
+            per_bot,
+        };
+
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(
+            json.contains("\"tx_packets_enqueued\":0"),
+            "tx_packets_enqueued must be present even when zero, got: {json}"
+        );
+        assert!(
+            json.contains("\"tx_drops_channel_full\":0"),
+            "tx_drops_channel_full must be present even when zero, got: {json}"
+        );
+        assert!(
+            json.contains("\"tx_drops_send_error\":0"),
+            "tx_drops_send_error must be present even when zero, got: {json}"
+        );
+    }
 }
