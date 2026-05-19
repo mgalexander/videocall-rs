@@ -83,6 +83,12 @@ pub struct ReceiverSubscription {
     pub slots: Vec<VisibilitySlot>,
     pub max_video_kbps: u32,
     pub receive_all_audio: bool,
+    /// vc-3s8: when true, video fans out to every current and future room
+    /// member (minus self), capped at [`MAX_VISIBLE_VIDEO`]. Mirrors
+    /// `receive_all_audio` for video so a receiver that wants to "see
+    /// everyone" doesn't get locked out of senders that join AFTER its
+    /// subscription is applied (webinar first-joiner bug).
+    pub receive_all_video: bool,
 }
 
 /// Cached `AllowSet` for one receiver, keyed by the three generation counters
@@ -169,6 +175,7 @@ impl SubscriptionStore {
             slots,
             max_video_kbps,
             receive_all_audio,
+            receive_all_video,
             ..
         } = update;
 
@@ -207,6 +214,7 @@ impl SubscriptionStore {
                 slots: kept_slots,
                 max_video_kbps,
                 receive_all_audio,
+                receive_all_video,
             },
         );
 
@@ -380,6 +388,24 @@ impl SubscriptionStore {
             }
         }
 
+        // vc-3s8: `receive_all_video` is a fourth tier that fans out to every
+        // current room member. Runs after pinned/slots/speakers so explicit
+        // tiers win when the cap is tight. Sorted by SessionId for
+        // determinism, just like the other tiers.
+        if sub.receive_all_video && video.len() < cap {
+            let mut all_sorted: Vec<SessionId> = current_members
+                .iter()
+                .copied()
+                .filter(|&s| in_room(s) && !seen.contains(&s))
+                .collect();
+            all_sorted.sort_unstable();
+            for sid in all_sorted {
+                if !push(sid, &mut video, &mut seen) {
+                    break;
+                }
+            }
+        }
+
         let audio: HashSet<SessionId> = if sub.receive_all_audio {
             current_members
                 .iter()
@@ -428,6 +454,19 @@ mod tests {
         u.slots = slots;
         u.max_video_kbps = 0;
         u.receive_all_audio = receive_all_audio;
+        u.receive_all_video = false;
+        u
+    }
+
+    /// vc-3s8: builder for opt-in "see everyone" subscriptions.
+    fn update_all(
+        pinned: &[SessionId],
+        slots: Vec<VisibilitySlot>,
+        receive_all_audio: bool,
+        receive_all_video: bool,
+    ) -> SubscriptionUpdate {
+        let mut u = update(pinned, slots, receive_all_audio);
+        u.receive_all_video = receive_all_video;
         u
     }
 
@@ -672,6 +711,181 @@ mod tests {
             allow.audio.is_empty(),
             "audio must be empty (receive_all_audio=false, no video)"
         );
+    }
+
+    /// vc-3s8 regression: a receiver that opts in to "see everyone" via
+    /// `receive_all_video=true` must, after a NEW sender joins, see that
+    /// sender's video — not just audio. Webinar listeners hit this path when
+    /// the client's `SubscriptionCoalescer` ships its initial empty update
+    /// (default: `receive_all_audio:true`, `receive_all_video:true`) before
+    /// the first peer becomes visible.
+    #[test]
+    fn vc_3s8_late_joiner_visible_when_receive_all_video() {
+        let mut store = SubscriptionStore::new();
+        // Step 1: only the listener is in the room.
+        let room_before = members(&[1]);
+        // Listener sends an empty SubscriptionUpdate with
+        // receive_all_audio=true AND receive_all_video=true — the fix-side
+        // contract that mirrors audio's existing semantics for video.
+        store.apply_update(1, update_all(&[], vec![], true, true), &room_before);
+
+        // Step 2: sender 2 joins later. Membership generation bumps.
+        let room_after = members(&[1, 2]);
+        let allow = store.resolve(1, &room_after, &[]);
+
+        assert!(
+            allow.audio.contains(&2),
+            "audio: late-joining sender 2 must be audible to listener 1"
+        );
+        assert!(
+            allow.video.contains_key(&2),
+            "video: late-joining sender 2 must be visible to listener 1 \
+             (vc-3s8 fix: receive_all_video=true mirrors receive_all_audio \
+             for late-joining publishers)"
+        );
+    }
+
+    /// vc-3s8: `receive_all_video=true` honors the MAX_VISIBLE_VIDEO cap so
+    /// a fan-out subscription cannot DoS the layer selector. Deterministic
+    /// tie-break by SessionId (sorted ascending), matching the other tiers.
+    #[test]
+    fn vc_3s8_receive_all_video_caps_at_max_visible() {
+        let mut store = SubscriptionStore::new();
+        // Receiver 1 + 10 senders (10..20). receive_all_video=true with no
+        // explicit pins/slots/speakers should cover senders 10..16 (the
+        // lowest MAX_VISIBLE_VIDEO=6 by SessionId).
+        let mut all: Vec<SessionId> = (10..20).collect();
+        all.push(1);
+        let room = members(&all);
+        store.apply_update(1, update_all(&[], vec![], false, true), &room);
+
+        let allow = store.resolve(1, &room, &[]);
+        assert_eq!(allow.video.len(), MAX_VISIBLE_VIDEO as usize);
+        let mut got: Vec<SessionId> = allow.video.keys().copied().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11, 12, 13, 14, 15]);
+    }
+
+    /// vc-3s8: explicit tiers (pinned, slots, speakers) win over the
+    /// receive_all_video catch-all when the cap is tight. The catch-all only
+    /// fills leftover capacity.
+    #[test]
+    fn vc_3s8_explicit_tiers_win_over_receive_all_video() {
+        let mut store = SubscriptionStore::new();
+        // Room: receiver 1, plus 8 senders (10..18). Receiver pins 17 (a
+        // high-numbered id), enables receive_all_video. Cap=6 must include
+        // the pinned 17 plus the 5 lowest-by-id non-receiver members
+        // (10..15) — NOT 16 (which sorts before 17 but is bumped by the
+        // tier ordering: pinned drains capacity first, then catch-all fills
+        // ascending without revisiting 17).
+        let mut all: Vec<SessionId> = (10..18).collect();
+        all.push(1);
+        let room = members(&all);
+        store.apply_update(1, update_all(&[17], vec![], false, true), &room);
+
+        let allow = store.resolve(1, &room, &[]);
+        assert_eq!(allow.video.len(), MAX_VISIBLE_VIDEO as usize);
+        // Pinned must be present.
+        assert!(allow.video.contains_key(&17));
+        // Catch-all fills the remaining 5 slots with the lowest sids.
+        for sid in [10, 11, 12, 13, 14] {
+            assert!(allow.video.contains_key(&sid), "catch-all must admit {sid}");
+        }
+        // 15, 16 are squeezed out — pin + the 5 lowest already exhausted cap.
+        assert!(!allow.video.contains_key(&15));
+        assert!(!allow.video.contains_key(&16));
+    }
+
+    /// vc-3s8: toggling `receive_all_video` from true → false must shrink the
+    /// AllowSet on the next resolve. Cache eviction is provided by the
+    /// `sub_version` bump in `apply_update`; this test locks in the wire-level
+    /// contract for clients that opt out (e.g., bandwidth-constrained
+    /// receivers flipping the catch-all off once their UI has materialised
+    /// the visible tiles).
+    #[test]
+    fn vc_3s8_receive_all_video_dynamic_toggle_shrinks_allowset() {
+        let mut store = SubscriptionStore::new();
+        let room = members(&[1, 10, 11, 12]);
+
+        // Step 1: receive_all_video=true with no explicit pins/slots → AllowSet
+        // covers every non-receiver.
+        store.apply_update(1, update_all(&[], vec![], false, true), &room);
+        let allow_on = store.resolve(1, &room, &[]);
+        assert_eq!(allow_on.video.len(), 3);
+        for sid in [10, 11, 12] {
+            assert!(allow_on.video.contains_key(&sid));
+        }
+
+        // Step 2: receive_all_video=false with the same (empty) explicit
+        // tiers → AllowSet collapses to empty. Declarative-replace contract
+        // is preserved; the catch-all does not "stick".
+        store.apply_update(1, update_all(&[], vec![], false, false), &room);
+        let allow_off = store.resolve(1, &room, &[]);
+        assert!(
+            allow_off.video.is_empty(),
+            "video must collapse when receive_all_video flips false with no \
+             explicit pins/slots — declarative-replace contract"
+        );
+    }
+
+    /// vc-3s8: a sender that departs the room while `receive_all_video=true`
+    /// is in effect must drop out of the AllowSet on the next resolve.
+    /// Membership is supplied by the caller (room state), so this verifies
+    /// the resolver consumes `current_members` correctly rather than caching
+    /// a stale snapshot internally.
+    #[test]
+    fn vc_3s8_receive_all_video_drops_departed_member() {
+        let mut store = SubscriptionStore::new();
+
+        // Step 1: room has {1, 10, 11}. receive_all_video=true covers both
+        // non-receivers.
+        let room_before = members(&[1, 10, 11]);
+        store.apply_update(1, update_all(&[], vec![], false, true), &room_before);
+        let allow_before = store.resolve(1, &room_before, &[]);
+        assert!(allow_before.video.contains_key(&10));
+        assert!(allow_before.video.contains_key(&11));
+
+        // Step 2: member 10 leaves. Caller hands the resolver the updated
+        // membership snapshot. The catch-all must NOT smuggle 10 back in.
+        let room_after = members(&[1, 11]);
+        let allow_after = store.resolve(1, &room_after, &[]);
+        assert!(
+            !allow_after.video.contains_key(&10),
+            "departed member 10 must not appear in catch-all AllowSet"
+        );
+        assert!(allow_after.video.contains_key(&11));
+    }
+
+    /// vc-3s8: when speakers + catch-all together would exceed cap, speakers
+    /// drain capacity ahead of the catch-all. Locks in the tier order
+    /// pinned → slots → speakers → receive_all_video so future tuning is
+    /// intentional rather than accidental.
+    #[test]
+    fn vc_3s8_speakers_win_over_receive_all_video_at_cap() {
+        let mut store = SubscriptionStore::new();
+        // Room: receiver 1 + 8 senders (10..18). Speakers explicitly include
+        // 16, 17 (high-numbered). receive_all_video=true catch-all fills
+        // remaining capacity from the lowest sids upward.
+        let mut all: Vec<SessionId> = (10..18).collect();
+        all.push(1);
+        let room = members(&all);
+        store.apply_update(1, update_all(&[], vec![], false, true), &room);
+
+        let allow = store.resolve(1, &room, &[16, 17]);
+        assert_eq!(allow.video.len(), MAX_VISIBLE_VIDEO as usize);
+
+        // Speakers must be present (they drained capacity ahead of the
+        // catch-all).
+        assert!(allow.video.contains_key(&16));
+        assert!(allow.video.contains_key(&17));
+        // Catch-all fills the remaining 4 slots with the lowest non-speaker
+        // sids: 10, 11, 12, 13.
+        for sid in [10, 11, 12, 13] {
+            assert!(allow.video.contains_key(&sid), "catch-all must admit {sid}");
+        }
+        // 14, 15 squeezed out — speakers + the 4 lowest exhausted cap.
+        assert!(!allow.video.contains_key(&14));
+        assert!(!allow.video.contains_key(&15));
     }
 
     /// Sanity: forget() wipes both per_receiver and pending.

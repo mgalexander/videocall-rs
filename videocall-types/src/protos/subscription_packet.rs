@@ -36,6 +36,15 @@ pub struct SubscriptionUpdate {
     pub max_video_kbps: u32,
     // @@protoc_insertion_point(field:videocall.SubscriptionUpdate.receive_all_audio)
     pub receive_all_audio: bool,
+    ///  vc-3s8: when true, the receiver wants video from every current and
+    ///  future member of the room (minus self), capped at MAX_VISIBLE_VIDEO.
+    ///  Mirrors `receive_all_audio` for video so a webinar listener that ships
+    ///  an opening empty SubscriptionUpdate (visible={}, pinned={},
+    ///  receive_all_audio=true) still receives video from senders that join
+    ///  AFTER the subscription was applied. Default false preserves the
+    ///  existing declarative-replace contract for clients that don't opt in.
+    // @@protoc_insertion_point(field:videocall.SubscriptionUpdate.receive_all_video)
+    pub receive_all_video: bool,
     // special fields
     // @@protoc_insertion_point(special_field:videocall.SubscriptionUpdate.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -53,7 +62,7 @@ impl SubscriptionUpdate {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut fields = ::std::vec::Vec::with_capacity(5);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
             "pinned_sessions",
@@ -74,6 +83,11 @@ impl SubscriptionUpdate {
             "receive_all_audio",
             |m: &SubscriptionUpdate| { &m.receive_all_audio },
             |m: &mut SubscriptionUpdate| { &mut m.receive_all_audio },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "receive_all_video",
+            |m: &SubscriptionUpdate| { &m.receive_all_video },
+            |m: &mut SubscriptionUpdate| { &mut m.receive_all_video },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<SubscriptionUpdate>(
             "SubscriptionUpdate",
@@ -108,6 +122,9 @@ impl ::protobuf::Message for SubscriptionUpdate {
                 32 => {
                     self.receive_all_audio = is.read_bool()?;
                 },
+                40 => {
+                    self.receive_all_video = is.read_bool()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -131,6 +148,9 @@ impl ::protobuf::Message for SubscriptionUpdate {
         if self.receive_all_audio != false {
             my_size += 1 + 1;
         }
+        if self.receive_all_video != false {
+            my_size += 1 + 1;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -146,6 +166,9 @@ impl ::protobuf::Message for SubscriptionUpdate {
         }
         if self.receive_all_audio != false {
             os.write_bool(4, self.receive_all_audio)?;
+        }
+        if self.receive_all_video != false {
+            os.write_bool(5, self.receive_all_video)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -168,6 +191,7 @@ impl ::protobuf::Message for SubscriptionUpdate {
         self.slots.clear();
         self.max_video_kbps = 0;
         self.receive_all_audio = false;
+        self.receive_all_video = false;
         self.special_fields.clear();
     }
 
@@ -177,6 +201,7 @@ impl ::protobuf::Message for SubscriptionUpdate {
             slots: ::std::vec::Vec::new(),
             max_video_kbps: 0,
             receive_all_audio: false,
+            receive_all_video: false,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -359,39 +384,53 @@ impl ::protobuf::reflect::ProtobufValue for VisibilitySlot {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1ftypes/subscription_packet.proto\x12\tvideocall\"\xc0\x01\n\x12Subs\
+    \n\x1ftypes/subscription_packet.proto\x12\tvideocall\"\xec\x01\n\x12Subs\
     criptionUpdate\x12'\n\x0fpinned_sessions\x18\x01\x20\x03(\x04R\x0epinned\
     Sessions\x12/\n\x05slots\x18\x02\x20\x03(\x0b2\x19.videocall.VisibilityS\
     lotR\x05slots\x12$\n\x0emax_video_kbps\x18\x03\x20\x01(\rR\x0cmaxVideoKb\
     ps\x12*\n\x11receive_all_audio\x18\x04\x20\x01(\x08R\x0freceiveAllAudio\
-    \"\x8b\x01\n\x0eVisibilitySlot\x12\x1d\n\nsession_id\x18\x01\x20\x01(\
-    \x04R\tsessionId\x12+\n\x11preferred_spatial\x18\x02\x20\x01(\rR\x10pref\
-    erredSpatial\x12-\n\x12preferred_temporal\x18\x03\x20\x01(\rR\x11preferr\
-    edTemporalJ\xfd\x03\n\x06\x12\x04\0\0\x0e\x01\n\x08\n\x01\x0c\x12\x03\0\
-    \0\x12\n\x08\n\x01\x02\x12\x03\x01\0\x12\n\n\n\x02\x04\0\x12\x04\x03\0\
-    \x08\x01\n\n\n\x03\x04\0\x01\x12\x03\x03\x08\x1a\n\x0b\n\x04\x04\0\x02\0\
-    \x12\x03\x04\x02&\n\x0c\n\x05\x04\0\x02\0\x04\x12\x03\x04\x02\n\n\x0c\n\
-    \x05\x04\0\x02\0\x05\x12\x03\x04\x0b\x11\n\x0c\n\x05\x04\0\x02\0\x01\x12\
-    \x03\x04\x12!\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x04$%\n\x0b\n\x04\x04\
-    \0\x02\x01\x12\x03\x05\x02$\n\x0c\n\x05\x04\0\x02\x01\x04\x12\x03\x05\
-    \x02\n\n\x0c\n\x05\x04\0\x02\x01\x06\x12\x03\x05\x0b\x19\n\x0c\n\x05\x04\
-    \0\x02\x01\x01\x12\x03\x05\x1a\x1f\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\
-    \x05\"#\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x06\x02\x1c\n\x0c\n\x05\x04\0\
-    \x02\x02\x05\x12\x03\x06\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\
-    \x06\t\x17\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x06\x1a\x1b\n\x1f\n\x04\
-    \x04\0\x02\x03\x12\x03\x07\x02\x1d\"\x12\x20v1\x20default:\x20true\n\n\
-    \x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x07\x02\x06\n\x0c\n\x05\x04\0\x02\
-    \x03\x01\x12\x03\x07\x07\x18\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x07\
-    \x1b\x1c\n\n\n\x02\x04\x01\x12\x04\n\0\x0e\x01\n\n\n\x03\x04\x01\x01\x12\
-    \x03\n\x08\x16\n\x0b\n\x04\x04\x01\x02\0\x12\x03\x0b\x02\x18\n\x0c\n\x05\
-    \x04\x01\x02\0\x05\x12\x03\x0b\x02\x08\n\x0c\n\x05\x04\x01\x02\0\x01\x12\
-    \x03\x0b\t\x13\n\x0c\n\x05\x04\x01\x02\0\x03\x12\x03\x0b\x16\x17\n\x0b\n\
-    \x04\x04\x01\x02\x01\x12\x03\x0c\x02\x1f\n\x0c\n\x05\x04\x01\x02\x01\x05\
-    \x12\x03\x0c\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03\x0c\t\x1a\n\
-    \x0c\n\x05\x04\x01\x02\x01\x03\x12\x03\x0c\x1d\x1e\n\x0b\n\x04\x04\x01\
-    \x02\x02\x12\x03\r\x02\x20\n\x0c\n\x05\x04\x01\x02\x02\x05\x12\x03\r\x02\
-    \x08\n\x0c\n\x05\x04\x01\x02\x02\x01\x12\x03\r\t\x1b\n\x0c\n\x05\x04\x01\
-    \x02\x02\x03\x12\x03\r\x1e\x1fb\x06proto3\
+    \x12*\n\x11receive_all_video\x18\x05\x20\x01(\x08R\x0freceiveAllVideo\"\
+    \x8b\x01\n\x0eVisibilitySlot\x12\x1d\n\nsession_id\x18\x01\x20\x01(\x04R\
+    \tsessionId\x12+\n\x11preferred_spatial\x18\x02\x20\x01(\rR\x10preferred\
+    Spatial\x12-\n\x12preferred_temporal\x18\x03\x20\x01(\rR\x11preferredTem\
+    poralJ\x93\x08\n\x06\x12\x04\0\0\x16\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\
+    \n\x08\n\x01\x02\x12\x03\x01\0\x12\n\n\n\x02\x04\0\x12\x04\x03\0\x10\x01\
+    \n\n\n\x03\x04\0\x01\x12\x03\x03\x08\x1a\n\x0b\n\x04\x04\0\x02\0\x12\x03\
+    \x04\x02&\n\x0c\n\x05\x04\0\x02\0\x04\x12\x03\x04\x02\n\n\x0c\n\x05\x04\
+    \0\x02\0\x05\x12\x03\x04\x0b\x11\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x04\
+    \x12!\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x04$%\n\x0b\n\x04\x04\0\x02\
+    \x01\x12\x03\x05\x02$\n\x0c\n\x05\x04\0\x02\x01\x04\x12\x03\x05\x02\n\n\
+    \x0c\n\x05\x04\0\x02\x01\x06\x12\x03\x05\x0b\x19\n\x0c\n\x05\x04\0\x02\
+    \x01\x01\x12\x03\x05\x1a\x1f\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x05\"\
+    #\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x06\x02\x1c\n\x0c\n\x05\x04\0\x02\
+    \x02\x05\x12\x03\x06\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x06\t\
+    \x17\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x06\x1a\x1b\n\x1f\n\x04\x04\0\
+    \x02\x03\x12\x03\x07\x02\x1d\"\x12\x20v1\x20default:\x20true\n\n\x0c\n\
+    \x05\x04\0\x02\x03\x05\x12\x03\x07\x02\x06\n\x0c\n\x05\x04\0\x02\x03\x01\
+    \x12\x03\x07\x07\x18\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x07\x1b\x1c\n\
+    \xe9\x03\n\x04\x04\0\x02\x04\x12\x03\x0f\x02\x1d\x1a\xdb\x03\x20vc-3s8:\
+    \x20when\x20true,\x20the\x20receiver\x20wants\x20video\x20from\x20every\
+    \x20current\x20and\n\x20future\x20member\x20of\x20the\x20room\x20(minus\
+    \x20self),\x20capped\x20at\x20MAX_VISIBLE_VIDEO.\n\x20Mirrors\x20`receiv\
+    e_all_audio`\x20for\x20video\x20so\x20a\x20webinar\x20listener\x20that\
+    \x20ships\n\x20an\x20opening\x20empty\x20SubscriptionUpdate\x20(visible=\
+    {},\x20pinned={},\n\x20receive_all_audio=true)\x20still\x20receives\x20v\
+    ideo\x20from\x20senders\x20that\x20join\n\x20AFTER\x20the\x20subscriptio\
+    n\x20was\x20applied.\x20Default\x20false\x20preserves\x20the\n\x20existi\
+    ng\x20declarative-replace\x20contract\x20for\x20clients\x20that\x20don't\
+    \x20opt\x20in.\n\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\x0f\x02\x06\n\x0c\
+    \n\x05\x04\0\x02\x04\x01\x12\x03\x0f\x07\x18\n\x0c\n\x05\x04\0\x02\x04\
+    \x03\x12\x03\x0f\x1b\x1c\n\n\n\x02\x04\x01\x12\x04\x12\0\x16\x01\n\n\n\
+    \x03\x04\x01\x01\x12\x03\x12\x08\x16\n\x0b\n\x04\x04\x01\x02\0\x12\x03\
+    \x13\x02\x18\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03\x13\x02\x08\n\x0c\n\
+    \x05\x04\x01\x02\0\x01\x12\x03\x13\t\x13\n\x0c\n\x05\x04\x01\x02\0\x03\
+    \x12\x03\x13\x16\x17\n\x0b\n\x04\x04\x01\x02\x01\x12\x03\x14\x02\x1f\n\
+    \x0c\n\x05\x04\x01\x02\x01\x05\x12\x03\x14\x02\x08\n\x0c\n\x05\x04\x01\
+    \x02\x01\x01\x12\x03\x14\t\x1a\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03\
+    \x14\x1d\x1e\n\x0b\n\x04\x04\x01\x02\x02\x12\x03\x15\x02\x20\n\x0c\n\x05\
+    \x04\x01\x02\x02\x05\x12\x03\x15\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\x01\
+    \x12\x03\x15\t\x1b\n\x0c\n\x05\x04\x01\x02\x02\x03\x12\x03\x15\x1e\x1fb\
+    \x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

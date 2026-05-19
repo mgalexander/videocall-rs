@@ -712,3 +712,120 @@ async fn sfu_subscription_filters_per_receiver() {
          (A→B drops): before={dropped_before} after={dropped_after} delta={drop_delta}"
     );
 }
+
+// ===========================================================================
+// vc-3s8: webinar first-joiner bug — sender that joins AFTER a listener must
+// still be visible to that listener.
+//
+// Two scenarios mirroring the bead's repro:
+//   1. Listener joins first, sender joins later. Listener never sends a
+//      SubscriptionUpdate. Sender publishes MEDIA. Listener must capture it
+//      (legacy-default AllowSet path).
+//   2. Listener joins first, sends an empty SubscriptionUpdate with
+//      receive_all_audio=true (the coalescer's default opening emit once any
+//      visibility/pin flips). Sender joins later. Sender publishes MEDIA.
+//      Listener must capture it — this is the regression the fix targets.
+// ===========================================================================
+
+#[actix_rt::test]
+#[serial]
+async fn sfu_vc_3s8_late_joiner_visible_no_subscription_update() {
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+
+    let env = EnvGuard::new();
+    env.set("sfu");
+
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .expect("connect to NATS");
+    let chat = ChatServer::new(nats_client).await.start();
+
+    let room = "vc-3s8-no-sub".to_string();
+    // Distinct sid range from other tests in this file.
+    let listener = Participant::new(80_000, "listener-1@example.com");
+    let sender = Participant::new(80_001, "sender-1@example.com");
+
+    // Step 1: listener joins FIRST and never sends a SubscriptionUpdate.
+    register_and_join(&chat, &listener, &room)
+        .await
+        .expect("listener join");
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Step 2: sender joins AFTER the listener.
+    register_and_join(&chat, &sender, &room)
+        .await
+        .expect("sender join");
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Step 3: sender publishes MEDIA.
+    const BURST: usize = 5;
+    let _sent = send_media_burst(&chat, &sender, &room, BURST).await;
+    sleep(PUBLISH_SETTLE).await;
+
+    let listener_media = listener.captured_of(PacketType::MEDIA);
+    assert_eq!(
+        listener_media.len(),
+        BURST,
+        "vc-3s8 scenario 1: listener (no SubscriptionUpdate) must capture all \
+         {BURST} MEDIA packets from a sender that joined AFTER it, got {}",
+        listener_media.len()
+    );
+}
+
+#[actix_rt::test]
+#[serial]
+async fn sfu_vc_3s8_late_joiner_visible_with_empty_receive_all_audio_update() {
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+
+    let env = EnvGuard::new();
+    env.set("sfu");
+
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .expect("connect to NATS");
+    let chat = ChatServer::new(nats_client).await.start();
+
+    let room = "vc-3s8-empty-sub".to_string();
+    let listener = Participant::new(80_010, "listener-2@example.com");
+    let sender = Participant::new(80_011, "sender-2@example.com");
+
+    // Step 1: listener joins FIRST.
+    register_and_join(&chat, &listener, &room)
+        .await
+        .expect("listener join");
+
+    // Step 2: listener sends an empty SubscriptionUpdate with both
+    // receive_all_audio and receive_all_video set. This mirrors the client's
+    // `SubscriptionCoalescer` opening emit: visible={}, pinned={},
+    // receive_all_audio=true, receive_all_video=true (vc-3s8). Real clients
+    // flush this packet the first time any visibility/pin flip happens,
+    // often BEFORE the first peer has joined the room.
+    let mut update = SubscriptionUpdate::new();
+    update.pinned_sessions = vec![];
+    update.slots = vec![];
+    update.receive_all_audio = true;
+    update.receive_all_video = true;
+    send_subscription_update(&chat, &listener, &room, update).await;
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Step 3: sender joins AFTER the listener's subscription was applied.
+    register_and_join(&chat, &sender, &room)
+        .await
+        .expect("sender join");
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Step 4: sender publishes MEDIA.
+    const BURST: usize = 5;
+    let _sent = send_media_burst(&chat, &sender, &room, BURST).await;
+    sleep(PUBLISH_SETTLE).await;
+
+    let listener_media = listener.captured_of(PacketType::MEDIA);
+    assert_eq!(
+        listener_media.len(),
+        BURST,
+        "vc-3s8 scenario 2: listener (empty update, receive_all_audio=true) \
+         must capture all {BURST} MEDIA packets from a sender that joined \
+         AFTER the subscription was applied, got {}",
+        listener_media.len()
+    );
+}

@@ -6,6 +6,14 @@ message SubscriptionUpdate {
   repeated VisibilitySlot slots = 2;
   uint32 max_video_kbps = 3;
   bool receive_all_audio = 4;            // v1 default: true
+  // vc-3s8: when true, the receiver wants video from every current and
+  // future member of the room (minus self), capped at MAX_VISIBLE_VIDEO.
+  // Mirrors `receive_all_audio` for video so a webinar listener that ships
+  // an opening empty SubscriptionUpdate (visible={}, pinned={},
+  // receive_all_audio=true) still receives video from senders that join
+  // AFTER the subscription was applied. Default false preserves the
+  // existing declarative-replace contract for clients that don't opt in.
+  bool receive_all_video = 5;
 }
 
 message VisibilitySlot {

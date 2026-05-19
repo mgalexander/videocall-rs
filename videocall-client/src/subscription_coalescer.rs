@@ -87,6 +87,12 @@ struct Inner {
     seq: u64,
     max_video_kbps: u32,
     receive_all_audio: bool,
+    /// vc-3s8: when true, the SFU fans out video to every current and future
+    /// room member (minus self), capped at the server's MAX_VISIBLE_VIDEO.
+    /// Mirrors `receive_all_audio` for video so a webinar listener that
+    /// hasn't yet flipped any peer to visible still receives video from
+    /// senders that join AFTER the coalescer's initial flush.
+    receive_all_video: bool,
     emit: EmitFn,
 }
 
@@ -121,6 +127,7 @@ impl Inner {
             slots,
             max_video_kbps: self.max_video_kbps,
             receive_all_audio: self.receive_all_audio,
+            receive_all_video: self.receive_all_video,
             ..Default::default()
         };
 
@@ -153,6 +160,7 @@ impl std::fmt::Debug for SubscriptionCoalescer {
                 .field("seq", &inner.seq)
                 .field("max_video_kbps", &inner.max_video_kbps)
                 .field("receive_all_audio", &inner.receive_all_audio)
+                .field("receive_all_video", &inner.receive_all_video)
                 .finish(),
             Err(_) => f
                 .debug_struct("SubscriptionCoalescer")
@@ -173,6 +181,16 @@ impl SubscriptionCoalescer {
                 seq: 0,
                 max_video_kbps: DEFAULT_MAX_VIDEO_KBPS,
                 receive_all_audio: true,
+                // vc-3s8: default to "see everyone" for video too. The SFU
+                // applies MAX_VISIBLE_VIDEO so this can't blow up fan-out,
+                // and matching the audio default closes the webinar
+                // first-joiner gap: a listener that hasn't yet flipped any
+                // peer to visible still gets video from late-joining
+                // publishers. Once the UI starts emitting set_peer_visibility
+                // for the visible tiles, the more restrictive slots tier
+                // takes precedence (cap drains pins/slots first, fan-out
+                // fills any leftover capacity).
+                receive_all_video: true,
                 emit,
             })),
             trigger: Rc::new(trigger),
@@ -328,6 +346,14 @@ mod tests {
         assert!(update.pinned_sessions.is_empty());
         assert_eq!(update.max_video_kbps, DEFAULT_MAX_VIDEO_KBPS);
         assert!(update.receive_all_audio);
+        // vc-3s8: coalescer defaults to receive_all_video=true so a webinar
+        // listener that flushes an opening update before the first sender
+        // joins still gets video from late-joining publishers.
+        assert!(
+            update.receive_all_video,
+            "vc-3s8: receive_all_video must default to true to match \
+             receive_all_audio semantics"
+        );
         assert_eq!(c.seq(), 1, "sequence counter advanced exactly once");
     }
 
