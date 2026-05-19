@@ -40,6 +40,24 @@ use vpx_sys::{
 /// unbounded growth that previously OOM'd 4 GiB pods.
 const NATIVE_DECODER_CHANNEL_BOUND: usize = 32;
 
+/// Stack size for the per-decoder worker thread (vc-wx3).
+///
+/// Linux's default thread stack is 8 MiB of *reserved* virtual address space
+/// per thread. The bot listener creates one [`NativeDecoder`] per
+/// (listener × publisher); a 100-listener pod with ~5 publishers spawns ~500
+/// decoder threads, which by themselves reserve ~4 GiB of VM — enough to OOM
+/// a 4 GiB pod the instant all listeners have observed all publishers, even
+/// before any frames flow.
+///
+/// The VP9 decode loop is not stack-hungry: `copy_plane_to_buffer` allocates
+/// on the heap, `vpx_codec_get_frame` returns a pointer into libvpx-managed
+/// memory, and the worker's own frame holds only a [`FrameBuffer`] plus a
+/// `Vec<DecodedFrame>` on the stack. 512 KiB is comfortably above the
+/// observed high-water mark while shrinking the per-thread VM cost by 16x
+/// (from ~8 MiB to ~512 KiB), bringing the ~500-thread fleet ceiling from
+/// ~4 GiB down to ~256 MiB.
+const NATIVE_DECODER_THREAD_STACK_BYTES: usize = 512 * 1024;
+
 // --- Vp9Decoder implementation, now living inside the native module ---
 
 /// A VP9 decoder using libvpx.
@@ -426,9 +444,15 @@ impl NativeDecoder {
         on_error: Option<ErrorCallback>,
     ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(NATIVE_DECODER_CHANNEL_BOUND);
-        let thread_handle = Some(thread::spawn(move || {
-            run_decoder_loop(decoder, receiver, on_decoded, on_error);
-        }));
+        let thread_handle = Some(
+            thread::Builder::new()
+                .name("vc-decoder".to_string())
+                .stack_size(NATIVE_DECODER_THREAD_STACK_BYTES)
+                .spawn(move || {
+                    run_decoder_loop(decoder, receiver, on_decoded, on_error);
+                })
+                .expect("spawn decoder thread"),
+        );
         NativeDecoder {
             thread_handle,
             sender: Some(sender),
@@ -450,41 +474,54 @@ impl NativeDecoder {
         // tokio blocking-pool worker that called `decode` (vc-35t).
         let (sender, receiver) = mpsc::sync_channel(NATIVE_DECODER_CHANNEL_BOUND);
 
-        let thread_handle = Some(thread::spawn(move || {
-            // vc-4ns: try to construct the platform decoder, but tolerate
-            // failure by falling back to a MockDecoder so the thread stays
-            // alive and the error callback keeps firing for every subsequent
-            // frame. The trait method's `.expect()`-panic path is preserved
-            // only when no error callback is supplied — that case is the
-            // legacy "no observability hook" path and is still better off
-            // panicking loudly than silently dropping every queued frame.
-            let decoder: Box<dyn ThreadDecodable> = match codec {
-                crate::decoder::VideoCodec::Vp9Profile0Level10Bit8
-                | crate::decoder::VideoCodec::Vp8 => match Vp9Decoder::new() {
-                    Ok(d) => Box::new(SendableVp9Decoder(d)),
-                    Err(e) => {
-                        let msg = format!("Vp9Decoder init failed: {}", e);
-                        if let Some(cb) = on_error.as_ref() {
-                            cb(msg);
-                            Box::new(MockDecoder::new())
-                        } else {
-                            // No observability hook attached — preserve the
-                            // pre-vc-4ns loud-failure behaviour rather than
-                            // silently turning every frame into a no-op.
-                            panic!("{}", msg);
+        // vc-wx3: explicit `Builder::stack_size` to cap per-thread VM
+        // reservation at 512 KiB instead of the platform default (8 MiB on
+        // Linux). See the `NATIVE_DECODER_THREAD_STACK_BYTES` constant for
+        // the sizing rationale. `Builder::spawn` returns `io::Result` because
+        // thread creation can fail (e.g. EAGAIN on resource exhaustion);
+        // panicking here matches the pre-vc-wx3 `thread::spawn` behaviour
+        // since libstd panics on spawn failure too.
+        let thread_handle = Some(
+            thread::Builder::new()
+                .name("vc-decoder".to_string())
+                .stack_size(NATIVE_DECODER_THREAD_STACK_BYTES)
+                .spawn(move || {
+                    // vc-4ns: try to construct the platform decoder, but tolerate
+                    // failure by falling back to a MockDecoder so the thread stays
+                    // alive and the error callback keeps firing for every subsequent
+                    // frame. The trait method's `.expect()`-panic path is preserved
+                    // only when no error callback is supplied — that case is the
+                    // legacy "no observability hook" path and is still better off
+                    // panicking loudly than silently dropping every queued frame.
+                    let decoder: Box<dyn ThreadDecodable> = match codec {
+                        crate::decoder::VideoCodec::Vp9Profile0Level10Bit8
+                        | crate::decoder::VideoCodec::Vp8 => match Vp9Decoder::new() {
+                            Ok(d) => Box::new(SendableVp9Decoder(d)),
+                            Err(e) => {
+                                let msg = format!("Vp9Decoder init failed: {}", e);
+                                if let Some(cb) = on_error.as_ref() {
+                                    cb(msg);
+                                    Box::new(MockDecoder::new())
+                                } else {
+                                    // No observability hook attached — preserve the
+                                    // pre-vc-4ns loud-failure behaviour rather than
+                                    // silently turning every frame into a no-op.
+                                    panic!("{}", msg);
+                                }
+                            }
+                        },
+                        crate::decoder::VideoCodec::Mock => Box::new(MockDecoder::new()),
+                        crate::decoder::VideoCodec::Unspecified => {
+                            // Unspecified is a programmer error, not a runtime
+                            // failure — keep the panic on this code path regardless
+                            // of the error callback.
+                            panic!("Cannot create decoder for unspecified codec")
                         }
-                    }
-                },
-                crate::decoder::VideoCodec::Mock => Box::new(MockDecoder::new()),
-                crate::decoder::VideoCodec::Unspecified => {
-                    // Unspecified is a programmer error, not a runtime
-                    // failure — keep the panic on this code path regardless
-                    // of the error callback.
-                    panic!("Cannot create decoder for unspecified codec")
-                }
-            };
-            run_decoder_loop(decoder, receiver, on_decoded_frame, on_error);
-        }));
+                    };
+                    run_decoder_loop(decoder, receiver, on_decoded_frame, on_error);
+                })
+                .expect("spawn decoder thread"),
+        );
 
         NativeDecoder {
             thread_handle,
