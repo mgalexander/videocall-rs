@@ -426,10 +426,257 @@ impl WtChatSession {
         join_room
             .then(|response, act, ctx| {
                 if act.logic.handle_join_room_result(response) {
-                    ctx.stop();
+                    // vc-883: queue StopSession instead of calling ctx.stop()
+                    // directly. The JoinRoom rejection path (e.g.
+                    // ADMISSION_DECISION{REDIRECT} on a non-owner pod, see
+                    // chat_server.rs ~line 1538) `try_send`s a server-
+                    // originated `Message` into THIS actor's mailbox BEFORE
+                    // returning Err. If we call `ctx.stop()` here directly,
+                    // the actix-0.13.5 poll loop sets the STOPPING flag and
+                    // `mailbox.poll`'s `while !ctx.waiting()` guard sees
+                    // STOPPING via `ContextParts::waiting`, so the queued
+                    // Message NEVER runs — the REDIRECT bytes never reach
+                    // `outbound_tx`, the bridge writer never writes them,
+                    // and the client sees the QUIC session close with no
+                    // packet in flight. Bots in `--orchestrate` mode then
+                    // observed `accept_uni` error WITHOUT a REDIRECT to
+                    // follow, defeating the entire vc-kni reconnect loop.
+                    //
+                    // `ctx.notify(StopSession)` instead pushes the stop
+                    // request onto the actor's `items` list (see
+                    // actix-0.13.5 `AsyncContext::notify` →
+                    // `ContextParts::spawn`). The poll loop processes the
+                    // mailbox BEFORE the items list, so the queued REDIRECT
+                    // `Message` handler runs first (placing bytes in
+                    // `outbound_tx`), the bridge writer drains them onto
+                    // QUIC, and only then does the `StopSession` item run
+                    // and call `ctx.stop()`. The `outbound_tx`
+                    // `PrioritySender` stays alive across that window
+                    // because it's a field on the actor, dropped only when
+                    // the actor is fully stopped — by which time the writer
+                    // has already pulled the REDIRECT off the queue.
+                    ctx.notify(StopSession);
                 }
                 fut::ready(())
             })
             .wait(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! vc-883 regression tests for the actor lifecycle on a JoinRoom
+    //! rejection that pre-queues a "last gasp" `Message` (the
+    //! `ADMISSION_DECISION{REDIRECT}` payload in the real path).
+    //!
+    //! We do NOT spin up a full `WtChatSession` here because that requires
+    //! a `ChatServer` actor, NATS client, session manager, and bridge
+    //! writer — roughly half of `actix-api`. Instead these tests exercise
+    //! the actix-0.13.5 mailbox semantics on a minimal pair of actors that
+    //! mirror the exact pattern used by [`WtChatSession::join_room`]:
+    //!
+    //!   1. A `Server` actor whose `JoinRoom` handler `try_send`s an
+    //!      `OutboundMessage` into the `Session` actor's mailbox, then
+    //!      returns `Err(())`.
+    //!   2. A `Session` actor whose `started` runs `addr.send(JoinRoom)`
+    //!      under `.wait(ctx)`, then in the `.then` closure either calls
+    //!      `ctx.stop()` (the broken pre-vc-883 behaviour) or
+    //!      `ctx.notify(StopSession)` (the vc-883 fix).
+    //!
+    //! The `OutboundMessage` handler bumps a shared counter. After the
+    //! `Session` actor terminates we assert the counter:
+    //!
+    //!   * Under the broken path the counter is `0`: the mailbox-poll
+    //!     guard `while !ctx.waiting()` short-circuits once STOPPING is
+    //!     set, so the queued message is dropped. This is exactly the
+    //!     failure that made the bot's inbound consumer never see a
+    //!     REDIRECT.
+    //!   * Under the fixed path the counter is `1`: the mailbox drains
+    //!     the queued message before the `StopSession` item runs.
+    //!
+    //! No protobuf, no PrioritySender, no QUIC — just the mailbox +
+    //! items-list ordering rule that the real fix depends on. If actix
+    //! changes its poll semantics in a future bump, these tests are the
+    //! canary.
+
+    use super::StopSession;
+    use actix::{
+        fut, Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context,
+        ContextFutureSpawner, Handler, Message as ActixMessage, MessageResult, WrapFuture,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// Marker message the server "leaks" into the session mailbox right
+    /// before rejecting `JoinRoom`. Stand-in for the real REDIRECT
+    /// `Message` (which carries `Bytes`); we only care about delivery.
+    #[derive(ActixMessage)]
+    #[rtype(result = "()")]
+    struct OutboundMessage;
+
+    /// Server-to-session JoinRoom request. The server's handler queues an
+    /// `OutboundMessage` into the session mailbox BEFORE returning Err —
+    /// mirroring `chat_server::JoinRoom` ~line 1541 calling
+    /// `recipient.try_send(Message { msg: ... })` before
+    /// `return MessageResult(Err(...))`.
+    #[derive(ActixMessage)]
+    #[rtype(result = "Result<(), ()>")]
+    struct JoinRoom {
+        session_recipient: actix::Recipient<OutboundMessage>,
+    }
+
+    struct Server;
+    impl Actor for Server {
+        type Context = Context<Self>;
+    }
+    impl Handler<JoinRoom> for Server {
+        type Result = MessageResult<JoinRoom>;
+        fn handle(&mut self, msg: JoinRoom, _ctx: &mut Context<Self>) -> Self::Result {
+            // 1. Queue the "REDIRECT" into the session mailbox.
+            let _ = msg.session_recipient.try_send(OutboundMessage);
+            // 2. Reject the join. The session's `.then` closure decides
+            //    how to stop.
+            MessageResult(Err(()))
+        }
+    }
+
+    /// Selects which stop pattern the session uses on JoinRoom Err.
+    #[derive(Clone, Copy)]
+    enum StopMode {
+        /// Pre-vc-883 (broken): call `ctx.stop()` directly. The STOPPING
+        /// flag blocks the mailbox-poll from draining the queued
+        /// `OutboundMessage`.
+        Direct,
+        /// vc-883 fix: `ctx.notify(StopSession)`. The mailbox drains the
+        /// queued `OutboundMessage` before the items-list runs the stop.
+        ViaNotify,
+    }
+
+    struct Session {
+        server: Addr<Server>,
+        mode: StopMode,
+        delivered: Arc<AtomicU32>,
+    }
+    impl Actor for Session {
+        type Context = Context<Self>;
+        fn started(&mut self, ctx: &mut Self::Context) {
+            // Mirror `WtChatSession::join_room`: send JoinRoom and `.wait`
+            // on the response. While waiting, the mailbox is blocked. The
+            // server's handler queues an `OutboundMessage` into our
+            // mailbox while we're parked here.
+            let recipient = ctx.address().recipient::<OutboundMessage>();
+            let mode = self.mode;
+            self.server
+                .send(JoinRoom {
+                    session_recipient: recipient,
+                })
+                .into_actor(self)
+                .then(move |res, _act, ctx| {
+                    match res {
+                        Ok(Err(())) => match mode {
+                            StopMode::Direct => ctx.stop(),
+                            StopMode::ViaNotify => ctx.notify(StopSession),
+                        },
+                        // Ok(Ok(())) — irrelevant for these tests; the
+                        // server always returns Err.
+                        // Err(MailboxError) — also stop, but the test
+                        // path always succeeds at the mailbox layer.
+                        _ => ctx.stop(),
+                    }
+                    fut::ready(())
+                })
+                .wait(ctx);
+        }
+    }
+    impl Handler<OutboundMessage> for Session {
+        type Result = ();
+        fn handle(&mut self, _msg: OutboundMessage, _ctx: &mut Self::Context) -> Self::Result {
+            // This is the handler that, in the real path, would push the
+            // REDIRECT bytes into `outbound_tx` for the bridge writer to
+            // flush onto the QUIC stream before the actor terminates.
+            self.delivered.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Handler<StopSession> for Session {
+        type Result = ();
+        fn handle(&mut self, _msg: StopSession, ctx: &mut Self::Context) -> Self::Result {
+            ctx.stop();
+        }
+    }
+
+    async fn run_with(mode: StopMode) -> u32 {
+        let counter = Arc::new(AtomicU32::new(0));
+        let server = Server.start();
+        let session = Session {
+            server: server.clone(),
+            mode,
+            delivered: counter.clone(),
+        }
+        .start();
+        // Wait for the session to fully terminate. `started` schedules
+        // both the JoinRoom wait-future and either the stop or the
+        // notify; once those resolve and the actor stops, its address
+        // becomes disconnected. We poll with a short sleep budget — the
+        // whole interaction is local-actor mailbox roundtrips, so even
+        // 100ms is generous.
+        for _ in 0..50 {
+            if !session.connected() {
+                break;
+            }
+            actix_rt::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            !session.connected(),
+            "session actor did not terminate within the test budget"
+        );
+        counter.load(Ordering::SeqCst)
+    }
+
+    /// REGRESSION GUARD for vc-883.
+    ///
+    /// Documents the broken pre-vc-883 behaviour: calling `ctx.stop()`
+    /// directly inside the JoinRoom-Err closure means a `Message` that
+    /// the server `try_send`ed into the session mailbox BEFORE returning
+    /// Err is DROPPED — the mailbox poll loop's `while !ctx.waiting()`
+    /// guard sees the STOPPING flag and short-circuits without
+    /// dispatching the queued message.
+    ///
+    /// This is the exact mechanism that prevented the bot's inbound
+    /// consumer from ever seeing an `ADMISSION_DECISION{REDIRECT}` in
+    /// `--orchestrate` mode — the bytes never made it from the actor
+    /// mailbox to the PrioritySender to the bridge writer to QUIC. If
+    /// this test ever starts FAILING (i.e. the counter becomes `1`),
+    /// either actix changed semantics or someone reverted the fix; in
+    /// the latter case the `ViaNotify` test below should also be
+    /// re-examined.
+    #[actix_rt::test]
+    async fn ctx_stop_drops_messages_already_queued_in_the_mailbox() {
+        let delivered = run_with(StopMode::Direct).await;
+        assert_eq!(
+            delivered, 0,
+            "ctx.stop() directly after a queued Message MUST drop the message — \
+             this is the actix-0.13.5 mailbox poll guard semantics that vc-883 hit"
+        );
+    }
+
+    /// REGRESSION GUARD for vc-883: the fix.
+    ///
+    /// `ctx.notify(StopSession)` pushes the stop request onto the items
+    /// list, NOT the STOPPING flag. The mailbox is polled BEFORE items
+    /// in the actor poll loop, so the queued `OutboundMessage` runs
+    /// first (in the real path: pushes REDIRECT bytes into `outbound_tx`
+    /// so the bridge writer can flush them to QUIC), then `StopSession`
+    /// runs and finally calls `ctx.stop()`.
+    ///
+    /// If this test FAILS, the bot will silently lose REDIRECTs again
+    /// and `--orchestrate` runs will fall back to asymmetric shard load.
+    #[actix_rt::test]
+    async fn ctx_notify_stop_drains_queued_messages_before_terminating() {
+        let delivered = run_with(StopMode::ViaNotify).await;
+        assert_eq!(
+            delivered, 1,
+            "ctx.notify(StopSession) MUST allow the queued mailbox Message \
+             to run before the actor terminates — this is the vc-883 fix"
+        );
     }
 }
