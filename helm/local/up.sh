@@ -438,8 +438,8 @@ helm --kube-context "${KUBECONTEXT}" upgrade --install rustlemania-websocket \
     --values "${HELM_DIR}/rustlemania-websocket/values-local.yaml" \
     --set "podAnnotations.checksum/nats-credentials=${NATS_CRED_CHECKSUM}"
 
-log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-websocket Deployment to roll out"
-kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/rustlemania-websocket \
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-websocket StatefulSet to roll out"
+kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/rustlemania-websocket \
     --timeout="${DEPLOY_READY_TIMEOUT}s"
 
 # ----- Phase: rustlemania-webtransport ----------------------------------------
@@ -450,8 +450,8 @@ helm --kube-context "${KUBECONTEXT}" upgrade --install rustlemania-webtransport 
     --values "${HELM_DIR}/rustlemania-webtransport/values-local.yaml" \
     --set "podAnnotations.checksum/nats-credentials=${NATS_CRED_CHECKSUM}"
 
-log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-webtransport Deployment to roll out"
-kubectl --context "${KUBECONTEXT}" -n default rollout status deployment/rustlemania-webtransport \
+log "waiting up to ${DEPLOY_READY_TIMEOUT}s for the rustlemania-webtransport StatefulSet to roll out"
+kubectl --context "${KUBECONTEXT}" -n default rollout status statefulset/rustlemania-webtransport \
     --timeout="${DEPLOY_READY_TIMEOUT}s"
 
 # ----- Phase: WebTransport /healthz Ingress -----------------------------------
