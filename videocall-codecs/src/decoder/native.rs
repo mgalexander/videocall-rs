@@ -87,6 +87,16 @@ impl MockDecoder {
     }
 }
 
+/// Test-only knob: when non-zero, `MockDecoder::decode_frame` sleeps for this
+/// many nanoseconds before returning. The slow consumer thus runs *inside the
+/// decoder thread*, not in the `on_decoded_frame` callback, which makes the
+/// backpressure test in `tests::full_channel_drops_and_reports` deterministic
+/// even though `MockDecoder` never produces any frames to dispatch (vc-35t).
+///
+/// Outside tests this is always `0`, so the production path remains a no-op.
+#[cfg(test)]
+static MOCK_DECODE_DELAY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A trait for any decoder that can run on the internal thread.
 trait ThreadDecodable: Send {
     fn decode_frame(&mut self, frame_buffer: &FrameBuffer) -> Result<Vec<DecodedFrame>, String>;
@@ -201,21 +211,38 @@ impl ThreadDecodable for MockDecoder {
         // Intentionally silent: this runs once per frame in the bot's listener
         // path. Per-frame stdout writes flood the orchestrator's JSON parser
         // at scale (vc-35t / vc-4tl).
+        #[cfg(test)]
+        {
+            let delay_ns = MOCK_DECODE_DELAY_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+            if delay_ns > 0 {
+                std::thread::sleep(std::time::Duration::from_nanos(delay_ns));
+            }
+        }
         Ok(Vec::new())
     }
 }
 
 /// A message sent to the native decoder thread.
+///
+/// Previously held an explicit `Shutdown` variant, but the teardown path now
+/// drops the sender (see `NativeDecoder::drop`) and relies on
+/// `recv() -> Err(RecvError)` to terminate the worker. That avoids the
+/// shutdown-deadlock window where a `Shutdown` sentinel could not be enqueued
+/// because the bounded channel was full (vc-35t).
 enum DecoderMessage {
     /// A frame to be decoded.
     Frame(FrameBuffer),
-    /// A signal to shut down the thread.
-    Shutdown,
 }
 
 pub struct NativeDecoder {
     thread_handle: Option<JoinHandle<()>>,
-    sender: SyncSender<DecoderMessage>,
+    /// `Some` for the lifetime of the decoder; `None` only transiently inside
+    /// `Drop::drop`, where it is taken and dropped *before* joining the worker
+    /// thread to avoid a shutdown deadlock (vc-35t). When the channel is full
+    /// at teardown, a `try_send(Shutdown)` would fail and `recv()` would block
+    /// forever because the sender is still owned by `self`. Taking the sender
+    /// here lets `recv()` return `Err(RecvError)` and the thread exit cleanly.
+    sender: Option<SyncSender<DecoderMessage>>,
     /// Invoked from the producer side of the bounded channel whenever a frame
     /// cannot be enqueued (channel full or decoder thread gone). Used by the
     /// bot listener to attribute backpressure-induced drops.
@@ -264,23 +291,17 @@ impl NativeDecoder {
                 }
             };
 
-            // This is the decoder thread loop.
-            while let Ok(message) = receiver.recv() {
-                match message {
-                    DecoderMessage::Frame(frame_buffer) => {
-                        // Per-frame logging was removed (vc-35t / vc-4tl): at
-                        // bot-scale (100+ listeners × multiple publishers) the
-                        // stdout volume crowds out the orchestrator's summary
-                        // JSON. Decode errors are surfaced via the bot's stats
-                        // counters instead of stderr.
-                        if let Ok(images) = decoder.decode_frame(&frame_buffer) {
-                            for img in images {
-                                on_decoded_frame(img);
-                            }
-                        }
-                    }
-                    DecoderMessage::Shutdown => {
-                        break;
+            // This is the decoder thread loop. Exits when the producer side
+            // of the channel is dropped (see `NativeDecoder::drop`).
+            while let Ok(DecoderMessage::Frame(frame_buffer)) = receiver.recv() {
+                // Per-frame logging was removed (vc-35t / vc-4tl): at
+                // bot-scale (100+ listeners × multiple publishers) the
+                // stdout volume crowds out the orchestrator's summary
+                // JSON. Decode errors are surfaced via the bot's stats
+                // counters instead of stderr.
+                if let Ok(images) = decoder.decode_frame(&frame_buffer) {
+                    for img in images {
+                        on_decoded_frame(img);
                     }
                 }
             }
@@ -288,7 +309,7 @@ impl NativeDecoder {
 
         NativeDecoder {
             thread_handle,
-            sender,
+            sender: Some(sender),
             on_dropped,
         }
     }
@@ -311,7 +332,16 @@ impl Decodable for NativeDecoder {
         // `try_send` keeps this non-blocking even on a tokio blocking-pool
         // worker. The decoder thread falling behind must not back up onto the
         // network read loop.
-        match self.sender.try_send(DecoderMessage::Frame(frame)) {
+        //
+        // `sender` is only `None` transiently inside `Drop::drop`, and `decode`
+        // cannot be called once the struct has been dropped, so the `else`
+        // branch is unreachable in practice — we treat it as a drop for
+        // accounting symmetry rather than panicking.
+        let Some(sender) = self.sender.as_ref() else {
+            (self.on_dropped)();
+            return;
+        };
+        match sender.try_send(DecoderMessage::Frame(frame)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 // Channel is at capacity: the decoder thread is behind. Drop
@@ -330,11 +360,24 @@ impl Decodable for NativeDecoder {
 
 impl Drop for NativeDecoder {
     fn drop(&mut self) {
-        // Best-effort shutdown signal: ignore Full/Disconnected errors. The
-        // recv loop will exit when the sender drops anyway.
-        let _ = self.sender.try_send(DecoderMessage::Shutdown);
+        // vc-35t: do NOT signal Shutdown via `try_send` and then join while the
+        // sender is still alive. If the channel is at capacity at teardown,
+        // `try_send` fails and the worker's `recv()` would block forever
+        // because we still hold a live `SyncSender` (the worker exits its
+        // `while let Ok(_) = receiver.recv()` loop only when *all* senders
+        // drop). Joining in that state deadlocks `Drop::drop`.
+        //
+        // Instead, take and drop the sender first. The worker's next `recv()`
+        // (after draining any frames already in the channel) returns
+        // `Err(RecvError)`, which terminates the loop. The dedicated
+        // `Shutdown` message is now redundant for the teardown path and is
+        // intentionally not sent: it would only ever sit behind queued frames
+        // and the channel-close signal is strictly better than a sentinel.
+        drop(self.sender.take());
 
-        // Wait for the thread to finish.
+        // Wait for the thread to drain in-flight frames and exit. Bounded by
+        // the channel depth (NATIVE_DECODER_CHANNEL_BOUND frames) × per-frame
+        // decode cost; with the sender dropped, this is finite and small.
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
@@ -367,11 +410,35 @@ mod tests {
     }
 
     /// vc-35t: a full bounded channel must drop the frame on the producer side
-    /// and invoke the `on_dropped` callback rather than block the caller. We
-    /// use the Mock decoder backed by a slow consumer-side sleep to wedge the
-    /// channel.
+    /// and invoke the `on_dropped` callback rather than block the caller.
+    ///
+    /// Determinism: the Mock decoder's `decode_frame` itself sleeps for the
+    /// duration configured in `MOCK_DECODE_DELAY_NANOS`. This guarantees that
+    /// the worker thread is the bottleneck (not the producer), so the math
+    /// is unambiguous:
+    ///   - 200 frames sent back-to-back
+    ///   - 5 ms per frame on the consumer => ~1 s of consumer work total
+    ///   - channel bound is 32 => overflow of (200 − 32) = 168 frames worst
+    ///     case, and at least (200 − 32 − a few drained during the send loop)
+    ///     in practice — comfortably > 0 on any scheduler.
+    /// Previously the test relied on a sleep inside `on_decoded_frame`, but
+    /// `MockDecoder` never emits decoded frames, so that callback never ran
+    /// and the test only "drove" drops by winning a scheduler race — flaky on
+    /// idle CI.
     #[test]
     fn full_channel_drops_and_reports() {
+        // 5 ms is enough to dominate any plausible producer-loop iteration
+        // cost on CI while keeping the test wall-clock ≤ ~1.5 s.
+        const PER_FRAME_DELAY: Duration = Duration::from_millis(5);
+        const TOTAL_FRAMES: usize = 200;
+
+        // The delay knob is a process-global static. Set it before spawning
+        // the decoder thread so the worker observes the value on every frame.
+        MOCK_DECODE_DELAY_NANOS.store(
+            PER_FRAME_DELAY.as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         let decoded = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
 
@@ -381,10 +448,8 @@ mod tests {
         let decoder = NativeDecoder::with_drop_callback(
             VideoCodec::Mock,
             Box::new(move |_| {
-                // Simulate a slow consumer so the queue fills up. The blocking
-                // sleep runs on the dedicated decoder thread and does not
-                // affect the producer.
-                std::thread::sleep(Duration::from_millis(20));
+                // MockDecoder never emits frames, so this never fires.
+                // Tracked anyway in case the mock is changed later.
                 decoded_clone.fetch_add(1, Ordering::Relaxed);
             }),
             Box::new(move || {
@@ -392,27 +457,113 @@ mod tests {
             }),
         );
 
-        // The Mock decoder produces no frames, so `on_decoded_frame` will not
-        // actually fire — that's fine; the point of this test is the producer
-        // side. Push significantly more frames than the channel bound; the
-        // overflow must hit `on_dropped`.
-        let total = NATIVE_DECODER_CHANNEL_BOUND * 4;
-        for i in 0..total as u64 {
+        // Push significantly more frames than the channel bound, timing the
+        // producer to assert that `try_send` never blocks for long.
+        let producer_start = std::time::Instant::now();
+        for i in 0..TOTAL_FRAMES as u64 {
+            decoder.decode(make_frame(i));
+        }
+        let producer_elapsed = producer_start.elapsed();
+
+        // Drop the decoder to release the static delay knob for any other
+        // tests, and to exercise the non-blocking Drop path (vc-35t blocker).
+        drop(decoder);
+
+        // Reset the global so we don't poison other tests in the same binary.
+        MOCK_DECODE_DELAY_NANOS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let dropped_total = dropped.load(Ordering::Relaxed);
+
+        // 1. Backpressure must have dropped at least one frame. With a 5 ms
+        //    consumer and an instant producer this is overdetermined:
+        //    expected_min = TOTAL_FRAMES − NATIVE_DECODER_CHANNEL_BOUND − slack.
+        assert!(
+            dropped_total > 0,
+            "expected the bounded channel to drop frames, dropped={dropped_total}, bound={NATIVE_DECODER_CHANNEL_BOUND}, total_sent={TOTAL_FRAMES}"
+        );
+        // Tighter check: with the queue full almost immediately, the vast
+        // majority of the 200 frames should be dropped. Allow generous slack
+        // for scheduler variance but catch a regression that lets the
+        // try_send path silently start blocking (which would make drops near
+        // zero again).
+        let expected_min_drops = TOTAL_FRAMES - NATIVE_DECODER_CHANNEL_BOUND - 16;
+        assert!(
+            dropped_total >= expected_min_drops,
+            "expected at least {expected_min_drops} drops with a 5ms-per-frame consumer, got {dropped_total}"
+        );
+
+        // 2. Producer must not have blocked. Even with worst-case OS jitter,
+        //    200 non-blocking try_send calls should finish in well under
+        //    100 ms; if try_send is silently turning into send, this balloons
+        //    to ~1 s (TOTAL_FRAMES × PER_FRAME_DELAY = 1s).
+        assert!(
+            producer_elapsed < Duration::from_millis(100),
+            "producer loop took {producer_elapsed:?}; try_send appears to be blocking"
+        );
+
+        // 3. Sanity: we shouldn't have dropped every single frame — the
+        //    channel does hold NATIVE_DECODER_CHANNEL_BOUND entries.
+        assert!(
+            dropped_total < TOTAL_FRAMES,
+            "expected at least some frames to enqueue, but all {TOTAL_FRAMES} were dropped"
+        );
+
+        // Silence dead_store warnings on `decoded`: MockDecoder never emits
+        // frames, so this count is always zero. The assertion documents that
+        // invariant rather than checking a meaningful property.
+        assert_eq!(
+            decoded.load(Ordering::Relaxed),
+            0,
+            "MockDecoder must not produce decoded frames"
+        );
+    }
+
+    /// vc-35t: dropping a `NativeDecoder` while the channel is full must not
+    /// deadlock. The previous implementation tried to enqueue a `Shutdown`
+    /// sentinel via `try_send` and then joined the worker; if the channel was
+    /// full at that moment the send failed and `recv()` blocked forever
+    /// because the live `SyncSender` in `self` was never dropped. We exercise
+    /// that exact condition: wedge the consumer with a delay, jam the
+    /// channel, then drop the decoder and assert it returns in finite time.
+    ///
+    /// Note on bound: after the fix, dropping the sender allows the worker to
+    /// drain the *already-buffered* frames at real time before `recv()`
+    /// returns `Err(RecvError)`. That's an accepted trade-off (per the bead);
+    /// the goal here is to prove there's no deadlock, not to prove
+    /// instantaneous shutdown. With a 5 ms per-frame delay and a 32-frame
+    /// queue the upper bound is ~160 ms of drain plus jitter.
+    #[test]
+    fn drop_does_not_deadlock_when_channel_full() {
+        const PER_FRAME_DELAY: Duration = Duration::from_millis(5);
+
+        MOCK_DECODE_DELAY_NANOS.store(
+            PER_FRAME_DELAY.as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let decoder =
+            NativeDecoder::with_drop_callback(VideoCodec::Mock, Box::new(|_| {}), Box::new(|| {}));
+
+        // Overflow the channel so the wedge is unambiguous: with the consumer
+        // at 5ms/frame and the producer instant, the channel is full by the
+        // time we return from this loop. Any extra frames are dropped on the
+        // producer side.
+        for i in 0..(NATIVE_DECODER_CHANNEL_BOUND as u64 * 4) {
             decoder.decode(make_frame(i));
         }
 
-        // At least some frames must have been dropped, and the producer must
-        // not have blocked unboundedly.
-        let dropped_total = dropped.load(Ordering::Relaxed);
+        let drop_start = std::time::Instant::now();
+        drop(decoder);
+        let drop_elapsed = drop_start.elapsed();
+
+        MOCK_DECODE_DELAY_NANOS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Upper bound: 32 buffered frames × 5 ms = 160 ms, plus generous
+        // scheduler slack. Pre-fix would have blocked forever (test would be
+        // killed by harness timeout).
         assert!(
-            dropped_total > 0,
-            "expected the bounded channel to drop frames, dropped={dropped_total}, bound={NATIVE_DECODER_CHANNEL_BOUND}, total_sent={total}"
-        );
-        // Sanity: we shouldn't have dropped every frame — the channel does
-        // hold NATIVE_DECODER_CHANNEL_BOUND entries.
-        assert!(
-            dropped_total < total,
-            "expected at least some frames to enqueue, but all {total} were dropped"
+            drop_elapsed < Duration::from_millis(1_000),
+            "Drop took {drop_elapsed:?}; expected < 1s. A truly unbounded value here means the deadlock has regressed."
         );
     }
 }

@@ -80,7 +80,12 @@ pub struct BotStats {
     /// listener successfully decoded.
     pub audio_frames_decoded: AtomicU64,
     /// Listener-decode bookkeeping (vc-86j): wrapper/media parse failures and
-    /// codec decode errors observed while servicing the inbound stream.
+    /// codec decode errors observed while servicing the inbound stream. Since
+    /// vc-35t this also includes backpressure drops from the per-publisher
+    /// VP9 decoder channel: when the bounded native-decoder input queue is
+    /// full, the producer drops the frame and bumps this counter rather than
+    /// blocking the network read loop. A follow-up bead will split these into
+    /// separate counters; for now they share one bucket.
     pub decode_errors: AtomicU64,
     /// Listener-feedback bookkeeping (vc-dwc): total `DiagnosticsPacket`
     /// frames the listener emitted back to the SFU (per-publisher × per-
