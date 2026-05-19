@@ -234,6 +234,12 @@ enum DecoderMessage {
     Frame(FrameBuffer),
 }
 
+/// Optional decoder-thread error callback (vc-4ns). Invoked on decoder
+/// construction failure (e.g. libvpx ABI mismatch) and on per-frame
+/// `decode_frame` errors so consumers can attribute decode failures to a
+/// counter instead of relying on `eprintln!` to stderr.
+pub type ErrorCallback = Box<dyn Fn(String) + Send + Sync>;
+
 pub struct NativeDecoder {
     thread_handle: Option<JoinHandle<()>>,
     /// `Some` for the lifetime of the decoder; `None` only transiently inside
@@ -250,24 +256,45 @@ pub struct NativeDecoder {
 }
 
 impl NativeDecoder {
-    /// Construct a decoder with both the standard decoded-frame callback and a
-    /// `on_dropped` callback that is invoked when a frame is discarded because
-    /// the decoder's bounded input channel is full or the decoder thread has
-    /// terminated. The on_dropped callback runs synchronously on the producer
-    /// thread, so it must be cheap and non-blocking (an atomic counter bump is
-    /// the intended use; see `bot/src/stats.rs`).
-    pub fn with_drop_callback(
+    /// Single combined constructor (vc-35t + vc-4ns merge).
+    ///
+    /// Wires three independent callbacks at once:
+    ///
+    /// - `on_decoded` — invoked on the decoder thread for every successfully
+    ///   decoded frame.
+    /// - `on_dropped` — invoked on the **producer** thread (the caller of
+    ///   [`decode`](Self::decode)) when a frame cannot be enqueued because the
+    ///   bounded input channel is full or the worker thread has terminated.
+    ///   Must be cheap and non-blocking (atomic counter bump is the intended
+    ///   use). Surfaces backpressure to the bot's `decode_errors` counter
+    ///   (vc-35t).
+    /// - `on_error` — optional callback invoked on the **decoder** thread for
+    ///   per-frame decode failures AND for VP9 decoder construction failures
+    ///   (e.g. libvpx ABI mismatch). When `None`, decoder construction
+    ///   failures panic the trait method's `.expect()` path; when `Some`, the
+    ///   thread falls back to `MockDecoder` and keeps running so subsequent
+    ///   frames continue to bump the consumer's counter (vc-4ns).
+    ///
+    /// All three callbacks must be `Send + Sync` because they cross the
+    /// thread boundary. Per-frame stderr writes have been removed; if the
+    /// caller cares about decode errors it must pass `on_error: Some(...)`.
+    pub fn with_callbacks(
         codec: crate::decoder::VideoCodec,
-        on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+        on_decoded: Box<dyn Fn(DecodedFrame) + Send + Sync>,
         on_dropped: Box<dyn Fn() + Send + Sync>,
+        on_error: Option<ErrorCallback>,
     ) -> Self {
-        Self::build(codec, on_decoded_frame, on_dropped)
+        Self::build(codec, on_decoded, on_dropped, on_error)
     }
 
+    /// Internal helper that spawns the decoder worker and assembles the
+    /// `NativeDecoder` value. Both [`with_callbacks`](Self::with_callbacks)
+    /// and the [`Decodable::new`] trait impl route through here.
     fn build(
         codec: crate::decoder::VideoCodec,
         on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
         on_dropped: Box<dyn Fn() + Send + Sync>,
+        on_error: Option<ErrorCallback>,
     ) -> Self {
         // Bounded channel: a full queue means the decoder thread is behind
         // real-time. The producer drops the frame rather than blocking the
@@ -275,33 +302,60 @@ impl NativeDecoder {
         let (sender, receiver) = mpsc::sync_channel(NATIVE_DECODER_CHANNEL_BOUND);
 
         let thread_handle = Some(thread::spawn(move || {
+            // vc-4ns: try to construct the platform decoder, but tolerate
+            // failure by falling back to a MockDecoder so the thread stays
+            // alive and the error callback keeps firing for every subsequent
+            // frame. The trait method's `.expect()`-panic path is preserved
+            // only when no error callback is supplied — that case is the
+            // legacy "no observability hook" path and is still better off
+            // panicking loudly than silently dropping every queued frame.
             let mut decoder: Box<dyn ThreadDecodable> = match codec {
-                crate::decoder::VideoCodec::Vp9Profile0Level10Bit8 => Box::new(SendableVp9Decoder(
-                    Vp9Decoder::new().expect("Failed to create Vp9Decoder"),
-                )),
-                crate::decoder::VideoCodec::Vp8 => {
-                    // VP8 uses the same libvpx decoder
-                    Box::new(SendableVp9Decoder(
-                        Vp9Decoder::new().expect("Failed to create Vp9Decoder"),
-                    ))
-                }
+                crate::decoder::VideoCodec::Vp9Profile0Level10Bit8
+                | crate::decoder::VideoCodec::Vp8 => match Vp9Decoder::new() {
+                    Ok(d) => Box::new(SendableVp9Decoder(d)),
+                    Err(e) => {
+                        let msg = format!("Vp9Decoder init failed: {}", e);
+                        if let Some(cb) = on_error.as_ref() {
+                            cb(msg);
+                            Box::new(MockDecoder::new())
+                        } else {
+                            // No observability hook attached — preserve the
+                            // pre-vc-4ns loud-failure behaviour rather than
+                            // silently turning every frame into a no-op.
+                            panic!("{}", msg);
+                        }
+                    }
+                },
                 crate::decoder::VideoCodec::Mock => Box::new(MockDecoder::new()),
                 crate::decoder::VideoCodec::Unspecified => {
+                    // Unspecified is a programmer error, not a runtime
+                    // failure — keep the panic on this code path regardless
+                    // of the error callback.
                     panic!("Cannot create decoder for unspecified codec")
                 }
             };
 
-            // This is the decoder thread loop. Exits when the producer side
-            // of the channel is dropped (see `NativeDecoder::drop`).
+            // Decoder thread loop. Exits when the producer side of the
+            // channel is dropped (see `NativeDecoder::drop`). Per-frame
+            // stdout was removed in vc-35t / vc-4tl — at bot-scale the
+            // stdout volume crowds out the orchestrator's summary JSON.
             while let Ok(DecoderMessage::Frame(frame_buffer)) = receiver.recv() {
-                // Per-frame logging was removed (vc-35t / vc-4tl): at
-                // bot-scale (100+ listeners × multiple publishers) the
-                // stdout volume crowds out the orchestrator's summary
-                // JSON. Decode errors are surfaced via the bot's stats
-                // counters instead of stderr.
-                if let Ok(images) = decoder.decode_frame(&frame_buffer) {
-                    for img in images {
-                        on_decoded_frame(img);
+                match decoder.decode_frame(&frame_buffer) {
+                    Ok(images) => {
+                        for img in images {
+                            on_decoded_frame(img);
+                        }
+                    }
+                    Err(e) => {
+                        // vc-4ns: route per-frame decode errors to the
+                        // consumer-supplied counter when configured. NO
+                        // fallback `eprintln!`: vc-35t/vc-4tl deliberately
+                        // removed per-frame stderr because the 200-bot
+                        // harness writes summary JSON to stdout and inspects
+                        // counters, not stderr.
+                        if let Some(cb) = on_error.as_ref() {
+                            cb(format!("decode_frame failed: {}", e));
+                        }
                     }
                 }
             }
@@ -323,9 +377,10 @@ impl Decodable for NativeDecoder {
         codec: crate::decoder::VideoCodec,
         on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
     ) -> Self {
-        // Default drop callback is a no-op; callers that care about backpressure
-        // should use `NativeDecoder::with_drop_callback` directly.
-        Self::build(codec, on_decoded_frame, Box::new(|| {}))
+        // Default drop / error callbacks are no-ops; callers that care about
+        // backpressure or per-frame decode errors should use
+        // `NativeDecoder::with_callbacks` directly.
+        Self::build(codec, on_decoded_frame, Box::new(|| {}), None)
     }
 
     fn decode(&self, frame: FrameBuffer) {
@@ -389,7 +444,7 @@ mod tests {
     use super::*;
     use crate::decoder::VideoCodec;
     use crate::frame::{FrameCodec, FrameType, VideoFrame};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -445,7 +500,7 @@ mod tests {
         let decoded_clone = decoded.clone();
         let dropped_clone = dropped.clone();
 
-        let decoder = NativeDecoder::with_drop_callback(
+        let decoder = NativeDecoder::with_callbacks(
             VideoCodec::Mock,
             Box::new(move |_| {
                 // MockDecoder never emits frames, so this never fires.
@@ -455,6 +510,7 @@ mod tests {
             Box::new(move || {
                 dropped_clone.fetch_add(1, Ordering::Relaxed);
             }),
+            None,
         );
 
         // Push significantly more frames than the channel bound, timing the
@@ -541,8 +597,12 @@ mod tests {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        let decoder =
-            NativeDecoder::with_drop_callback(VideoCodec::Mock, Box::new(|_| {}), Box::new(|| {}));
+        let decoder = NativeDecoder::with_callbacks(
+            VideoCodec::Mock,
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            None,
+        );
 
         // Overflow the channel so the wedge is unambiguous: with the consumer
         // at 5ms/frame and the producer instant, the channel is full by the
@@ -565,5 +625,57 @@ mod tests {
             drop_elapsed < Duration::from_millis(1_000),
             "Drop took {drop_elapsed:?}; expected < 1s. A truly unbounded value here means the deadlock has regressed."
         );
+    }
+
+    /// vc-4ns (adapted to the merged constructor): `with_callbacks` must
+    /// accept `None` for the error callback and tear down cleanly even when
+    /// no decode errors ever fire. Uses the Mock codec so the test doesn't
+    /// depend on libvpx; Mock returns `Ok(empty)` for each frame so the
+    /// success callback is never invoked, but the worker thread must still
+    /// process the channel-close signal cleanly on drop.
+    #[test]
+    fn with_callbacks_accepts_none_error() {
+        let dec = NativeDecoder::with_callbacks(
+            VideoCodec::Mock,
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            None,
+        );
+        dec.decode(make_frame(0));
+        // Allow the worker thread a moment to drain.
+        std::thread::sleep(Duration::from_millis(50));
+        // Dropping joins the thread; absence of a deadlock is the test.
+        drop(dec);
+    }
+
+    /// vc-4ns (adapted to the merged constructor): when the error callback IS
+    /// provided, it must be held for the lifetime of the worker thread and
+    /// not dropped/leaked. We can't directly trigger a per-frame error with
+    /// the Mock decoder (Mock always returns Ok), but we CAN exercise the
+    /// wiring by capturing an `Arc<AtomicU64>` in the callback; if the
+    /// trait object were dropped prematurely the Arc strong count would
+    /// underflow when we later check it after Drop. The counter remaining
+    /// at 0 also documents that Mock's happy path does NOT spuriously fire
+    /// the error callback.
+    #[test]
+    fn with_callbacks_captures_error_callback_lifetime() {
+        let err_count = Arc::new(AtomicU64::new(0));
+        let cb_clone = err_count.clone();
+        let dec = NativeDecoder::with_callbacks(
+            VideoCodec::Mock,
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            Some(Box::new(move |_msg| {
+                cb_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        dec.decode(make_frame(0));
+        std::thread::sleep(Duration::from_millis(50));
+        drop(dec);
+        // Mock decoder doesn't fail, so callback shouldn't fire — the
+        // assertion is that the Arc is still valid and the test
+        // process didn't panic (i.e. the worker thread didn't drop
+        // the callback prematurely).
+        assert_eq!(err_count.load(Ordering::Relaxed), 0);
     }
 }

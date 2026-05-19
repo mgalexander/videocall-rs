@@ -516,7 +516,9 @@ impl WebTransportClient {
                     signal.fire(None);
                 }
                 // Dropping `decoders` here joins the per-publisher VP9
-                // decoder threads (NativeDecoder::Drop sends Shutdown).
+                // decoder threads. `NativeDecoder::drop` takes its sender,
+                // which terminates the worker's `recv()` loop (vc-35t) —
+                // no Shutdown sentinel is needed.
                 drop(decoders);
                 info!("Inbound consumer stopped for {}", user_id);
             });
@@ -656,13 +658,18 @@ fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
     // recover from poisoning: decoder ctor on another thread may have panicked, the map state itself is still valid
     let mut map = pool.video.lock().unwrap_or_else(|p| p.into_inner());
     let decoder = map.entry(publisher.to_string()).or_insert_with(|| {
-        // Hand the decoder two stats handles: one for successful decodes and
-        // one for frames the bounded input channel had to drop because the
-        // decoder thread fell behind (vc-35t). Both reuse `record_decode_error`
-        // / `record_video_decoded` so the summary JSON schema stays stable.
+        // Merged vc-35t + vc-4ns wiring: `record_decode_error` is the single
+        // counter for both backpressure-induced drops (bounded channel full
+        // / worker gone, vc-35t) AND decoder-thread errors (per-frame
+        // decode failure or libvpx init failure, vc-4ns). Keeping one
+        // counter preserves the summary JSON schema; if we later want to
+        // distinguish drops vs errors we can file a follow-up that adds a
+        // dedicated `decode_drops` counter without churning callers.
         let decoded_stats = pool.stats.clone();
         let dropped_stats = pool.stats.clone();
-        NativeDecoder::with_drop_callback(
+        let err_stats = pool.stats.clone();
+        let publisher_id = publisher.to_string();
+        NativeDecoder::with_callbacks(
             DecVideoCodec::Vp9Profile0Level10Bit8,
             Box::new(move |_decoded| {
                 decoded_stats.record_video_decoded();
@@ -670,6 +677,13 @@ fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
             Box::new(move || {
                 dropped_stats.record_decode_error();
             }),
+            Some(Box::new(move |msg| {
+                debug!(
+                    "Video decoder thread error for publisher {}: {}",
+                    publisher_id, msg
+                );
+                err_stats.record_decode_error();
+            })),
         )
     });
 
@@ -1320,5 +1334,199 @@ mod tests {
         let pool = empty_pool();
         decode_packet(&pool, &wrapper.write_to_bytes().unwrap());
         assert_eq!(pool.stats.decode_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// vc-4ns: end-to-end regression test for the listener audio decode
+    /// path. Builds a real Opus-encoded 20ms frame using the SAME encoder
+    /// configuration as `bot::audio_producer` (`48000 Hz`, mono, Voip),
+    /// wraps it in a `MediaPacket`/`PacketWrapper` shaped exactly like the
+    /// sender produces, and calls `decode_packet` directly.
+    ///
+    /// The pre-vc-4ns test suite only exercised garbage parses and the
+    /// HEARTBEAT skip branch — there was no test that proved the actual
+    /// `opus::Decoder::decode_float` call wires through to
+    /// `audio_frames_decoded`. A regression in `decode_audio` (wrong
+    /// publisher key, wrong sample-rate config, wrong buffer sizing,
+    /// mis-routed enum match) would have left every counter at zero in
+    /// production and gone undetected because no test reached the codec.
+    ///
+    /// On Pass: `audio_frames_decoded == 1`, `decode_errors == 0`.
+    /// On Fail (any decode path regression): the assertion below
+    /// distinguishes "decoder constructor / config" from "wrong dispatch
+    /// branch" by checking both counters.
+    #[test]
+    fn decode_packet_increments_audio_counter_on_real_opus_frame() {
+        use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
+
+        // Mirror audio_producer.rs exactly: 48 kHz mono Voip Opus, 20 ms
+        // frames = 960 samples.
+        let sample_rate = 48000u32;
+        let mut encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)
+            .expect("construct Opus encoder");
+        let samples = vec![0.0f32; 960];
+        let mut encoded = vec![0u8; 4000];
+        let bytes_written = encoder
+            .encode_float(&samples, &mut encoded)
+            .expect("Opus encode silence");
+        encoded.truncate(bytes_written);
+        // Sanity check: Opus must produce at least a single byte (even
+        // for silence — DTX is off in the bot encoder).
+        assert!(
+            !encoded.is_empty(),
+            "Opus encode should produce a non-empty frame for silence"
+        );
+
+        // Shape matches audio_producer.rs construction.
+        let media = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            user_id: b"sender-7".to_vec(),
+            data: encoded,
+            frame_type: "key".to_string(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: b"sender-7".to_vec(),
+            data: media.write_to_bytes().expect("serialise MediaPacket"),
+            ..Default::default()
+        };
+        let pool = empty_pool();
+        decode_packet(&pool, &wrapper.write_to_bytes().expect("serialise wrapper"));
+
+        assert_eq!(
+            pool.stats.audio_frames_decoded.load(Ordering::Relaxed),
+            1,
+            "real Opus frame must increment audio_frames_decoded"
+        );
+        assert_eq!(
+            pool.stats.decode_errors.load(Ordering::Relaxed),
+            0,
+            "valid Opus frame must NOT count as a decode error"
+        );
+
+        // And the per-publisher diagnostics tracker must see the AUDIO
+        // bytes — without this, the periodic diagnostics emitter would
+        // also stay at zero and we'd lose two observability signals at
+        // once.
+        let publishers = pool.publishers.lock().expect("publishers lock");
+        let tracker = publishers
+            .get("sender-7")
+            .expect("publisher tracker materialised on first AUDIO frame");
+        assert_eq!(tracker.audio_frames, 1);
+        assert!(tracker.audio_bytes > 0);
+    }
+
+    /// vc-4ns: a second AUDIO frame from the same publisher must reuse
+    /// the cached `opus::Decoder` (decoder state is jitter-buffer /
+    /// PLC-relevant and must NOT be reconstructed per frame). The cached
+    /// path is the steady-state hot path; the prior test only exercised
+    /// the Vacant branch of the HashMap entry.
+    #[test]
+    fn decode_packet_reuses_opus_decoder_across_frames() {
+        use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
+
+        let mut encoder = OpusEncoder::new(48000, OpusChannels::Mono, OpusApp::Voip)
+            .expect("construct Opus encoder");
+        let samples = vec![0.0f32; 960];
+        let mut encoded = vec![0u8; 4000];
+        let n = encoder.encode_float(&samples, &mut encoded).unwrap();
+        encoded.truncate(n);
+
+        let make_wrapper_bytes = |seq: u64| {
+            let media = MediaPacket {
+                media_type: MediaType::AUDIO.into(),
+                user_id: b"sender-9".to_vec(),
+                data: encoded.clone(),
+                frame_type: "key".to_string(),
+                timestamp: seq as f64,
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEDIA.into(),
+                user_id: b"sender-9".to_vec(),
+                data: media.write_to_bytes().unwrap(),
+                ..Default::default()
+            };
+            wrapper.write_to_bytes().unwrap()
+        };
+
+        let pool = empty_pool();
+        for seq in 0..5 {
+            decode_packet(&pool, &make_wrapper_bytes(seq));
+        }
+
+        assert_eq!(pool.stats.audio_frames_decoded.load(Ordering::Relaxed), 5);
+        assert_eq!(pool.stats.decode_errors.load(Ordering::Relaxed), 0);
+        // Exactly one decoder must have been constructed (Vacant branch
+        // hit once, then four Occupied reuses).
+        let audio_map = pool.audio.lock().expect("audio decoder map");
+        assert_eq!(
+            audio_map.len(),
+            1,
+            "per-publisher Opus decoder must be reused across frames"
+        );
+    }
+
+    /// vc-4ns: confirm the per-publisher Opus decoder map keys on
+    /// `media.user_id` (the publisher) and NOT on the outer
+    /// `PacketWrapper.user_id` (the SFU-rewritten field) or the
+    /// `PacketWrapper.session_id`. Two distinct publishers must
+    /// instantiate two decoders; one publisher's frames must NOT
+    /// flow through another publisher's decoder state.
+    ///
+    /// This was the user's hypothesised root cause #2 in the bug
+    /// report ("publisher key wrong"). The assertion below would
+    /// catch a regression where `decode_audio` accidentally used the
+    /// wrapper's session id (a u64) as the publisher key, or
+    /// `String::from_utf8_lossy(&wrapper.user_id)` instead of
+    /// `media.user_id`.
+    #[test]
+    fn decode_packet_keys_decoder_map_by_media_user_id() {
+        use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
+
+        let mut encoder = OpusEncoder::new(48000, OpusChannels::Mono, OpusApp::Voip)
+            .expect("construct Opus encoder");
+        let samples = vec![0.0f32; 960];
+        let mut encoded = vec![0u8; 4000];
+        let n = encoder.encode_float(&samples, &mut encoded).unwrap();
+        encoded.truncate(n);
+
+        let make_wrapper = |publisher: &[u8]| {
+            let media = MediaPacket {
+                media_type: MediaType::AUDIO.into(),
+                user_id: publisher.to_vec(),
+                data: encoded.clone(),
+                frame_type: "key".to_string(),
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::MEDIA.into(),
+                // Intentionally constant: confirm decode_audio reads
+                // the INNER MediaPacket.user_id, not the outer
+                // PacketWrapper.user_id.
+                user_id: b"sfu-rewritten".to_vec(),
+                data: media.write_to_bytes().unwrap(),
+                ..Default::default()
+            };
+            wrapper.write_to_bytes().unwrap()
+        };
+
+        let pool = empty_pool();
+        decode_packet(&pool, &make_wrapper(b"publisher-A"));
+        decode_packet(&pool, &make_wrapper(b"publisher-B"));
+
+        assert_eq!(pool.stats.audio_frames_decoded.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.stats.decode_errors.load(Ordering::Relaxed), 0);
+
+        let audio_map = pool.audio.lock().expect("audio decoder map");
+        assert_eq!(
+            audio_map.len(),
+            2,
+            "distinct publishers must own distinct decoders"
+        );
+        assert!(audio_map.contains_key("publisher-A"));
+        assert!(audio_map.contains_key("publisher-B"));
+        // SFU-rewritten wrapper user_id must NOT leak into the map.
+        assert!(!audio_map.contains_key("sfu-rewritten"));
     }
 }
