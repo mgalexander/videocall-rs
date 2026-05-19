@@ -257,6 +257,12 @@ impl BotStats {
         let tx_packets_enqueued = self.tx_packets_enqueued.load(Ordering::Relaxed);
         let tx_drops_channel_full = self.tx_drops_channel_full.load(Ordering::Relaxed);
         let tx_drops_send_error = self.tx_drops_send_error.load(Ordering::Relaxed);
+        // vc-020: unified producer-side drop aggregate. Mirrors the
+        // receive-side `drops` counter so dashboards / jq filters can read
+        // `.tx_drops` as a single number without summing the split fields.
+        // The split fields (`tx_drops_channel_full`, `tx_drops_send_error`)
+        // remain for attribution.
+        let tx_drops = tx_drops_channel_full + tx_drops_send_error;
         let redirects_followed = self.redirects_followed.load(Ordering::Relaxed);
         BotStatsSnapshot {
             user_id: self.user_id.clone(),
@@ -317,6 +323,7 @@ impl BotStats {
             } else {
                 Some(tx_drops_send_error)
             },
+            tx_drops: if tx_drops == 0 { None } else { Some(tx_drops) },
             redirects_followed: if redirects_followed == 0 {
                 None
             } else {
@@ -369,6 +376,14 @@ pub struct BotStatsSnapshot {
     /// failures occurred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_drops_send_error: Option<u64>,
+    /// Producer-side bookkeeping (vc-020): unified aggregate of producer
+    /// drops (`tx_drops_channel_full + tx_drops_send_error`). Mirrors the
+    /// receive-side `drops` field so jq dashboards can read `.tx_drops` as
+    /// a single number. `None` when both split counters are zero (same
+    /// "omit when 0" pattern as the other producer-side fields). The split
+    /// fields are retained for attribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_drops: Option<u64>,
     /// Redirect bookkeeping (vc-kni). `None` when the bot never followed an
     /// `ADMISSION_DECISION{REDIRECT}` target during the run.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,6 +404,7 @@ mod tests {
         assert_eq!(snap.tx_packets_enqueued, None);
         assert_eq!(snap.tx_drops_channel_full, None);
         assert_eq!(snap.tx_drops_send_error, None);
+        assert_eq!(snap.tx_drops, None);
 
         // And the JSON shape must omit them entirely (forward-compat).
         let json = serde_json::to_string(&snap).expect("serialize snapshot");
@@ -403,6 +419,12 @@ mod tests {
         assert!(
             !json.contains("tx_drops_send_error"),
             "tx_drops_send_error must be omitted when zero, got: {json}"
+        );
+        // vc-020: the unified `tx_drops` aggregate follows the same
+        // omit-when-zero pattern.
+        assert!(
+            !json.contains("\"tx_drops\""),
+            "tx_drops must be omitted when zero, got: {json}"
         );
     }
 
@@ -449,10 +471,13 @@ mod tests {
         assert_eq!(snap.tx_packets_enqueued, Some(2));
         assert_eq!(snap.tx_drops_channel_full, Some(1));
         assert_eq!(snap.tx_drops_send_error, Some(3));
+        // vc-020: unified aggregate is the sum of the split fields.
+        assert_eq!(snap.tx_drops, Some(4));
 
         let json = serde_json::to_string(&snap).expect("serialize snapshot");
         assert!(json.contains("\"tx_packets_enqueued\":2"));
         assert!(json.contains("\"tx_drops_channel_full\":1"));
         assert!(json.contains("\"tx_drops_send_error\":3"));
+        assert!(json.contains("\"tx_drops\":4"));
     }
 }

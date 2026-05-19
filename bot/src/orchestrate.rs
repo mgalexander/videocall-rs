@@ -97,6 +97,13 @@ struct Totals {
     /// vc-xpf: aggregate of `tx_drops_send_error` — drops attributed to a
     /// WebTransport send failure.
     tx_drops_send_error: u64,
+    /// vc-020: unified aggregate of producer-side drops
+    /// (`tx_drops_channel_full + tx_drops_send_error`) across all bots.
+    /// Mirrors the receive-side `drops` field so jq dashboards reading
+    /// `.totals.tx_drops` (and `.tx_drops` at root) get a single number
+    /// without summing the split fields. The split fields are retained for
+    /// attribution.
+    tx_drops: u64,
     /// vc-kni: aggregate of `redirects_followed` across all bots — total
     /// `ADMISSION_DECISION{REDIRECT}` hops successfully followed during the
     /// run. Non-zero values indicate at least one bot landed on a
@@ -130,6 +137,13 @@ struct OrchestrationSummary {
     /// `tx_packets_enqueued` above for the schema-parity rationale and
     /// [`crate::failover::FailoverSummary`] for the matching field.
     tx_drops_send_error: u64,
+    /// vc-020: unified producer-side drop aggregate
+    /// (`tx_drops_channel_full + tx_drops_send_error`), surfaced at the root
+    /// so jq dashboards can read `.tx_drops` as a single number — mirroring
+    /// the receive-side `.drops` field. The split fields above are retained
+    /// for attribution. Always serialized — never gated by
+    /// `skip_serializing_if`.
+    tx_drops: u64,
     /// vc-kni: aggregate of `redirects_followed` across all bots, surfaced
     /// at the top level so dashboards / jq filters can use the same path
     /// (`.redirects_followed`) without descending into `totals`. Non-zero
@@ -242,6 +256,10 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
     let tx_packets_enqueued = totals.tx_packets_enqueued;
     let tx_drops_channel_full = totals.tx_drops_channel_full;
     let tx_drops_send_error = totals.tx_drops_send_error;
+    // vc-020: unified producer-drop aggregate copied alongside the split
+    // fields so dashboards reading `.tx_drops` get a single number that
+    // mirrors the receive-side `.drops`.
+    let tx_drops = totals.tx_drops;
     let redirects_followed = totals.redirects_followed;
 
     let summary = OrchestrationSummary {
@@ -253,6 +271,7 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
         tx_packets_enqueued,
         tx_drops_channel_full,
         tx_drops_send_error,
+        tx_drops,
         redirects_followed,
         totals,
         sender_totals,
@@ -302,6 +321,7 @@ fn empty_totals() -> Totals {
         tx_packets_enqueued: 0,
         tx_drops_channel_full: 0,
         tx_drops_send_error: 0,
+        tx_drops: 0,
         redirects_followed: 0,
     }
 }
@@ -321,6 +341,10 @@ fn accumulate(t: &mut Totals, snap: &BotStatsSnapshot) {
     t.tx_packets_enqueued += snap.tx_packets_enqueued.unwrap_or(0);
     t.tx_drops_channel_full += snap.tx_drops_channel_full.unwrap_or(0);
     t.tx_drops_send_error += snap.tx_drops_send_error.unwrap_or(0);
+    // vc-020: derived from the split fields (NOT `snap.tx_drops`) so the
+    // aggregate is consistent even if a future change loosens the snapshot
+    // invariant. Equivalent to `snap.tx_drops.unwrap_or(0)` today.
+    t.tx_drops += snap.tx_drops_channel_full.unwrap_or(0) + snap.tx_drops_send_error.unwrap_or(0);
     t.redirects_followed += snap.redirects_followed.unwrap_or(0);
 }
 
@@ -566,10 +590,13 @@ mod tests {
         assert_eq!(totals.tx_packets_enqueued, 0);
         assert_eq!(totals.tx_drops_channel_full, 0);
         assert_eq!(totals.tx_drops_send_error, 0);
+        // vc-020: unified aggregate is zero when both split counters are zero.
+        assert_eq!(totals.tx_drops, 0);
 
         let tx_packets_enqueued = totals.tx_packets_enqueued;
         let tx_drops_channel_full = totals.tx_drops_channel_full;
         let tx_drops_send_error = totals.tx_drops_send_error;
+        let tx_drops = totals.tx_drops;
         let redirects_followed = totals.redirects_followed;
 
         let summary = OrchestrationSummary {
@@ -581,6 +608,7 @@ mod tests {
             tx_packets_enqueued,
             tx_drops_channel_full,
             tx_drops_send_error,
+            tx_drops,
             redirects_followed,
             totals,
             sender_totals,
@@ -608,6 +636,11 @@ mod tests {
             json.contains("\"tx_drops_send_error\":0"),
             "tx_drops_send_error must be present even when zero, got: {json}"
         );
+        // vc-020: the unified aggregate must also be present at root.
+        assert!(
+            json.contains("\"tx_drops\":0"),
+            "tx_drops must be present even when zero, got: {json}"
+        );
 
         // Stronger guarantee: ensure the top-level fields appear before the
         // `totals` sub-object key in the serialized JSON. Field order in
@@ -621,6 +654,15 @@ mod tests {
         assert!(
             root_tx_idx < totals_idx,
             "tx_packets_enqueued must appear at the root (before \"totals\"), got: {json}"
+        );
+        // vc-020: the unified `tx_drops` must also appear at the root, NOT
+        // only inside the `totals` sub-object.
+        let root_tx_drops_idx = json
+            .find("\"tx_drops\"")
+            .expect("tx_drops missing from root");
+        assert!(
+            root_tx_drops_idx < totals_idx,
+            "tx_drops must appear at the root (before \"totals\"), got: {json}"
         );
     }
 

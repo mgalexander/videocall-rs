@@ -111,6 +111,13 @@ struct FailoverSummary {
     /// vc-6hu: aggregate of `tx_drops_send_error` — drops attributed to a
     /// WebTransport send failure. Always present.
     tx_drops_send_error: u64,
+    /// vc-020: unified producer-side drop aggregate
+    /// (`tx_drops_channel_full + tx_drops_send_error`), surfaced at the root
+    /// so jq dashboards can read `.tx_drops` as a single number — mirroring
+    /// the receive-side `.drops` field on each `BotStatsSnapshot`. The split
+    /// fields above are retained for attribution. Always serialized — never
+    /// gated by `skip_serializing_if`.
+    tx_drops: u64,
     per_bot: Vec<BotStatsSnapshot>,
 }
 
@@ -226,6 +233,7 @@ pub async fn run(cfg: FailoverConfig) -> anyhow::Result<()> {
         tx_packets_enqueued: tx_totals.tx_packets_enqueued,
         tx_drops_channel_full: tx_totals.tx_drops_channel_full,
         tx_drops_send_error: tx_totals.tx_drops_send_error,
+        tx_drops: tx_totals.tx_drops,
         per_bot,
     };
 
@@ -265,6 +273,10 @@ struct TxTotals {
     tx_packets_enqueued: u64,
     tx_drops_channel_full: u64,
     tx_drops_send_error: u64,
+    /// vc-020: unified aggregate (`tx_drops_channel_full + tx_drops_send_error`)
+    /// surfaced at the failover summary root so jq dashboards can read
+    /// `.tx_drops` as a single number.
+    tx_drops: u64,
 }
 
 fn aggregate_tx_totals(per_bot: &[BotStatsSnapshot]) -> TxTotals {
@@ -273,6 +285,11 @@ fn aggregate_tx_totals(per_bot: &[BotStatsSnapshot]) -> TxTotals {
         totals.tx_packets_enqueued += snap.tx_packets_enqueued.unwrap_or(0);
         totals.tx_drops_channel_full += snap.tx_drops_channel_full.unwrap_or(0);
         totals.tx_drops_send_error += snap.tx_drops_send_error.unwrap_or(0);
+        // vc-020: derive from the split fields so the aggregate stays
+        // self-consistent regardless of whether `snap.tx_drops` was set
+        // (today it always is, but this avoids coupling to that invariant).
+        totals.tx_drops +=
+            snap.tx_drops_channel_full.unwrap_or(0) + snap.tx_drops_send_error.unwrap_or(0);
     }
     totals
 }
@@ -486,6 +503,8 @@ mod tests {
                 tx_packets_enqueued: 350,
                 tx_drops_channel_full: 5,
                 tx_drops_send_error: 9,
+                // vc-020: unified aggregate = channel_full + send_error.
+                tx_drops: 14,
             }
         );
     }
@@ -513,6 +532,7 @@ mod tests {
             tx_packets_enqueued: totals.tx_packets_enqueued,
             tx_drops_channel_full: totals.tx_drops_channel_full,
             tx_drops_send_error: totals.tx_drops_send_error,
+            tx_drops: totals.tx_drops,
             per_bot,
         };
 
@@ -528,6 +548,26 @@ mod tests {
         assert!(
             json.contains("\"tx_drops_send_error\":0"),
             "tx_drops_send_error must be present even when zero, got: {json}"
+        );
+        // vc-020: the unified `tx_drops` must also be present at the root,
+        // even when zero. The per-bot snapshot uses `Option<u64>` and
+        // disappears when zero, so this top-level field is the schema-stable
+        // entry point for jq dashboards.
+        assert!(
+            json.contains("\"tx_drops\":0"),
+            "tx_drops must be present even when zero, got: {json}"
+        );
+        // Stronger guarantee: `tx_drops` must appear at the root, before the
+        // `per_bot` array. Field order in serde_json matches struct
+        // declaration order, so this catches a future regression that
+        // accidentally pushes `tx_drops` into `per_bot` snapshots only.
+        let tx_drops_idx = json
+            .find("\"tx_drops\"")
+            .expect("tx_drops missing from JSON");
+        let per_bot_idx = json.find("\"per_bot\"").expect("per_bot key missing");
+        assert!(
+            tx_drops_idx < per_bot_idx,
+            "tx_drops must appear at the root (before \"per_bot\"), got: {json}"
         );
     }
 }
