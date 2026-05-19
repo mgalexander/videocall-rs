@@ -54,6 +54,15 @@ pub struct OrchestrationConfig {
     pub audio_path: String,
     /// Optional path to the directory containing `output_120.jpg`..`output_124.jpg`.
     pub image_dir: String,
+    /// String prefix prepended to every generated user_id. Used to shard
+    /// multiple driver invocations against the same room without colliding
+    /// user IDs. Empty string preserves the original
+    /// `sender-{i}` / `listener-{j}` naming.
+    pub user_id_prefix: String,
+    /// Non-negative integer added to the bot index when forming the
+    /// user_id (e.g. with `index_offset = 100` the first sender becomes
+    /// `sender-100`).
+    pub index_offset: usize,
 }
 
 /// Aggregate totals across every bot in the run.
@@ -98,7 +107,7 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
 
     // Spawn senders first so the room has publishers before listeners attach.
     for i in 0..cfg.senders {
-        let user_id = format!("sender-{i}");
+        let user_id = format!("{}sender-{}", cfg.user_id_prefix, i + cfg.index_offset);
         let stats = BotStats::new(user_id.clone(), BotRole::Sender);
         stats_handles.push(stats.clone());
 
@@ -125,7 +134,7 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
     }
 
     for j in 0..cfg.listeners {
-        let user_id = format!("listener-{j}");
+        let user_id = format!("{}listener-{}", cfg.user_id_prefix, j + cfg.index_offset);
         let stats = BotStats::new(user_id.clone(), BotRole::Listener);
         stats_handles.push(stats.clone());
 

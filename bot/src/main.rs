@@ -107,6 +107,22 @@ struct Cli {
     /// hammer the LB during the kill window.
     #[arg(long, default_value_t = 500)]
     reconnect_interval_ms: u64,
+
+    /// String prefix prepended to every generated user_id. Used to shard
+    /// multiple driver invocations against the same room without colliding
+    /// user IDs (e.g. `--user-id-prefix=us-east-`). Applies to both
+    /// `--orchestrate` and `--failover-test` modes; ignored in single-bot
+    /// mode. Default: empty string (unchanged behavior).
+    #[arg(long, default_value = "")]
+    user_id_prefix: String,
+
+    /// Non-negative integer added to the bot index when forming the
+    /// generated user_id. Used together with `--user-id-prefix` to shard
+    /// across drivers (e.g. `--index-offset=100` makes a driver's first
+    /// sender `sender-100`). Applies to both `--orchestrate` and
+    /// `--failover-test` modes; ignored in single-bot mode. Default: 0.
+    #[arg(long, default_value_t = 0)]
+    index_offset: usize,
 }
 
 #[tokio::main]
@@ -135,6 +151,13 @@ async fn main() -> anyhow::Result<()> {
     if cli.orchestrate {
         let cfg = build_orchestration_config(cli)?;
         return orchestrate::run(cfg).await;
+    }
+
+    if !cli.user_id_prefix.is_empty() || cli.index_offset != 0 {
+        warn!(
+            "--user-id-prefix / --index-offset are ignored in single-bot mode; \
+             they only affect --orchestrate and --failover-test runs"
+        );
     }
 
     info!("Starting videocall synthetic client bot (single-bot mode)");
@@ -175,6 +198,8 @@ fn build_failover_config(cli: Cli) -> anyhow::Result<FailoverConfig> {
         audio_path: cli.audio_path,
         image_dir: cli.image_dir,
         reconnect_interval: Duration::from_millis(cli.reconnect_interval_ms),
+        user_id_prefix: cli.user_id_prefix,
+        index_offset: cli.index_offset,
     })
 }
 
@@ -211,6 +236,8 @@ fn build_orchestration_config(cli: Cli) -> anyhow::Result<OrchestrationConfig> {
         insecure: cli.insecure,
         audio_path: cli.audio_path,
         image_dir: cli.image_dir,
+        user_id_prefix: cli.user_id_prefix,
+        index_offset: cli.index_offset,
     })
 }
 

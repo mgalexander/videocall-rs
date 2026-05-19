@@ -75,6 +75,25 @@ N_CLIENTS=10 ROOM="load-test" cargo run
 docker build -t videocall-synthetic-client .
 ```
 
+### Sharded Multi-Driver Load Test
+
+To run multiple `--orchestrate` (or `--failover-test`) drivers against the same
+room without colliding user IDs, give each driver a unique `--user-id-prefix`
+and/or `--index-offset`. The bot composes user IDs as
+`{prefix}sender-{i + offset}` / `{prefix}listener-{j + offset}`.
+
+```bash
+# Driver A: senders/listeners 0..99
+cargo run -- --orchestrate --room load --senders 50 --listeners 50 \
+  --duration 60 --server-url https://... --index-offset 0
+
+# Driver B: senders/listeners 100..199 (same room, no collisions)
+cargo run -- --orchestrate --room load --senders 50 --listeners 50 \
+  --duration 60 --server-url https://... --index-offset 100
+```
+
+A `--user-id-prefix=us-east-` would yield `us-east-sender-100`, etc.
+
 ## Media Protocol
 
 - **Audio**: 50fps (20ms Opus packets) following neteq_player.rs pattern

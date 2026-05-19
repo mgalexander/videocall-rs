@@ -68,6 +68,15 @@ pub struct FailoverConfig {
     /// to 500ms in the CLI; exposed here so unit/integration tests can
     /// override.
     pub reconnect_interval: Duration,
+    /// String prefix prepended to every generated user_id. Used to shard
+    /// multiple driver invocations against the same room without colliding
+    /// user IDs. Empty string preserves the original
+    /// `sender-{i}` / `listener-{j}` naming.
+    pub user_id_prefix: String,
+    /// Non-negative integer added to the bot index when forming the
+    /// user_id (e.g. with `index_offset = 100` the first listener becomes
+    /// `listener-100`).
+    pub index_offset: usize,
 }
 
 /// Per-bot snapshot plus the aggregate failover metrics.
@@ -109,7 +118,7 @@ pub async fn run(cfg: FailoverConfig) -> anyhow::Result<()> {
     // Senders: same as orchestrate mode, no reconnect logic. Producers will
     // stop when the task is aborted at duration-end.
     for i in 0..cfg.senders {
-        let user_id = format!("sender-{i}");
+        let user_id = format!("{}sender-{}", cfg.user_id_prefix, i + cfg.index_offset);
         let stats = BotStats::new(user_id.clone(), BotRole::Sender);
         stats_handles.push(stats.clone());
 
@@ -137,7 +146,7 @@ pub async fn run(cfg: FailoverConfig) -> anyhow::Result<()> {
 
     // Listeners: wrapped in a reconnect loop.
     for j in 0..cfg.listeners {
-        let user_id = format!("listener-{j}");
+        let user_id = format!("{}listener-{}", cfg.user_id_prefix, j + cfg.index_offset);
         let stats = BotStats::new(user_id.clone(), BotRole::Listener);
         stats_handles.push(stats.clone());
 
