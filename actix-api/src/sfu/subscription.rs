@@ -856,6 +856,67 @@ mod tests {
         assert!(allow_after.video.contains_key(&11));
     }
 
+    /// vc-7wi (symmetric counterpart to vc-3s8): a receiver that joins AFTER
+    /// an existing publisher and never sends a SubscriptionUpdate must, on
+    /// first resolve, see the publisher via the legacy-default AllowSet path.
+    ///
+    /// This guards the publisher-first direction at the resolver layer. The
+    /// integration test pins the dispatcher fan-out side of the same path
+    /// (the new listener has to land in the per-room receivers map before
+    /// the next NATS message arrives); this test pins the resolver side.
+    #[test]
+    fn vc_7wi_late_listener_no_update_sees_existing_publisher() {
+        let store = SubscriptionStore::new();
+        // Room state at the moment the listener joins: publisher 2 is
+        // already a member; listener is 1.
+        let room = members(&[1, 2]);
+        let allow = store.resolve(1, &room, &[]);
+
+        assert!(
+            allow.video.contains_key(&2),
+            "video: an existing publisher (2) must be visible to a fresh \
+             listener (1) that has never sent a SubscriptionUpdate \
+             (legacy-default AllowSet path)"
+        );
+        assert!(
+            allow.audio.contains(&2),
+            "audio: an existing publisher (2) must be audible to a fresh \
+             listener (1) that has never sent a SubscriptionUpdate"
+        );
+    }
+
+    /// vc-7wi: a receiver that joins AFTER an existing publisher and then
+    /// sends the SubscriptionCoalescer's opening empty update
+    /// (`receive_all_audio=true`, `receive_all_video=true`) must, on the
+    /// resolve immediately following the update, see the publisher.
+    ///
+    /// Unlike `vc_3s8_late_joiner_visible_when_receive_all_video`, where the
+    /// listener applied its update BEFORE the publisher joined (so the
+    /// catch-all kicked in via a later `members_generation` bump), this test
+    /// applies the update when the publisher is already in
+    /// `current_members`. The catch-all must materialise the publisher into
+    /// the AllowSet on the very first resolve.
+    #[test]
+    fn vc_7wi_late_listener_with_empty_receive_all_sees_existing_publisher() {
+        let mut store = SubscriptionStore::new();
+        // Publisher 2 is already a member when the listener applies its
+        // opening empty update.
+        let room = members(&[1, 2]);
+        store.apply_update(1, update_all(&[], vec![], true, true), &room);
+
+        let allow = store.resolve(1, &room, &[]);
+        assert!(
+            allow.video.contains_key(&2),
+            "video: existing publisher (2) must be in the AllowSet on the \
+             first resolve after an empty receive_all_video=true update"
+        );
+        assert!(
+            allow.audio.contains(&2),
+            "audio: existing publisher (2) must be in the AllowSet on the \
+             first resolve after an empty receive_all_audio=true update"
+        );
+    }
+
     /// vc-3s8: when speakers + catch-all together would exceed cap, speakers
     /// drain capacity ahead of the catch-all. Locks in the tier order
     /// pinned → slots → speakers → receive_all_video so future tuning is

@@ -829,3 +829,154 @@ async fn sfu_vc_3s8_late_joiner_visible_with_empty_receive_all_audio_update() {
         listener_media.len()
     );
 }
+
+// ===========================================================================
+// vc-7wi: symmetric counterpart to vc-3s8 — listener joins AFTER an existing
+// publisher. The publisher is already in the room and may already have been
+// publishing before the listener joined; the listener must receive media for
+// all packets the publisher sends from the moment the listener is registered
+// as a receiver in the per-room dispatcher.
+//
+// Two scenarios that mirror the vc-3s8 layout but flip the join order:
+//   A. Sender joins first and publishes. Listener joins AFTER. Listener never
+//      sends a SubscriptionUpdate. Listener must capture all media the sender
+//      emits AFTER the listener joined (legacy-default AllowSet path).
+//   B. Sender joins first and publishes. Listener joins AFTER and sends an
+//      empty SubscriptionUpdate with `receive_all_audio=true,
+//      receive_all_video=true` (the SubscriptionCoalescer's opening emit).
+//      Listener must capture all subsequent media from the sender.
+//
+// These tests pin down the symmetric direction of the fix. The forwarder's
+// per-room dispatcher snapshots the `receivers` map on every inbound NATS
+// message, and `SubscriptionStore::resolve_inner` returns either the legacy
+// default fan-out (no SubscriptionUpdate ever applied) or applies the
+// `receive_all_video` catch-all over the *live* `current_members` set — both
+// paths already cover late-joining receivers. The tests below lock that
+// behavior in as a regression guard so future tuning of the resolver or
+// dispatcher cannot silently break it.
+// ===========================================================================
+
+#[actix_rt::test]
+#[serial]
+async fn sfu_vc_7wi_late_joining_listener_sees_existing_publisher_no_subscription_update() {
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+
+    let env = EnvGuard::new();
+    env.set("sfu");
+
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .expect("connect to NATS");
+    let chat = ChatServer::new(nats_client).await.start();
+
+    let room = "vc-7wi-no-sub".to_string();
+    // Distinct sid range from other tests in this file.
+    let sender = Participant::new(81_000, "sender-7wi-1@example.com");
+    let listener = Participant::new(81_001, "listener-7wi-1@example.com");
+
+    // Step 1: sender joins FIRST.
+    register_and_join(&chat, &sender, &room)
+        .await
+        .expect("sender join");
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Step 2: sender publishes a pre-listener burst. These packets predate
+    // the listener's membership and we explicitly do NOT require the listener
+    // to receive them — there is no buffering in the SFU pass-through. This
+    // burst exists only to make sure the dispatcher is hot and the sender's
+    // outbound NATS publish path is fully attached before the listener
+    // arrives.
+    const PRE_LISTENER_BURST: usize = 3;
+    let _pre = send_media_burst(&chat, &sender, &room, PRE_LISTENER_BURST).await;
+    sleep(PUBLISH_SETTLE).await;
+
+    // Step 3: listener joins AFTER the sender has already been publishing.
+    // Listener NEVER sends a SubscriptionUpdate, so the SubscriptionStore
+    // returns the legacy-default AllowSet (everyone else, base layer) on
+    // every resolve.
+    register_and_join(&chat, &listener, &room)
+        .await
+        .expect("listener join");
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Step 4: sender publishes a fresh burst AFTER the listener has joined.
+    // These are the packets the listener must capture.
+    const POST_JOIN_BURST: usize = 5;
+    let _post = send_media_burst(&chat, &sender, &room, POST_JOIN_BURST).await;
+    sleep(PUBLISH_SETTLE).await;
+
+    let listener_media = listener.captured_of(PacketType::MEDIA);
+    assert_eq!(
+        listener_media.len(),
+        POST_JOIN_BURST,
+        "vc-7wi scenario A: listener (no SubscriptionUpdate, joined AFTER an \
+         existing publisher) must capture all {POST_JOIN_BURST} MEDIA packets \
+         the publisher emits AFTER the listener joined, got {}",
+        listener_media.len()
+    );
+}
+
+#[actix_rt::test]
+#[serial]
+async fn sfu_vc_7wi_late_joining_listener_sees_existing_publisher_with_empty_receive_all_update() {
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+
+    let env = EnvGuard::new();
+    env.set("sfu");
+
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .expect("connect to NATS");
+    let chat = ChatServer::new(nats_client).await.start();
+
+    let room = "vc-7wi-empty-sub".to_string();
+    let sender = Participant::new(81_010, "sender-7wi-2@example.com");
+    let listener = Participant::new(81_011, "listener-7wi-2@example.com");
+
+    // Step 1: sender joins FIRST and publishes a pre-listener warm-up burst.
+    register_and_join(&chat, &sender, &room)
+        .await
+        .expect("sender join");
+    sleep(SUBSCRIBE_SETTLE).await;
+    const PRE_LISTENER_BURST: usize = 3;
+    let _pre = send_media_burst(&chat, &sender, &room, PRE_LISTENER_BURST).await;
+    sleep(PUBLISH_SETTLE).await;
+
+    // Step 2: listener joins AFTER. Sender is already a member of the room.
+    register_and_join(&chat, &listener, &room)
+        .await
+        .expect("listener join");
+
+    // Step 3: listener sends its opening empty SubscriptionUpdate with both
+    // catch-alls set, mirroring the SubscriptionCoalescer's default emit. The
+    // catch-all reads `current_members`, which already contains the sender.
+    // The vc-3s8 fix added the `receive_all_video` fan-out tier specifically
+    // to cover this path on the resolver side; the symmetric vc-7wi assertion
+    // is that the per-room dispatcher's `receivers` snapshot already includes
+    // the just-joined listener by the time the next inbound NATS message
+    // arrives.
+    let mut update = SubscriptionUpdate::new();
+    update.pinned_sessions = vec![];
+    update.slots = vec![];
+    update.receive_all_audio = true;
+    update.receive_all_video = true;
+    send_subscription_update(&chat, &listener, &room, update).await;
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Step 4: sender publishes a fresh burst. Listener must capture every
+    // packet — the existing-publisher direction of the vc-3s8 regression.
+    const POST_JOIN_BURST: usize = 5;
+    let _post = send_media_burst(&chat, &sender, &room, POST_JOIN_BURST).await;
+    sleep(PUBLISH_SETTLE).await;
+
+    let listener_media = listener.captured_of(PacketType::MEDIA);
+    assert_eq!(
+        listener_media.len(),
+        POST_JOIN_BURST,
+        "vc-7wi scenario B: listener (empty update with receive_all_audio=true \
+         and receive_all_video=true, joined AFTER an existing publisher) must \
+         capture all {POST_JOIN_BURST} MEDIA packets the publisher emits AFTER \
+         the listener joined, got {}",
+        listener_media.len()
+    );
+}
