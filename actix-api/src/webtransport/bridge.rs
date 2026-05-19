@@ -424,7 +424,6 @@ mod tests {
     // owned reference drop. The reference is an `Arc<()>` cloned out of
     // the test scope so we can observe drop timing via `Arc::strong_count`.
     // =====================================================================
-    // =====================================================================
 
     /// vc-s9e: documents the grace-period invariant. If this value is
     /// changed materially (e.g. dropped to 0 or above 2s) the writer's
