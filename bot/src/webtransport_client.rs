@@ -790,51 +790,68 @@ fn update_publisher_video_window(
     bytes: u64,
 ) -> Option<MediaType> {
     let now = now_ms();
-    let mut map = pool.publishers.lock().unwrap_or_else(|p| p.into_inner());
-    evict_lru_if_full(pool, &mut map, publisher);
-    let tracker = map.entry(publisher.to_string()).or_default();
-    tracker.last_access_ms = now;
-    if tracker.window_start_ms == 0 {
-        tracker.window_start_ms = now;
-    }
-    tracker.video_frames = tracker.video_frames.saturating_add(1);
-    tracker.video_bytes = tracker.video_bytes.saturating_add(bytes);
-
-    let is_key = frame_type == "key";
-    // Keyframes recover us from any pending gap. Mirrors line 701 of
-    // peer_decode_manager.rs.
-    if is_key {
-        tracker.video_gap_detected_at_ms = None;
-    }
-
-    if let Some(prev) = tracker.last_video_seq {
-        if sequence > prev + 1 && tracker.video_gap_detected_at_ms.is_none() {
-            tracker.video_gap_detected_at_ms = Some(now);
-            debug!(
-                "Bot detected video sequence gap for publisher {}: expected {}, got {}",
-                publisher,
-                prev + 1,
-                sequence
-            );
+    // Result of the update path: `Some(MediaType::VIDEO)` if a KFR should
+    // be dispatched for this publisher, else `None`. Computed under the
+    // publishers lock; returned at end-of-function AFTER the lock guard
+    // and any evicted decoder have been dropped.
+    let mut kfr: Option<MediaType> = None;
+    // Evicted-publisher state, captured under the publishers lock and
+    // dropped at end-of-function (i.e. *after* the publishers guard
+    // releases). See `evict_lru_if_full` for why the drop must be
+    // outside all pool mutexes.
+    let evicted: EvictedPublisher;
+    {
+        let mut map = pool.publishers.lock().unwrap_or_else(|p| p.into_inner());
+        evicted = evict_lru_if_full(pool, &mut map, publisher);
+        let tracker = map.entry(publisher.to_string()).or_default();
+        tracker.last_access_ms = now;
+        if tracker.window_start_ms == 0 {
+            tracker.window_start_ms = now;
         }
-    }
-    tracker.last_video_seq = Some(sequence);
+        tracker.video_frames = tracker.video_frames.saturating_add(1);
+        tracker.video_bytes = tracker.video_bytes.saturating_add(bytes);
 
-    // Rate-limited dispatch: only emit if the gap has been outstanding
-    // longer than the arm window AND the per-publisher KFR debounce has
-    // elapsed. Matches the legacy seq-based dispatch in
-    // peer_decode_manager.rs:729.
-    if let Some(gap_time) = tracker.video_gap_detected_at_ms {
-        let elapsed_since_gap = now.saturating_sub(gap_time);
-        let elapsed_since_last_req = now.saturating_sub(tracker.last_video_keyframe_request_ms);
-        if elapsed_since_gap >= KEYFRAME_REQUEST_GAP_ARM_MS
-            && elapsed_since_last_req >= KEYFRAME_REQUEST_MIN_INTERVAL_MS
-        {
-            tracker.last_video_keyframe_request_ms = now;
-            return Some(MediaType::VIDEO);
+        let is_key = frame_type == "key";
+        // Keyframes recover us from any pending gap. Mirrors line 701 of
+        // peer_decode_manager.rs.
+        if is_key {
+            tracker.video_gap_detected_at_ms = None;
         }
-    }
-    None
+
+        if let Some(prev) = tracker.last_video_seq {
+            if sequence > prev + 1 && tracker.video_gap_detected_at_ms.is_none() {
+                tracker.video_gap_detected_at_ms = Some(now);
+                debug!(
+                    "Bot detected video sequence gap for publisher {}: expected {}, got {}",
+                    publisher,
+                    prev + 1,
+                    sequence
+                );
+            }
+        }
+        tracker.last_video_seq = Some(sequence);
+
+        // Rate-limited dispatch: only emit if the gap has been outstanding
+        // longer than the arm window AND the per-publisher KFR debounce has
+        // elapsed. Matches the legacy seq-based dispatch in
+        // peer_decode_manager.rs:729.
+        if let Some(gap_time) = tracker.video_gap_detected_at_ms {
+            let elapsed_since_gap = now.saturating_sub(gap_time);
+            let elapsed_since_last_req = now.saturating_sub(tracker.last_video_keyframe_request_ms);
+            if elapsed_since_gap >= KEYFRAME_REQUEST_GAP_ARM_MS
+                && elapsed_since_last_req >= KEYFRAME_REQUEST_MIN_INTERVAL_MS
+            {
+                tracker.last_video_keyframe_request_ms = now;
+                kfr = Some(MediaType::VIDEO);
+            }
+        }
+    } // <- publishers guard released here, before `evicted` drops below.
+
+    // `evicted` drops on this implicit scope exit. By construction, no
+    // pool mutex is held, so `NativeDecoder::drop`'s worker-thread join
+    // only stalls the calling thread — not the entire listener fleet.
+    drop(evicted);
+    kfr
 }
 
 /// Update the per-publisher AUDIO window counters. AUDIO has no KFR
@@ -842,15 +859,47 @@ fn update_publisher_video_window(
 /// periodic diagnostics emitter.
 fn update_publisher_audio_window(pool: &DecoderPool, publisher: &str, bytes: u64) {
     let now = now_ms();
-    let mut map = pool.publishers.lock().unwrap_or_else(|p| p.into_inner());
-    evict_lru_if_full(pool, &mut map, publisher);
-    let tracker = map.entry(publisher.to_string()).or_default();
-    tracker.last_access_ms = now;
-    if tracker.window_start_ms == 0 {
-        tracker.window_start_ms = now;
-    }
-    tracker.audio_frames = tracker.audio_frames.saturating_add(1);
-    tracker.audio_bytes = tracker.audio_bytes.saturating_add(bytes);
+    // Same lock-then-drop ordering as `update_publisher_video_window`:
+    // capture the evicted decoder under the publishers guard, release the
+    // guard, then drop the decoder. See `evict_lru_if_full` doc for why.
+    let evicted: EvictedPublisher;
+    {
+        let mut map = pool.publishers.lock().unwrap_or_else(|p| p.into_inner());
+        evicted = evict_lru_if_full(pool, &mut map, publisher);
+        let tracker = map.entry(publisher.to_string()).or_default();
+        tracker.last_access_ms = now;
+        if tracker.window_start_ms == 0 {
+            tracker.window_start_ms = now;
+        }
+        tracker.audio_frames = tracker.audio_frames.saturating_add(1);
+        tracker.audio_bytes = tracker.audio_bytes.saturating_add(bytes);
+    } // <- publishers guard released here.
+    drop(evicted);
+}
+
+/// Evicted-publisher state extracted from the pool by
+/// [`evict_lru_if_full`]. Returned to the caller so that the expensive
+/// `Drop` impls (the `NativeDecoder` join, in particular) run AFTER every
+/// pool mutex has been released. See the helper's doc-comment for why
+/// this matters.
+#[must_use = "evicted decoders must be dropped outside the pool locks; \
+              binding to `_` defeats the point — bind to `let _evicted = ...;` \
+              after `drop(publishers_guard)`"]
+struct EvictedPublisher {
+    /// Publisher id we evicted. `None` when no eviction happened (the
+    /// caller can ignore the struct entirely in that case).
+    id: Option<String>,
+    /// Video decoder that was associated with the victim, if any. Its
+    /// `Drop` joins the worker thread (bounded by the 32-frame in-flight
+    /// queue × per-frame VP9 decode cost — up to ~960ms at 1080p), so the
+    /// caller must drop ALL pool mutex guards before dropping this.
+    video: Option<NativeDecoder>,
+    /// Opus decoder that was associated with the victim, if any. Its
+    /// `Drop` is cheap (no thread to join), but we return it for symmetry
+    /// and to keep the policy "all evicted state drops outside the locks"
+    /// uniform — easier to reason about than "video outside, audio
+    /// inside".
+    audio: Option<opus::Decoder>,
 }
 
 /// Enforce the [`DECODER_POOL_MAX_PUBLISHERS`] cap on `pool.publishers` /
@@ -874,13 +923,34 @@ fn update_publisher_audio_window(pool: &DecoderPool, publisher: &str, bytes: u64
 /// publisher we no longer track for KFR/diagnostics — a slow memory leak
 /// that defeats the point of the cap).
 ///
+/// ## Why drops happen outside the pool locks (vc-wx3 review)
+///
+/// `NativeDecoder::drop` joins the worker thread (bounded by
+/// `NATIVE_DECODER_CHANNEL_BOUND = 32` × per-frame VP9 decode cost — up to
+/// ~960ms at 1080p). If we drop the decoder under `pool.video.lock()` and
+/// the caller's `pool.publishers.lock()`, EVERY other listener's
+/// `decode_video`, `decode_audio`, and `diagnostics_emitter` stalls for
+/// the duration of the join. On a 100-listener pod under REDIRECT churn
+/// that is a textbook thundering-herd stall.
+///
+/// Rust's temporary-drop ordering bites here: writing
+/// `pool.video.lock().unwrap().remove(&victim);` drops the `Option`
+/// (containing `NativeDecoder`) BEFORE the `MutexGuard` at end-of-
+/// statement — so the join runs with the lock still held.
+///
+/// We sidestep both traps by returning [`EvictedPublisher`] to the
+/// caller. The caller drops its `publishers` guard, THEN drops the
+/// returned struct. By that point all three pool mutexes are free; only
+/// the calling thread pays the join latency, no other listener stalls.
+///
 /// ## Lock ordering
 ///
-/// Held order is `publishers → video → audio`. The publishers lock is
-/// already held by the caller (passed in as `publishers`); we acquire the
-/// other two inside this function. No other code path in this file takes
-/// `video` or `audio` and then `publishers`, so this ordering is
-/// deadlock-free.
+/// Held order inside this function is `publishers → video → audio`. The
+/// publishers lock is already held by the caller (passed in as
+/// `publishers`); we acquire `video` and `audio` only long enough to
+/// `remove()` the entry, then release each before acquiring the next. No
+/// other code path in this file takes `video` or `audio` and then
+/// `publishers`, so this ordering is deadlock-free.
 ///
 /// ## Tie-break
 ///
@@ -893,12 +963,17 @@ fn evict_lru_if_full(
     pool: &DecoderPool,
     publishers: &mut HashMap<String, PublisherTracker>,
     new_publisher: &str,
-) {
+) -> EvictedPublisher {
+    let empty = EvictedPublisher {
+        id: None,
+        video: None,
+        audio: None,
+    };
     if publishers.contains_key(new_publisher) {
-        return;
+        return empty;
     }
     if publishers.len() < DECODER_POOL_MAX_PUBLISHERS {
-        return;
+        return empty;
     }
     // Find LRU. `min_by` over `(last_access_ms, key)` handles ties
     // deterministically (lexicographically-smallest publisher id wins on
@@ -912,26 +987,35 @@ fn evict_lru_if_full(
         })
         .map(|(k, _)| k.clone());
     let Some(victim) = victim else {
-        return;
+        return empty;
     };
     publishers.remove(&victim);
-    // Drop video decoder (joins its worker thread under Drop — bounded by
-    // the 32-frame in-flight queue × per-frame decode cost) and the opus
-    // decoder. Both maps may legitimately not contain the victim if no
-    // frames of that media type had arrived yet; `remove` returning None
-    // in that case is harmless.
-    pool.video
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&victim);
-    pool.audio
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&victim);
+
+    // CRITICAL: each `remove()` is scoped in its own block so the
+    // `MutexGuard` drops at the end of the block, BEFORE the `Option`
+    // moves into `evicted_video` / `evicted_audio`. The actual decoder
+    // `Drop` impls (and their worker-thread joins) run when the caller
+    // drops the returned [`EvictedPublisher`] AFTER releasing the
+    // `publishers` guard. See the function-level doc-comment for why
+    // this ordering is load-bearing.
+    let evicted_video = {
+        let mut map = pool.video.lock().unwrap_or_else(|p| p.into_inner());
+        map.remove(&victim)
+    };
+    let evicted_audio = {
+        let mut map = pool.audio.lock().unwrap_or_else(|p| p.into_inner());
+        map.remove(&victim)
+    };
+
     debug!(
         "DecoderPool evicted LRU publisher {} (cap={})",
         victim, DECODER_POOL_MAX_PUBLISHERS
     );
+    EvictedPublisher {
+        id: Some(victim),
+        video: evicted_video,
+        audio: evicted_audio,
+    }
 }
 
 /// Build the KEYFRAME_REQUEST PacketWrapper that
@@ -1665,17 +1749,23 @@ mod tests {
     /// [`DECODER_POOL_MAX_PUBLISHERS`] tracked publishers. Driving the
     /// VIDEO path for `CAP + 5` distinct publishers must result in
     /// `publishers.len() == CAP` AND the LRU victim must be evicted from
-    /// `audio` and `publishers` in lockstep (the original bug was three
-    /// independent maps that grew without bound; a fix that only capped
-    /// one of them would let `diagnostics_emitter` operate on half-evicted
-    /// state).
+    /// `video`, `audio`, and `publishers` in lockstep (the original bug
+    /// was three independent maps that grew without bound; a fix that
+    /// only capped one of them would let `diagnostics_emitter` operate
+    /// on half-evicted state).
     ///
     /// Uses `update_publisher_video_window` directly rather than the full
     /// `decode_video` path so the test is libvpx-agnostic — the cap logic
     /// lives entirely in that helper and the eviction reaches into all
-    /// three maps. We seed `audio` and `publishers` with a known LRU victim
-    /// up front (smallest `last_access_ms`) and assert all three maps drop
-    /// it in lockstep when the cap is breached.
+    /// three maps. We seed `video`, `audio` and `publishers` with a known
+    /// LRU victim up front (smallest `last_access_ms`) and assert all
+    /// three maps drop it in lockstep when the cap is breached.
+    ///
+    /// vc-wx3 review: seeding `pool.video` for the victim (with a
+    /// `VideoCodec::Mock` decoder so we don't link libvpx) is the
+    /// load-bearing change — without it, `pool.video.remove(&victim)`
+    /// returns `None` and a regression that broke video eviction would
+    /// pass silently.
     #[test]
     fn decoder_pool_caps_publishers_and_evicts_in_lockstep() {
         let (pool, _rx) = pool_with_drain();
@@ -1689,6 +1779,23 @@ mod tests {
             audio.insert(
                 lru_victim.to_string(),
                 opus::Decoder::new(48000, opus::Channels::Mono).expect("opus decoder"),
+            );
+        }
+        // vc-wx3 review: also seed the VIDEO map for the victim so
+        // `pool.video.remove(&victim)` returns Some and a regression that
+        // broke video eviction is caught (the prior test had pool.video
+        // empty and silently passed even if the eviction call was a
+        // no-op). VideoCodec::Mock skips libvpx entirely.
+        {
+            let mut video = pool.video.lock().expect("video lock");
+            video.insert(
+                lru_victim.to_string(),
+                NativeDecoder::with_callbacks(
+                    DecVideoCodec::Mock,
+                    Box::new(|_| {}),
+                    Box::new(|| {}),
+                    None,
+                ),
             );
         }
 
@@ -1720,7 +1827,7 @@ mod tests {
         }
 
         // Push a CAP+1th publisher — this must trigger eviction of pub-0
-        // from publishers AND audio.
+        // from publishers AND audio AND video.
         let overflow_publisher = format!("pub-{}", DECODER_POOL_MAX_PUBLISHERS);
         update_publisher_video_window(&pool, &overflow_publisher, 99, "delta", 100);
 
@@ -1738,12 +1845,19 @@ mod tests {
             "LRU publisher {} should have been evicted from publishers map",
             lru_victim
         );
-        // ...AND from the audio decoder map (lockstep eviction is the
-        // load-bearing invariant for diagnostics correctness).
+        // ...AND from the audio decoder map...
         let audio = pool.audio.lock().expect("audio lock");
         assert!(
             !audio.contains_key(lru_victim),
             "LRU publisher {} should have been evicted from audio map in lockstep",
+            lru_victim
+        );
+        // ...AND from the video decoder map (lockstep eviction is the
+        // load-bearing invariant for diagnostics correctness).
+        let video = pool.video.lock().expect("video lock");
+        assert!(
+            !video.contains_key(lru_victim),
+            "LRU publisher {} should have been evicted from video map in lockstep",
             lru_victim
         );
         // The new publisher is present.
@@ -1752,6 +1866,136 @@ mod tests {
             "new publisher {} must be inserted after eviction",
             overflow_publisher
         );
+    }
+
+    /// vc-wx3 review: the expensive `NativeDecoder::drop` must NOT run
+    /// while any of `pool.publishers` / `pool.video` / `pool.audio` is
+    /// held — otherwise every other listener's `decode_video` /
+    /// `decode_audio` / `diagnostics_emitter` stalls on the worker-thread
+    /// join (bounded by `NATIVE_DECODER_CHANNEL_BOUND × per-frame decode
+    /// cost`, up to ~960ms at 1080p). This is the textbook
+    /// thundering-herd stall the review flagged.
+    ///
+    /// Test strategy is the structural contract assertion, not a
+    /// timing-based hammer-thread observation. The bot crate has no way
+    /// to inject a slow-Drop into `NativeDecoder` (MockDecoder's
+    /// per-frame delay is `#[cfg(test)]` inside `videocall-codecs`'s own
+    /// crate-internal tests, not exposed to consumers), so a timing test
+    /// would have a Drop window in the microseconds and be too flaky to
+    /// run in CI.
+    ///
+    /// The structural test instead verifies the documented contract:
+    ///
+    /// 1. `evict_lru_if_full` returns the evicted `NativeDecoder` and
+    ///    `opus::Decoder` via [`EvictedPublisher`] rather than dropping
+    ///    them internally. This is the load-bearing API change: the
+    ///    pre-review code had `pool.video.lock().unwrap().remove(&v);`
+    ///    as a single statement, where Rust's temp-drop order ran
+    ///    `NativeDecoder::drop` BEFORE the `MutexGuard` dropped — i.e.
+    ///    Drop ran with the lock held.
+    /// 2. Immediately after `evict_lru_if_full` returns and the
+    ///    publishers guard is released, all three pool mutexes are
+    ///    acquirable via `try_lock` from the same thread (a std::sync
+    ///    Mutex is not re-entrant, so a leaked guard from the same
+    ///    thread would make this fail).
+    /// 3. After explicitly dropping the `EvictedPublisher` (joining the
+    ///    worker thread), the locks remain free.
+    ///
+    /// What this test does NOT directly catch: a regression that
+    /// re-inlined the single-statement form `pool.video.lock()...
+    /// .remove(&v);` inside `evict_lru_if_full` itself, since by the
+    /// time the function returns the guards are dropped. That class of
+    /// regression is guarded by the `#[must_use]` annotation on
+    /// [`EvictedPublisher`] (which makes silent inline-drop a compile
+    /// warning), the doc-comment on `evict_lru_if_full`, and the
+    /// scoped-block form already used in the implementation.
+    #[test]
+    fn decoder_pool_eviction_drops_decoder_outside_locks() {
+        let (pool, _rx) = pool_with_drain();
+
+        // Seed video map with a real NativeDecoder for the LRU victim so
+        // the returned EvictedPublisher.video carries a real value (and
+        // its Drop joins a real worker thread on this thread's stack).
+        let lru_victim = "victim-pub";
+        {
+            let mut video = pool.video.lock().expect("video lock");
+            video.insert(
+                lru_victim.to_string(),
+                NativeDecoder::with_callbacks(
+                    DecVideoCodec::Mock,
+                    Box::new(|_| {}),
+                    Box::new(|| {}),
+                    None,
+                ),
+            );
+        }
+        // Seed audio map with a real opus decoder.
+        {
+            let mut audio = pool.audio.lock().expect("audio lock");
+            audio.insert(
+                lru_victim.to_string(),
+                opus::Decoder::new(48000, opus::Channels::Mono).expect("opus decoder"),
+            );
+        }
+        // Fill publishers to cap with the victim at the oldest timestamp.
+        {
+            let mut pubs = pool.publishers.lock().expect("publishers lock");
+            pubs.entry(lru_victim.to_string())
+                .or_default()
+                .last_access_ms = 1;
+        }
+        for i in 1..(DECODER_POOL_MAX_PUBLISHERS as u64) {
+            update_publisher_video_window(&pool, &format!("pub-{}", i), i, "delta", 100);
+        }
+
+        // (1) Call evict_lru_if_full directly with the publishers lock,
+        // capture the returned EvictedPublisher, then explicitly release
+        // the publishers guard via the scope.
+        let evicted = {
+            let mut pubs = pool.publishers.lock().expect("publishers lock");
+            let e = evict_lru_if_full(&pool, &mut pubs, "fresh-publisher");
+            // Sanity: a victim was actually selected and the value was
+            // plumbed through, not dropped under the helper's locks.
+            assert_eq!(e.id.as_deref(), Some(lru_victim));
+            assert!(
+                e.video.is_some(),
+                "victim's video decoder must be returned for outside-the-lock drop"
+            );
+            assert!(
+                e.audio.is_some(),
+                "victim's audio decoder must be returned for outside-the-lock drop"
+            );
+            e
+        };
+
+        // (2) With `evicted` still bound (not yet dropped), all three
+        // pool mutexes must be acquirable from THIS thread via try_lock
+        // — proving evict_lru_if_full released video/audio before
+        // returning, and the scope above released publishers. A
+        // regression that held any of these across the function return
+        // would deadlock the std::sync::Mutex (same thread, re-entrant
+        // lock).
+        assert!(
+            pool.video.try_lock().is_ok(),
+            "pool.video must NOT be held while EvictedPublisher is alive — \
+             a regression to `pool.video.lock().remove(&v)` as a single \
+             statement would leak the guard across `NativeDecoder::drop`"
+        );
+        assert!(
+            pool.audio.try_lock().is_ok(),
+            "pool.audio must NOT be held while EvictedPublisher is alive"
+        );
+        assert!(
+            pool.publishers.try_lock().is_ok(),
+            "pool.publishers must NOT be held while EvictedPublisher is alive"
+        );
+
+        // (3) Drop the evicted publisher (joins the worker thread).
+        // Locks must remain free afterwards.
+        drop(evicted);
+        assert!(pool.video.try_lock().is_ok());
+        assert!(pool.audio.try_lock().is_ok());
+        assert!(pool.publishers.try_lock().is_ok());
     }
 
     /// vc-wx3: re-accessing an existing publisher must NOT trigger an
