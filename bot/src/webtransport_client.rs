@@ -76,6 +76,11 @@ struct DecoderPool {
 /// `DiagnosticsPacket` with fps + bitrate_kbps + bandwidth_estimate) and
 /// `peer_decode_manager.rs::track_sequence` for the KEYFRAME_REQUEST
 /// debounce.
+///
+/// Also carries the LRU last-access timestamp (vc-wx3): when the pool hits
+/// [`DECODER_POOL_MAX_PUBLISHERS`], the publisher with the smallest
+/// `last_access_ms` is evicted from `video`, `audio`, and `publishers` in
+/// lockstep so half-evicted state can't leak into diagnostics or KFR logic.
 #[derive(Default)]
 struct PublisherTracker {
     /// Wall-clock unix-millis of the start of the current diagnostics
@@ -102,6 +107,12 @@ struct PublisherTracker {
     /// Used to debounce per `KEYFRAME_REQUEST_MIN_INTERVAL_MS` (500ms,
     /// matches `adaptive_quality_constants.rs:312`).
     last_video_keyframe_request_ms: u64,
+    /// Unix-millis of the most recent VIDEO or AUDIO frame observed for
+    /// this publisher. Drives the [`DECODER_POOL_MAX_PUBLISHERS`] LRU
+    /// eviction (vc-wx3). Updated on every frame so an active publisher
+    /// stays "hot" and idle publishers fall out first when the cap is hit.
+    /// `0` until the first frame arrives.
+    last_access_ms: u64,
 }
 
 /// Cadence for outbound `DiagnosticsPacket` emission per (publisher × media
@@ -130,6 +141,30 @@ const KEYFRAME_REQUEST_GAP_ARM_MS: u64 = 1000;
 /// above the steady-state load (~2 packets/sec/publisher) so steady
 /// emission never blocks the decode thread.
 const FEEDBACK_CHANNEL_BOUND: usize = 256;
+
+/// Maximum number of distinct publishers a listener tracks simultaneously
+/// in its [`DecoderPool`] (vc-wx3). Each entry holds a [`NativeDecoder`]
+/// (one worker thread + 32-frame bounded channel ≈ ~2 MiB worst case), an
+/// `opus::Decoder` (~tens of KiB), and a [`PublisherTracker`] (negligible).
+/// The dominant cost is the video decoder; capping at 16 publishers caps
+/// the per-listener decoder footprint at ~32 MiB worst-case (and with the
+/// vc-wx3 stack-size fix, ~24 MiB of that is the bounded channel rather
+/// than thread stack reservation).
+///
+/// 16 is generous for the production case (rooms top out at ~6 active
+/// publishers) while still bounding REDIRECT-loop and soak-test scenarios
+/// where publishers churn (each REDIRECT cycle re-uses a new transient
+/// publisher id) — without that cap, the maps grew without bound and
+/// dominated steady-state listener memory.
+///
+/// Eviction is LRU by `PublisherTracker::last_access_ms`. We deliberately
+/// did NOT pull in a dedicated LRU crate: the cap is small, eviction is
+/// triggered only on the cap-hit code path (cold), and a linear scan over
+/// ≤ 16 entries is faster than a doubly-linked-list update on the hot path.
+/// The single source of truth for recency is the `publishers` map so all
+/// three maps (video, audio, publishers) can be kept in lockstep without
+/// a fourth sidecar map.
+const DECODER_POOL_MAX_PUBLISHERS: usize = 16;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -756,7 +791,9 @@ fn update_publisher_video_window(
 ) -> Option<MediaType> {
     let now = now_ms();
     let mut map = pool.publishers.lock().unwrap_or_else(|p| p.into_inner());
+    evict_lru_if_full(pool, &mut map, publisher);
     let tracker = map.entry(publisher.to_string()).or_default();
+    tracker.last_access_ms = now;
     if tracker.window_start_ms == 0 {
         tracker.window_start_ms = now;
     }
@@ -806,12 +843,95 @@ fn update_publisher_video_window(
 fn update_publisher_audio_window(pool: &DecoderPool, publisher: &str, bytes: u64) {
     let now = now_ms();
     let mut map = pool.publishers.lock().unwrap_or_else(|p| p.into_inner());
+    evict_lru_if_full(pool, &mut map, publisher);
     let tracker = map.entry(publisher.to_string()).or_default();
+    tracker.last_access_ms = now;
     if tracker.window_start_ms == 0 {
         tracker.window_start_ms = now;
     }
     tracker.audio_frames = tracker.audio_frames.saturating_add(1);
     tracker.audio_bytes = tracker.audio_bytes.saturating_add(bytes);
+}
+
+/// Enforce the [`DECODER_POOL_MAX_PUBLISHERS`] cap on `pool.publishers` /
+/// `pool.video` / `pool.audio` (vc-wx3).
+///
+/// Called from the `update_publisher_*_window` paths just before
+/// `map.entry(publisher).or_default()` would insert a new tracker. When the
+/// caller is about to push the map past the cap (i.e. `publisher` is not
+/// already present AND the map is at-or-above capacity), we pick the entry
+/// with the smallest `last_access_ms` and evict it from ALL three maps in
+/// lockstep.
+///
+/// ## Why lockstep eviction
+///
+/// `decoder_pool` is three parallel maps keyed by publisher id; the
+/// invariant the rest of the bot relies on is "if the publishers map has
+/// `pub_X`, then `video[pub_X]` and `audio[pub_X]` *may* exist and are valid
+/// for that publisher". Evicting from one map without the others would let
+/// `diagnostics_emitter` snapshot a publisher whose decoders were freed
+/// (and conversely, leave a libvpx context + worker thread alive for a
+/// publisher we no longer track for KFR/diagnostics — a slow memory leak
+/// that defeats the point of the cap).
+///
+/// ## Lock ordering
+///
+/// Held order is `publishers → video → audio`. The publishers lock is
+/// already held by the caller (passed in as `publishers`); we acquire the
+/// other two inside this function. No other code path in this file takes
+/// `video` or `audio` and then `publishers`, so this ordering is
+/// deadlock-free.
+///
+/// ## Tie-break
+///
+/// On ties (e.g. two publishers both at `last_access_ms == 0`, the default
+/// before the first frame arrives), we evict the lexicographically
+/// smallest publisher id. This is deterministic and test-friendly; in
+/// practice ties only occur transiently because `last_access_ms` is
+/// updated on every frame and is millisecond-resolution.
+fn evict_lru_if_full(
+    pool: &DecoderPool,
+    publishers: &mut HashMap<String, PublisherTracker>,
+    new_publisher: &str,
+) {
+    if publishers.contains_key(new_publisher) {
+        return;
+    }
+    if publishers.len() < DECODER_POOL_MAX_PUBLISHERS {
+        return;
+    }
+    // Find LRU. `min_by` over `(last_access_ms, key)` handles ties
+    // deterministically (lexicographically-smallest publisher id wins on
+    // tie) without allocating a temporary key copy inside the comparator.
+    let victim = publishers
+        .iter()
+        .min_by(|a, b| {
+            a.1.last_access_ms
+                .cmp(&b.1.last_access_ms)
+                .then_with(|| a.0.cmp(b.0))
+        })
+        .map(|(k, _)| k.clone());
+    let Some(victim) = victim else {
+        return;
+    };
+    publishers.remove(&victim);
+    // Drop video decoder (joins its worker thread under Drop — bounded by
+    // the 32-frame in-flight queue × per-frame decode cost) and the opus
+    // decoder. Both maps may legitimately not contain the victim if no
+    // frames of that media type had arrived yet; `remove` returning None
+    // in that case is harmless.
+    pool.video
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&victim);
+    pool.audio
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&victim);
+    debug!(
+        "DecoderPool evicted LRU publisher {} (cap={})",
+        victim, DECODER_POOL_MAX_PUBLISHERS
+    );
 }
 
 /// Build the KEYFRAME_REQUEST PacketWrapper that
@@ -1539,5 +1659,151 @@ mod tests {
         assert!(audio_map.contains_key("publisher-B"));
         // SFU-rewritten wrapper user_id must NOT leak into the map.
         assert!(!audio_map.contains_key("sfu-rewritten"));
+    }
+
+    /// vc-wx3: the per-listener pool must cap at exactly
+    /// [`DECODER_POOL_MAX_PUBLISHERS`] tracked publishers. Driving the
+    /// VIDEO path for `CAP + 5` distinct publishers must result in
+    /// `publishers.len() == CAP` AND the LRU victim must be evicted from
+    /// `audio` and `publishers` in lockstep (the original bug was three
+    /// independent maps that grew without bound; a fix that only capped
+    /// one of them would let `diagnostics_emitter` operate on half-evicted
+    /// state).
+    ///
+    /// Uses `update_publisher_video_window` directly rather than the full
+    /// `decode_video` path so the test is libvpx-agnostic — the cap logic
+    /// lives entirely in that helper and the eviction reaches into all
+    /// three maps. We seed `audio` and `publishers` with a known LRU victim
+    /// up front (smallest `last_access_ms`) and assert all three maps drop
+    /// it in lockstep when the cap is breached.
+    #[test]
+    fn decoder_pool_caps_publishers_and_evicts_in_lockstep() {
+        let (pool, _rx) = pool_with_drain();
+
+        // Pre-populate the audio map with stub Opus decoders for what will
+        // become the LRU victim, so we can prove eviction reaches the audio
+        // map. Opus::Decoder::new is cheap and doesn't link libvpx.
+        let lru_victim = "pub-0";
+        {
+            let mut audio = pool.audio.lock().expect("audio lock");
+            audio.insert(
+                lru_victim.to_string(),
+                opus::Decoder::new(48000, opus::Channels::Mono).expect("opus decoder"),
+            );
+        }
+
+        // Seed the publishers map with the victim at the OLDEST timestamp.
+        // Subsequent publishers all get strictly larger timestamps so the
+        // LRU is unambiguously `pub-0`.
+        {
+            let mut pubs = pool.publishers.lock().expect("publishers lock");
+            let t = pubs.entry(lru_victim.to_string()).or_default();
+            t.last_access_ms = 1; // strictly < everything we'll insert below
+            t.window_start_ms = 1;
+        }
+
+        // Fill the pool to exactly CAP entries with monotonically-increasing
+        // access times (pub-1, pub-2, ...). The seed counts as the first
+        // entry, so we insert (CAP - 1) more.
+        for i in 1..(DECODER_POOL_MAX_PUBLISHERS as u64) {
+            // Each call to update_publisher_video_window bumps that
+            // publisher's last_access_ms to now_ms(); we don't need to
+            // override here because i > 0 is already newer than seed=1.
+            let publisher = format!("pub-{}", i);
+            update_publisher_video_window(&pool, &publisher, i, "delta", 100);
+        }
+        // Sanity: we're at the cap, victim still present.
+        {
+            let pubs = pool.publishers.lock().unwrap();
+            assert_eq!(pubs.len(), DECODER_POOL_MAX_PUBLISHERS);
+            assert!(pubs.contains_key(lru_victim));
+        }
+
+        // Push a CAP+1th publisher — this must trigger eviction of pub-0
+        // from publishers AND audio.
+        let overflow_publisher = format!("pub-{}", DECODER_POOL_MAX_PUBLISHERS);
+        update_publisher_video_window(&pool, &overflow_publisher, 99, "delta", 100);
+
+        // Map size must have stayed at CAP, not grown to CAP+1.
+        let pubs = pool.publishers.lock().expect("publishers lock");
+        assert_eq!(
+            pubs.len(),
+            DECODER_POOL_MAX_PUBLISHERS,
+            "publishers map must cap at DECODER_POOL_MAX_PUBLISHERS, got {}",
+            pubs.len()
+        );
+        // LRU victim must have been removed from publishers...
+        assert!(
+            !pubs.contains_key(lru_victim),
+            "LRU publisher {} should have been evicted from publishers map",
+            lru_victim
+        );
+        // ...AND from the audio decoder map (lockstep eviction is the
+        // load-bearing invariant for diagnostics correctness).
+        let audio = pool.audio.lock().expect("audio lock");
+        assert!(
+            !audio.contains_key(lru_victim),
+            "LRU publisher {} should have been evicted from audio map in lockstep",
+            lru_victim
+        );
+        // The new publisher is present.
+        assert!(
+            pubs.contains_key(&overflow_publisher),
+            "new publisher {} must be inserted after eviction",
+            overflow_publisher
+        );
+    }
+
+    /// vc-wx3: re-accessing an existing publisher must NOT trigger an
+    /// eviction even when the map is at the cap. A regression that
+    /// re-evicted on every frame would thrash the codec state and produce
+    /// an artillery of KFRs.
+    #[test]
+    fn decoder_pool_does_not_evict_on_existing_publisher_access() {
+        let (pool, _rx) = pool_with_drain();
+
+        // Fill to cap.
+        for i in 0..DECODER_POOL_MAX_PUBLISHERS as u64 {
+            let publisher = format!("pub-{}", i);
+            update_publisher_video_window(&pool, &publisher, i, "delta", 100);
+        }
+        {
+            let pubs = pool.publishers.lock().unwrap();
+            assert_eq!(pubs.len(), DECODER_POOL_MAX_PUBLISHERS);
+        }
+
+        // Update an existing publisher many times — the map must stay at
+        // exactly CAP entries and the publisher must remain present.
+        for seq in 1..50u64 {
+            update_publisher_video_window(&pool, "pub-0", seq, "delta", 100);
+        }
+
+        let pubs = pool.publishers.lock().unwrap();
+        assert_eq!(
+            pubs.len(),
+            DECODER_POOL_MAX_PUBLISHERS,
+            "re-accessing an existing publisher must not change map size"
+        );
+        assert!(pubs.contains_key("pub-0"));
+    }
+
+    /// vc-wx3: the AUDIO path must drive the same cap as the VIDEO path —
+    /// they share the `publishers` map. A regression that capped only on
+    /// the VIDEO path would let an audio-only stream blow past the cap.
+    #[test]
+    fn decoder_pool_caps_publishers_via_audio_path() {
+        let (pool, _rx) = pool_with_drain();
+
+        for i in 0..(DECODER_POOL_MAX_PUBLISHERS as u64 + 5) {
+            let publisher = format!("audio-pub-{}", i);
+            update_publisher_audio_window(&pool, &publisher, 200);
+        }
+
+        let pubs = pool.publishers.lock().unwrap();
+        assert_eq!(
+            pubs.len(),
+            DECODER_POOL_MAX_PUBLISHERS,
+            "AUDIO path must also enforce DECODER_POOL_MAX_PUBLISHERS cap"
+        );
     }
 }

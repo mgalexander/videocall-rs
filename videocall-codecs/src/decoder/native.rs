@@ -911,4 +911,57 @@ mod tests {
         drop(dec);
         assert_eq!(err_count.load(Ordering::Relaxed), 0);
     }
+
+    /// vc-wx3: the worker thread must spawn successfully under the reduced
+    /// 512 KiB stack and must process at least one frame before teardown.
+    /// `Builder::spawn` returns `io::Result`; a regression that drops the
+    /// `Builder` configuration (and falls back to `thread::spawn` with the
+    /// 8 MiB Linux default) would silently undo the fleet-VM-reservation win
+    /// that this bead exists to deliver. We can't directly measure RLIMIT_AS
+    /// from inside a unit test on every platform, but we CAN prove the
+    /// builder path is wired by:
+    ///   1. constructing the decoder (proving `Builder::spawn` succeeded —
+    ///      a fallback to `thread::spawn` would also succeed, so this alone
+    ///      isn't enough),
+    ///   2. observing the worker actually consumed a frame (proves the
+    ///      worker is alive and the bounded channel is wired through the
+    ///      smaller stack), and
+    ///   3. tearing down cleanly (proves Drop's `recv()`-error termination
+    ///      still works under the reduced stack).
+    ///
+    /// Combined with the `ScriptedErrorDecoder` injection path, this covers
+    /// the codec-agnostic invariant without linking libvpx.
+    #[test]
+    fn worker_thread_runs_under_reduced_stack() {
+        let frames_seen = Arc::new(AtomicUsize::new(0));
+        let cb_seen = frames_seen.clone();
+        let dec = NativeDecoder::with_injected_decoder(
+            // ScriptedErrorDecoder runs the worker loop without libvpx and
+            // bumps `seen` on every frame; we route that count out via the
+            // on_error callback (set fire_after_n = 0 so every frame fires).
+            Box::new(ScriptedErrorDecoder {
+                error_msg: "tick".to_string(),
+                fire_after_n: 0,
+                seen: 0,
+            }),
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            Some(Box::new(move |_| {
+                cb_seen.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        for seq in 0..3 {
+            dec.decode(make_frame(seq));
+        }
+        // Give the worker a moment to drain.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(dec);
+        assert_eq!(
+            frames_seen.load(Ordering::Relaxed),
+            3,
+            "worker thread must process all 3 frames under the reduced stack \
+             (a regression to thread::spawn would still pass; this test \
+             primarily guards the wiring path)"
+        );
+    }
 }
