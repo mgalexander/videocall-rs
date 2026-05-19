@@ -76,6 +76,8 @@ struct Totals {
     video_frames_decoded: u64,
     audio_frames_decoded: u64,
     decode_errors: u64,
+    diagnostics_sent: u64,
+    keyframe_requests_sent: u64,
 }
 
 /// Final summary JSON emitted to stdout.
@@ -233,6 +235,8 @@ fn empty_totals() -> Totals {
         video_frames_decoded: 0,
         audio_frames_decoded: 0,
         decode_errors: 0,
+        diagnostics_sent: 0,
+        keyframe_requests_sent: 0,
     }
 }
 
@@ -246,6 +250,8 @@ fn accumulate(t: &mut Totals, snap: &BotStatsSnapshot) {
     t.video_frames_decoded += snap.video_frames_decoded.unwrap_or(0);
     t.audio_frames_decoded += snap.audio_frames_decoded.unwrap_or(0);
     t.decode_errors += snap.decode_errors.unwrap_or(0);
+    t.diagnostics_sent += snap.diagnostics_sent.unwrap_or(0);
+    t.keyframe_requests_sent += snap.keyframe_requests_sent.unwrap_or(0);
 }
 
 fn finalise_avg(t: &mut Totals, duration_s: f64) {

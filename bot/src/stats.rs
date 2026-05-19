@@ -82,6 +82,15 @@ pub struct BotStats {
     /// Listener-decode bookkeeping (vc-86j): wrapper/media parse failures and
     /// codec decode errors observed while servicing the inbound stream.
     pub decode_errors: AtomicU64,
+    /// Listener-feedback bookkeeping (vc-dwc): total `DiagnosticsPacket`
+    /// frames the listener emitted back to the SFU (per-publisher × per-
+    /// media-type at ~2Hz, matching the real client cadence). `0` for
+    /// senders and for listeners with decode disabled.
+    pub diagnostics_sent: AtomicU64,
+    /// Listener-feedback bookkeeping (vc-dwc): total KEYFRAME_REQUEST
+    /// MediaPackets the listener emitted (rate-limited per publisher to
+    /// match `KEYFRAME_REQUEST_MIN_INTERVAL_MS`).
+    pub keyframe_requests_sent: AtomicU64,
 }
 
 impl BotStats {
@@ -158,6 +167,16 @@ impl BotStats {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one outbound `DiagnosticsPacket` emission (vc-dwc).
+    pub fn record_diagnostics_sent(&self) {
+        self.diagnostics_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one outbound KEYFRAME_REQUEST `MediaPacket` emission (vc-dwc).
+    pub fn record_keyframe_request_sent(&self) {
+        self.keyframe_requests_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Capture a serializable snapshot of the current counters.
     pub fn snapshot(&self, duration_s: f64) -> BotStatsSnapshot {
         let bytes = self.bytes_received.load(Ordering::Relaxed);
@@ -179,6 +198,8 @@ impl BotStats {
         let video_frames_decoded = self.video_frames_decoded.load(Ordering::Relaxed);
         let audio_frames_decoded = self.audio_frames_decoded.load(Ordering::Relaxed);
         let decode_errors = self.decode_errors.load(Ordering::Relaxed);
+        let diagnostics_sent = self.diagnostics_sent.load(Ordering::Relaxed);
+        let keyframe_requests_sent = self.keyframe_requests_sent.load(Ordering::Relaxed);
         BotStatsSnapshot {
             user_id: self.user_id.clone(),
             role: self.role,
@@ -213,6 +234,16 @@ impl BotStats {
             } else {
                 Some(decode_errors)
             },
+            diagnostics_sent: if diagnostics_sent == 0 {
+                None
+            } else {
+                Some(diagnostics_sent)
+            },
+            keyframe_requests_sent: if keyframe_requests_sent == 0 {
+                None
+            } else {
+                Some(keyframe_requests_sent)
+            },
         }
     }
 }
@@ -244,4 +275,8 @@ pub struct BotStatsSnapshot {
     pub audio_frames_decoded: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_errors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics_sent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyframe_requests_sent: Option<u64>,
 }
