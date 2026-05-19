@@ -97,6 +97,23 @@ struct OrchestrationSummary {
     duration_s: u64,
     room: String,
     server_url: String,
+    /// vc-8pl: aggregate of `tx_packets_enqueued` across all bots, surfaced
+    /// at the top level so dashboards / jq filters can use the same path
+    /// (`.tx_packets_enqueued`) against both orchestrate and failover
+    /// summaries. Mirrors the matching field on
+    /// [`crate::failover::FailoverSummary`]. The value is also present
+    /// inside `totals` / `sender_totals` / `listener_totals` for the
+    /// per-role split; this top-level copy exists for schema parity.
+    /// Always serialized — never gated by `skip_serializing_if`.
+    tx_packets_enqueued: u64,
+    /// vc-8pl: aggregate of `tx_drops_channel_full` across all bots. See
+    /// `tx_packets_enqueued` above for the schema-parity rationale and
+    /// [`crate::failover::FailoverSummary`] for the matching field.
+    tx_drops_channel_full: u64,
+    /// vc-8pl: aggregate of `tx_drops_send_error` across all bots. See
+    /// `tx_packets_enqueued` above for the schema-parity rationale and
+    /// [`crate::failover::FailoverSummary`] for the matching field.
+    tx_drops_send_error: u64,
     totals: Totals,
     sender_totals: Totals,
     listener_totals: Totals,
@@ -195,12 +212,23 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
 
     let (sender_totals, listener_totals, totals) = aggregate(&per_bot, duration_s);
 
+    // vc-8pl: copy the producer-side aggregates out before moving `totals`
+    // into the struct literal so the top-level fields stay in lock-step with
+    // the totals sub-object. u64 is `Copy`, but the explicit bindings make
+    // the ordering obvious and mirror `failover::FailoverSummary`.
+    let tx_packets_enqueued = totals.tx_packets_enqueued;
+    let tx_drops_channel_full = totals.tx_drops_channel_full;
+    let tx_drops_send_error = totals.tx_drops_send_error;
+
     let summary = OrchestrationSummary {
         senders: cfg.senders,
         listeners: cfg.listeners,
         duration_s: cfg.duration.as_secs(),
         room: cfg.room,
         server_url: cfg.server_url.to_string(),
+        tx_packets_enqueued,
+        tx_drops_channel_full,
+        tx_drops_send_error,
         totals,
         sender_totals,
         listener_totals,
@@ -346,4 +374,83 @@ async fn run_listener(
     // by `connect` records packets_received for us.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// vc-8pl: the orchestrate summary must surface `tx_packets_enqueued`,
+    /// `tx_drops_channel_full`, and `tx_drops_send_error` at the JSON root
+    /// even when every aggregate is zero. This mirrors
+    /// `failover::FailoverSummary` so dashboards / jq filters get a stable
+    /// schema across both modes. Guards against a future regression where
+    /// someone adds `skip_serializing_if = "..."` to (or outright removes)
+    /// the top-level fields.
+    #[test]
+    fn orchestration_summary_serializes_zero_tx_totals_at_root_vc_8pl() {
+        // One zero-counter listener snapshot drives the aggregate to all
+        // zeros. The listener role means none of the tx_* recorders fire.
+        let stats = BotStats::new("listener-0".to_string(), BotRole::Listener);
+        let per_bot = vec![stats.snapshot(1.0)];
+        let (sender_totals, listener_totals, totals) = aggregate(&per_bot, 1.0);
+
+        assert_eq!(totals.tx_packets_enqueued, 0);
+        assert_eq!(totals.tx_drops_channel_full, 0);
+        assert_eq!(totals.tx_drops_send_error, 0);
+
+        let tx_packets_enqueued = totals.tx_packets_enqueued;
+        let tx_drops_channel_full = totals.tx_drops_channel_full;
+        let tx_drops_send_error = totals.tx_drops_send_error;
+
+        let summary = OrchestrationSummary {
+            senders: 0,
+            listeners: 1,
+            duration_s: 1,
+            room: "room-a".into(),
+            server_url: "https://example".into(),
+            tx_packets_enqueued,
+            tx_drops_channel_full,
+            tx_drops_send_error,
+            totals,
+            sender_totals,
+            listener_totals,
+            per_bot,
+        };
+
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+
+        // Root-level keys: present and zero. The `totals` sub-object also
+        // contains the same keys, but the assertions below only require
+        // *at least one* occurrence per key, which is sufficient to prove
+        // the top-level fields are emitted (the totals copy alone would
+        // satisfy the substring check, so we additionally verify the JSON
+        // contains the field after `server_url` — i.e. at the root).
+        assert!(
+            json.contains("\"tx_packets_enqueued\":0"),
+            "tx_packets_enqueued must be present even when zero, got: {json}"
+        );
+        assert!(
+            json.contains("\"tx_drops_channel_full\":0"),
+            "tx_drops_channel_full must be present even when zero, got: {json}"
+        );
+        assert!(
+            json.contains("\"tx_drops_send_error\":0"),
+            "tx_drops_send_error must be present even when zero, got: {json}"
+        );
+
+        // Stronger guarantee: ensure the top-level fields appear before the
+        // `totals` sub-object key in the serialized JSON. Field order in
+        // serde_json matches struct declaration order, so this catches
+        // someone deleting the top-level fields and leaving only the
+        // totals-nested copies.
+        let root_tx_idx = json
+            .find("\"tx_packets_enqueued\"")
+            .expect("tx_packets_enqueued missing");
+        let totals_idx = json.find("\"totals\"").expect("totals key missing");
+        assert!(
+            root_tx_idx < totals_idx,
+            "tx_packets_enqueued must appear at the root (before \"totals\"), got: {json}"
+        );
+    }
 }
