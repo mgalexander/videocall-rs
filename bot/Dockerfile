@@ -21,7 +21,7 @@
 # /app/ so the default CLI flags --audio-path /app/BundyBests2.wav and
 # --image-dir /app resolve.
 
-FROM rust:1.89-slim AS build
+FROM rust:1.89-slim-bookworm AS build
 
 ARG GIT_SHA=unknown
 ARG GIT_BRANCH=unknown
