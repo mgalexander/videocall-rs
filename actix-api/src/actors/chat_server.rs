@@ -5573,4 +5573,228 @@ mod tests {
 
         std::env::remove_var("SFU_TRANSPORT_KIND");
     }
+
+    // ==========================================================================
+    // TEST (vc-9z6): concurrent T=0 joiners on a non-owner pod must NOT loop
+    // ==========================================================================
+    // Reproduction for vc-9z6: at T=0 on shard A (the room's non-owner pod),
+    // many concurrent JoinRoom messages arrive at once (e.g. the 200-bot
+    // harness sending 100 listener bots + senders against the same room).
+    //
+    // The bead's failure signature is bots exhausting MAX_REDIRECT_HOPS=5
+    // without converging. For that to happen, each bot's reconnect attempt
+    // must keep being told to redirect — i.e. the server is emitting a
+    // REDIRECT packet for sessions it should NOT be redirecting, OR the
+    // REDIRECT target it emits is wrong for some sessions.
+    //
+    // This test exercises the chat_server side in isolation: spawn N
+    // concurrent JoinRoom messages from N distinct sessions, all targeting
+    // a room whose jump-hash owner is a DIFFERENT pod ordinal than `self`.
+    // Required behaviour:
+    //
+    //   1. Every JoinRoom must return Err(... "different pod" ...).
+    //   2. Every session must receive exactly ONE ADMISSION_DECISION{REDIRECT}
+    //      packet on its recipient.
+    //   3. Every redirect target must point at the same owner pod's headless
+    //      DNS — N concurrent joiners must NOT split between conflicting
+    //      targets (which would happen if jump_hash or the env reads were
+    //      non-deterministic under contention).
+    //   4. No session must end up in `joined_sessions` or in the SFU member
+    //      table for the room. The redirect path is non-admitting.
+    //
+    // A passing assertion set here is necessary-but-not-sufficient to fix
+    // vc-9z6 — but a failure here at concurrent T=0 join time would be a
+    // proximate explanation for the redirect-loop signature, since a bot
+    // that arrives at a pod and is told to redirect a second time would
+    // increment its hop counter against the MAX_REDIRECT_HOPS=5 cap.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_concurrent_t0_joiners_redirect_consistently_vc_9z6() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        // Pod 0 in a 3-replica StatefulSet, identical to
+        // test_join_room_redirects_on_pod_ownership_mismatch so the redirect
+        // target shape is comparable.
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Pick a room whose jump-hash owner is NOT pod 0.
+        let replicas = 3u32;
+        let (room, owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("concurrent-t0-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // One capturing recipient per session so we can assert that EVERY
+        // session received the REDIRECT (rather than asserting on a shared
+        // counter that masks per-session delivery failures).
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        const N: u64 = 100;
+        let mut per_session_received: Vec<Arc<Mutex<Vec<bytes::Bytes>>>> =
+            Vec::with_capacity(N as usize);
+        let mut sids: Vec<SessionId> = Vec::with_capacity(N as usize);
+
+        // Phase 1: register all N sessions synchronously so Connect lands
+        // BEFORE any JoinRoom is processed. This matches the real flow
+        // (WtChatSession.started does Connect.send.await before JoinRoom.send).
+        for i in 0..N {
+            let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+            let capturing = CapturingSession {
+                received: received.clone(),
+            }
+            .start();
+            let sid: SessionId = 80_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: capturing.recipient(),
+                })
+                .await
+                .unwrap();
+            per_session_received.push(received);
+            sids.push(sid);
+        }
+
+        // Phase 2: fan out N JoinRoom messages CONCURRENTLY. Use a tokio
+        // join_all so the actor's mailbox sees them all at once — the
+        // single-threaded actor will still serialise execution, but the
+        // queueing models the T=0 burst scenario from the bead.
+        let join_futs: Vec<_> = sids
+            .iter()
+            .enumerate()
+            .map(|(i, sid)| {
+                let cs = chat_server.clone();
+                let room = room.clone();
+                let user = format!("listener-{i}@example.com");
+                async move {
+                    cs.send(JoinRoom {
+                        session: *sid,
+                        room,
+                        user_id: user.clone(),
+                        display_name: user,
+                        observer: false,
+                        capabilities: 0,
+                    })
+                    .await
+                    .unwrap()
+                }
+            })
+            .collect();
+        let results = futures::future::join_all(join_futs).await;
+
+        // ASSERTION 1: every JoinRoom returned Err with the pod-ownership
+        // redirect message. Any Ok here would mean the joiner was admitted
+        // onto the wrong pod, which is the proximate cause of bots running
+        // out of the bot harness's per-pod accounting.
+        for (i, r) in results.iter().enumerate() {
+            assert!(
+                r.is_err(),
+                "session #{i} ({}) must be redirected (Err), got Ok",
+                sids[i]
+            );
+            let err = r.as_ref().unwrap_err();
+            assert!(
+                err.contains("different pod"),
+                "session #{i}: error must be a pod-ownership redirect, got: {err}"
+            );
+        }
+
+        // Let the actor mailbox flush all REDIRECT Message deliveries.
+        sleep(Duration::from_millis(300)).await;
+
+        // ASSERTION 2 + 3: every session got exactly ONE ADMISSION_DECISION
+        // {REDIRECT} packet, and every redirect target points at the same
+        // owner pod DNS. If concurrent joiners produced inconsistent
+        // redirect targets, the bot's reconnect logic would split between
+        // pods and increment hop counters non-monotonically — the bead's
+        // "loop redirect" signature.
+        let expected_dns =
+            format!("rustlemania-webtransport-{owner_ord}.webtransport-headless.svc.cluster.local");
+        for (i, recv) in per_session_received.iter().enumerate() {
+            let msgs = recv.lock().unwrap().clone();
+            let mut redirects: Vec<AdmissionDecision> = Vec::new();
+            for bytes in msgs.iter() {
+                if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(bytes) {
+                    if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                        let dec = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                            .expect("AdmissionDecision must decode");
+                        if dec.status.enum_value_or_default() == AdmStatus::REDIRECT {
+                            redirects.push(dec);
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                redirects.len(),
+                1,
+                "session #{i} ({}) must receive exactly ONE REDIRECT \
+                 packet at T=0; got {} (a duplicate would push the bot \
+                 closer to MAX_REDIRECT_HOPS without it actually following \
+                 conflicting targets)",
+                sids[i],
+                redirects.len()
+            );
+            let dec = &redirects[0];
+            assert_eq!(
+                dec.redirect_to, expected_dns,
+                "session #{i} ({}) redirect_to MUST point at the same owner \
+                 pod under concurrent joiners — any divergence here would \
+                 split the bot fleet across pods on reconnect",
+                sids[i]
+            );
+            assert_eq!(dec.reason, "wrong_owner");
+        }
+
+        // ASSERTION 4: NO session was admitted to the room. Both the
+        // user-visible room_members list and the SFU member table must be
+        // empty for the room. If any session is admitted on a non-owner
+        // pod, the bot harness's per-pod participant-count gate breaks.
+        let sfu_members = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .unwrap();
+        assert!(
+            sfu_members.map(|m| m.is_empty()).unwrap_or(true),
+            "SFU member table for redirected room must be empty"
+        );
+        let user_members = chat_server
+            .send(SnapshotRoomMembersList { room: room.clone() })
+            .await
+            .unwrap();
+        assert!(
+            user_members.map(|m| m.is_empty()).unwrap_or(true),
+            "room_members for redirected room must be empty"
+        );
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
 }
