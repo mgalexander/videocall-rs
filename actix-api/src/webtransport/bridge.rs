@@ -62,6 +62,28 @@ use web_transport_quinn::Session;
 /// Callback for tracking packets sent to clients (used in tests)
 pub type PacketSentCallback = Box<dyn Fn() + Send + Sync>;
 
+/// vc-s9e: grace period the bridge writer task holds its `Session` clone
+/// after its outbound channel closes (every `PrioritySender` clone has been
+/// dropped, which in practice means the `WtChatSession` actor stopped).
+///
+/// `web_transport_quinn::SendStream::finish` only sets the local FIN flag;
+/// the underlying QUIC stream's FIN frame and any buffered bytes are
+/// delivered later by quinn's I/O driver. Without this grace period, the
+/// writer's `Session` clone drops at task exit, `bridge.shutdown()` then
+/// aborts the reader tasks (dropping their clones too), and the connection
+/// refcount hits zero — quinn's `implicit_close` discards anything not yet
+/// flushed. That race is what lost the JoinRoom-Err
+/// `ADMISSION_DECISION{REDIRECT}` packet that vc-883 took care to keep
+/// alive across the actor stop, leading to "redirects_followed counter
+/// never increments despite real redirects" (bot-spec §6.1).
+///
+/// 250ms is a generous one-RTT-class budget for any sane production network
+/// and is well under the 2s `RECONNECT_GRACE_PERIOD` elsewhere in this
+/// crate. Only paid on server-initiated teardown (writer recv→None); on
+/// client-initiated disconnect the readers end first and `bridge.shutdown()`
+/// aborts the writer before it reaches the sleep.
+pub(crate) const WRITER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Bridge between WebTransport session and an Actix actor.
 ///
 /// Spawns I/O tasks that:
@@ -209,8 +231,33 @@ impl WebTransportBridge {
                     }
                 }
             }
+
+            Self::writer_drain_grace().await;
+            // `session` is still alive here — the grace inside
+            // `writer_drain_grace` gave quinn's I/O driver time to flush
+            // pending stream data before the clone drops at task exit.
+            drop(session);
             info!("WebTransport Writer ended");
         });
+    }
+
+    /// vc-s9e: dedicated async helper invoked by [`Self::spawn_writer`]
+    /// after its recv loop exits. Holds the `Session` clone for
+    /// [`WRITER_DRAIN_GRACE`] so the trailing UniStream FIN + payload
+    /// (notably the `ADMISSION_DECISION{REDIRECT}` packet emitted by the
+    /// JoinRoom-Err path — see chat_server.rs ~1540 and the vc-883
+    /// regression test in `wt_chat_session::tests`) reaches the wire
+    /// before refcount→0 triggers quinn's implicit `Connection::close`,
+    /// which discards anything not yet flushed.
+    ///
+    /// Exposed as a separate fn (rather than inlined into
+    /// [`Self::spawn_writer`]) so the vc-s9e regression test in this
+    /// module can confirm it actually sleeps without requiring a real
+    /// `Session`. If this is ever inlined back, the regression-guard
+    /// test below has to be replaced with an integration test that runs
+    /// the full bridge against a quinn endpoint pair.
+    async fn writer_drain_grace() {
+        tokio::time::sleep(WRITER_DRAIN_GRACE).await;
     }
 }
 
@@ -351,5 +398,145 @@ mod tests {
         big.data = vec![0u8; DATAGRAM_MAX_SIZE + 1];
         let big_bytes = big.write_to_bytes().expect("encode oversized");
         assert!(!is_datagram_eligible(&big_bytes));
+    }
+
+    // =====================================================================
+    // vc-s9e regression tests for the writer's QUIC-flush grace period.
+    //
+    // The writer task's `Session` clone is what keeps quinn's I/O driver
+    // alive long enough to actually transmit the trailing UniStream FIN +
+    // payload after `stream.finish()` returns. Without the grace, every
+    // server-initiated teardown (notably the JoinRoom-Err
+    // `ADMISSION_DECISION{REDIRECT}` path tied off by vc-883) races the
+    // implicit `Connection::close` that fires when the last clone drops,
+    // and the bot's `start_inbound_consumer` sees `accept_uni` error
+    // without ever observing the REDIRECT bytes. That's the
+    // "redirects_followed counter never increments" symptom from
+    // bot-spec §6.1.
+    //
+    // We can't exercise the real writer in-process without standing up a
+    // full quinn endpoint pair, so the test below shapes the exact
+    // observable invariant (the writer task does not drop its session-
+    // proxy reference for at least WRITER_DRAIN_GRACE after every
+    // PrioritySender clone has been dropped) via a stand-in that mirrors
+    // the writer's structure: a tokio task that drains a `PriorityReceiver`
+    // to None and then sleeps for `WRITER_DRAIN_GRACE` before letting its
+    // owned reference drop. The reference is an `Arc<()>` cloned out of
+    // the test scope so we can observe drop timing via `Arc::strong_count`.
+    // =====================================================================
+    // =====================================================================
+
+    /// vc-s9e: documents the grace-period invariant. If this value is
+    /// changed materially (e.g. dropped to 0 or above 2s) the writer's
+    /// teardown semantics shift in ways that affect every server-initiated
+    /// disconnect — re-read the constant's doc comment and bot-spec §6.1
+    /// before tuning.
+    #[test]
+    fn writer_drain_grace_is_non_zero_and_bounded() {
+        assert!(
+            WRITER_DRAIN_GRACE >= std::time::Duration::from_millis(50),
+            "WRITER_DRAIN_GRACE must be >= 50ms — anything shorter loses \
+             the trailing FIN under realistic localhost wall-clock jitter, \
+             reverting the vc-s9e fix. Current value: {WRITER_DRAIN_GRACE:?}"
+        );
+        assert!(
+            WRITER_DRAIN_GRACE <= std::time::Duration::from_secs(2),
+            "WRITER_DRAIN_GRACE must be <= 2s — longer values delay actor \
+             teardown past the disconnect grace periods elsewhere in this \
+             crate and start interacting with reconnection bookkeeping. \
+             Current value: {WRITER_DRAIN_GRACE:?}"
+        );
+    }
+
+    /// vc-s9e: the writer task must NOT drop its `Session` reference the
+    /// instant `outbound_rx.recv()` returns None. It has to hold the
+    /// reference for `WRITER_DRAIN_GRACE` so quinn's I/O driver can
+    /// transmit the trailing UniStream FIN + payload from the last
+    /// `stream.finish()` call. This test directly exercises
+    /// [`WebTransportBridge::writer_drain_grace`] — the helper invoked
+    /// by `spawn_writer` after its drain loop exits — by composing it
+    /// with a proxy `Arc<()>` whose strong count stands in for the real
+    /// `Session` refcount. Without the grace sleep the proxy drops the
+    /// instant recv→None, with the grace sleep the proxy is held for at
+    /// least `WRITER_DRAIN_GRACE/2`.
+    ///
+    /// If [`WebTransportBridge::writer_drain_grace`] is removed or
+    /// inlined-and-deleted from `spawn_writer`, this test stops
+    /// compiling, which is the right signal — the comment on
+    /// `writer_drain_grace` calls that out explicitly.
+    #[tokio::test(start_paused = false)]
+    async fn writer_task_holds_session_clone_through_drain_grace_vc_s9e() {
+        let (sender, channels) = PrioritySender::new();
+        let mut receiver = PriorityReceiver::new(channels);
+
+        // Stand-in for the writer's `session: Session` field — quinn's
+        // `Session` is internally `Arc<...>`, so refcount semantics are
+        // what matter here. We hold one clone outside the task to observe
+        // the inside-task drop timing.
+        let session_proxy = std::sync::Arc::new(());
+        let writer_proxy = session_proxy.clone();
+        assert_eq!(std::sync::Arc::strong_count(&session_proxy), 2);
+
+        // Pre-populate one P0 packet so the writer drains at least once
+        // before the channel closes (mirrors the real REDIRECT-then-stop
+        // sequence: the actor pushes a final packet, then the actor stops
+        // and `outbound_tx` drops → recv returns None on the *next* call).
+        let outcome = sender.send(Class::P0Control, Bytes::from_static(b"redirect-stand-in"));
+        assert_eq!(outcome, SendOutcome::Sent);
+
+        let writer_task = tokio::spawn(async move {
+            // Drain phase: identical shape to the production loop, minus
+            // the I/O.
+            while let Some(_data) = receiver.recv().await {
+                // Real writer would call `session.open_uni().await` +
+                // `write_all` + `finish` here. We omit because the
+                // grace-window invariant is independent of payload.
+            }
+            // Exact same call as `spawn_writer`: this is the helper the
+            // production writer uses. If it's removed or stops sleeping
+            // for WRITER_DRAIN_GRACE, this test catches it.
+            WebTransportBridge::writer_drain_grace().await;
+            drop(writer_proxy);
+        });
+
+        // Drop the sender — the writer's recv will return None on its
+        // next iteration. Record this moment so we can assert the writer
+        // task holds the proxy for at least most of WRITER_DRAIN_GRACE
+        // after this point.
+        drop(sender);
+        let dropped_at = std::time::Instant::now();
+
+        // Sample at the midpoint of the grace window: the writer must
+        // still be holding its clone (strong_count == 2). If the grace
+        // sleep is removed, the writer drops its clone within a few
+        // microseconds of recv returning None and strong_count == 1.
+        let sample_at = WRITER_DRAIN_GRACE / 2;
+        tokio::time::sleep(sample_at).await;
+        let elapsed = dropped_at.elapsed();
+        assert!(
+            elapsed < WRITER_DRAIN_GRACE,
+            "test scheduling failed — slept past grace window"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&session_proxy),
+            2,
+            "writer task dropped its session proxy {:?} after sender drop \
+             (grace window is {:?}) — the WRITER_DRAIN_GRACE sleep in \
+             `spawn_writer` was removed or shortened, reverting the \
+             vc-s9e fix: the trailing UniStream FIN + payload (e.g. the \
+             vc-883 ADMISSION_DECISION{{REDIRECT}} packet) will race the \
+             implicit Connection::close and the bot's `redirects_followed` \
+             counter will stop incrementing.",
+            elapsed,
+            WRITER_DRAIN_GRACE,
+        );
+
+        // Let the writer finish so we don't leak the task.
+        writer_task.await.expect("writer task did not panic");
+        assert_eq!(
+            std::sync::Arc::strong_count(&session_proxy),
+            1,
+            "writer task must eventually drop its session proxy"
+        );
     }
 }
