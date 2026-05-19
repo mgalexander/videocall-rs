@@ -26,7 +26,8 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use vpx_sys::{
     vpx_codec_ctx_t, vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy,
-    vpx_codec_get_frame, vpx_codec_vp9_dx, VPX_CODEC_OK, VPX_DECODER_ABI_VERSION,
+    vpx_codec_error_detail, vpx_codec_get_frame, vpx_codec_vp9_dx, VPX_CODEC_OK,
+    VPX_DECODER_ABI_VERSION,
 };
 
 /// Upper bound on the number of in-flight encoded frames buffered per
@@ -44,6 +45,15 @@ const NATIVE_DECODER_CHANNEL_BOUND: usize = 32;
 /// A VP9 decoder using libvpx.
 struct Vp9Decoder {
     context: vpx_codec_ctx_t,
+    /// Last `vpx_codec_error_detail` string observed on this context, used to
+    /// dedupe libvpx soft-error reports across consecutive frames (vc-02f).
+    ///
+    /// libvpx's C-level error path can set `ctx->err_detail` for recoverable
+    /// conditions even when `vpx_codec_decode` returns `VPX_CODEC_OK`. Without
+    /// dedup, every subsequent decode would re-surface the same stale detail
+    /// and inflate `decode_errors`. We only fire `on_error` when the detail
+    /// string actually changes from the previously observed value.
+    last_error_detail: Option<String>,
 }
 
 impl Vp9Decoder {
@@ -61,7 +71,10 @@ impl Vp9Decoder {
         if ret != VPX_CODEC_OK {
             return Err(format!("Failed to initialize VP9 decoder: {:?}", ret));
         }
-        Ok(Self { context })
+        Ok(Self {
+            context,
+            last_error_detail: None,
+        })
     }
 }
 
@@ -97,13 +110,25 @@ impl MockDecoder {
 #[cfg(test)]
 static MOCK_DECODE_DELAY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Outcome of one `decode_frame` call. Distinguishes three states so the
+/// worker loop can fire `on_decoded` for produced frames AND `on_error` for
+/// soft codec issues independently (vc-02f).
+struct DecodeOutcome {
+    frames: Vec<DecodedFrame>,
+    /// `Some(msg)` when libvpx reported a new error-detail string for this
+    /// frame (either via a non-`VPX_CODEC_OK` return OR via a freshly set
+    /// `ctx->err_detail` on a nominally OK return). `None` means the frame
+    /// decoded cleanly.
+    soft_error: Option<String>,
+}
+
 /// A trait for any decoder that can run on the internal thread.
 trait ThreadDecodable: Send {
-    fn decode_frame(&mut self, frame_buffer: &FrameBuffer) -> Result<Vec<DecodedFrame>, String>;
+    fn decode_frame(&mut self, frame_buffer: &FrameBuffer) -> DecodeOutcome;
 }
 
 impl ThreadDecodable for SendableVp9Decoder {
-    fn decode_frame(&mut self, frame_buffer: &FrameBuffer) -> Result<Vec<DecodedFrame>, String> {
+    fn decode_frame(&mut self, frame_buffer: &FrameBuffer) -> DecodeOutcome {
         let mut decoded_frames = Vec::new();
 
         let ret = unsafe {
@@ -126,8 +151,32 @@ impl ThreadDecodable for SendableVp9Decoder {
                         .into_owned()
                 }
             };
-            return Err(format!("VPX Decode failed: {}", error_msg));
+            // Sync the dedup tracker so a hard error doesn't get re-reported
+            // a second time via the soft-error path on the next OK return.
+            self.0.last_error_detail = read_error_detail(&mut self.0.context);
+            return DecodeOutcome {
+                frames: decoded_frames,
+                soft_error: Some(format!("VPX Decode failed: {}", error_msg)),
+            };
         }
+
+        // vc-02f: even on `VPX_CODEC_OK`, libvpx may have populated
+        // `ctx->err_detail` for recoverable conditions (corrupt slice header,
+        // reference-frame mismatch on a mid-stream join, etc.) Without polling
+        // here, those conditions only surface via libvpx's C-level stderr
+        // writes — invisible to the bot's `tracing` layer and to the
+        // `decode_errors` counter the operator inspects.
+        //
+        // We dedupe against `last_error_detail` so a sticky detail string
+        // doesn't re-fire on every subsequent frame.
+        let detail_now = read_error_detail(&mut self.0.context);
+        let soft_error = match (&detail_now, &self.0.last_error_detail) {
+            (Some(new), prev) if Some(new) != prev.as_ref() => {
+                Some(format!("VPX soft error detail: {}", new))
+            }
+            _ => None,
+        };
+        self.0.last_error_detail = detail_now;
 
         let mut iter = ptr::null_mut::<c_void>();
         loop {
@@ -187,7 +236,29 @@ impl ThreadDecodable for SendableVp9Decoder {
                 data: image_data,
             });
         }
-        Ok(decoded_frames)
+        DecodeOutcome {
+            frames: decoded_frames,
+            soft_error,
+        }
+    }
+}
+
+/// Read the libvpx error-detail string for a context, returning `None` when
+/// the pointer is null or the string is empty. Safe to call after either a
+/// successful or failed `vpx_codec_decode` — libvpx always writes either a
+/// valid NUL-terminated string or a null pointer (vc-02f).
+fn read_error_detail(ctx: &mut vpx_codec_ctx_t) -> Option<String> {
+    let detail_ptr = unsafe { vpx_codec_error_detail(ctx as *mut _) };
+    if detail_ptr.is_null() {
+        return None;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(detail_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -207,7 +278,7 @@ unsafe fn copy_plane_to_buffer(
 }
 
 impl ThreadDecodable for MockDecoder {
-    fn decode_frame(&mut self, _frame_buffer: &FrameBuffer) -> Result<Vec<DecodedFrame>, String> {
+    fn decode_frame(&mut self, _frame_buffer: &FrameBuffer) -> DecodeOutcome {
         // Intentionally silent: this runs once per frame in the bot's listener
         // path. Per-frame stdout writes flood the orchestrator's JSON parser
         // at scale (vc-35t / vc-4tl).
@@ -218,7 +289,38 @@ impl ThreadDecodable for MockDecoder {
                 std::thread::sleep(std::time::Duration::from_nanos(delay_ns));
             }
         }
-        Ok(Vec::new())
+        DecodeOutcome {
+            frames: Vec::new(),
+            soft_error: None,
+        }
+    }
+}
+
+/// Test-only decoder that fires a configurable soft error on every frame.
+/// Lets the unit suite exercise the `on_error` wiring end-to-end without
+/// linking libvpx — needed for the vc-02f regression test.
+#[cfg(test)]
+struct ScriptedErrorDecoder {
+    error_msg: String,
+    fire_after_n: usize,
+    seen: usize,
+}
+
+#[cfg(test)]
+impl ThreadDecodable for ScriptedErrorDecoder {
+    fn decode_frame(&mut self, _frame_buffer: &FrameBuffer) -> DecodeOutcome {
+        self.seen += 1;
+        if self.seen > self.fire_after_n {
+            DecodeOutcome {
+                frames: Vec::new(),
+                soft_error: Some(self.error_msg.clone()),
+            }
+        } else {
+            DecodeOutcome {
+                frames: Vec::new(),
+                soft_error: None,
+            }
+        }
     }
 }
 
@@ -239,6 +341,31 @@ enum DecoderMessage {
 /// `decode_frame` errors so consumers can attribute decode failures to a
 /// counter instead of relying on `eprintln!` to stderr.
 pub type ErrorCallback = Box<dyn Fn(String) + Send + Sync>;
+
+/// Decoder thread main loop. Drains `receiver` until the producer side is
+/// dropped (NativeDecoder::drop), dispatching decoded frames via
+/// `on_decoded_frame` and routing per-frame soft errors through
+/// `on_error` when supplied. Frame dispatch and error dispatch are
+/// independent: libvpx can produce both visible output AND a soft error
+/// detail string on the same call (vc-02f).
+fn run_decoder_loop(
+    mut decoder: Box<dyn ThreadDecodable>,
+    receiver: mpsc::Receiver<DecoderMessage>,
+    on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+    on_error: Option<ErrorCallback>,
+) {
+    while let Ok(DecoderMessage::Frame(frame_buffer)) = receiver.recv() {
+        let outcome = decoder.decode_frame(&frame_buffer);
+        for img in outcome.frames {
+            on_decoded_frame(img);
+        }
+        if let Some(msg) = outcome.soft_error {
+            if let Some(cb) = on_error.as_ref() {
+                cb(format!("decode_frame failed: {}", msg));
+            }
+        }
+    }
+}
 
 pub struct NativeDecoder {
     thread_handle: Option<JoinHandle<()>>,
@@ -287,6 +414,28 @@ impl NativeDecoder {
         Self::build(codec, on_decoded, on_dropped, on_error)
     }
 
+    /// Test-only constructor that injects a fully-formed
+    /// [`ThreadDecodable`] (skipping codec dispatch and `Vp9Decoder::new`).
+    /// Used to exercise the worker-thread `DecodeOutcome` dispatch — frames
+    /// AND soft-error routing — without linking libvpx (vc-02f).
+    #[cfg(test)]
+    fn with_injected_decoder(
+        decoder: Box<dyn ThreadDecodable>,
+        on_decoded: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+        on_dropped: Box<dyn Fn() + Send + Sync>,
+        on_error: Option<ErrorCallback>,
+    ) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(NATIVE_DECODER_CHANNEL_BOUND);
+        let thread_handle = Some(thread::spawn(move || {
+            run_decoder_loop(decoder, receiver, on_decoded, on_error);
+        }));
+        NativeDecoder {
+            thread_handle,
+            sender: Some(sender),
+            on_dropped,
+        }
+    }
+
     /// Internal helper that spawns the decoder worker and assembles the
     /// `NativeDecoder` value. Both [`with_callbacks`](Self::with_callbacks)
     /// and the [`Decodable::new`] trait impl route through here.
@@ -309,7 +458,7 @@ impl NativeDecoder {
             // only when no error callback is supplied — that case is the
             // legacy "no observability hook" path and is still better off
             // panicking loudly than silently dropping every queued frame.
-            let mut decoder: Box<dyn ThreadDecodable> = match codec {
+            let decoder: Box<dyn ThreadDecodable> = match codec {
                 crate::decoder::VideoCodec::Vp9Profile0Level10Bit8
                 | crate::decoder::VideoCodec::Vp8 => match Vp9Decoder::new() {
                     Ok(d) => Box::new(SendableVp9Decoder(d)),
@@ -334,31 +483,7 @@ impl NativeDecoder {
                     panic!("Cannot create decoder for unspecified codec")
                 }
             };
-
-            // Decoder thread loop. Exits when the producer side of the
-            // channel is dropped (see `NativeDecoder::drop`). Per-frame
-            // stdout was removed in vc-35t / vc-4tl — at bot-scale the
-            // stdout volume crowds out the orchestrator's summary JSON.
-            while let Ok(DecoderMessage::Frame(frame_buffer)) = receiver.recv() {
-                match decoder.decode_frame(&frame_buffer) {
-                    Ok(images) => {
-                        for img in images {
-                            on_decoded_frame(img);
-                        }
-                    }
-                    Err(e) => {
-                        // vc-4ns: route per-frame decode errors to the
-                        // consumer-supplied counter when configured. NO
-                        // fallback `eprintln!`: vc-35t/vc-4tl deliberately
-                        // removed per-frame stderr because the 200-bot
-                        // harness writes summary JSON to stdout and inspects
-                        // counters, not stderr.
-                        if let Some(cb) = on_error.as_ref() {
-                            cb(format!("decode_frame failed: {}", e));
-                        }
-                    }
-                }
-            }
+            run_decoder_loop(decoder, receiver, on_decoded_frame, on_error);
         }));
 
         NativeDecoder {
@@ -676,6 +801,77 @@ mod tests {
         // assertion is that the Arc is still valid and the test
         // process didn't panic (i.e. the worker thread didn't drop
         // the callback prematurely).
+        assert_eq!(err_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// vc-02f regression: when a decode call reports `soft_error`, the worker
+    /// thread MUST invoke `on_error` exactly once per soft-error event. This
+    /// is the codec-agnostic contract that the bot's `decode_errors` counter
+    /// depends on; vc-4ns wired the callback but never asserted the worker
+    /// actually fires it end-to-end for the per-frame error path (only the
+    /// init-failure path had implicit coverage).
+    ///
+    /// Uses [`ScriptedErrorDecoder`] so the test doesn't link libvpx — the
+    /// libvpx-specific `vpx_codec_error_detail` polling in
+    /// `SendableVp9Decoder::decode_frame` is exercised by the bot's
+    /// integration tests under the 50-bot CI gate where libvpx is available.
+    #[test]
+    fn soft_error_routes_to_on_error_callback() {
+        let err_count = Arc::new(AtomicU64::new(0));
+        let cb_clone = err_count.clone();
+        let dec = NativeDecoder::with_injected_decoder(
+            Box::new(ScriptedErrorDecoder {
+                error_msg: "synthetic soft error".to_string(),
+                fire_after_n: 0,
+                seen: 0,
+            }),
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            Some(Box::new(move |_msg| {
+                cb_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        // Three frames; each must fire the callback once.
+        for seq in 0..3 {
+            dec.decode(make_frame(seq));
+        }
+        // Allow the worker thread to drain.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(dec);
+        assert_eq!(
+            err_count.load(Ordering::Relaxed),
+            3,
+            "every soft_error must fire on_error exactly once"
+        );
+    }
+
+    /// vc-02f regression: when a decoder returns `DecodeOutcome { frames: …,
+    /// soft_error: None }` the worker MUST NOT fire `on_error`. The dispatch
+    /// of frames and errors is independent — but the absence of a soft error
+    /// is just as much a contract as the presence of one. A regression here
+    /// would inflate `decode_errors` on every successful frame.
+    #[test]
+    fn clean_frames_do_not_fire_on_error() {
+        let err_count = Arc::new(AtomicU64::new(0));
+        let cb_clone = err_count.clone();
+        let dec = NativeDecoder::with_injected_decoder(
+            // fire_after_n = usize::MAX => never fires
+            Box::new(ScriptedErrorDecoder {
+                error_msg: "must not fire".to_string(),
+                fire_after_n: usize::MAX,
+                seen: 0,
+            }),
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            Some(Box::new(move |_msg| {
+                cb_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        for seq in 0..5 {
+            dec.decode(make_frame(seq));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        drop(dec);
         assert_eq!(err_count.load(Ordering::Relaxed), 0);
     }
 }
