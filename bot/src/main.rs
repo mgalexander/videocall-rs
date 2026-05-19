@@ -321,6 +321,7 @@ async fn run_client(
             config.user_id.clone(),
             "BundyBests2.wav",
             packet_tx.clone(),
+            None,
         ) {
             Ok(producer) => {
                 audio_producer = Some(producer);
@@ -342,6 +343,7 @@ async fn run_client(
             config.user_id.clone(),
             ".", // Images are in current directory (bot working dir)
             packet_tx.clone(),
+            None,
         ) {
             Ok(producer) => {
                 video_producer = Some(producer);
