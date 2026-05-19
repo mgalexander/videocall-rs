@@ -30,6 +30,10 @@
 #   --verdict-path PATH   (default: $(pwd)/load-test-verdict.json)
 #   --skip-build          (don't rebuild/import the bot image — useful when
 #                          iterating on the eval script locally)
+#   --netem-profile NAME  (default: clean — no shaping. Valid values:
+#                          clean, wifi, mobile, lossy, transcontinental.
+#                          Applied by the netem-init container in the
+#                          load-test Job Pod before the bot starts.)
 #
 # Exit code mirrors eval-load-test.py.
 
@@ -61,9 +65,14 @@ ROOM="ci-loadtest-$(date +%s)"
 SERVER_URL="https://webtransport-headless.default.svc.cluster.local:443"
 VERDICT_PATH="$(pwd)/load-test-verdict.json"
 SKIP_BUILD=0
+NETEM_PROFILE="clean"
+
+# Valid netem profiles — must match the case-statement in
+# helm/local/manifests/load-test-job.yaml. Keep these in sync.
+VALID_NETEM_PROFILES="clean wifi mobile lossy transcontinental"
 
 usage() {
-    sed -n '2,40p' "${BASH_SOURCE[0]}"
+    sed -n '2,44p' "${BASH_SOURCE[0]}"
     exit 0
 }
 
@@ -78,6 +87,7 @@ while [ $# -gt 0 ]; do
         --server-url)     SERVER_URL="$2"; shift 2 ;;
         --verdict-path)   VERDICT_PATH="$2"; shift 2 ;;
         --skip-build)     SKIP_BUILD=1; shift ;;
+        --netem-profile)  NETEM_PROFILE="$2"; shift 2 ;;
         -h|--help)        usage ;;
         *)                err "unknown flag: $1"; exit 2 ;;
     esac
@@ -89,6 +99,23 @@ for var in SENDERS LISTENERS DURATION MAX_LOSS_PCT REPLICAS; do
         exit 2
     fi
 done
+
+# Validate --netem-profile against the known set BEFORE we touch the
+# cluster. An unknown profile would later fail the netem-init container
+# loudly, but failing here keeps a bad invocation from scaling SFU pods
+# and rebuilding the bot image first.
+profile_ok=0
+for p in ${VALID_NETEM_PROFILES}; do
+    if [ "${NETEM_PROFILE}" = "${p}" ]; then
+        profile_ok=1
+        break
+    fi
+done
+if [ "${profile_ok}" -ne 1 ]; then
+    err "invalid --netem-profile '${NETEM_PROFILE}' (valid: ${VALID_NETEM_PROFILES})"
+    exit 2
+fi
+log "netem profile: ${NETEM_PROFILE}"
 
 # Preflight: required binaries
 for bin in kubectl k3d docker python3; do
@@ -143,13 +170,14 @@ else
 fi
 
 # ----- Apply the load-test ConfigMap -----------------------------------------
-log "applying ConfigMap/load-test-config (room=${ROOM} senders=${SENDERS} listeners=${LISTENERS} duration=${DURATION}s)"
+log "applying ConfigMap/load-test-config (room=${ROOM} senders=${SENDERS} listeners=${LISTENERS} duration=${DURATION}s netem=${NETEM_PROFILE})"
 "${KCTL[@]}" -n default create configmap load-test-config \
     --from-literal="ROOM=${ROOM}" \
     --from-literal="SENDERS=${SENDERS}" \
     --from-literal="LISTENERS=${LISTENERS}" \
     --from-literal="DURATION_S=${DURATION}" \
     --from-literal="SERVER_URL=${SERVER_URL}" \
+    --from-literal="NETEM_PROFILE=${NETEM_PROFILE}" \
     --dry-run=client -o yaml \
     | "${KCTL[@]}" -n default apply -f - >/dev/null
 

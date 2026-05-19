@@ -49,6 +49,88 @@ spec:
         app.kubernetes.io/component: bot
     spec:
       restartPolicy: Never
+      # netem init container: applies `tc qdisc … netem …` to eth0 in the
+      # Pod's network namespace BEFORE the bot starts. Init and main
+      # containers share the network namespace, so the qdisc installed
+      # here shapes the bot container's egress traffic too.
+      #
+      # Image choice: nicolaka/netshoot ships iproute2 (tc) and is the
+      # smallest known-good option that's reliable in CI. agnhost does
+      # not ship tc on all tags; debian:bookworm-slim would need an
+      # apt-get install at runtime which is non-deterministic in air-
+      # gapped CI. netshoot pins everything we need at image-build time.
+      initContainers:
+        - name: netem-init
+          image: nicolaka/netshoot:v0.13
+          imagePullPolicy: IfNotPresent
+          # NETEM_PROFILE is sourced from the same ConfigMap as the bot.
+          envFrom:
+            - configMapRef:
+                name: load-test-config
+          # Inline script — small enough to audit at the manifest layer
+          # without adding another ConfigMap. Profiles are a literal table
+          # so unknown profiles are rejected loudly (no silent unshaped
+          # runs masquerading as shaped ones).
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              PROFILE="${NETEM_PROFILE:-clean}"
+              echo "[netem-init] requested profile: ${PROFILE}"
+              # Profile set must match VALID_NETEM_PROFILES in
+              # helm/local/load-test.sh — keep both ends in sync.
+              case "${PROFILE}" in
+                clean)
+                  # No shaping — preserves CI behavior (50-bot merge gate,
+                  # 200-bot release gate). Exit 0 with no qdisc applied.
+                  echo "[netem-init] no shaping applied (clean profile)"
+                  exit 0
+                  ;;
+                wifi)
+                  # Typical home Wi-Fi: 30ms ± 10ms delay, 0.5% loss.
+                  DELAY_MS=30; JITTER_MS=10; LOSS_PCT=0.5
+                  ;;
+                mobile)
+                  # 4G/LTE: 80ms ± 20ms delay, 1% loss.
+                  DELAY_MS=80; JITTER_MS=20; LOSS_PCT=1
+                  ;;
+                lossy)
+                  # Congested / poor link: 50ms ± 15ms delay, 3% loss.
+                  DELAY_MS=50; JITTER_MS=15; LOSS_PCT=3
+                  ;;
+                transcontinental)
+                  # US <-> EU long-haul: 200ms ± 30ms delay, 0.2% loss.
+                  DELAY_MS=200; JITTER_MS=30; LOSS_PCT=0.2
+                  ;;
+                *)
+                  echo "[netem-init] ERROR: unknown NETEM_PROFILE '${PROFILE}'" >&2
+                  echo "[netem-init] valid profiles: clean, wifi, mobile, lossy, transcontinental" >&2
+                  exit 1
+                  ;;
+              esac
+              echo "[netem-init] applying: tc qdisc add dev eth0 root netem delay ${DELAY_MS}ms ${JITTER_MS}ms loss ${LOSS_PCT}%"
+              tc qdisc add dev eth0 root netem delay "${DELAY_MS}ms" "${JITTER_MS}ms" loss "${LOSS_PCT}%"
+              echo "[netem-init] active qdisc:"
+              tc qdisc show dev eth0
+          securityContext:
+            # Needs NET_ADMIN to install qdiscs. Runs as root (uid 0)
+            # because tc requires it; this is scoped to the init phase
+            # only — the bot container keeps its hardened non-root
+            # securityContext below.
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: 16Mi
+            limits:
+              cpu: "100m"
+              memory: 64Mi
       containers:
         - name: bot
           image: localhost:5000/videocall-bot:dev
