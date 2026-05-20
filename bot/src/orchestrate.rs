@@ -125,6 +125,19 @@ struct Totals {
     /// vc-1re: total unexplained sequence gaps across the rollup.
     /// FIXED-SHAPE.
     unexplained_gaps: u64,
+    /// vc-by0: sum of `control_packets_received` across all bots in this
+    /// rollup (non-MEDIA wrappers: heartbeat, SPEAKER_UPDATE,
+    /// ADMISSION_DECISION, ...). FIXED-SHAPE — always serialized, even at zero.
+    control_packets_received: u64,
+    /// vc-by0: sum of `media_received_video` across all bots in this rollup.
+    /// FIXED-SHAPE — always serialized, even at zero.
+    media_received_video: u64,
+    /// vc-by0: sum of `media_received_audio` across all bots in this rollup.
+    /// FIXED-SHAPE — always serialized, even at zero.
+    media_received_audio: u64,
+    /// vc-by0: sum of `media_received_other` across all bots in this rollup.
+    /// FIXED-SHAPE — always serialized, even at zero.
+    media_received_other: u64,
 }
 
 /// Final summary JSON emitted to stdout.
@@ -376,6 +389,10 @@ fn empty_totals() -> Totals {
         media_received_distinct: 0,
         crc_mismatches: 0,
         unexplained_gaps: 0,
+        control_packets_received: 0,
+        media_received_video: 0,
+        media_received_audio: 0,
+        media_received_other: 0,
     }
 }
 
@@ -406,6 +423,13 @@ fn accumulate(t: &mut Totals, snap: &BotStatsSnapshot) {
     t.media_received_distinct += snap.media_received_distinct;
     t.crc_mismatches += snap.crc_mismatches;
     t.unexplained_gaps += snap.unexplained_gaps;
+    // vc-by0: roll up the four media-split counters. Each snapshot field is
+    // `Option<u64>` (per-bot fixed-shape on the snapshot side), summed into a
+    // plain `u64` that always serializes on the Totals side.
+    t.control_packets_received += snap.control_packets_received.unwrap_or(0);
+    t.media_received_video += snap.media_received_video.unwrap_or(0);
+    t.media_received_audio += snap.media_received_audio.unwrap_or(0);
+    t.media_received_other += snap.media_received_other.unwrap_or(0);
 }
 
 fn finalise_avg(t: &mut Totals, duration_s: f64) {
@@ -451,11 +475,32 @@ fn now_ms() -> u64 {
 /// the `ADMISSION_DECISION{REDIRECT}`. It is `Some` only between observing a
 /// redirect and the next successful connect; this fn clears it. A direct
 /// (first) connect leaves the chain empty and only sets `joined_pod`.
-fn record_landing(stats: &BotStats, current_url: &Url, pending_redirect_at_ms: &mut Option<u64>) {
-    let pod = current_url.host_str().unwrap_or("unknown").to_string();
+/// vc-by0: resolve the real pod identity for the live session. Prefers the
+/// resolved peer address of the QUIC connection (the actual pod IP the
+/// WebTransport session terminated on) over the connection-target host (the
+/// `--server-url` host, i.e. the headless Service DNS, which is constant
+/// across the fleet).
+///
+/// This fallback is necessary because the SFU's `ADMISSION_DECISION` carries a
+/// pod identity ONLY on REDIRECT (`redirect_to`); it does NOT report the
+/// serving pod for an ADMITTED session. The resolved peer address is therefore
+/// the only server-identifying signal available for an admitted bot, and
+/// behind a headless Service it varies per pod at replicas>=2. Falls back to
+/// the connection-target host only when no session has been established yet.
+fn resolve_pod(client: &WebTransportClient, fallback_url: &Url) -> String {
+    client
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| fallback_url.host_str().unwrap_or("unknown").to_string())
+}
+
+fn record_landing(stats: &BotStats, pod: String, pending_redirect_at_ms: &mut Option<u64>) {
     stats.set_joined_pod(pod.clone());
     if let Some(started) = pending_redirect_at_ms.take() {
         let latency = now_ms().saturating_sub(started);
+        // vc-by0: record the hop with the same resolved pod so `joined_pod`
+        // and the final `redirect_chain` hop label stay consistent — both
+        // become the real pod identifier (resolved peer address).
         stats.record_redirect_hop(pod, latency);
     }
 }
@@ -499,7 +544,10 @@ async fn run_sender(
         client.connect(&current_url, insecure).await?;
         // vc-1re: record the pod we actually landed on, and close out any
         // pending redirect hop with its measured latency.
-        record_landing(&stats, &current_url, &mut pending_redirect_at_ms);
+        // vc-by0: prefer the resolved peer address (real pod) over the
+        // connection-target host (service DNS).
+        let pod = resolve_pod(&client, &current_url);
+        record_landing(&stats, pod, &mut pending_redirect_at_ms);
 
         let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
         client.start_packet_sender(packet_rx).await;
@@ -632,7 +680,10 @@ async fn run_listener(
             .with_decode(true)
             .with_verify_integrity(verify_integrity);
         client.connect(&current_url, insecure).await?;
-        record_landing(&stats, &current_url, &mut pending_redirect_at_ms);
+        // vc-by0: prefer the resolved peer address (real pod) over the
+        // connection-target host (service DNS).
+        let pod = resolve_pod(&client, &current_url);
+        record_landing(&stats, pod, &mut pending_redirect_at_ms);
 
         let notified = signal.notify.notified();
         tokio::pin!(notified);
@@ -923,5 +974,54 @@ mod tests {
         assert_eq!(a.media_received_distinct, 111);
         assert_eq!(a.crc_mismatches, 4);
         assert_eq!(a.unexplained_gaps, 6);
+    }
+
+    /// vc-by0: the four media-split counters
+    /// (`control_packets_received`, `media_received_video`,
+    /// `media_received_audio`, `media_received_other`) must roll up as sums
+    /// into the Totals aggregation, and must stay fixed-shape — present and
+    /// serialized as `0` even when no bot received anything.
+    #[test]
+    fn media_split_counters_roll_up_into_totals_vc_by0() {
+        // Two listener snapshots with distinct non-zero media-split values.
+        let mut snap_a = BotStats::new("l0".into(), BotRole::Listener).snapshot(1.0);
+        let mut snap_b = BotStats::new("l1".into(), BotRole::Listener).snapshot(1.0);
+        snap_a.control_packets_received = Some(2);
+        snap_a.media_received_video = Some(3);
+        snap_a.media_received_audio = Some(5);
+        snap_a.media_received_other = Some(7);
+        snap_b.control_packets_received = Some(11);
+        snap_b.media_received_video = Some(13);
+        snap_b.media_received_audio = Some(17);
+        snap_b.media_received_other = Some(19);
+
+        let per_bot = vec![snap_a, snap_b];
+        let (_sender_totals, listener_totals, _totals) = aggregate(&per_bot, 1.0);
+
+        assert_eq!(listener_totals.control_packets_received, 2 + 11);
+        assert_eq!(listener_totals.media_received_video, 3 + 13);
+        assert_eq!(listener_totals.media_received_audio, 5 + 17);
+        assert_eq!(listener_totals.media_received_other, 7 + 19);
+
+        // Fixed-shape: an all-zero snapshot still serializes all four keys as
+        // `Some(0)` — they must never vanish from the Totals JSON.
+        let zero = BotStats::new("l2".into(), BotRole::Listener).snapshot(1.0);
+        let (_s, listener_zero, _t) = aggregate(&[zero], 1.0);
+        let value: serde_json::Value =
+            serde_json::to_value(&listener_zero).expect("serialize listener_totals to value");
+        for f in [
+            "control_packets_received",
+            "media_received_video",
+            "media_received_audio",
+            "media_received_other",
+        ] {
+            assert_eq!(
+                value.get(f).and_then(|v| v.as_u64()),
+                Some(0),
+                "listener_totals must carry fixed-shape media-split field {}, got: {}",
+                f,
+                value
+            );
+        }
     }
 }

@@ -353,7 +353,17 @@ async fn run_sender(
     client.connect(&server_url, insecure).await?;
     // vc-1re: record the pod this sender landed on. Failover senders are not
     // wrapped in a redirect loop, so the chain stays empty (direct connect).
-    stats.set_joined_pod(server_url.host_str().unwrap_or("unknown").to_string());
+    // vc-by0: report the resolved peer address (real pod IP the QUIC session
+    // terminated on), not the connection-target host (service DNS, constant
+    // across the fleet). The SFU's ADMISSION_DECISION carries no admitted-pod
+    // identity, so the peer address is the fallback; falls back to the host
+    // only if the session is somehow not yet established.
+    stats.set_joined_pod(
+        client
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| server_url.host_str().unwrap_or("unknown").to_string()),
+    );
 
     let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
     client.start_packet_sender(packet_rx).await;

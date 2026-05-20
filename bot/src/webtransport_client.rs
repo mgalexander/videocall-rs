@@ -639,6 +639,20 @@ impl WebTransportClient {
         self.quit.store(true, Ordering::Relaxed);
         info!("Stopping WebTransport client for {}", self.config.user_id);
     }
+
+    /// vc-by0: resolved peer address of the live QUIC connection — i.e. the
+    /// actual pod the WebTransport session terminated on. This is the only
+    /// server-identifying signal available to the bot: the SFU's
+    /// `ADMISSION_DECISION` carries a pod identity only on REDIRECT
+    /// (`redirect_to`), never for an admitted session, so the resolved peer
+    /// address is the fallback used to populate `joined_pod`. Behind a headless
+    /// Service the DNS returns individual pod IPs (no cluster VIP), so this
+    /// value differs across the fleet at replicas>=2 — unlike the
+    /// connection-target host (the service DNS), which is constant. Returns
+    /// `None` before `connect()` has established a session.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.session.as_ref().map(|s| s.remote_address())
+    }
 }
 
 /// Parse `data` as a `PacketWrapper`; if it is an `ADMISSION_DECISION` with
@@ -949,6 +963,12 @@ fn update_publisher_audio_window(pool: &DecoderPool, publisher: &str, bytes: u64
 #[must_use = "evicted decoders must be dropped outside the pool locks; \
               binding to `_` defeats the point — bind to `let _evicted = ...;` \
               after `drop(publishers_guard)`"]
+// All fields exist purely to extend the lifetime of the evicted decoders so
+// their `Drop` (the `NativeDecoder` worker-thread join) runs AFTER the pool
+// locks are released — they are written but never read by design. Matches the
+// `#[allow(dead_code)]` Drop-guard convention used in `video_producer.rs` /
+// `audio_producer.rs`; rustc 1.93's tightened dead-code lint now flags these.
+#[allow(dead_code)]
 struct EvictedPublisher {
     /// Publisher id we evicted. `None` when no eviction happened (the
     /// caller can ignore the struct entirely in that case).
