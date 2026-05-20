@@ -495,31 +495,24 @@ impl WebTransportClient {
                             // error and breaks the loop. Throughput on a
                             // single listener bot is low enough that
                             // sequential draining is fine.
-                            if let Some(signal_handle) = &session_end {
+                            if session_end.is_some() {
+                                // Inline-drain arm (redirect-critical): when a
+                                // `SessionEndSignal` is attached we MUST drain
+                                // and stash any REDIRECT before the next
+                                // `accept_uni` returns its terminal error.
+                                // Keep this arm sequential — do not reroute to
+                                // the spawned path (vc-k4w / Change Impact).
                                 match stream.read_to_end(usize::MAX).await {
                                     Ok(data) => {
                                         let t = now_ms();
-                                        if let Some(stats) = &stats {
-                                            stats.record_packet_at(data.len() as u64, t);
-                                        }
-                                        if let Some(target) = try_extract_redirect_target(&data) {
-                                            info!(
-                                                "Listener {} received ADMISSION_DECISION REDIRECT to {}",
-                                                user_id, target
-                                            );
-                                            *signal_handle.redirect_to.lock().unwrap() =
-                                                Some(target);
-                                        }
-                                        if let Some(pool) = &decoders {
-                                            // Same off-thread decode as the
-                                            // default path; keeps failover-test
-                                            // bots aligned with the 200-bot
-                                            // workload shape.
-                                            let pool_clone = pool.clone();
-                                            tokio::task::spawn_blocking(move || {
-                                                decode_packet(&pool_clone, &data);
-                                            });
-                                        }
+                                        handle_inbound_stream_data(
+                                            data,
+                                            &session_end,
+                                            &stats,
+                                            &decoders,
+                                            &user_id,
+                                            t,
+                                        );
                                     }
                                     Err(e) => {
                                         if let Some(stats) = &stats {
@@ -532,26 +525,34 @@ impl WebTransportClient {
                                     }
                                 }
                             } else {
+                                // Default spawn-per-stream arm. For every
+                                // current caller `session_end` is `None` here
+                                // (orchestrate/failover attach a signal and so
+                                // take the inline arm above), so the helper's
+                                // redirect peek+stash never runs on this path.
+                                // We thread the `session_end` clone through
+                                // anyway so the extraction is a property of the
+                                // shared helper rather than of one arm: a future
+                                // caller that passes `Some` would get redirect
+                                // capture here too, without the parse ever
+                                // running while the signal is `None` (vc-k4w
+                                // defense-in-depth — see helper doc comment).
                                 let stats_spawn = stats.clone();
                                 let user_id_spawn = user_id.clone();
                                 let decoders_spawn = decoders.clone();
+                                let session_end_spawn = session_end.clone();
                                 tokio::spawn(async move {
                                     match stream.read_to_end(usize::MAX).await {
                                         Ok(data) => {
-                                            if let Some(stats) = stats_spawn {
-                                                stats.record_packet(data.len() as u64);
-                                            }
-                                            if let Some(pool) = decoders_spawn {
-                                                // Move decode (protobuf parse +
-                                                // VP9/Opus) onto the blocking
-                                                // pool: opus::decode_float is
-                                                // pure-CPU and would starve
-                                                // accept_uni at 200 colocated
-                                                // bots otherwise.
-                                                tokio::task::spawn_blocking(move || {
-                                                    decode_packet(&pool, &data);
-                                                });
-                                            }
+                                            let t = now_ms();
+                                            handle_inbound_stream_data(
+                                                data,
+                                                &session_end_spawn,
+                                                &stats_spawn,
+                                                &decoders_spawn,
+                                                &user_id_spawn,
+                                                t,
+                                            );
                                         }
                                         Err(e) => {
                                             if let Some(stats) = stats_spawn {
@@ -673,6 +674,59 @@ fn try_extract_redirect_target(data: &[u8]) -> Option<String> {
         return None;
     }
     Some(decision.redirect_to)
+}
+
+/// Shared per-inbound-stream handling, called from BOTH arms of
+/// [`WebTransportClient::start_inbound_consumer`] (the inline-drain arm used
+/// when a [`SessionEndSignal`] is attached, and the spawn-per-stream default
+/// arm).
+///
+/// Responsibilities, in order:
+/// 1. Record the packet into `stats` with its arrival timestamp `t`
+///    (`record_packet_at`). Both arms use the timestamped variant so packet
+///    bookkeeping is identical regardless of which arm drained the stream.
+/// 2. Peek the payload for an `ADMISSION_DECISION{REDIRECT}` via
+///    [`try_extract_redirect_target`] and, when a `session_end` clone is
+///    present, stash the target onto `session_end.redirect_to`. This is the
+///    de-coupling / hardening required by vc-k4w: REDIRECT extraction now
+///    happens on whichever arm drained the stream, not only the inline arm.
+/// 3. Offload decode (protobuf parse + VP9/Opus) onto the blocking pool when
+///    `decoders` is present, so pure-CPU codec work never starves
+///    `accept_uni`.
+///
+/// NOTE on routing (vc-k4w / Change Impact Policy): the inline-drain arm
+/// remains the redirect-critical path whenever `session_end` is attached —
+/// see the doc comment on [`WebTransportClient::start_inbound_consumer`]. The
+/// extraction wired into the spawned arm here is strictly defense-in-depth
+/// and must not become the path the orchestrate reconnect loop depends on for
+/// ordering, because the spawned task cannot guarantee the stash completes
+/// before the next `accept_uni` returns its terminal error.
+fn handle_inbound_stream_data(
+    data: Vec<u8>,
+    session_end: &Option<Arc<SessionEndSignal>>,
+    stats: &Option<Arc<BotStats>>,
+    decoders: &Option<Arc<DecoderPool>>,
+    user_id: &str,
+    t: u64,
+) {
+    if let Some(stats) = stats {
+        stats.record_packet_at(data.len() as u64, t);
+    }
+    if let Some(signal) = session_end {
+        if let Some(target) = try_extract_redirect_target(&data) {
+            info!(
+                "Listener {} received ADMISSION_DECISION REDIRECT to {}",
+                user_id, target
+            );
+            *signal.redirect_to.lock().unwrap() = Some(target);
+        }
+    }
+    if let Some(pool) = decoders {
+        let pool_clone = pool.clone();
+        tokio::task::spawn_blocking(move || {
+            decode_packet(&pool_clone, &data);
+        });
+    }
 }
 
 /// Parse `data` as a `PacketWrapper` containing a `MediaPacket`, then route
@@ -1444,6 +1498,139 @@ mod tests {
     #[test]
     fn try_extract_redirect_target_ignores_garbage() {
         assert!(try_extract_redirect_target(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // vc-k4w: the shared inbound-stream helper must stash a REDIRECT onto a
+    // provided SessionEndSignal regardless of which arm drained the stream,
+    // and must leave it untouched for media / non-redirect / garbage. These
+    // mirror the `try_extract_redirect_target_*` cases above but exercise the
+    // helper's end-to-end stash behaviour (record + extract + stash).
+
+    fn redirect_wrapper_bytes(target: &str) -> Vec<u8> {
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::REDIRECT.into(),
+            redirect_to: target.to_string(),
+            reason: "wrong_owner".to_string(),
+            ..Default::default()
+        };
+        PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            user_id: b"system".to_vec(),
+            data: decision.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    #[test]
+    fn handle_inbound_stream_data_stashes_redirect_into_signal() {
+        let signal = Arc::new(SessionEndSignal::default());
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+        let session_end = Some(signal.clone());
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+        let data =
+            redirect_wrapper_bytes("rustlemania-webtransport-0.webtransport-headless.svc.cluster");
+
+        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 42);
+
+        let stashed = signal.redirect_to.lock().unwrap().clone();
+        assert_eq!(
+            stashed.as_deref(),
+            Some("rustlemania-webtransport-0.webtransport-headless.svc.cluster")
+        );
+        // The packet must still be recorded with its timestamp.
+        assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.last_packet_at_ms.load(Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn handle_inbound_stream_data_ignores_media_for_redirect_stash() {
+        let signal = Arc::new(SessionEndSignal::default());
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+        let session_end = Some(signal.clone());
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            ..Default::default()
+        };
+        let data = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+
+        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 7);
+
+        assert!(signal.redirect_to.lock().unwrap().is_none());
+        assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_inbound_stream_data_ignores_non_redirect_admission_for_stash() {
+        let signal = Arc::new(SessionEndSignal::default());
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+        let session_end = Some(signal.clone());
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::QUEUED.into(),
+            position: 1,
+            ..Default::default()
+        };
+        let data = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            data: decision.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+
+        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 7);
+
+        assert!(signal.redirect_to.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn handle_inbound_stream_data_ignores_garbage_for_stash() {
+        let signal = Arc::new(SessionEndSignal::default());
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+        let session_end = Some(signal.clone());
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+
+        handle_inbound_stream_data(
+            vec![0xff, 0xff, 0xff],
+            &session_end,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            7,
+        );
+
+        assert!(signal.redirect_to.lock().unwrap().is_none());
+        // Garbage is still recorded as a received packet (it was drained off
+        // the wire); only decode classifies it as an error.
+        assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_inbound_stream_data_no_signal_does_not_panic_and_records() {
+        // Spawned-arm shape: `session_end` is None. Helper must still record
+        // the packet and must not attempt to stash a redirect.
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+        let session_end: Option<Arc<SessionEndSignal>> = None;
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+        let data = redirect_wrapper_bytes("some-pod.svc.cluster");
+
+        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 9);
+
+        assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
     }
 
     use crate::stats::{BotRole, BotStats};
