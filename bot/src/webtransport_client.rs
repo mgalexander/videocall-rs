@@ -1736,10 +1736,40 @@ mod tests {
         (local_addr, server)
     }
 
-    /// vc-k4w: REAL QUIC end-to-end. Stand up the in-process SFU, point the
-    /// bot's production `connect()` path at it, have the SFU deliver a
-    /// REDIRECT on a uni-stream then close, and assert the bot extracted and
-    /// stashed the redirect target and fired its session-end signal.
+    /// Datagram-eligibility decision mirrored from the SFU bridge writer
+    /// (`actix-api/src/webtransport/bridge.rs::is_datagram_eligible`).
+    ///
+    /// The bot crate does not (and should not) depend on `videocall-api`, so
+    /// we cannot import the real function. We instead replicate the exact
+    /// const-time wire-prefix policy the production writer uses to choose
+    /// transport, so this test exercises the SAME decision production makes
+    /// rather than the old false-green path that called `open_uni()`
+    /// unconditionally (vc-xnp). If the bridge policy changes, this mirror
+    /// must change with it — the assertion below is the regression guard.
+    ///
+    /// `PacketWrapper.packet_type` is field 1 (varint tag `0x08`); MEDIA=3
+    /// → prefix `[0x08, 0x03]`, ADMISSION_DECISION=13 → prefix `[0x08, 0x0d]`.
+    fn bridge_is_datagram_eligible(bytes: &[u8]) -> bool {
+        // Must match actix-api's `DATAGRAM_MAX_SIZE`.
+        const DATAGRAM_MAX_SIZE: usize = 1200;
+        let is_media = matches!(bytes, [0x08, 0x03, ..]);
+        let is_redirect_critical = matches!(bytes, [0x08, 0x0d, ..]);
+        !is_media && !is_redirect_critical && bytes.len() <= DATAGRAM_MAX_SIZE
+    }
+
+    /// vc-k4w / vc-xnp: REAL QUIC end-to-end. Stand up the in-process SFU,
+    /// point the bot's production `connect()` path at it, have the SFU route
+    /// the REDIRECT through the REAL writer transport decision
+    /// (`bridge_is_datagram_eligible`, mirrored from production) then close,
+    /// and assert the bot extracted and stashed the redirect target and fired
+    /// its session-end signal.
+    ///
+    /// vc-xnp: the original test called `open_uni()` unconditionally — the one
+    /// transport production never uses for this packet — so it stayed green
+    /// even though production datagram-routed the redirect (which the bot's
+    /// uni-stream-only reader never receives). Now the SFU side selects the
+    /// transport exactly as production does, and the explicit assertion below
+    /// fails if ADMISSION_DECISION is ever datagram-routed.
     #[tokio::test]
     async fn redirect_follow_end_to_end_over_real_quic_vc_k4w() {
         ensure_crypto_provider();
@@ -1749,10 +1779,10 @@ mod tests {
 
         let (sfu_addr, mut server) = build_test_sfu();
 
-        // SFU task: accept exactly one session, emit one REDIRECT on a
-        // uni-stream, finish it, then close. This is the minimal reproduction
-        // of the real SFU's "owner mismatch → ADMISSION_DECISION{REDIRECT} →
-        // close" behaviour.
+        // SFU task: accept exactly one session, emit one REDIRECT through the
+        // production transport decision, finish it, then close. This is the
+        // minimal reproduction of the real SFU's "owner mismatch →
+        // ADMISSION_DECISION{REDIRECT} → close" behaviour.
         let server_task = tokio::spawn(async move {
             let request = server
                 .accept()
@@ -1775,14 +1805,37 @@ mod tests {
             };
             let bytes = wrapper.write_to_bytes().unwrap();
 
-            let mut uni = session
-                .open_uni()
-                .await
-                .expect("SFU should open a uni-stream to the bot");
-            uni.write_all(&bytes)
-                .await
-                .expect("SFU should write the REDIRECT packet");
-            uni.finish().expect("SFU should finish the uni-stream");
+            // vc-xnp regression guard: the redirect MUST NOT be datagram-routed.
+            // The bot reader only consumes uni-streams, so a datagram redirect
+            // is silently lost. This assertion fails the test if the SFU's
+            // transport policy ever makes ADMISSION_DECISION datagram-eligible.
+            assert!(
+                !bridge_is_datagram_eligible(&bytes),
+                "ADMISSION_DECISION redirect must NOT be datagram-eligible — it has to \
+                 ride a reliable uni-stream or the bot never receives it (vc-xnp)"
+            );
+
+            // Route through the REAL writer transport decision rather than
+            // calling open_uni() unconditionally (the old false-green path).
+            // The bot reader only consumes uni-streams; routing a redirect via
+            // datagram here would (correctly) make the test hang/fail, which is
+            // exactly the production behaviour vc-xnp fixes.
+            if bridge_is_datagram_eligible(&bytes) {
+                // Production transport for datagram-eligible packets. A redirect
+                // must never land here — the assertion above guarantees it.
+                session
+                    .send_datagram(bytes.into())
+                    .expect("SFU datagram send");
+            } else {
+                let mut uni = session
+                    .open_uni()
+                    .await
+                    .expect("SFU should open a uni-stream to the bot");
+                uni.write_all(&bytes)
+                    .await
+                    .expect("SFU should write the REDIRECT packet");
+                uni.finish().expect("SFU should finish the uni-stream");
+            }
 
             // Give the bot a beat to drain the uni-stream before we tear the
             // session down, then close — mirroring the real SFU which closes

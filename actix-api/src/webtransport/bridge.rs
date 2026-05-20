@@ -273,14 +273,38 @@ fn is_media_packet(bytes: &[u8]) -> bool {
     matches!(bytes, [0x08, 0x03, ..])
 }
 
+/// True iff `bytes` is a serialized `PacketWrapper` whose `packet_type`
+/// is `ADMISSION_DECISION` — the redirect-critical control packet.
+///
+/// `PacketWrapper.packet_type` is field 1 (varint, tag byte `0x08`) and
+/// `ADMISSION_DECISION = 13` in `packet_wrapper.proto`, so an
+/// ADMISSION_DECISION-wrapped packet starts with the two-byte prefix
+/// `[0x08, 0x0d]`. Like [`is_media_packet`] this is a constant-time check
+/// that avoids a full protobuf parse on the egress path.
+///
+/// Datagrams are lossy (unreliable QUIC), but a redirect MUST be reliably
+/// delivered: if the `ADMISSION_DECISION{REDIRECT}` packet is dropped, a
+/// non-owner-pod listener never follows the redirect and silently fails to
+/// receive media (vc-xnp). The bot reader only consumes uni-streams
+/// (`bot/src/webtransport_client.rs`), so this packet MUST go via UniStream.
+fn is_redirect_critical(bytes: &[u8]) -> bool {
+    matches!(bytes, [0x08, 0x0d, ..])
+}
+
 /// True iff `bytes` should be sent via Datagram (unreliable, low-overhead)
 /// rather than a unidirectional stream.
 ///
 /// Matches the legacy `send_auto` policy: non-MEDIA packets that fit
 /// within the datagram MTU go via Datagram; MEDIA or oversized packets
 /// go via UniStream.
+///
+/// Exception (vc-xnp): redirect-critical control packets
+/// (`ADMISSION_DECISION`, see [`is_redirect_critical`]) are forced onto a
+/// reliable UniStream even though they are small non-MEDIA packets. The
+/// exclusion is scoped narrowly to that packet type — ordinary small
+/// control packets (CONGESTION, etc.) remain datagram-eligible.
 fn is_datagram_eligible(bytes: &[u8]) -> bool {
-    !is_media_packet(bytes) && bytes.len() <= DATAGRAM_MAX_SIZE
+    !is_media_packet(bytes) && !is_redirect_critical(bytes) && bytes.len() <= DATAGRAM_MAX_SIZE
 }
 
 #[cfg(test)]
@@ -398,6 +422,68 @@ mod tests {
         big.data = vec![0u8; DATAGRAM_MAX_SIZE + 1];
         let big_bytes = big.write_to_bytes().expect("encode oversized");
         assert!(!is_datagram_eligible(&big_bytes));
+    }
+
+    /// vc-xnp: small non-MEDIA control packets other than the
+    /// redirect-critical `ADMISSION_DECISION` must remain datagram-eligible.
+    /// The exclusion added for redirect must NOT regress these.
+    #[test]
+    fn small_control_packets_remain_datagram_eligible() {
+        for pt in [
+            PacketType::CONGESTION,
+            PacketType::SESSION_ASSIGNED,
+            PacketType::MEETING,
+            PacketType::SPEAKER_UPDATE,
+            PacketType::SUBSCRIPTION_UPDATE,
+            PacketType::LAYER_HINT,
+            PacketType::CAPABILITY_ANNOUNCE,
+        ] {
+            let mut w = PacketWrapper::new();
+            w.packet_type = pt.into();
+            let bytes = w.write_to_bytes().expect("encode control wrapper");
+            assert!(
+                is_datagram_eligible(&bytes),
+                "small non-MEDIA control packet ({pt:?}) must stay datagram-eligible"
+            );
+        }
+    }
+
+    /// vc-xnp regression test: a real serialized `ADMISSION_DECISION`
+    /// wrapper (the redirect-critical control packet) MUST NOT be
+    /// datagram-eligible — it has to ride a reliable UniStream so the bot
+    /// reader (uni-stream only) actually receives the redirect.
+    ///
+    /// We encode via `write_to_bytes()` rather than hardcoding bytes to
+    /// prove the real wire encoding hits the exclusion. If this fails, the
+    /// redirect would be sent as a lossy datagram and `redirect_chain`
+    /// would stay 0 (the original vc-xnp bug).
+    #[test]
+    fn admission_decision_is_not_datagram_eligible() {
+        let mut redirect = PacketWrapper::new();
+        redirect.packet_type = PacketType::ADMISSION_DECISION.into();
+        // Mirror a realistic small redirect payload (a host string).
+        redirect.data =
+            b"rustlemania-webtransport-0.webtransport-headless.svc.cluster.local".to_vec();
+        let bytes = redirect
+            .write_to_bytes()
+            .expect("encode ADMISSION_DECISION wrapper");
+
+        // Sanity: the payload is well within the datagram MTU, so the ONLY
+        // reason it must be UniStream-routed is the redirect-critical
+        // exclusion — not size.
+        assert!(
+            bytes.len() <= DATAGRAM_MAX_SIZE,
+            "test fixture must be small enough to otherwise be datagram-eligible"
+        );
+        assert!(
+            is_redirect_critical(&bytes),
+            "real ADMISSION_DECISION encoding must match the fast-path detector"
+        );
+        assert!(
+            !is_datagram_eligible(&bytes),
+            "ADMISSION_DECISION (redirect) MUST be reliably delivered via UniStream, \
+             not a lossy datagram"
+        );
     }
 
     // =====================================================================
