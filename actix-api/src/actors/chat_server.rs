@@ -57,6 +57,7 @@ use crate::sfu::health_beacon::{
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::{NatsSpeakerPublisher, SpeakerScorer, SpeakerTick, TickHandle};
+use crate::sfu::spillover::{spawn_spillover_ingest, SpilloverIngestHandle, SpilloverStore};
 use crate::sfu::subscription::SubscriptionStore;
 use crate::sfu::{SfuConfig, SfuMode};
 use tokio::sync::RwLock as TokioRwLock;
@@ -307,6 +308,24 @@ pub struct ChatServer {
     /// silently degrades to single-region behaviour rather than failing
     /// every JoinRoom.
     home_region_kv: Arc<dyn crate::sfu::affinity::RegionKv>,
+    /// Process-wide snapshot of every room's owner-pod health beacon
+    /// (bead vc-85p / p6-5 wiring of the p6-8 store). Populated by the
+    /// background ingest task spawned in [`ChatServer::new`], which
+    /// subscribes to `room.*.system` and records the most recent
+    /// `participant_count` + `cpu_load` per room.
+    ///
+    /// Consulted on the non-owner JoinRoom path: when
+    /// [`SpilloverStore::is_spilled_over`] is `true` for the joined room
+    /// (owner over threshold AND a fresh beacon), the non-owner pod admits
+    /// the joiner LOCALLY (spill) instead of redirecting to the owner.
+    /// Otherwise behaviour is unchanged — redirect to the owner.
+    spillover_store: SpilloverStore,
+    /// Retains the [`spawn_spillover_ingest`] task for the actor's
+    /// lifetime. The handle's `Drop` aborts the background subscription on
+    /// shutdown; holding it here (rather than dropping the return value)
+    /// keeps the ingest task alive so the store stays populated. Never read
+    /// directly — its sole purpose is lifetime ownership.
+    _spillover_ingest: SpilloverIngestHandle,
 }
 
 impl ChatServer {
@@ -341,6 +360,17 @@ impl ChatServer {
                     Arc::new(crate::sfu::affinity::NoopRegionKv)
                 }
             };
+        // vc-85p (p6-5): spawn the spillover beacon-ingest task so the
+        // non-owner JoinRoom path can consult fresh owner-pod health. The
+        // task subscribes to `room.*.system`, decodes `HEALTH_BEACON`
+        // packets, and populates `spillover_store`. It runs on its own
+        // tokio task and never blocks the packet-forwarding hot path. We
+        // retain the returned handle so the task is not aborted when the
+        // return value would otherwise be dropped. Reusing the actor's
+        // existing NATS client keeps a single connection per pod.
+        let spillover_store = SpilloverStore::new();
+        let spillover_ingest =
+            spawn_spillover_ingest(nats_connection.clone(), spillover_store.clone());
         ChatServer {
             nats_connection,
             joined_sessions: HashSet::new(),
@@ -360,6 +390,8 @@ impl ChatServer {
             room_dispatch: HashMap::new(),
             home_region_cache: HashMap::new(),
             home_region_kv,
+            spillover_store,
+            _spillover_ingest: spillover_ingest,
         }
     }
 
@@ -1521,15 +1553,66 @@ impl Handler<JoinRoom> for ChatServer {
         // runs BEFORE the soft/hard-cap admission accounting below so a
         // redirected client never increments the wrong pod's caps and
         // never receives a QUEUED/REJECTED packet it would discard anyway.
+        //
+        // vc-85p (p6-5) SPILLOVER OVERRIDE: before honouring the ownership
+        // redirect, consult the owner-pod health beacon for this room. If
+        // `is_spilled_over` is true — the owner is over the participant or
+        // CPU threshold AND its beacon is fresh (< 15s) — we ADMIT THE
+        // JOINER LOCALLY (spill) instead of redirecting. Admitting locally
+        // means falling through to the same local-admit machinery below
+        // (reconnection bookkeeping, admission caps, room_members /
+        // room_states materialisation, per-room dispatcher) that any
+        // normally-admitted local participant takes — we do NOT emit the
+        // ADMISSION_DECISION{REDIRECT} packet. Spill-pod media federation
+        // already works: every pod's dispatcher subscribes `room.{room}.*`,
+        // so a locally-admitted listener receives senders' media via NATS.
+        //
+        // For under-threshold, unknown, or stale-beacon rooms,
+        // `is_spilled_over` returns false and behaviour is UNCHANGED:
+        // redirect to the owner exactly as before. Observers were already
+        // exempt from the redirect and remain so.
+        //
+        // Idempotency: this decision lives only in JoinRoom. Once admitted
+        // locally the session is in `room_members` / `room_states` and is
+        // treated as an ordinary local member; no later state message
+        // re-runs this branch, so a spilled joiner never bounces. A
+        // reconnect re-evaluates the predicate, which is correct healing
+        // behaviour (still spilled → stay; no longer spilled → redirect).
         if !observer {
             let replicas = crate::sfu::affinity::replicas_from_env();
             let self_ord = crate::sfu::affinity::self_ordinal_from_env();
-            if let Some(target) = crate::sfu::affinity::compute_redirect_target(
+            let spilled_over = self.spillover_store.is_spilled_over(&room);
+            // Compute the redirect target once: needed both for the spill
+            // observability log (when this pod is a non-owner) and for the
+            // actual redirect on the non-spill path.
+            let redirect_target = crate::sfu::affinity::compute_redirect_target(
                 &room,
                 self_ord,
                 replicas,
                 sfu_transport_kind(),
-            ) {
+            );
+            if spilled_over {
+                // Log the spill admission UNCONDITIONALLY — the predicate
+                // already passed, so the joiner is being admitted locally
+                // regardless of whether this pod is the owner. Include the
+                // would-be redirect target only when this pod is a non-owner
+                // (target is Some); when this pod IS the owner the spill is a
+                // normal local admission with no redirect to suppress.
+                match &redirect_target {
+                    Some(target) => info!(
+                        "JoinRoom SPILL: admitting joiner locally for room={} \
+                         (session {}, user {}, owner ordinal != self {:?}) \
+                         (would-redirect-to={})",
+                        room, session, user_id, self_ord, target,
+                    ),
+                    None => info!(
+                        "JoinRoom SPILL: admitting joiner locally for room={} \
+                         (session {}, user {}, this pod is the owner)",
+                        room, session, user_id,
+                    ),
+                }
+                // Fall through to the local-admit path below.
+            } else if let Some(target) = redirect_target {
                 info!(
                     "JoinRoom redirect: room {} owned by ordinal != self ({:?}); \
                      redirecting session {} (user {}) to {}",
@@ -2763,6 +2846,51 @@ impl Handler<SnapshotRoomMembers> for ChatServer {
             .collect();
         entries.sort_by_key(|(sid, _)| *sid);
         Some(entries)
+    }
+}
+
+// ==========================================================================
+// Test-only command: seed the spillover store for a room (vc-85p / p6-5).
+// ==========================================================================
+// Records a synthetic owner-pod health snapshot so the JoinRoom spill
+// decision branch can be exercised deterministically without standing up a
+// real owner pod publishing beacons. `last_seen` is set to `Instant::now()`
+// inside the handler, so a seeded over-threshold snapshot is always fresh
+// for the duration of a test.
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "()")]
+struct SeedSpilloverState {
+    room: String,
+    owner_count: u32,
+    owner_cpu: f32,
+}
+
+#[cfg(test)]
+impl Handler<SeedSpilloverState> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        SeedSpilloverState {
+            room,
+            owner_count,
+            owner_cpu,
+        }: SeedSpilloverState,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        // The ingest task stores subject-derived (underscore-normalized)
+        // keys; mirror that here so the JoinRoom lookup (which normalizes
+        // its raw room id the same way) hits the seeded entry.
+        let key = room.replace(' ', "_");
+        self.spillover_store.record(
+            &key,
+            crate::sfu::spillover::RoomSpilloverState {
+                owner_count,
+                owner_cpu,
+                last_seen: std::time::Instant::now(),
+            },
+        );
     }
 }
 
@@ -5182,6 +5310,133 @@ mod tests {
                 "redirected session must NOT appear in room_members"
             );
         }
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST (vc-85p / p6-5): spillover ADMITS LOCALLY instead of redirecting
+    // ==========================================================================
+    // Same setup as test_join_room_redirects_on_pod_ownership_mismatch — a
+    // room jump-hashed to a non-owner ordinal, so the redirect path would
+    // normally fire — but with a FRESH, OVER-THRESHOLD owner-pod beacon
+    // seeded into the spillover store. The non-owner pod MUST then:
+    //   1. NOT emit ADMISSION_DECISION{REDIRECT}
+    //   2. return MessageResult(Ok(_)) (the join succeeds locally)
+    //   3. add the session to room_members (normal local admission)
+    //
+    // This is the inverse assertion of the redirect test and locks in the
+    // admit-vs-redirect branch added in vc-85p.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_spills_locally_when_owner_over_threshold() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Room owned by a NON-zero ordinal (this pod is 0) so the redirect
+        // path WOULD fire absent the spill override.
+        let replicas = 3u32;
+        let (room, _owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("spill-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // Seed a fresh, over-threshold owner beacon so is_spilled_over()
+        // returns true for this room.
+        chat_server
+            .send(SeedSpilloverState {
+                room: room.clone(),
+                owner_count: 200, // > SPILLOVER_PARTICIPANT_THRESHOLD (180)
+                owner_cpu: 0.10,
+            })
+            .await
+            .unwrap();
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let sid: SessionId = 72_000;
+        chat_server
+            .send(Connect {
+                id: sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: sid,
+                room: room.clone(),
+                user_id: "spill-user@example.com".to_string(),
+                display_name: "spill-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "join on non-owner pod with over-threshold owner beacon must be \
+             admitted LOCALLY (spill), not declined: {result:?}"
+        );
+
+        // Drain the recipient mpsc and assert NO REDIRECT was delivered.
+        sleep(Duration::from_millis(150)).await;
+        let msgs = received.lock().unwrap().clone();
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                assert_ne!(
+                    wrapper.packet_type,
+                    PacketType::ADMISSION_DECISION.into(),
+                    "a spilled (locally-admitted) joiner must NOT receive an \
+                     ADMISSION_DECISION{{REDIRECT}} packet"
+                );
+            }
+        }
+
+        // The spilled session MUST be admitted to the local room_members.
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .unwrap()
+            .expect("room must exist after local admission");
+        assert!(
+            snapshot.iter().any(|(s, _)| *s == sid),
+            "spilled session must appear in local room_members"
+        );
 
         std::env::remove_var("POD_NAME");
         std::env::remove_var("STATEFULSET_REPLICAS");
