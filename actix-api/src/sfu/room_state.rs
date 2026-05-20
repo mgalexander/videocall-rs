@@ -319,6 +319,14 @@ impl RoomState {
     pub fn senders(&self) -> impl Iterator<Item = &MemberEntry> {
         self.members.values().filter(|m| !m.is_observer)
     }
+
+    /// vc-9eh: `true` if any member is a (non-observer) sender. A `bool`
+    /// convenience so a caller holding a transient lock guard need not keep the
+    /// borrowing iterator returned by [`senders`](Self::senders) alive across
+    /// the guard's drop.
+    pub fn has_senders(&self) -> bool {
+        self.senders().next().is_some()
+    }
 }
 
 impl Default for RoomState {

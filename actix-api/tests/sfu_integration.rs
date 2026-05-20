@@ -179,6 +179,49 @@ fn build_media_payload(sender_sid: SessionId, sender_user: &str, seed: u8) -> Ve
     wrapper.write_to_bytes().expect("encode PacketWrapper")
 }
 
+/// vc-9eh: build a deterministic serialized MEDIA `PacketWrapper` of an
+/// explicit `MediaType`. The base `build_media_payload` always emits VIDEO; the
+/// late-listener load test needs BOTH AUDIO and VIDEO so it can assert the late
+/// listener captured each independently (the budget calls out audio AND video).
+fn build_media_payload_typed(
+    sender_sid: SessionId,
+    sender_user: &str,
+    media_type: MediaType,
+    seed: u8,
+) -> Vec<u8> {
+    let media = MediaPacket {
+        media_type: media_type.into(),
+        data: vec![seed; 32],
+        ..Default::default()
+    };
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::MEDIA.into(),
+        session_id: sender_sid,
+        user_id: sender_user.as_bytes().to_vec(),
+        data: media.write_to_bytes().expect("encode MediaPacket"),
+        ..Default::default()
+    };
+    wrapper.write_to_bytes().expect("encode PacketWrapper")
+}
+
+/// vc-9eh: count captured MEDIA wrappers of a given `MediaType`.
+fn captured_media_of_type(received: &Arc<Mutex<Vec<Vec<u8>>>>, media_type: MediaType) -> usize {
+    let lock = received.lock().unwrap();
+    lock.iter()
+        .filter(|bytes| {
+            let Ok(w) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(bytes) else {
+                return false;
+            };
+            if w.packet_type != PacketType::MEDIA.into() {
+                return false;
+            }
+            MediaPacket::parse_from_bytes(&w.data)
+                .map(|m| m.media_type == media_type.into())
+                .unwrap_or(false)
+        })
+        .count()
+}
+
 /// Build a serialized CONGESTION `PacketWrapper`.
 fn build_congestion_payload(sender_sid: SessionId, sender_user: &str, seed: u8) -> Vec<u8> {
     let wrapper = PacketWrapper {
@@ -978,5 +1021,490 @@ async fn sfu_vc_7wi_late_joining_listener_sees_existing_publisher_with_empty_rec
          capture all {POST_JOIN_BURST} MEDIA packets the publisher emits AFTER \
          the listener joined, got {}",
         listener_media.len()
+    );
+}
+
+// ===========================================================================
+// vc-9eh: late-listener-onto-active-publishers under SUSTAINED LOAD.
+//
+// This reproduces the bottom-left matrix cell from the root-cause analysis
+// (LATE-LISTENER-ROOTCAUSE.md §1/§5) that the vc-7wi tests above CANNOT: those
+// use a single listener, no pre-existing receiver cohort, and a 5-packet burst.
+// The real failure (Bug A) only manifests with (a) a populated `receivers` map
+// (the early cohort) keeping the dispatcher hot AND (b) a sustained publisher
+// stream, after which a LATE listener that joins must still capture continuous
+// publisher media — BOTH audio AND video — within the responsiveness budget.
+//
+// The fix under test is the per-room delivery watchdog in
+// `spawn_room_dispatcher` (Part A) plus the locked-in insert ordering (Part B):
+// even if the dispatcher's wildcard subscription goes silent under the storm,
+// the watchdog forces a clean resubscribe against the SAME `receivers` Arc, so
+// the late cohort resumes receiving without any client reconnect.
+// ===========================================================================
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+/// vc-9eh: spawn a background task that publishes a SUSTAINED interleaved
+/// audio+video stream from `sender` into `room` until `stop` is set. Rate is
+/// well above the toy `send_media_burst` (which sends a fixed handful): ~10ms
+/// between frames (~100 packets/sec, audio+video alternating). Returns the
+/// `JoinHandle` so the caller can await drain after stopping.
+fn spawn_sustained_publisher(
+    chat: actix::Addr<ChatServer>,
+    sender_sid: SessionId,
+    sender_user: String,
+    room: String,
+    stop: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seed: u8 = 0;
+        while !stop.load(Ordering::Relaxed) {
+            seed = seed.wrapping_add(1);
+            // Interleave audio and video so a late listener can be asserted to
+            // capture BOTH independently.
+            for media_type in [MediaType::AUDIO, MediaType::VIDEO] {
+                let bytes = build_media_payload_typed(sender_sid, &sender_user, media_type, seed);
+                // `do_send` (not `send().await`): fire-and-forget that DROPS on a
+                // full mailbox instead of waiting for a slot. This mirrors the
+                // production drop-on-overflow path and, crucially, keeps the
+                // publisher emitting at the intended rate to actually pressure
+                // the dispatcher — `send().await` would backpressure the
+                // publisher and never build a queue.
+                chat.do_send(ClientMessage {
+                    session: sender_sid,
+                    room: room.clone(),
+                    user: sender_user.clone(),
+                    msg: Packet {
+                        data: Arc::new(bytes),
+                        kind: PacketKind::Data,
+                    },
+                });
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+}
+
+#[actix_rt::test]
+#[serial]
+async fn sfu_vc_9eh_late_listener_under_sustained_load_sees_audio_and_video() {
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+
+    let env = EnvGuard::new();
+    env.set("sfu");
+
+    let nats_client = sec_api::nats_connect::connect(&nats_url)
+        .await
+        .expect("connect to NATS");
+    let chat = ChatServer::new(nats_client).await.start();
+
+    let room = "vc-9eh-sustained".to_string();
+
+    // --- N publishers (sustained streams) ---------------------------------
+    const N_PUBLISHERS: usize = 3;
+    let mut publishers = Vec::new();
+    for i in 0..N_PUBLISHERS {
+        let p = Participant::new(90_000 + i as SessionId, &format!("pub-9eh-{i}@example.com"));
+        register_and_join(&chat, &p, &room)
+            .await
+            .expect("publisher join");
+        publishers.push(p);
+    }
+    sleep(SUBSCRIBE_SETTLE).await;
+
+    // Start the sustained publisher streams (audio+video interleaved).
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut pub_tasks = Vec::new();
+    for p in &publishers {
+        pub_tasks.push(spawn_sustained_publisher(
+            chat.clone(),
+            p.sid,
+            p.user.clone(),
+            room.clone(),
+            stop.clone(),
+        ));
+    }
+
+    // --- Early listener cohort (populate `receivers`, keep dispatcher hot) --
+    const EARLY_COHORT: usize = 5;
+    let mut early = Vec::new();
+    for i in 0..EARLY_COHORT {
+        let l = Participant::new(
+            90_100 + i as SessionId,
+            &format!("early-9eh-{i}@example.com"),
+        );
+        register_and_join(&chat, &l, &room)
+            .await
+            .expect("early listener join");
+        early.push(l);
+    }
+
+    // --- Sustained window so the dispatcher subscription is under load ------
+    sleep(Duration::from_millis(1500)).await;
+
+    // --- LATE listener joins (no SubscriptionUpdate) ------------------------
+    let late = Participant::new(90_200, "late-9eh@example.com");
+    register_and_join(&chat, &late, &room)
+        .await
+        .expect("late listener join");
+    let late_join_at = Instant::now();
+
+    // --- Publishers continue. Poll the late listener's capture buffer for
+    // the responsiveness budget: first media <= 1.5s, usable audio <= 2.0s.
+    let mut first_media_at: Option<Duration> = None;
+    let mut first_audio_at: Option<Duration> = None;
+    loop {
+        let elapsed = late_join_at.elapsed();
+        let audio = captured_media_of_type(&late.received, MediaType::AUDIO);
+        let video = captured_media_of_type(&late.received, MediaType::VIDEO);
+        if first_media_at.is_none() && (audio + video) > 0 {
+            first_media_at = Some(elapsed);
+        }
+        if first_audio_at.is_none() && audio > 0 {
+            first_audio_at = Some(elapsed);
+        }
+        // Stop once we have a healthy continuous sample of both, or we blow
+        // the budget.
+        if audio >= 5 && video >= 5 {
+            break;
+        }
+        if elapsed > Duration::from_millis(2500) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Stop publishing and drain.
+    stop.store(true, Ordering::Relaxed);
+    for t in pub_tasks {
+        let _ = t.await;
+    }
+
+    let late_audio = captured_media_of_type(&late.received, MediaType::AUDIO);
+    let late_video = captured_media_of_type(&late.received, MediaType::VIDEO);
+
+    // Budget assertions.
+    let first_media =
+        first_media_at.expect("late listener captured NO publisher media at all (Bug A)");
+    assert!(
+        first_media <= Duration::from_millis(1500),
+        "vc-9eh: first media must arrive within 1.5s of the late join, got {}ms \
+         (audio={late_audio}, video={late_video})",
+        first_media.as_millis()
+    );
+    let first_audio = first_audio_at.expect("late listener captured NO publisher AUDIO (Bug A)");
+    assert!(
+        first_audio <= Duration::from_millis(2000),
+        "vc-9eh: usable audio must arrive within 2.0s of the late join, got {}ms",
+        first_audio.as_millis()
+    );
+
+    // Continuous (not just first packet) delivery of BOTH media types.
+    assert!(
+        late_audio >= 5,
+        "vc-9eh: late listener must capture CONTINUOUS publisher AUDIO, got {late_audio}"
+    );
+    assert!(
+        late_video >= 5,
+        "vc-9eh: late listener must capture CONTINUOUS publisher VIDEO, got {late_video}"
+    );
+
+    // Sanity: the early cohort kept receiving too (the storm didn't black-hole
+    // the whole room).
+    let early_audio = captured_media_of_type(&early[0].received, MediaType::AUDIO);
+    let early_video = captured_media_of_type(&early[0].received, MediaType::VIDEO);
+    assert!(
+        early_audio > 0 && early_video > 0,
+        "vc-9eh: early-cohort listener must also receive media \
+         (audio={early_audio}, video={early_video})"
+    );
+}
+
+// ===========================================================================
+// vc-9eh REGRESSION GUARD: the watchdog gating predicate must fire exactly when
+// the subscription has gone silent WHILE receivers are non-empty AND there are
+// active publishers — and must NOT fire (no thrash) otherwise. Reliably forcing
+// real async-nats slow-consumer backpressure in-process is impractical and
+// timing-dependent, so per the bead's allowance we exercise the watchdog
+// decision branch directly via the factored-out pure predicate
+// `watchdog_should_resubscribe` (the SAME function the live dispatcher
+// `select!` arm calls). This locks in that the watchdog cannot silently rot.
+// ===========================================================================
+
+#[test]
+fn sfu_vc_9eh_watchdog_resubscribe_gating() {
+    use sec_api::actors::chat_server::{
+        watchdog_should_resubscribe, watchdog_silence_window, WATCHDOG_GRACE, WATCHDOG_SILENCE,
+    };
+
+    let past_grace = WATCHDOG_GRACE + Duration::from_millis(1);
+    // Window at trips=0 is the base SILENCE; use a silence just past it.
+    let window0 = watchdog_silence_window(0);
+    let silent = window0 + Duration::from_millis(1);
+
+    // THE failure condition: past grace, silent, receivers present, publishers
+    // present => MUST force a resubscribe (this is the Bug A recovery).
+    assert!(
+        watchdog_should_resubscribe(past_grace, silent, window0, true, true),
+        "watchdog must resubscribe when silent with receivers + publishers"
+    );
+
+    // Must NOT fire (each gate independently suppresses, preventing thrash):
+    assert!(
+        !watchdog_should_resubscribe(past_grace, silent, window0, false, true),
+        "no receivers => nothing to recover"
+    );
+    assert!(
+        !watchdog_should_resubscribe(past_grace, silent, window0, true, false),
+        "no publishers => silence is expected (idle/all-muted room must not thrash)"
+    );
+    assert!(
+        !watchdog_should_resubscribe(
+            past_grace,
+            window0 - Duration::from_millis(1),
+            window0,
+            true,
+            true
+        ),
+        "recent delivery (< current window) => subscription is healthy"
+    );
+    assert!(
+        !watchdog_should_resubscribe(
+            WATCHDOG_GRACE - Duration::from_millis(1),
+            silent,
+            window0,
+            true,
+            true
+        ),
+        "within grace => a fresh/resubscribed subscription must not be judged dead"
+    );
+
+    // Budget sanity: the FIRST trip after traffic (trips=0) uses the base
+    // window <= 750ms so a genuinely-broken subscription with active publishers
+    // resubscribes fast enough to keep first media within the 1.5s budget.
+    assert!(
+        window0 <= Duration::from_millis(750) && WATCHDOG_SILENCE <= Duration::from_millis(750),
+        "base silence window must be <= 750ms to keep first media within budget"
+    );
+}
+
+#[test]
+fn sfu_vc_9eh_watchdog_backoff_escalates_and_caps() {
+    use sec_api::actors::chat_server::{
+        watchdog_should_resubscribe, watchdog_silence_window, WATCHDOG_GRACE, WATCHDOG_SILENCE,
+        WATCHDOG_SILENCE_CAP,
+    };
+
+    // Escalation: each consecutive silent trip doubles the window from the base
+    // (750ms, 1.5s, 3s, ...) up to the cap.
+    assert_eq!(
+        watchdog_silence_window(0),
+        WATCHDOG_SILENCE,
+        "trip 0 = base"
+    );
+    assert_eq!(
+        watchdog_silence_window(1),
+        WATCHDOG_SILENCE * 2,
+        "trip 1 = 2x base"
+    );
+    assert_eq!(
+        watchdog_silence_window(2),
+        WATCHDOG_SILENCE * 4,
+        "trip 2 = 4x base"
+    );
+    // Monotonic non-decreasing and capped.
+    let mut prev = Duration::ZERO;
+    for trips in 0..40u32 {
+        let w = watchdog_silence_window(trips);
+        assert!(w >= prev, "window must be monotonic non-decreasing");
+        assert!(
+            w <= WATCHDOG_SILENCE_CAP,
+            "window must never exceed the cap"
+        );
+        prev = w;
+    }
+    assert_eq!(
+        watchdog_silence_window(1000),
+        WATCHDOG_SILENCE_CAP,
+        "deep trip count saturates at the cap (no overflow)"
+    );
+
+    // Anti-thrash semantics through the predicate: a populated, quiet room that
+    // has already tripped once is NOT eligible again until the LONGER (escalated)
+    // window has elapsed — so it cannot resubscribe at a fixed fast cadence.
+    let past_grace = WATCHDOG_GRACE + Duration::from_millis(1);
+    let window1 = watchdog_silence_window(1); // 1.5s
+                                              // Silence just past the BASE window but short of the escalated window:
+                                              // after one trip, must NOT fire again yet.
+    let silence_between = WATCHDOG_SILENCE + Duration::from_millis(1);
+    assert!(silence_between < window1);
+    assert!(
+        !watchdog_should_resubscribe(past_grace, silence_between, window1, true, true),
+        "after escalation the room must wait the LONGER window before firing again \
+         (this is the persisted backoff that prevents thrash)"
+    );
+    // Once silence exceeds the escalated window, it fires again.
+    assert!(
+        watchdog_should_resubscribe(
+            past_grace,
+            window1 + Duration::from_millis(1),
+            window1,
+            true,
+            true
+        ),
+        "a still-broken subscription eventually re-fires at the escalated window"
+    );
+}
+
+/// vc-9eh: model the dispatcher's ACTUAL watchdog state machine across ticks to
+/// prove the steady-state cadence DECAYS to the 30s cap (not collapses to ~1s).
+///
+/// This is the regression that the window-table-only test missed: the bug was
+/// that `silence` is measured from the last REAL message and grows monotonically
+/// for a quiet room, so once it permanently exceeds the cap the `silence >=
+/// window` gate is always satisfied and the only remaining gate is GRACE (reset
+/// on every resubscribe) — flooring the cadence at ~GRACE. The fix is resetting
+/// the silence clock (`last_msg_at`) on each resubscribe. This test mirrors the
+/// loop's bookkeeping (a virtual clock, no real time) and asserts:
+///   1. first detection fires at exactly the base 750ms window from last traffic
+///      (budget preserved),
+///   2. inter-trip spacing escalates 750ms → 1.5s → 3s → … and FLOORS at the
+///      30s cap (the decay the bead requires), and
+///   3. traffic resets both the silence clock and the trip counter (fast
+///      recovery).
+#[test]
+fn sfu_vc_9eh_watchdog_cadence_decays_to_cap() {
+    use sec_api::actors::chat_server::{
+        watchdog_should_resubscribe, watchdog_silence_window, WATCHDOG_GRACE, WATCHDOG_SILENCE,
+        WATCHDOG_SILENCE_CAP, WATCHDOG_TICK,
+    };
+
+    // Virtual dispatcher state, mirroring spawn_room_dispatcher's locals.
+    // We use Durations-since-epoch as the virtual clock (monotonic millis).
+    let mut now = Duration::ZERO;
+    let mut subscribe_at = now; // grace clock
+    let mut last_msg_at = now; // silence clock
+    let mut trips: u32 = 0;
+
+    // Drive the loop forward one TICK at a time, applying the SAME gating the
+    // dispatcher applies, and record the virtual time of each resubscribe trip.
+    let mut trip_times: Vec<Duration> = Vec::new();
+    // Run long enough to exit the escalation ramp and reach the capped cadence
+    // several times over (sum of windows to cap ~= 56s; run ~3 minutes).
+    let horizon = Duration::from_secs(180);
+    while now < horizon {
+        now += WATCHDOG_TICK;
+        let uptime = now - subscribe_at;
+        let silence = now - last_msg_at;
+        let window = watchdog_silence_window(trips);
+        if watchdog_should_resubscribe(
+            uptime, silence, window, /*recv*/ true, /*pub*/ true,
+        ) {
+            trip_times.push(now);
+            // Mirror the FIXED resubscribe arm: escalate trips, restart BOTH the
+            // grace clock and the silence clock from the resubscribe instant.
+            trips = trips.saturating_add(1);
+            subscribe_at = now;
+            last_msg_at = now;
+        }
+    }
+
+    assert!(
+        trip_times.len() >= 6,
+        "expected several trips over the horizon, got {}",
+        trip_times.len()
+    );
+
+    // (1) First detection fires at the base window from last traffic. The tick
+    // granularity rounds up to the next 250ms boundary at/after 750ms => 750ms.
+    assert_eq!(
+        trip_times[0], WATCHDOG_SILENCE,
+        "first trip must fire at the base 750ms window from last traffic \
+         (budget preserved); got {:?}",
+        trip_times[0]
+    );
+
+    // (2) Inter-trip spacing escalates then floors at the cap. Spacing[i] is the
+    // gap between trip i and trip i+1; it must equal window(i+1) rounded up to a
+    // tick boundary (window is tied to the trip count AFTER the i-th escalation).
+    let round_up_to_tick = |d: Duration| -> Duration {
+        let tick = WATCHDOG_TICK.as_millis() as u64;
+        let ms = d.as_millis() as u64;
+        Duration::from_millis(ms.div_ceil(tick) * tick)
+    };
+    for i in 0..trip_times.len() - 1 {
+        let spacing = trip_times[i + 1] - trip_times[i];
+        let expected = round_up_to_tick(watchdog_silence_window((i as u32) + 1));
+        assert_eq!(
+            spacing, expected,
+            "inter-trip spacing #{i} must follow the escalating window \
+             (got {:?}, expected {:?})",
+            spacing, expected
+        );
+    }
+    // The LAST observed spacing must be the capped cadence (rounded to tick),
+    // proving the cadence decays to ~30s and does NOT collapse to ~1s.
+    let last_spacing = trip_times[trip_times.len() - 1] - trip_times[trip_times.len() - 2];
+    assert_eq!(
+        last_spacing,
+        round_up_to_tick(WATCHDOG_SILENCE_CAP),
+        "steady-state cadence must floor at the 30s cap, not collapse to ~GRACE"
+    );
+    assert!(
+        last_spacing >= Duration::from_secs(30),
+        "capped cadence must be >= 30s (regression guard against the ~1s collapse)"
+    );
+
+    // (3) Traffic resets BOTH the silence clock and the trip counter. Model a
+    // dispatcher deep into escalation, then a real message arriving mid-stall.
+    let trips_before_traffic: u32 = 4; // window would be 12s
+    let escalated_window = watchdog_silence_window(trips_before_traffic);
+    assert_eq!(
+        escalated_window,
+        WATCHDOG_SILENCE * 16,
+        "trip 4 window is 16x base (12s)"
+    );
+    // Before traffic, a base-window silence is NOT enough to trip (the escalated
+    // window governs) — this is the persisted backoff.
+    assert!(
+        !watchdog_should_resubscribe(
+            WATCHDOG_GRACE + Duration::from_millis(1),
+            WATCHDOG_SILENCE + Duration::from_millis(1),
+            escalated_window,
+            true,
+            true
+        ),
+        "while escalated, a base-window silence must not trip"
+    );
+    // A message arrives: the Some(msg) arm sets last_msg_at = now AND trips = 0.
+    let trips_after_traffic: u32 = 0;
+    let base_window = watchdog_silence_window(trips_after_traffic);
+    assert_eq!(
+        base_window, WATCHDOG_SILENCE,
+        "reset returns to the base window"
+    );
+    // The NEXT stall must now fire at the base window again — fast recovery.
+    assert!(
+        watchdog_should_resubscribe(
+            WATCHDOG_GRACE + Duration::from_millis(1),
+            WATCHDOG_SILENCE + Duration::from_millis(1),
+            base_window,
+            true,
+            true
+        ),
+        "after traffic resets trips to 0, the next stall must trip at the BASE \
+         window (fast recovery), not the previously-escalated window"
+    );
+    // And the grace gate still protects a freshly-reset clock.
+    assert!(
+        !watchdog_should_resubscribe(
+            WATCHDOG_GRACE - Duration::from_millis(1),
+            WATCHDOG_SILENCE + Duration::from_millis(1),
+            watchdog_silence_window(0),
+            true,
+            true
+        ),
+        "within grace, even a base-window silence must not trip"
     );
 }

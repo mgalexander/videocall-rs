@@ -114,9 +114,61 @@ pub async fn connect(url: &str) -> Result<Client, NatsConnectError> {
 
     let ca_path = std::env::var("NATS_TLS_CA").ok().filter(|s| !s.is_empty());
 
+    // vc-9eh: surface slow-consumer drops. async-nats delivers each
+    // subscription's messages through a bounded mpsc; when that channel fills
+    // (e.g. a per-room dispatcher falling behind a publisher storm) async-nats
+    // SILENTLY DROPS the message and fires a connection-global
+    // `Event::SlowConsumer(sid)` — it does NOT close the subscription. This is
+    // the root cause of Bug A (the late-listener black hole): the dispatcher's
+    // `sub.next()` never sees `None`, so the existing respawn path never fires.
+    //
+    // The event channel is per-`Client` and carries only the opaque
+    // subscription `sid` (the `Subscriber.sid` field is private), so we cannot
+    // route a `SlowConsumer` back to a specific room from here — the actual
+    // recovery is the per-room liveness watchdog in `spawn_room_dispatcher`
+    // (vc-9eh). What we do here is make the condition OBSERVABLE: a WARN log so
+    // operators can correlate backpressure with watchdog-driven respawns.
+    let event_handler = |event: async_nats::Event| async move {
+        match event {
+            async_nats::Event::SlowConsumer(sid) => {
+                tracing::warn!(
+                    target: "nats_connect",
+                    sid,
+                    "NATS slow-consumer drop on subscription {sid}: a subscriber \
+                     channel filled and async-nats dropped a message. If this is \
+                     a per-room dispatcher, the vc-9eh liveness watchdog will \
+                     resubscribe in place.",
+                );
+            }
+            // ServerError/ClientError are genuine faults — surface at WARN.
+            async_nats::Event::ServerError(_) | async_nats::Event::ClientError(_) => {
+                tracing::warn!(target: "nats_connect", "NATS event: {event}");
+            }
+            // Lifecycle events (Connected/Disconnected/LameDuck/Draining/Closed).
+            other => {
+                tracing::debug!(target: "nats_connect", "NATS event: {other}");
+            }
+        }
+    };
+
     let mut opts = ConnectOptions::new()
         .require_tls(tls_enabled)
-        .ping_interval(Duration::from_secs(10));
+        .ping_interval(Duration::from_secs(10))
+        // vc-9eh: bound the per-subscription pending queue BELOW the async-nats
+        // default (65536). Now that the per-room liveness watchdog
+        // (spawn_room_dispatcher) is the recovery net for a wedged/slow
+        // subscription, a deep queue is no longer needed to ride out hiccups —
+        // and the deep default is the dominant memory risk in this change
+        // (64Ki msgs x ~1.2KB media x N saturated rooms). 16Ki keeps ~160s of
+        // audio (~50pps) or ~9min of buffer headroom — far longer than the
+        // 750ms base watchdog window — while capping worst-case per-subscription
+        // memory at ~4x lower. The other production subscriber on this shared
+        // connection (spillover control) is low-volume and unaffected; the
+        // metrics binaries use their own connections. When the queue IS
+        // exceeded, the event_callback above logs the SlowConsumer and the
+        // watchdog resubscribes.
+        .subscription_capacity(16 * 1024)
+        .event_callback(event_handler);
 
     if let (Some(u), Some(p)) = (user.as_ref(), password.as_ref()) {
         opts = opts.user_and_password(u.clone(), p.clone());

@@ -1875,6 +1875,19 @@ impl Handler<JoinRoom> for ChatServer {
             // Insert (or replace) — reconnects share the same SessionId
             // semantics as the prior per-session model: the latest
             // recipient wins.
+            //
+            // vc-9eh ORDERING INVARIANT (Part B — DO NOT MOVE THIS BELOW THE
+            // `tokio::spawn` POST-JOIN TASK): this `receivers.write().insert`
+            // MUST happen synchronously here, BEFORE any `.await`/`spawn`
+            // boundary in this handler. The dispatcher fans out by snapshotting
+            // this exact `receivers` Arc per inbound message (see
+            // `spawn_room_dispatcher`), so a joiner is delivery-eligible the
+            // instant it is in the map — there is no separate "register with the
+            // dispatcher" step. If a future refactor moves this insert after the
+            // post-join `tokio::spawn` (or behind any await), a late joiner
+            // could be admitted into the room AFTER the dispatcher snapshots,
+            // reintroducing the insert-after-subscribe race that the vc-9eh
+            // watchdog above is the recovery net for. Keep it here.
             w.insert(session, session_recipient.clone());
         }
         self.joined_sessions.insert(session);
@@ -1986,6 +1999,110 @@ impl Handler<JoinRoom> for ChatServer {
     }
 }
 
+// --- vc-9eh: per-room delivery watchdog tunables + decision ----------------
+//
+// These thresholds are justified against the vc-7wi responsiveness budget
+// (first media <= 1.5s, usable audio <= 2.0s after a late join). See
+// `spawn_room_dispatcher` for the full mechanism write-up.
+//
+//   * SILENCE_BASE = 750ms — the silence window for the FIRST resubscribe
+//     after traffic. A healthy room with active publishers keeps the
+//     dispatcher's `last_msg_at` fresh at ~30fps (audio alone is ~50pps), so
+//     750ms of TOTAL silence is far outside any normal inter-packet gap. For a
+//     genuinely-broken subscription with active publishers, the FIRST trip
+//     fires at 750ms and the in-place resubscribe restores traffic — so first
+//     media is well inside the 1.5s budget.
+//   * TICK = 250ms — worst-case detection latency is the current silence
+//     window + one tick; the in-place resubscribe is sub-millisecond
+//     (single-digit ms to a remote NATS), so for the first trip the total is
+//     ~= 1000ms, comfortably inside the 1.5s first-media budget.
+//   * GRACE = 750ms minimum uptime AFTER each (re)subscribe before the
+//     watchdog may fire again. A fresh subscription must be given at least one
+//     silence-window to receive before we judge it dead.
+//   * BACKOFF (the real anti-thrash, persisted across resubscribes): the
+//     silence window ESCALATES on each *consecutive* trip that fails to
+//     restore traffic — 750ms, 1.5s, 3s, 6s, 12s, 24s, capped at 30s — and
+//     RESETS to SILENCE_BASE the instant any real message advances
+//     `last_msg_at`. This is load-bearing because the `has_publishers` gate is
+//     currently inert in production (`is_observer` is never set true, so
+//     `senders()` == all members) and the only periodic traffic on the
+//     `room.{room}.*` wildcard — the 5s health beacon on `.system` — is far
+//     longer than the 750ms base window. Gating alone therefore cannot tell a
+//     silently-broken subscription from a legitimately-quiet room, so without
+//     the backoff a quiet populated room would resubscribe at a fixed ~1s
+//     cadence forever. With it, a broken room recovers fast (first trip at
+//     750ms) while a quiet room decays to one resubscribe per ~30s.
+pub const WATCHDOG_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+pub const WATCHDOG_SILENCE: std::time::Duration = std::time::Duration::from_millis(750);
+pub const WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+/// vc-9eh: ceiling on the escalating silence window. A persistently-quiet
+/// populated room (everyone muted/camera-off) decays to ~one resubscribe per
+/// 30s — enough to eventually heal a truly-wedged subscription without WARN-log
+/// spam or resubscribe churn.
+pub const WATCHDOG_SILENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// vc-9eh: compute the silence window for the current consecutive-trip count.
+///
+/// `trips` is the number of consecutive watchdog resubscribes that have NOT
+/// been followed by real traffic (it resets to 0 the moment `last_msg_at`
+/// advances). The window doubles each trip from [`WATCHDOG_SILENCE`], capped at
+/// [`WATCHDOG_SILENCE_CAP`]:
+///
+/// | trips | window |
+/// |-------|--------|
+/// | 0     | 750ms  |
+/// | 1     | 1.5s   |
+/// | 2     | 3s     |
+/// | 3     | 6s     |
+/// | 4     | 12s    |
+/// | 5     | 24s    |
+/// | >=6   | 30s (cap) |
+///
+/// `trips == 0` (the first trip after traffic) yields the base window, so a
+/// genuinely-broken subscription with active publishers still resubscribes at
+/// 750ms — keeping first-media within the 1.5s budget. The escalation only
+/// bites on REPEATED no-traffic trips, which is exactly the legitimately-quiet
+/// room the bead said must not thrash.
+pub fn watchdog_silence_window(trips: u32) -> std::time::Duration {
+    // Saturating shift so a large `trips` cannot overflow; clamp to the cap.
+    let scaled = WATCHDOG_SILENCE
+        .checked_mul(1u32.checked_shl(trips.min(20)).unwrap_or(u32::MAX))
+        .unwrap_or(WATCHDOG_SILENCE_CAP);
+    scaled.min(WATCHDOG_SILENCE_CAP)
+}
+
+/// vc-9eh: pure liveness-watchdog decision, factored out of the dispatcher
+/// `select!` so the gating logic is unit-testable without provoking real
+/// async-nats slow-consumer backpressure (which is impractical to trigger
+/// deterministically in-process).
+///
+/// Returns `true` IFF the per-room dispatcher should force a clean resubscribe.
+/// The gate is strict on purpose:
+///
+///   * `uptime >= WATCHDOG_GRACE` — never judge a freshly (re)subscribed
+///     subscription dead before it has had a silence-window to receive.
+///   * `silence >= silence_window` — only act on genuinely stalled delivery,
+///     where `silence_window` is the (escalating) window from
+///     [`watchdog_silence_window`].
+///   * `has_receivers` — nobody to serve ⇒ nothing to recover (a respawn would
+///     be pointless; the normal drain path aborts the task anyway).
+///   * `has_publishers` — no member at all ⇒ nothing to recover. (NOTE: this is
+///     a coarse gate today — `is_observer` is inert in production so this is
+///     effectively `member_count > 0`; the escalating backoff, not this gate,
+///     is what prevents a quiet-but-populated room from thrashing.)
+///
+/// All four must hold. This adds ZERO per-join work: it reads only the room's
+/// own `receivers` map + `RoomState`, and runs on exactly ONE timer per ROOM.
+pub fn watchdog_should_resubscribe(
+    uptime: std::time::Duration,
+    silence: std::time::Duration,
+    silence_window: std::time::Duration,
+    has_receivers: bool,
+    has_publishers: bool,
+) -> bool {
+    uptime >= WATCHDOG_GRACE && silence >= silence_window && has_receivers && has_publishers
+}
+
 /// Spawn the per-room demux subscription task (vc-q0v).
 ///
 /// One task per room. Subscribes once to `room.<room>.*`, parses each
@@ -1996,14 +2113,21 @@ impl Handler<JoinRoom> for ChatServer {
 /// N-participant room; this consolidation eliminates the (N-1) redundant
 /// parses per published packet.
 ///
-/// The task exits on three conditions:
+/// The task exits on four conditions:
 ///   1. **Normal drain** — [`ChatServer::drop_room_receiver`] aborts the
 ///      `JoinHandle` once the receivers map empties.
 ///   2. **Initial subscribe failed** — `nc.subscribe` returned `Err`.
 ///   3. **Subscription closed mid-flight** — `sub.next()` returned `None`
 ///      (NATS server closed the subscription, lame-duck shutdown, etc.).
+///   4. **vc-9eh liveness watchdog** — the subscription went *silent without
+///      closing* (the slow-consumer black hole: async-nats drops the message
+///      and fires a connection-global `Event::SlowConsumer` but keeps the
+///      `Subscriber` stream open, so `sub.next()` never yields `None`). When no
+///      inbound message has arrived for `WATCHDOG_SILENCE` WHILE the room still
+///      has receivers AND active publishers, the watchdog notifies the actor to
+///      force a clean resubscribe.
 ///
-/// In cases (2) and (3) the task sends [`RoomDispatcherExited`] back to
+/// In cases (2), (3) and (4) the task sends [`RoomDispatcherExited`] back to
 /// the actor so the entry is cleaned up (or the dispatcher respawned if
 /// receivers are still present). Without this signal the room would be
 /// silently dead — receivers in the map but no parser feeding them. In
@@ -2047,7 +2171,193 @@ fn spawn_room_dispatcher(
             "Per-room demux subscribed to {} (room {}, mode {:?})",
             subject, room, sfu_mode
         );
-        while let Some(msg) = sub.next().await {
+
+        // --- vc-9eh: per-room delivery watchdog -------------------------------
+        //
+        // ROOT CAUSE (Bug A): under a sustained publisher storm the async-nats
+        // wildcard subscription's bounded channel can fill faster than this
+        // loop drains it. When that happens async-nats does NOT close the
+        // subscription and does NOT block — it *silently drops* the message and
+        // fires a connection-global `Event::SlowConsumer(sid)` (see
+        // async-nats lib.rs ~L732). The `Subscriber` stream stays open, so
+        // `sub.next()` never returns `None`; the existing `None`-exit / respawn
+        // path therefore never fires and the subscription becomes a quiet black
+        // hole. Every receiver in `receivers` — including any cohort that joins
+        // afterward — then stops being served, with no liveness signal at all.
+        //
+        // We detect this with a liveness watchdog instead of trying to route the
+        // connection-global `SlowConsumer` event back to a specific room (the
+        // `Subscriber.sid` is private and the event channel is per-`Client`, so
+        // there is no per-room hook). A subscription that has gone quiet — for
+        // ANY reason (slow-consumer drops, a wedged re-attach across reconnect,
+        // a server-side hiccup) — manifests uniformly as `last_msg_at` going
+        // stale. On prolonged silence WHILE the room still has receivers AND
+        // active publishers, we resubscribe IN PLACE: drop the old `Subscriber`,
+        // re-`subscribe` on the SAME task against the SAME `receivers` Arc +
+        // forwarder, and continue the loop. Live sessions (including the late
+        // cohort) resume the instant the fresh subscription attaches, with no
+        // client reconnect and no actor mailbox round-trip.
+        //
+        // Why IN-PLACE (not posting `RoomDispatcherExited`): the escalating
+        // backoff state (`consecutive_silent_trips`) must PERSIST across
+        // resubscribes, or it is defeated — a respawn via the actor would reset
+        // it to base every time. Keeping the resubscribe local also avoids a
+        // resubscribe herd through the actor mailbox on a cluster-wide
+        // slow-consumer event. The `None`-exit → `RoomDispatcherExited` path is
+        // kept as-is for the genuinely-closed-subscription case.
+        //
+        // Thresholds + the escalating-window + the gating predicate live in
+        // `watchdog_silence_window` / `watchdog_should_resubscribe` above
+        // (factored out so they are unit-testable without provoking real
+        // backpressure).
+        let mut subscribe_at = std::time::Instant::now();
+        let mut last_msg_at = subscribe_at;
+        // vc-9eh: consecutive watchdog resubscribes NOT followed by traffic.
+        // Resets to 0 the moment a real message advances `last_msg_at`. Drives
+        // the escalating silence window so a legitimately-quiet populated room
+        // decays to ~one resubscribe per WATCHDOG_SILENCE_CAP instead of
+        // thrashing at a fixed cadence.
+        let mut consecutive_silent_trips: u32 = 0;
+        let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
+        // The first tick fires immediately; skip it so the very first watchdog
+        // evaluation happens one full TICK in (and is anyway gated by GRACE).
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // vc-9eh perf: de-align per-room watchdog timers so a cluster-wide
+        // slow-consumer event does not trip every room within the same 250ms
+        // tick (a synchronized resubscribe wave against the already-stressed
+        // connection). Derive a deterministic 0..TICK phase from the room name
+        // so each room's tick lands at a different sub-tick offset; no `rand`
+        // dependency and stable across the room's lifetime.
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            room.hash(&mut h);
+            let jitter_ms = h.finish() % (WATCHDOG_TICK.as_millis() as u64);
+            if jitter_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+            }
+        }
+
+        loop {
+            let msg = tokio::select! {
+                biased;
+                maybe_msg = sub.next() => match maybe_msg {
+                    Some(msg) => {
+                        // vc-9eh: subscription is alive — refresh liveness and
+                        // reset the backoff so the NEXT stall starts at the base
+                        // 750ms window again.
+                        last_msg_at = std::time::Instant::now();
+                        consecutive_silent_trips = 0;
+                        msg
+                    }
+                    // `None` => subscription closed (existing behavior). Break
+                    // out of the loop to the abnormal-exit / respawn notify.
+                    None => break,
+                },
+                _ = watchdog.tick() => {
+                    // vc-9eh: liveness check. ZERO per-join work — exactly ONE
+                    // timer per ROOM, O(1) resubscribe per room. We read only
+                    // data already in scope (the `receivers` map + `room_state`)
+                    // and defer the decision to the unit-tested predicate.
+                    let now = std::time::Instant::now();
+                    let uptime = now.duration_since(subscribe_at);
+                    let silence = now.duration_since(last_msg_at);
+                    let window = watchdog_silence_window(consecutive_silent_trips);
+                    // Cheap pre-gate: avoid taking the locks at all until we are
+                    // actually past grace AND past the (escalating) silence
+                    // window. The common steady-state path (recent delivery)
+                    // bails here without touching state.
+                    if uptime < WATCHDOG_GRACE || silence < window {
+                        continue;
+                    }
+                    let (has_receivers, receiver_count) = {
+                        let g = match receivers.read() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        (!g.is_empty(), g.len())
+                    };
+                    let has_publishers = {
+                        let g = match room_state.read() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        g.has_senders()
+                    };
+                    if !watchdog_should_resubscribe(
+                        uptime,
+                        silence,
+                        window,
+                        has_receivers,
+                        has_publishers,
+                    ) {
+                        continue;
+                    }
+                    // Escalate the backoff: this trip counts toward the next
+                    // window. It resets to 0 on the `Some(msg)` arm above the
+                    // moment real traffic resumes.
+                    consecutive_silent_trips = consecutive_silent_trips.saturating_add(1);
+                    warn!(
+                        "Per-room demux for room {} saw no inbound message for \
+                         {}ms (window {}ms, consecutive silent trip #{}) while {} \
+                         receiver(s) and active publishers remain — the \
+                         subscription has gone silent (likely slow-consumer \
+                         backpressure); resubscribing in place",
+                        room,
+                        silence.as_millis(),
+                        window.as_millis(),
+                        consecutive_silent_trips,
+                        receiver_count,
+                    );
+                    // Resubscribe IN PLACE. Drop the old (silent) `Subscriber`
+                    // and attach a fresh one on the SAME task. On success the
+                    // grace clock restarts so the new subscription gets a full
+                    // window to receive before it can be judged dead again.
+                    match nc.subscribe(subject.clone()).await {
+                        Ok(fresh) => {
+                            let now = std::time::Instant::now();
+                            sub = fresh;
+                            subscribe_at = now;
+                            // CRITICAL (anti-thrash): restart the SILENCE clock at
+                            // the resubscribe too, not just the grace clock. The
+                            // next trip is then measured FROM this resubscribe, so
+                            // a persistently-quiet room re-trips only after the
+                            // ESCALATED `watchdog_silence_window(trips)` elapses —
+                            // decaying the cadence toward the 30s cap. If we left
+                            // `last_msg_at` as-is, `silence` would grow
+                            // monotonically from the last REAL message and, once it
+                            // permanently exceeds the cap, the `silence >= window`
+                            // gate would always pass — flooring the cadence at
+                            // ~GRACE (≈1s) and spamming WARN forever. The escalation
+                            // is keyed on `consecutive_silent_trips` (NOT reset
+                            // here), and the `Some(msg)` arm resets BOTH the moment
+                            // any real traffic resumes — so genuine-broken recovery
+                            // stays fast.
+                            last_msg_at = now;
+                            info!(
+                                "Per-room demux resubscribed in place to {} \
+                                 (room {})",
+                                subject, room
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            // Could not re-establish locally — fall back to the
+                            // actor respawn path (it reuses the same receivers
+                            // Arc + forwarder) and exit this task.
+                            warn!(
+                                "Per-room demux failed to resubscribe to {} \
+                                 (room {}): {} — handing off to actor respawn",
+                                subject, room, e
+                            );
+                            let _ = chat_server
+                                .try_send(RoomDispatcherExited { room: room.clone() });
+                            return;
+                        }
+                    }
+                }
+            };
+
             // Parse ONCE per inbound message — the whole point of vc-q0v.
             // `msg.payload` is `bytes::Bytes`; deref to `&[u8]` for the
             // parser. The decision call below takes the `&Bytes` so it
@@ -2206,7 +2516,8 @@ fn spawn_room_dispatcher(
                 }
             }
         }
-        // `sub.next()` returned None — the subscription is closed. This is
+        // `sub.next()` returned None (the `None` arm `break`s the loop) — the
+        // subscription is closed. This is
         // unexpected during normal operation (async-nats is supposed to
         // transparently re-attach subscriptions across reconnects). Surface
         // loudly and ask the actor to either respawn (receivers still
