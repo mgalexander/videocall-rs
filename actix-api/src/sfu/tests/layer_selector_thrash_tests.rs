@@ -98,7 +98,7 @@ fn temporal(sel: &LayerSelection) -> Option<u32> {
 /// one-call change).
 #[test]
 fn s1_steady_high_bandwidth_never_changes_selection() {
-    let mut sel = LayerSelector::new();
+    let sel = LayerSelector::new();
     let allow = allow_one();
     let t0 = Instant::now();
 
@@ -125,7 +125,7 @@ fn s1_steady_high_bandwidth_never_changes_selection() {
 /// spike or after the drop.
 #[test]
 fn s2_brief_two_second_spike_does_not_upgrade() {
-    let mut sel = LayerSelector::new();
+    let sel = LayerSelector::new();
     let allow = allow_one();
     let t0 = Instant::now();
 
@@ -164,7 +164,7 @@ fn s2_brief_two_second_spike_does_not_upgrade() {
 /// remaining 7 s do not produce a second upgrade.
 #[test]
 fn s3_sustained_increase_upgrades_at_three_seconds() {
-    let mut sel = LayerSelector::new();
+    let sel = LayerSelector::new();
     let allow = allow_one();
     let t0 = Instant::now();
 
@@ -240,7 +240,7 @@ fn s3_sustained_increase_upgrades_at_three_seconds() {
 /// boundary, the upgrade fires.
 #[test]
 fn s4_brief_dip_downgrades_immediately_then_cooldown_holds_five_seconds() {
-    let mut sel = LayerSelector::new();
+    let sel = LayerSelector::new();
     let allow = allow_one();
     let t0 = Instant::now();
 
@@ -311,7 +311,7 @@ fn s4_brief_dip_downgrades_immediately_then_cooldown_holds_five_seconds() {
 /// 0 upgrades.
 #[test]
 fn s5_oscillation_yields_one_downgrade_and_no_upgrades() {
-    let mut sel = LayerSelector::new();
+    let sel = LayerSelector::new();
     let allow = allow_one();
     let t0 = Instant::now();
 
@@ -357,7 +357,7 @@ fn s5_oscillation_yields_one_downgrade_and_no_upgrades() {
 /// on every tick → `Identical` classifier → no downgrade emitted.
 #[test]
 fn s6_bouncing_within_t1_headroom_band_yields_no_downgrade() {
-    let mut sel = LayerSelector::new();
+    let sel = LayerSelector::new();
     let allow = allow_one();
     let t0 = Instant::now();
 
@@ -370,7 +370,7 @@ fn s6_bouncing_within_t1_headroom_band_yields_no_downgrade() {
 
     // Sanity: confirm the band edges still resolve to T1 only.
     {
-        let mut sanity = LayerSelector::new();
+        let sanity = LayerSelector::new();
         let edge_lo = sanity.pick_with_hysteresis(RECEIVER, &allow, &[], lo, t0);
         let edge_hi = sanity.pick_with_hysteresis(RECEIVER, &allow, &[], hi, t0);
         assert_eq!(

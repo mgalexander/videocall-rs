@@ -545,11 +545,18 @@ pub const FAIRNESS_QUANTUM: u8 = 8;
 ///
 /// Drains the five class queues in priority order (P0 → P4). When the consumer
 /// has produced `FAIRNESS_QUANTUM` consecutive packets from one class, that
-/// class is *skipped* on the next pass so a lower-priority class may take one
-/// turn; once a lower class is served, the higher classes' quanta are reset so
-/// strict priority resumes. This bounds starvation of P3/P4 when P0/P1/P2 are
-/// continuously loaded without sacrificing strict-priority ordering in the
-/// common case.
+/// class is *skipped* for the rest of the current cycle so lower-priority
+/// classes may take their turn. A class's quantum is only reset when it is
+/// observed empty mid-cycle or at the cycle boundary (every class empty or
+/// exhausted). This makes the loop a weighted round-robin that bounds
+/// starvation of P3/P4 to no worse than `1/N` of egress when P0/P1/P2 are
+/// continuously loaded, while still letting a single higher-priority packet
+/// preempt lower classes in the common, non-saturated case (strict priority).
+///
+/// vc-ihk: an earlier version reset *all* higher-priority quanta on every
+/// single lower-class serve, which defeated the round-robin under sustained
+/// higher-class load and starved video (P3/P4) to ~0 while audio (P1) kept
+/// flowing. See [`Self::poll_priority`] for the detailed analysis.
 ///
 /// ## Deviation from bead vc-244 spec
 ///
@@ -574,10 +581,13 @@ pub struct PriorityReceiver {
     video_base: ClassReceiver,
     enhancement: ClassReceiver,
 
-    /// Per-class consecutive drain count. Index matches `Class::all()` order
+    /// Per-class consecutive drain count within the current weighted
+    /// round-robin cycle. Index matches `Class::all()` order
     /// (0 = P0Control … 4 = P4Enhancement). Saturates at `FAIRNESS_QUANTUM`
-    /// — once a class hits the quantum it is skipped until lower-priority
-    /// classes get a turn, at which point higher-priority quanta are reset.
+    /// — once a class hits the quantum it is skipped for the rest of the
+    /// cycle. Counters are reset for a class observed empty mid-cycle, and
+    /// for *all* classes at the cycle boundary (every class empty or
+    /// exhausted; see [`Self::recv`] Step 2).
     drain_count_by_class: [u8; 5],
 
     /// Per-class "we observed the recv() future return None" flag. Used only
@@ -630,11 +640,16 @@ impl PriorityReceiver {
             }
 
             // Step 4: await on whichever class wakes first, with biased
-            // priority. On wake we serve the awoken packet directly (with
-            // the same drain-counter + higher-quanta-reset bookkeeping as
-            // the sync path) and return. A closed-signal wake (`recv`
-            // returned `None`) sets the per-class closed flag and loops
-            // back to re-check liveness.
+            // priority. We only reach here after Step 2 confirmed every
+            // counter is already 0 (genuinely empty queues, not just
+            // exhausted), so this starts a fresh round-robin cycle. On wake
+            // we serve the awoken packet directly and bump its drain count.
+            // The `for c in 0..idx` reset below is vestigial/defensive — all
+            // counters are already 0 at this point, so it is a no-op; it does
+            // NOT reintroduce the vc-ihk "reset higher quanta on every serve"
+            // bug, which lived in `poll_priority`'s serve branch (Step 1). A
+            // closed-signal wake (`recv` returned `None`) sets the per-class
+            // closed flag and loops back to re-check liveness.
             if let Some((idx, bytes)) = self.await_any().await {
                 self.drain_count_by_class[idx] = self.drain_count_by_class[idx].saturating_add(1);
                 for c in 0..idx {
@@ -647,14 +662,39 @@ impl PriorityReceiver {
 
     /// Walk classes in priority order, returning the first packet from a
     /// class that has data AND is below its fairness quantum. Resets the
-    /// drain counter of any class observed empty on this pass; increments
-    /// the drain counter of the class served and resets all higher-priority
-    /// counters (since serving a lower class means higher classes either had
-    /// nothing to offer or were quantum-exhausted — either way they get a
-    /// fresh round on the next iteration).
+    /// drain counter of any class observed empty on this pass.
+    ///
+    /// vc-ihk: when a lower class is served, only higher classes that were
+    /// observed *empty* on this pass have their counters reset — a higher
+    /// class that is quantum-exhausted **but still backlogged** keeps its
+    /// exhausted counter so it has to wait out the rest of the weighted
+    /// round-robin cycle. The full reset that restarts the cycle is done by
+    /// [`Self::recv`]'s Step 2 once `poll_priority` returns `None` (every
+    /// class is either empty or exhausted).
+    ///
+    /// The previous implementation reset *all* higher-priority counters on
+    /// every lower-class serve. Under sustained higher-class load (e.g. ~100
+    /// listeners' fanned-out P1 audio) that reset fired on every single
+    /// lower serve, so a higher class's quantum never "stuck": it got a
+    /// fresh 8-packet burst after every one lower-class packet. The effect
+    /// compounded geometrically down the priority ladder (P1 ~90%,
+    /// P2 ~10%, P3 ~1%, P4 ~0.1% of egress), starving the P3 video-base and
+    /// P4 enhancement layers to effectively zero and collapsing video
+    /// fan-out to 0 decoded frames while audio kept flowing — the v7→v8
+    /// regression. Resetting only empty higher classes turns the loop into a
+    /// proper weighted round-robin: each loaded class gets its 8-packet
+    /// quantum per cycle, so no class is starved below `1/N` of egress under
+    /// saturation, while a *single* higher packet (count below quantum)
+    /// still preempts lower classes — strict priority in the common,
+    /// non-saturated case.
     fn poll_priority(&mut self) -> Option<Bytes> {
         for class_idx in 0..5 {
             if self.drain_count_by_class[class_idx] >= FAIRNESS_QUANTUM {
+                // Quantum-exhausted: skip this class for the rest of the
+                // cycle. Crucially we do NOT clear its counter here — if it
+                // is still backlogged it must wait out the cycle. Its
+                // counter is only cleared by the full reset in `recv`'s
+                // Step 2 (cycle boundary) or below if it is observed empty.
                 continue;
             }
             let maybe = self.try_recv_class(class_idx);
@@ -662,16 +702,12 @@ impl PriorityReceiver {
                 Some(bytes) => {
                     self.drain_count_by_class[class_idx] =
                         self.drain_count_by_class[class_idx].saturating_add(1);
-                    // Reset higher-priority quanta so strict priority resumes
-                    // immediately on the next call. Without this, a
-                    // continuously-loaded P0 that had hit count=8 would stay
-                    // skipped indefinitely after a single lower-class serve.
-                    for c in 0..class_idx {
-                        self.drain_count_by_class[c] = 0;
-                    }
                     return Some(bytes);
                 }
                 None => {
+                    // Observed empty this pass: clear its counter so it does
+                    // not hold back the cycle, and (being empty) it cannot
+                    // starve a lower class anyway.
                     self.drain_count_by_class[class_idx] = 0;
                 }
             }
@@ -1297,11 +1333,14 @@ mod tests {
     #[tokio::test]
     async fn priority_receiver_continuous_p0_yields_to_p4_every_quantum() {
         // The "real" starvation-prevention case: P0 has more than enough
-        // backlog to starve P4 under pure strict priority. Verify that
-        // after exactly FAIRNESS_QUANTUM P0 drains, the consumer serves
-        // one P4 packet, then resumes P0.
+        // backlog to starve P4 under pure strict priority. Under the
+        // weighted round-robin (vc-ihk fix), each cycle serves up to
+        // FAIRNESS_QUANTUM P0 then up to FAIRNESS_QUANTUM P4. With a small
+        // P4 backlog the cycle serves 8 P0 then drains the available P4
+        // (≤ quantum) before resuming P0.
         let (sender, channels) = PrioritySender::new();
-        let p0_count = (FAIRNESS_QUANTUM as usize) * 2; // 16
+        let q = FAIRNESS_QUANTUM as usize;
+        let p0_count = q * 2; // 16
         for i in 0..p0_count {
             assert_eq!(
                 sender.send(Class::P0Control, tag(Class::P0Control, i)),
@@ -1316,24 +1355,96 @@ mod tests {
         }
         let mut rx = PriorityReceiver::new(channels);
 
-        // Expect: 8 P0, 1 P4, 8 P0, 1 P4.
-        let q = FAIRNESS_QUANTUM as usize;
+        // Cycle 1: 8 P0 (quantum), then the 2 backlogged P4 (below quantum,
+        // P0 stays exhausted because it is still backlogged — it must wait
+        // out the cycle), then the remaining 8 P0.
         for i in 0..q {
             assert_eq!(rx.recv().await.unwrap(), tag(Class::P0Control, i));
         }
         assert_eq!(
             rx.recv().await.unwrap(),
             tag(Class::P4Enhancement, 0),
-            "after {q} P0 drains, one P4 must be served"
+            "after {q} P0 drains (P0 quantum-exhausted), P4 must be served"
         );
-        for i in q..(2 * q) {
-            assert_eq!(rx.recv().await.unwrap(), tag(Class::P0Control, i));
-        }
         assert_eq!(
             rx.recv().await.unwrap(),
             tag(Class::P4Enhancement, 1),
-            "after another {q} P0 drains, the second P4 must be served"
+            "P4 keeps draining within its quantum while P0 stays exhausted — \
+             the old code reset P0 after one P4 serve and starved P4"
         );
+        for i in q..(2 * q) {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                tag(Class::P0Control, i),
+                "P0 resumes after P4 empties and the cycle resets"
+            );
+        }
+    }
+
+    /// vc-ihk regression: under sustained higher-class (audio + control) load
+    /// the lower video classes must NOT be starved to zero. This reproduces
+    /// the v7→v8 "audio decoded, 0 video decoded" failure mode: a writer that
+    /// drains slower than ingest, so P0/P1 are always backlogged while the
+    /// P2/P3/P4 video queues also have data. The fix's weighted round-robin
+    /// must give every loaded video class a fair (non-trivial) share of
+    /// egress — concretely each video class gets at least one packet per
+    /// round-robin cycle, so over many cycles all four loaded classes are
+    /// served on the same order of magnitude rather than collapsing
+    /// geometrically (P3 ~1%, P4 ~0.1%) as the old reset-on-every-serve did.
+    #[tokio::test]
+    async fn priority_receiver_video_not_starved_under_sustained_audio_vc_ihk() {
+        let (sender, channels) = PrioritySender::new();
+        let mut rx = PriorityReceiver::new(channels);
+
+        // Saturate the higher classes (P1 audio + P2 keyframe) and keep the
+        // lower video classes (P3 base, P4 enhancement) continuously
+        // backlogged. We refill after each drain to model a writer that is
+        // slower than ingest, so no class ever empties.
+        let refill = |sender: &PrioritySender| {
+            // Top up each class so it stays at/above one quantum of backlog.
+            for _ in 0..FAIRNESS_QUANTUM {
+                let _ = sender.send(Class::P1Audio, b("a"));
+                let _ = sender.send(Class::P2Keyframe, b("k"));
+                let _ = sender.send(Class::P3VideoBase, b("v"));
+                let _ = sender.send(Class::P4Enhancement, b("e"));
+            }
+        };
+
+        let mut served = [0usize; 5];
+        // Run for several full round-robin cycles' worth of drains.
+        let drains = (FAIRNESS_QUANTUM as usize) * 4 * 25; // 25 cycles
+        for n in 0..drains {
+            if n % (FAIRNESS_QUANTUM as usize) == 0 {
+                refill(&sender);
+            }
+            let got = rx.recv().await.expect("packet available");
+            match &got[..] {
+                b"a" => served[1] += 1,
+                b"k" => served[2] += 1,
+                b"v" => served[3] += 1,
+                b"e" => served[4] += 1,
+                other => panic!("unexpected payload {other:?}"),
+            }
+        }
+
+        // The decisive assertion: the lowest video class (P4 enhancement)
+        // must not be starved to zero — and not to a geometric crumb. Under
+        // the old code P3/P4 collapsed to ~1% / ~0.1% of egress; under WRR
+        // every loaded class gets ~1/4 of egress. We assert each video class
+        // received a healthy share (well above the broken-code crumb).
+        let total: usize = served.iter().sum();
+        assert!(served[3] > 0, "P3 video-base starved to zero (vc-ihk)");
+        assert!(served[4] > 0, "P4 enhancement starved to zero (vc-ihk)");
+        // Each loaded class should get materially more than 5% of egress;
+        // the broken geometric cascade put P4 at ~0.1%.
+        let floor = total / 20; // 5%
+        for (idx, &count) in served.iter().enumerate().skip(1) {
+            assert!(
+                count >= floor,
+                "class index {idx} got {count}/{total} (<5%) — fairness \
+                 broken, video starvation regression (vc-ihk)"
+            );
+        }
     }
 
     #[tokio::test]
