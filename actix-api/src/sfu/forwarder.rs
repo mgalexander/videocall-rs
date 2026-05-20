@@ -36,7 +36,7 @@ use crate::metrics::{
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::ActiveSpeakerSet;
-use crate::sfu::subscription::SubscriptionStore;
+use crate::sfu::subscription::{SubscriptionStore, MAX_VISIBLE_VIDEO};
 
 /// Map a `PacketWrapper.packet_type` (an `EnumOrUnknown<PacketType>`) to a
 /// stable lowercase string suitable for use as a Prometheus label value.
@@ -372,28 +372,102 @@ impl Forwarder {
                     // allocations); miss recomputes once and stores. The
                     // outer read lock on `subscriptions` is sufficient — the
                     // cache itself is a `DashMap` with internal shard locks.
-                    let allow = {
+                    // vc-72a: capture the receiver's receive-all posture in
+                    // the SAME lock acquisition as the AllowSet resolve, so a
+                    // sender that physically arrived here but is NOT a local
+                    // room member (cross-pod co-arrival, or the brief window
+                    // before a same-pod sender's `insert_member` lands) can
+                    // still be admitted when the receiver wants everyone.
+                    let (allow, recv_all_audio, recv_all_video) = {
                         let store = match self.subscriptions.read() {
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        store.resolve_cached(
+                        let allow = store.resolve_cached(
                             receiver_sid,
                             &members_snapshot,
                             members_generation,
                             &speakers_top,
                             speakers_generation,
-                        )
+                        );
+                        let (ra, rv) = store.receive_mode(receiver_sid);
+                        (allow, ra, rv)
                     };
 
                     let sender_sid = packet_wrapper.session_id;
+                    // vc-72a: the AllowSet is membership-bound — it only ever
+                    // contains LOCAL room members. A sender that physically
+                    // arrived here but is NOT a local member (cross-pod
+                    // co-arrival, or the brief window before a same-pod
+                    // sender's `insert_member` lands) is therefore absent from
+                    // the AllowSet and would be hard-dropped, even though a
+                    // "see/hear everyone" receiver wants it. We admit such a
+                    // sender via the receive-all fallback.
+                    //
+                    // `non_member_video_admit` is set when a VIDEO/SCREEN
+                    // sender is admitted ONLY by that fallback (it is not in
+                    // the membership-bound `allow.video`). The downstream
+                    // layer-budget stage filters on `allow.video`, so without
+                    // threading this through it would re-drop every
+                    // non-keyframe of an admitted non-member — leaving the
+                    // receiver with periodic keyframes only (frozen video).
+                    // The flag lets the budget stage evaluate the sender
+                    // against an augmented AllowSet (see
+                    // `should_drop_non_member_for_layer_budget`).
+                    let mut non_member_video_admit = false;
                     let allowed = match media_type {
-                        MediaType::AUDIO => allow.audio.contains(&sender_sid),
+                        MediaType::AUDIO => allow.audio.contains(&sender_sid) || recv_all_audio,
                         // SCREEN rides the same allow tier as VIDEO (it's a
                         // visual stream; the subscription model has no
                         // SCREEN-specific tier today).
                         MediaType::VIDEO | MediaType::SCREEN => {
-                            allow.video.contains_key(&sender_sid)
+                            if allow.video.contains_key(&sender_sid) {
+                                true
+                            } else if recv_all_video {
+                                // vc-72a cap interaction: the receive-all
+                                // fallback honors MAX_VISIBLE_VIDEO, like
+                                // vc-3s8's `receive_all_video` catch-all tier.
+                                // The membership-bound `allow.video` already
+                                // caps local members at the ceiling; a
+                                // non-member is admitted only while there is
+                                // leftover capacity below the cap. Local
+                                // members deterministically win the cap because
+                                // they always populate `allow.video` first.
+                                //
+                                // ACCEPTED, BOUNDED LIMITATION (keyframe
+                                // over-admit): the cap is measured against
+                                // `allow.video.len()` — LOCAL members only,
+                                // always <= MAX_VISIBLE_VIDEO — NOT against a
+                                // running count of distinct non-members
+                                // admitted. So when local members number < 6
+                                // the `len() < cap` test passes for an
+                                // unbounded number of distinct non-members.
+                                // Sustained (non-base-layer) video from those
+                                // excess non-members is still bounded: it must
+                                // also clear the downstream budget stage
+                                // (`should_drop_non_member_for_layer_budget`),
+                                // which the SVC budget caps per receiver. The
+                                // residual leak is base keyframes (T0+S0):
+                                // those bypass the budget stage and clear only
+                                // this gate, so a receive-all receiver can
+                                // receive base keyframes from >MAX_VISIBLE_VIDEO
+                                // non-members when local members < 6. This is
+                                // accepted because keyframes are periodic (not
+                                // per-frame) — a small, bounded overhead, not a
+                                // sustained stream. A fully-precise cap would
+                                // require per-receiver tracking of which
+                                // non-members have been admitted, state the
+                                // stateless gate intentionally avoids on the
+                                // hot path.
+                                if allow.video.len() < MAX_VISIBLE_VIDEO as usize {
+                                    non_member_video_admit = true;
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
                         }
                         _ => true,
                     };
@@ -419,19 +493,46 @@ impl Forwarder {
                                 && rh.spatial_layer_id == 0;
                             if is_base_keyframe {
                                 SFU_KEYFRAME_FORWARDED_TOTAL.inc();
-                            } else if self.should_drop_for_layer_budget(
-                                receiver_sid,
-                                sender_sid,
-                                rh.spatial_layer_id,
-                                rh.temporal_layer_id,
-                                &allow,
-                                &speakers_top,
-                                speakers_generation,
-                                receiver_bw_kbps,
-                            ) {
-                                SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).inc();
-                                observe_decide_latency(start);
-                                return ForwardDecision::Drop;
+                            } else {
+                                // vc-72a: a non-member sender admitted via the
+                                // receive-all fallback is absent from the
+                                // membership-bound `allow.video`, so the cached
+                                // layer selection (and `ordered_senders`) would
+                                // never allocate it a budget entry → every
+                                // non-keyframe re-dropped. Evaluate it against
+                                // an AllowSet augmented with this one sender,
+                                // via a stateless `pick_layers` that neither
+                                // reads nor writes the shared per-receiver
+                                // selection cache (so member senders' cached
+                                // budget is never poisoned by the transient
+                                // augmentation).
+                                let drop = if non_member_video_admit {
+                                    self.should_drop_non_member_for_layer_budget(
+                                        receiver_sid,
+                                        sender_sid,
+                                        rh.spatial_layer_id,
+                                        rh.temporal_layer_id,
+                                        &allow,
+                                        &speakers_top,
+                                        receiver_bw_kbps,
+                                    )
+                                } else {
+                                    self.should_drop_for_layer_budget(
+                                        receiver_sid,
+                                        sender_sid,
+                                        rh.spatial_layer_id,
+                                        rh.temporal_layer_id,
+                                        &allow,
+                                        &speakers_top,
+                                        speakers_generation,
+                                        receiver_bw_kbps,
+                                    )
+                                };
+                                if drop {
+                                    SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).inc();
+                                    observe_decide_latency(start);
+                                    return ForwardDecision::Drop;
+                                }
                             }
 
                             // p4-9: reference-aware drop. Keyframes always
@@ -625,6 +726,77 @@ impl Forwarder {
             .forward
             .get(&(sender_sid, spatial_layer_id))
         {
+            Some(&max_t) => temporal_layer_id > max_t,
+            None => true,
+        }
+    }
+
+    /// vc-72a: layer-budget decision for a sender admitted via the
+    /// receive-all fallback that is NOT in the membership-bound `AllowSet`.
+    ///
+    /// The shared per-receiver layer-selection cache is keyed on
+    /// `(receiver, speakers_generation, bandwidth)` and is the source of
+    /// truth for the LOCAL members' budgets. Feeding it an AllowSet
+    /// augmented with a transient non-member sender would poison that cache
+    /// for every member sender at the same generation, so we deliberately do
+    /// NOT touch it here.
+    ///
+    /// Instead we clone the membership-bound `AllowSet`, splice in this one
+    /// sender at base-layer [`LayerPref`], and run the stateless
+    /// [`crate::sfu::layer_selector::LayerSelector::pick_layers`] greedy
+    /// selection (no hysteresis, no cache read/write). Within that throwaway
+    /// computation the non-member is ordered by ascending `SessionId` among
+    /// the non-speaker senders (see `ordered_senders`), so it consumes only
+    /// the leftover budget after the senders ahead of it in that ordering —
+    /// it does NOT sit at the tail and a low-id non-member can be ordered
+    /// before a higher-id local member. That ordering is irrelevant to the
+    /// LOCAL members' real budgets, though: each member's drop decision is
+    /// computed separately via the unaugmented, cached
+    /// [`Self::should_drop_for_layer_budget`] path, which never sees this
+    /// transient sender. So no member is actually starved regardless of where
+    /// the non-member lands in this one-off ordering — the only stream this
+    /// computation governs is the non-member's own.
+    ///
+    /// Returns `true` when this `(spatial, temporal)` exceeds the budget the
+    /// stateless selection allocated to the sender (or the sender got no
+    /// budget at all). Base keyframes are handled by the caller before this
+    /// is reached, so a `None` budget entry here is a genuine drop.
+    ///
+    /// Cost: one `AllowSet` clone + one greedy `pick_layers` pass, paid only
+    /// on a non-base-layer video packet from a non-member sender to a
+    /// receive-all receiver that has reported a bandwidth estimate — a rare
+    /// combination relative to the steady-state member hot path.
+    #[allow(clippy::too_many_arguments)]
+    fn should_drop_non_member_for_layer_budget(
+        &self,
+        receiver_sid: SessionId,
+        sender_sid: SessionId,
+        spatial_layer_id: u32,
+        temporal_layer_id: u32,
+        allow_set: &crate::sfu::subscription::AllowSet,
+        speaker_set: &[SessionId],
+        receiver_bw_kbps: Option<u32>,
+    ) -> bool {
+        use crate::sfu::subscription::AllowSet;
+
+        // No bandwidth estimate → pass through (legacy fan-out for a
+        // freshly-joined receiver), matching `should_drop_for_layer_budget`.
+        let bw_kbps = match receiver_bw_kbps {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // Augment a clone of the membership-bound AllowSet with this sender.
+        let mut augmented = AllowSet {
+            audio: allow_set.audio.clone(),
+            video: allow_set.video.clone(),
+        };
+        augmented.video.entry(sender_sid).or_default();
+
+        let selection =
+            self.layer_selector
+                .pick_layers(receiver_sid, &augmented, speaker_set, bw_kbps);
+        match selection.forward.get(&(sender_sid, spatial_layer_id)) {
             Some(&max_t) => temporal_layer_id > max_t,
             None => true,
         }

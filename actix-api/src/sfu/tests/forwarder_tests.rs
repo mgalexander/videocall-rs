@@ -43,7 +43,7 @@ use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::ActiveSpeakerSet;
-use crate::sfu::subscription::{AllowSet, LayerPref, SubscriptionStore};
+use crate::sfu::subscription::{AllowSet, LayerPref, SubscriptionStore, MAX_VISIBLE_VIDEO};
 
 fn make_packet(sender_sid: u64) -> PacketWrapper {
     let mut pw = PacketWrapper::new();
@@ -222,6 +222,38 @@ fn build_wired_forwarder(
     let layer_selector = Arc::new(LayerSelector::new());
     let fwd = Arc::new(Forwarder::new(room, subs.clone(), rx, layer_selector));
     (fwd, subs)
+}
+
+/// Like [`build_wired_forwarder`] but also returns the shared `RoomState`
+/// handle so the caller can mutate membership / seed a bandwidth estimate
+/// after construction (vc-72a co-arrival + layer-budget tests).
+fn build_wired_forwarder_with_room(
+    room_name: &str,
+    members: &[SessionId],
+    speakers: ActiveSpeakerSet,
+) -> (
+    Arc<Forwarder>,
+    Arc<RwLock<SubscriptionStore>>,
+    Arc<RwLock<RoomState>>,
+) {
+    let room = Arc::new(RwLock::new(RoomState::new(room_name.to_string())));
+    {
+        let mut w = room.write().unwrap();
+        for &sid in members {
+            w.insert_member(sid, 0);
+        }
+    }
+    let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
+    let (tx, rx) = watch::channel(speakers);
+    std::mem::forget(tx);
+    let layer_selector = Arc::new(LayerSelector::new());
+    let fwd = Arc::new(Forwarder::new(
+        room.clone(),
+        subs.clone(),
+        rx,
+        layer_selector,
+    ));
+    (fwd, subs, room)
 }
 
 /// Build a SubscriptionUpdate with the supplied fields, suitable for handing
@@ -1106,5 +1138,295 @@ fn vc_78q_prune_session_clears_layer_selector_state() {
     assert!(
         layer_selector.last_selection_for(receiver).is_none(),
         "prune_session must drop the receiver's cached LayerSelector state"
+    );
+}
+
+// ===========================================================================
+// vc-72a: T=0 co-arrival — a listener present before/with the first publisher
+// must receive that publisher's media, including when the publisher is NOT a
+// local room member (cross-pod co-arrival, or the brief window before a
+// same-pod sender's `insert_member` lands). The AllowSet is membership-bound,
+// so a receiver in receive-all mode falls back to admitting any sender whose
+// media actually reached this pod.
+// ===========================================================================
+
+/// vc-72a: a bot listener that never sent a `SubscriptionUpdate`
+/// (legacy-default → implicit "receive everyone") must receive the media of a
+/// publisher that is NOT in this pod's local member snapshot. This is the
+/// zero-media regression: in a multi-pod deployment the publisher joined a
+/// different pod, so it never appears in `current_members` here, yet its media
+/// is delivered over NATS and the listener must get it.
+#[test]
+fn vc_72a_co_arrival_no_update_admits_non_member_publisher() {
+    let listener: SessionId = 1;
+    let publisher: SessionId = 2;
+    // Only the listener is a LOCAL member; the publisher joined elsewhere.
+    // Give the listener a realistic bandwidth estimate (the normal real-world
+    // case) so the layer-budget stage actually engages — this is what made
+    // the original fix's video half a no-op (keyframes only).
+    let (fwd, _subs, room) =
+        build_wired_forwarder_with_room("vc-72a-no-update", &[listener], ActiveSpeakerSet::empty());
+    set_receiver_bandwidth(&room, listener, 2000); // fat pipe → T0+T1+T2 fit
+
+    let (pw_audio, mp_audio) = build_media(publisher, MediaType::AUDIO);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_audio, Some(&mp_audio)),
+            ForwardDecision::Forward
+        ),
+        "no-update listener must hear a non-member publisher's audio (cross-pod co-arrival)"
+    );
+
+    // Base keyframe (T0+S0) — always forwards (invariant 1), even pre-fix.
+    let (pw_kf, mp_kf) = build_video_with_layer(publisher, 0, 0, true);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_kf, Some(&mp_kf)),
+            ForwardDecision::Forward
+        ),
+        "no-update listener must see a non-member publisher's base keyframe"
+    );
+
+    // Non-keyframe T1 delta — this is the real test. Before the layer-budget
+    // fix this was DROPPED (sender absent from membership-bound allow.video →
+    // ordered_senders filters it out → no budget entry → drop), leaving the
+    // listener with frozen video. With a fat 2000 kbps budget the augmented
+    // pick_layers allocates the non-member T0+T1+T2, so a T1 must forward.
+    let (pw_t1, mp_t1) = build_video_with_layer(publisher, 0, 1, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_t1, Some(&mp_t1)),
+            ForwardDecision::Forward
+        ),
+        "no-update listener must receive a non-member publisher's NON-keyframe \
+         video (T1) — not just periodic keyframes (vc-72a video half)"
+    );
+}
+
+/// vc-72a: a listener that declared an empty subscription but with
+/// `receive_all_audio=true` / `receive_all_video=true` (the
+/// `SubscriptionCoalescer`'s opening flush) must likewise admit a non-member
+/// publisher's media. The receive-all flags express intent independent of
+/// local membership.
+#[test]
+fn vc_72a_co_arrival_receive_all_admits_non_member_publisher() {
+    let listener: SessionId = 100;
+    let publisher: SessionId = 200;
+    let (fwd, subs, room) = build_wired_forwarder_with_room(
+        "vc-72a-receive-all",
+        &[listener],
+        ActiveSpeakerSet::empty(),
+    );
+    set_receiver_bandwidth(&room, listener, 2000);
+
+    // Opening empty update with both receive-all flags set. Note the room
+    // snapshot at apply time contains only the listener.
+    {
+        let members = [listener].into_iter().collect();
+        let mut s = subs.write().unwrap();
+        let mut u = SubscriptionUpdate::new();
+        u.receive_all_audio = true;
+        u.receive_all_video = true;
+        s.apply_update(listener, u, &members);
+    }
+
+    let (pw_audio, mp_audio) = build_media(publisher, MediaType::AUDIO);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_audio, Some(&mp_audio)),
+            ForwardDecision::Forward
+        ),
+        "receive_all_audio listener must hear a non-member publisher"
+    );
+    // Non-keyframe T1 from a non-member publisher must forward through the
+    // layer-budget stage (not just keyframes).
+    let (pw_t1, mp_t1) = build_video_with_layer(publisher, 0, 1, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_t1, Some(&mp_t1)),
+            ForwardDecision::Forward
+        ),
+        "receive_all_video listener must see a non-member publisher's NON-keyframe video"
+    );
+}
+
+/// vc-72a layer-budget: a non-member publisher admitted via the receive-all
+/// fallback is still subject to the receiver's SVC budget. At a TIGHT 200 kbps
+/// downlink only T0 (128 kbps) fits, so a T1/T2 non-keyframe must be dropped
+/// with `layer_budget` — exactly like a local member. This proves the
+/// augmented `pick_layers` path applies the budget, not a blanket admit.
+#[test]
+fn vc_72a_non_member_video_obeys_tight_layer_budget() {
+    let listener: SessionId = 1;
+    let publisher: SessionId = 2; // non-member
+    let (fwd, _subs, room) = build_wired_forwarder_with_room(
+        "vc-72a-tight-budget",
+        &[listener],
+        ActiveSpeakerSet::empty(),
+    );
+    set_receiver_bandwidth(&room, listener, 200); // 170 effective → T0 only
+
+    // T0 delta forwards (fits the budget).
+    let (pw_t0, mp_t0) = build_video_with_layer(publisher, 0, 0, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_t0, Some(&mp_t0)),
+            ForwardDecision::Forward
+        ),
+        "non-member T0 must fit a 200 kbps budget"
+    );
+
+    // T1 delta does NOT fit → dropped as layer_budget.
+    let before = SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).get();
+    let (pw_t1, mp_t1) = build_video_with_layer(publisher, 0, 1, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_t1, Some(&mp_t1)),
+            ForwardDecision::Drop
+        ),
+        "non-member T1 must be dropped at a 200 kbps budget (T0 only)"
+    );
+    let after = SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).get();
+    assert!(
+        after > before,
+        "dropped non-member T1 must increment sfu_dropped_total{{layer_budget}}"
+    );
+}
+
+/// vc-72a cap interaction: the receive-all non-member fallback MUST honor
+/// MAX_VISIBLE_VIDEO. With the membership-bound AllowSet already at the cap
+/// (6 local member publishers, all visible via the legacy-default fan-out),
+/// a 7th NON-member publisher's video must be dropped — otherwise a
+/// receive-all receiver in a >6-publisher multi-pod room could be flooded
+/// with unbounded cross-pod video streams.
+#[test]
+fn vc_72a_non_member_video_respects_max_visible_cap() {
+    let listener: SessionId = 1;
+    // 6 local member publishers fill the cap for the no-update listener.
+    let local_pubs: Vec<SessionId> = (10..16).collect(); // exactly MAX_VISIBLE_VIDEO
+    let mut members = vec![listener];
+    members.extend(&local_pubs);
+    let (fwd, _subs, room) =
+        build_wired_forwarder_with_room("vc-72a-cap", &members, ActiveSpeakerSet::empty());
+    set_receiver_bandwidth(&room, listener, 100_000); // huge budget — cap, not budget, must bind
+
+    // Sanity: the membership-bound AllowSet already holds MAX_VISIBLE_VIDEO
+    // entries, so the cap is full.
+    assert_eq!(local_pubs.len(), MAX_VISIBLE_VIDEO as usize);
+
+    // A local member's video forwards (it is within the cap).
+    let (pw_member, mp_member) = build_video_with_layer(local_pubs[0], 0, 1, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_member, Some(&mp_member)),
+            ForwardDecision::Forward
+        ),
+        "a capped local member's video must still forward"
+    );
+
+    // A 7th NON-member publisher's video must be DROPPED — cap is full.
+    let non_member: SessionId = 999;
+    let before = SFU_DROPPED_TOTAL.with_label_values(&["unsubscribed"]).get();
+    let (pw_extra, mp_extra) = build_video_with_layer(non_member, 0, 1, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_extra, Some(&mp_extra)),
+            ForwardDecision::Drop
+        ),
+        "a non-member video admit beyond MAX_VISIBLE_VIDEO must be dropped"
+    );
+    let after = SFU_DROPPED_TOTAL.with_label_values(&["unsubscribed"]).get();
+    assert!(
+        after > before,
+        "the capped-out non-member video drop must count as unsubscribed"
+    );
+
+    // Audio is NOT subject to the video cap — the 7th publisher is still
+    // audible (receive-all audio).
+    let (pw_audio, mp_audio) = build_media(non_member, MediaType::AUDIO);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_audio, Some(&mp_audio)),
+            ForwardDecision::Forward
+        ),
+        "non-member audio is not subject to the video cap"
+    );
+}
+
+/// vc-72a regression guard: the receive-all fallback must NOT leak media to a
+/// listener that declared a genuinely restrictive subscription (both
+/// receive-all flags false, no pins/slots). Such a receiver still gets the
+/// membership-bound AllowSet and a non-subscribed sender is dropped.
+#[test]
+fn vc_72a_restrictive_subscription_still_drops_non_member() {
+    let listener: SessionId = 100;
+    let publisher: SessionId = 200;
+    let (fwd, subs) = build_wired_forwarder(
+        "vc-72a-restrictive",
+        &[listener, publisher],
+        ActiveSpeakerSet::empty(),
+    );
+
+    {
+        let members = [listener, publisher].into_iter().collect();
+        let mut s = subs.write().unwrap();
+        // Restrictive: empty pins, no slots, both receive-all flags false.
+        s.apply_update(listener, sub_update(&[], false), &members);
+    }
+
+    let (pw_audio, mp_audio) = build_media(publisher, MediaType::AUDIO);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_audio, Some(&mp_audio)),
+            ForwardDecision::Drop
+        ),
+        "restrictive listener must NOT receive an unsubscribed sender's audio"
+    );
+    let (pw_video, mp_video) = build_media(publisher, MediaType::VIDEO);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_video, Some(&mp_video)),
+            ForwardDecision::Drop
+        ),
+        "restrictive listener must NOT receive an unsubscribed sender's video"
+    );
+}
+
+/// vc-72a: ordering test (listener registers, THEN publisher registers and
+/// produces). Mirrors the staircase shard-A shape: the listener is present
+/// first, the publisher joins as a local member afterward, and the AllowSet
+/// must expand to deliver its media on the very first packet.
+#[test]
+fn vc_72a_listener_first_then_publisher_joins_local() {
+    let listener: SessionId = 1;
+    let publisher: SessionId = 2;
+    let room = Arc::new(RwLock::new(RoomState::new("vc-72a-order".to_string())));
+    {
+        let mut w = room.write().unwrap();
+        w.insert_member(listener, 0);
+    }
+    let subs = Arc::new(RwLock::new(SubscriptionStore::new()));
+    let (tx, rx) = watch::channel(ActiveSpeakerSet::empty());
+    std::mem::forget(tx);
+    let fwd = Arc::new(Forwarder::new(
+        room.clone(),
+        subs,
+        rx,
+        Arc::new(LayerSelector::new()),
+    ));
+
+    // Publisher joins as a local member after the listener is already present.
+    {
+        let mut w = room.write().unwrap();
+        w.insert_member(publisher, 0);
+    }
+
+    let (pw_audio, mp_audio) = build_media(publisher, MediaType::AUDIO);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_audio, Some(&mp_audio)),
+            ForwardDecision::Forward
+        ),
+        "listener-first then publisher-joins: first audio packet must forward"
     );
 }

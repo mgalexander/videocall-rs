@@ -419,6 +419,41 @@ impl SubscriptionStore {
         AllowSet { audio, video }
     }
 
+    /// Whether `receiver` is in a "receive everyone" posture for audio and
+    /// video respectively, returned as `(receive_all_audio, receive_all_video)`.
+    ///
+    /// vc-72a: the [`AllowSet`] produced by [`Self::resolve_inner`] is built
+    /// from the LOCAL room-member snapshot. In a multi-pod deployment a
+    /// sender that joined a *different* pod is never in this pod's
+    /// `current_members`, so it can never appear in the AllowSet — even
+    /// though its media physically arrives here over NATS. The same gap
+    /// shows up for a brief window during same-pod co-arrival, before the
+    /// sender's `insert_member` lands. Either way the forwarder would
+    /// hard-drop the sender's media as "unsubscribed" and the receiver gets
+    /// zero packets for the whole run.
+    ///
+    /// This predicate lets the forwarder recover the receiver's intent
+    /// independently of local membership: a receiver that wants to see/hear
+    /// everyone should be forwarded any sender whose media actually reached
+    /// this pod, regardless of whether that sender is a *local* member.
+    ///
+    /// Semantics:
+    /// * **No `SubscriptionUpdate` ever applied** (the bot / legacy-client
+    ///   path) → `(true, true)`. The receiver implicitly wants everyone, so
+    ///   both tiers fall back to receive-all. This mirrors the legacy-default
+    ///   AllowSet, which fans out to every member.
+    /// * **Explicit subscription present** → `(receive_all_audio,
+    ///   receive_all_video)` exactly as declared. A receiver that declared a
+    ///   restrictive subscription (both flags false) gets `(false, false)`
+    ///   and the membership-bound AllowSet remains authoritative for it.
+    pub fn receive_mode(&self, receiver: SessionId) -> (bool, bool) {
+        match self.per_receiver.get(&receiver) {
+            // Legacy-default receiver: implicitly "see + hear everyone".
+            None => (true, true),
+            Some(sub) => (sub.receive_all_audio, sub.receive_all_video),
+        }
+    }
+
     /// Drop all state associated with `receiver` (called on disconnect).
     pub fn forget(&mut self, receiver: SessionId) {
         self.per_receiver.remove(&receiver);
@@ -1091,6 +1126,37 @@ mod tests {
             Arc::ptr_eq(&a, &b),
             "receiver 1's cache must survive receiver 2's apply_update"
         );
+    }
+
+    // ---------------- vc-72a: receive_mode posture ----------------
+
+    /// vc-72a: a receiver that never sent a `SubscriptionUpdate` is in the
+    /// implicit "see + hear everyone" posture so the forwarder can admit a
+    /// publisher that is not a local member (cross-pod co-arrival).
+    #[test]
+    fn receive_mode_defaults_to_all_for_no_update_receiver() {
+        let store = SubscriptionStore::new();
+        assert_eq!(store.receive_mode(1), (true, true));
+    }
+
+    /// vc-72a: an explicit subscription reports its declared receive-all
+    /// flags verbatim. The `SubscriptionCoalescer`'s opening empty flush
+    /// (`receive_all_audio=true`, `receive_all_video=true`) → `(true, true)`.
+    #[test]
+    fn receive_mode_reports_declared_flags() {
+        let mut store = SubscriptionStore::new();
+        let room = members(&[1, 2]);
+
+        store.apply_update(1, update_all(&[], vec![], true, true), &room);
+        assert_eq!(store.receive_mode(1), (true, true));
+
+        // Audio-only fan-out.
+        store.apply_update(1, update_all(&[], vec![], true, false), &room);
+        assert_eq!(store.receive_mode(1), (true, false));
+
+        // Restrictive: both flags false.
+        store.apply_update(1, update_all(&[], vec![], false, false), &room);
+        assert_eq!(store.receive_mode(1), (false, false));
     }
 
     /// A lower (older) generation must miss the cache — the invariant is
