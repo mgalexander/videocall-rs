@@ -67,6 +67,10 @@ struct DecoderPool {
     /// logged at `debug` to avoid blocking decode.
     feedback_tx: mpsc::Sender<Vec<u8>>,
     stats: Arc<BotStats>,
+    /// vc-1re: when true the decode path strips + verifies the integrity
+    /// trailer on each MEDIA payload and folds the observation into
+    /// `stats.integrity`. Mirrors the `--verify-integrity` flag.
+    verify_integrity: bool,
 }
 
 /// Per-publisher rolling counters that drive feedback emission.
@@ -222,6 +226,9 @@ pub struct WebTransportClient {
     /// packet and runs real VP9 / Opus decode so the bot exerts client-side
     /// CPU comparable to a real browser participant (vc-86j).
     decode: bool,
+    /// vc-1re: when true the decode path strips + verifies the integrity
+    /// trailer on each MEDIA payload. Threaded into the [`DecoderPool`].
+    verify_integrity: bool,
 }
 
 impl WebTransportClient {
@@ -233,6 +240,7 @@ impl WebTransportClient {
             stats: None,
             session_end: None,
             decode: false,
+            verify_integrity: false,
         }
     }
 
@@ -257,6 +265,16 @@ impl WebTransportClient {
     /// CPU. Senders should leave this disabled — they don't subscribe.
     pub fn with_decode(mut self, decode: bool) -> Self {
         self.decode = decode;
+        self
+    }
+
+    /// Enable integrity trailer verification on the inbound decode path
+    /// (vc-1re). When set, the listener strips the `[magic][seq][crc32]`
+    /// trailer from each MEDIA payload, recomputes the CRC, and folds the
+    /// observation into `stats.integrity`. No-op unless decode is also on
+    /// (the trailer check runs inside the decode dispatch).
+    pub fn with_verify_integrity(mut self, verify_integrity: bool) -> Self {
+        self.verify_integrity = verify_integrity;
         self
     }
 
@@ -420,6 +438,7 @@ impl WebTransportClient {
             let quit = self.quit.clone();
             let stats = self.stats.clone();
             let session_end = self.session_end.clone();
+            let verify_integrity = self.verify_integrity;
             // Decoders only meaningful when both `decode` is on and we have a
             // stats handle to publish counters into.
             //
@@ -442,6 +461,7 @@ impl WebTransportClient {
                         local_user_id: user_id.clone(),
                         feedback_tx,
                         stats: s.clone(),
+                        verify_integrity,
                     });
                     start_feedback_writer(
                         session.clone(),
@@ -653,7 +673,13 @@ fn decode_packet(pool: &DecoderPool, data: &[u8]) {
             return;
         }
     };
+    // vc-1re media-vs-control split: classify the wrapper at the decode
+    // dispatch site. Non-MEDIA wrappers (heartbeat, SPEAKER_UPDATE,
+    // ADMISSION_DECISION, ...) land on `control_packets_received`; MEDIA
+    // wrappers are further split into video/audio/other below. This is the
+    // single increment site for all six split counters.
     if wrapper.packet_type != PacketType::MEDIA.into() {
+        pool.stats.record_control_packet();
         return;
     }
     let media = match MediaPacket::parse_from_bytes(&wrapper.data) {
@@ -666,15 +692,48 @@ fn decode_packet(pool: &DecoderPool, data: &[u8]) {
 
     let publisher = String::from_utf8_lossy(&media.user_id).into_owned();
     let media_type = media.media_type.enum_value_or(MediaType::HEARTBEAT);
+    pool.stats.record_media_packet(
+        media_type == MediaType::VIDEO,
+        media_type == MediaType::AUDIO,
+    );
+
+    // vc-1re integrity: strip + verify the trailer (if present) and fold the
+    // observation into the per-(publisher, media_type) tracker. The codec
+    // must be fed the bytes BEFORE the trailer, so we compute `payload_len`
+    // and slice `media.data` accordingly. When verification is off — or the
+    // payload carries no trailer — the codec sees the full `media.data`.
+    let payload: &[u8] = if pool.verify_integrity {
+        match crate::integrity::check_trailer(&media.data) {
+            crate::integrity::TrailerCheck::Ok { payload_len, seq } => {
+                pool.stats
+                    .integrity
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record_ok(&publisher, media_type, seq);
+                &media.data[..payload_len]
+            }
+            crate::integrity::TrailerCheck::CrcMismatch { payload_len, seq } => {
+                pool.stats
+                    .integrity
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record_crc_mismatch(&publisher, media_type, seq);
+                &media.data[..payload_len]
+            }
+            crate::integrity::TrailerCheck::Absent => &media.data,
+        }
+    } else {
+        &media.data
+    };
 
     match media_type {
-        MediaType::VIDEO => decode_video(pool, &publisher, &media),
-        MediaType::AUDIO => decode_audio(pool, &publisher, &media),
+        MediaType::VIDEO => decode_video(pool, &publisher, &media, payload),
+        MediaType::AUDIO => decode_audio(pool, &publisher, payload),
         _ => {}
     }
 }
 
-fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
+fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket, payload: &[u8]) {
     let frame_type = if media.frame_type == "key" {
         FrameType::KeyFrame
     } else {
@@ -689,13 +748,14 @@ fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
     // Per-publisher window accounting (drives DiagnosticsPacket fps/bitrate)
     // and sequence-gap KFR detection. Done under the publishers mutex; the
     // mutex itself is uncontended outside the periodic emitter, so the hot
-    // path stays single-lock single-publisher.
+    // path stays single-lock single-publisher. `payload` is the codec bytes
+    // with any integrity trailer already stripped (vc-1re).
     let kfr = update_publisher_video_window(
         pool,
         publisher,
         sequence_number,
         &media.frame_type,
-        media.data.len() as u64,
+        payload.len() as u64,
     );
     if let Some(req) = kfr {
         emit_keyframe_request(pool, publisher, req);
@@ -738,16 +798,20 @@ fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
         frame_type,
         codec: FrameCodec::Vp9Profile0Level10Bit8,
         temporal_layer_id: 0,
-        data: media.data.clone(),
+        // vc-1re: feed the codec the trailer-stripped payload, never the
+        // trailer bytes.
+        data: payload.to_vec(),
         timestamp: media.timestamp,
     };
     decoder.decode(FrameBuffer::new(frame, 0));
 }
 
-fn decode_audio(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
+fn decode_audio(pool: &DecoderPool, publisher: &str, payload: &[u8]) {
     // Update per-publisher AUDIO window counters before the actual decode
     // so the periodic emitter sees the byte/frame even if opus fails.
-    update_publisher_audio_window(pool, publisher, media.data.len() as u64);
+    // `payload` is the codec bytes with any integrity trailer stripped
+    // (vc-1re).
+    update_publisher_audio_window(pool, publisher, payload.len() as u64);
 
     let mut map = pool.audio.lock().unwrap_or_else(|p| p.into_inner());
     let decoder = match map.entry(publisher.to_string()) {
@@ -766,7 +830,7 @@ fn decode_audio(pool: &DecoderPool, publisher: &str, media: &MediaPacket) {
 
     // 20 ms at 48 kHz mono = 960 samples; oversize buffer is fine.
     let mut pcm = [0.0f32; 5760];
-    match decoder.decode_float(&media.data, &mut pcm, false) {
+    match decoder.decode_float(payload, &mut pcm, false) {
         Ok(_) => pool.stats.record_audio_decoded(),
         Err(_) => pool.stats.record_decode_error(),
     }
@@ -1377,7 +1441,16 @@ mod tests {
             local_user_id: "test-listener".to_string(),
             feedback_tx,
             stats: BotStats::new("test".into(), BotRole::Listener),
+            verify_integrity: false,
         }
+    }
+
+    /// vc-1re: an `empty_pool` variant with integrity verification enabled so
+    /// the trailer-strip + CRC path is exercised in tests.
+    fn empty_pool_with_integrity() -> DecoderPool {
+        let mut pool = empty_pool();
+        pool.verify_integrity = true;
+        pool
     }
 
     #[test]
@@ -1407,6 +1480,126 @@ mod tests {
         assert_eq!(pool.stats.audio_frames_decoded.load(Ordering::Relaxed), 0);
     }
 
+    /// vc-1re media-vs-control split: a non-MEDIA wrapper bumps
+    /// `control_packets_received`, never the media counters.
+    #[test]
+    fn decode_packet_classifies_control_wrapper_vc_1re() {
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::QUEUED.into(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            data: decision.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let pool = empty_pool();
+        decode_packet(&pool, &wrapper.write_to_bytes().unwrap());
+        assert_eq!(
+            pool.stats.control_packets_received.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(pool.stats.media_packets_received.load(Ordering::Relaxed), 0);
+    }
+
+    /// Build a real Opus 20ms frame matching `audio_producer.rs`, optionally
+    /// append the vc-1re integrity trailer, wrap it as the sender would, and
+    /// return the wire bytes. `seq` reuses AudioMetadata.sequence semantics.
+    fn opus_media_wire(publisher: &str, seq: u64, with_trailer: bool) -> Vec<u8> {
+        use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
+        let mut encoder = OpusEncoder::new(48000, OpusChannels::Mono, OpusApp::Voip)
+            .expect("construct Opus encoder");
+        let pcm = vec![0.05f32; 960]; // 20ms @ 48kHz mono
+        let mut encoded = vec![0u8; 4000];
+        let n = encoder
+            .encode_float(&pcm, &mut encoded)
+            .expect("encode opus");
+        encoded.truncate(n);
+        if with_trailer {
+            crate::integrity::append_trailer(&mut encoded, seq);
+        }
+        let media = MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            user_id: publisher.as_bytes().to_vec(),
+            data: encoded,
+            frame_type: "key".to_string(),
+            audio_metadata: Some(
+                videocall_types::protos::media_packet::AudioMetadata {
+                    sequence: seq,
+                    ..Default::default()
+                }
+                .into(),
+            )
+            .into(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: publisher.as_bytes().to_vec(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    /// vc-1re loopback self-test: sender → in-process → receiver, NO SFU. A
+    /// clean run of trailered frames must verify with zero CRC mismatches and
+    /// zero unexplained gaps, AND the audio must still decode (proving the
+    /// trailer was stripped before the codec saw it).
+    #[test]
+    fn integrity_loopback_clean_path_has_no_mismatches_or_gaps_vc_1re() {
+        let pool = empty_pool_with_integrity();
+        for seq in 0..10 {
+            let wire = opus_media_wire("sender-0", seq, true);
+            decode_packet(&pool, &wire);
+        }
+        let summary = pool
+            .stats
+            .integrity
+            .lock()
+            .unwrap()
+            .summarize(pool.stats.drops.load(Ordering::Relaxed));
+        assert_eq!(
+            summary.crc_mismatches, 0,
+            "clean path must have 0 mismatches"
+        );
+        assert_eq!(summary.unexplained_gaps, 0, "clean path must have 0 gaps");
+        assert_eq!(summary.media_received_distinct, 10);
+        assert_eq!(summary.media_seq_max, 9);
+        // Trailer was stripped → opus decoded every frame, no decode errors.
+        assert_eq!(pool.stats.audio_frames_decoded.load(Ordering::Relaxed), 10);
+        assert_eq!(pool.stats.decode_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// vc-1re loopback self-test (corruption arm): flipping one payload byte
+    /// after the trailer is stamped must surface exactly one `crc_mismatch`.
+    /// This proves the counter is live, not vacuously zero.
+    #[test]
+    fn integrity_loopback_corrupt_byte_trips_one_mismatch_vc_1re() {
+        let pool = empty_pool_with_integrity();
+        // First frame: clean.
+        decode_packet(&pool, &opus_media_wire("sender-0", 0, true));
+        // Second frame: corrupt one codec byte (index 0 is inside the
+        // payload, well before the trailer). The decoded wrapper carries the
+        // mutated payload + the original stamped CRC → mismatch.
+        let mut wire = opus_media_wire("sender-0", 1, true);
+        // Mutate a byte inside the inner MediaPacket payload. Re-parse,
+        // corrupt the codec data, re-serialize so the trailer CRC no longer
+        // matches the (now-mutated) payload.
+        let mut wrapper = PacketWrapper::parse_from_bytes(&wire).unwrap();
+        let mut media = MediaPacket::parse_from_bytes(&wrapper.data).unwrap();
+        media.data[0] ^= 0xFF;
+        wrapper.data = media.write_to_bytes().unwrap();
+        wire = wrapper.write_to_bytes().unwrap();
+        decode_packet(&pool, &wire);
+
+        let summary = pool.stats.integrity.lock().unwrap().summarize(0);
+        assert_eq!(
+            summary.crc_mismatches, 1,
+            "exactly one corrupted frame must trip crc_mismatches"
+        );
+    }
+
     /// Pool variant that keeps the feedback receiver alive so try_send
     /// succeeds, letting the test count packets actually queued.
     fn pool_with_drain() -> (DecoderPool, mpsc::Receiver<Vec<u8>>) {
@@ -1418,6 +1611,7 @@ mod tests {
             local_user_id: "test-listener".to_string(),
             feedback_tx,
             stats: BotStats::new("test".into(), BotRole::Listener),
+            verify_integrity: false,
         };
         (pool, feedback_rx)
     }

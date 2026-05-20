@@ -152,6 +152,19 @@ ci-load-test:
 	./helm/local/down.sh || true; \
 	exit $$LOAD_EXIT
 
+# Integrity-ON smoke (bead vc-1re). Runs the bot's byte-fidelity integrity
+# path every build so it never rots dark: the loopback self-test drives a
+# sender->in-process->receiver flow with the `[magic][seq][crc32]` trailer
+# enabled and asserts `crc_mismatches == 0` / `unexplained_gaps == 0` on the
+# clean path plus exactly one mismatch on a deliberately corrupted byte. This
+# exercises the same trailer codec the `--verify-integrity` orchestrate flag
+# uses, without standing up a cluster. The 100-bot startup-race stress test
+# and the fixed-shape counter-contract serialization tests run in the same
+# pass. Cheap (cargo test), so it gates every PR alongside the 50-bot gate.
+ci-bot-integrity:
+	cargo test -p bot integrity:: --no-fail-fast -- --nocapture
+	cargo test -p bot vc_1re --no-fail-fast -- --nocapture
+
 # Release gate override defaults. CLI/env overrides still win — `make
 # ci-load-test-release SENDERS=20` swaps the sender count in.
 RELEASE_SENDERS ?= 10

@@ -19,6 +19,7 @@
 mod audio_producer;
 mod config;
 mod failover;
+mod integrity;
 mod orchestrate;
 mod stats;
 mod video_encoder; // VP9 encoder from videocall-cli
@@ -123,6 +124,16 @@ struct Cli {
     /// `--failover-test` modes; ignored in single-bot mode. Default: 0.
     #[arg(long, default_value_t = 0)]
     index_offset: usize,
+
+    /// Enable byte-fidelity integrity verification (vc-1re). When set, sender
+    /// bots append a `[magic][seq][crc32]` trailer to each codec payload and
+    /// listener bots strip + verify it, populating the `crc_mismatches`,
+    /// `media_seq_max`, `media_received_distinct`, and `unexplained_gaps`
+    /// counters. Off by default so ordinary capacity runs stay byte-for-byte
+    /// identical to baseline traffic. Applies to `--orchestrate` and
+    /// `--failover-test`; ignored in single-bot mode.
+    #[arg(long, default_value_t = false)]
+    verify_integrity: bool,
 }
 
 #[tokio::main]
@@ -200,6 +211,7 @@ fn build_failover_config(cli: Cli) -> anyhow::Result<FailoverConfig> {
         reconnect_interval: Duration::from_millis(cli.reconnect_interval_ms),
         user_id_prefix: cli.user_id_prefix,
         index_offset: cli.index_offset,
+        verify_integrity: cli.verify_integrity,
     })
 }
 
@@ -238,6 +250,7 @@ fn build_orchestration_config(cli: Cli) -> anyhow::Result<OrchestrationConfig> {
         image_dir: cli.image_dir,
         user_id_prefix: cli.user_id_prefix,
         index_offset: cli.index_offset,
+        verify_integrity: cli.verify_integrity,
     })
 }
 
@@ -322,6 +335,7 @@ async fn run_client(
             "BundyBests2.wav",
             packet_tx.clone(),
             None,
+            false, // single-bot mode does not run integrity (vc-1re)
         ) {
             Ok(producer) => {
                 audio_producer = Some(producer);
@@ -344,6 +358,7 @@ async fn run_client(
             ".", // Images are in current directory (bot working dir)
             packet_tx.clone(),
             None,
+            false, // single-bot mode does not run integrity (vc-1re)
         ) {
             Ok(producer) => {
                 video_producer = Some(producer);

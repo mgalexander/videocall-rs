@@ -94,6 +94,22 @@ cargo run -- --orchestrate --room load --senders 50 --listeners 50 \
 
 A `--user-id-prefix=us-east-` would yield `us-east-sender-100`, etc.
 
+### Byte-Fidelity Integrity Verification (`--verify-integrity`)
+
+`--verify-integrity` makes senders append a `[magic][seq][crc32]` trailer to
+each codec payload and listeners strip + verify it, populating the
+`crc_mismatches`, `media_seq_max`, `media_received_distinct`, and
+`unexplained_gaps` counters in the summary JSON. Use it when you need to prove
+not just that media arrived but that the exact codec bytes arrived intact
+(Level-3 material match) and account for sequence gaps (Level-4 completeness);
+leave it off for ordinary capacity runs, since it keeps traffic byte-for-byte
+identical to baseline only when disabled.
+
+```bash
+cargo run -- --orchestrate --room load --senders 5 --listeners 45 \
+  --duration 60 --server-url https://... --verify-integrity
+```
+
 ## Media Protocol
 
 - **Audio**: 50fps (20ms Opus packets) following neteq_player.rs pattern

@@ -73,6 +73,9 @@ pub struct OrchestrationConfig {
     /// user_id (e.g. with `index_offset = 100` the first sender becomes
     /// `sender-100`).
     pub index_offset: usize,
+    /// vc-1re: enable byte-fidelity integrity verification. Senders append a
+    /// trailer; listeners strip + verify it. Off by default.
+    pub verify_integrity: bool,
 }
 
 /// Aggregate totals across every bot in the run.
@@ -110,6 +113,18 @@ struct Totals {
     /// non-owner pod under the room→ordinal jump-hash mapping and migrated
     /// to the correct owner. Stays at `0` for healthy single-pod runs.
     redirects_followed: u64,
+    /// vc-1re: highest media sequence observed across the bots in this
+    /// rollup. FIXED-SHAPE — always serialized, even at zero.
+    media_seq_max: u64,
+    /// vc-1re: total distinct verified media payloads across the rollup.
+    /// FIXED-SHAPE.
+    media_received_distinct: u64,
+    /// vc-1re: total CRC mismatches across the rollup. MUST be 0 on a clean
+    /// integrity run. FIXED-SHAPE.
+    crc_mismatches: u64,
+    /// vc-1re: total unexplained sequence gaps across the rollup.
+    /// FIXED-SHAPE.
+    unexplained_gaps: u64,
 }
 
 /// Final summary JSON emitted to stdout.
@@ -151,6 +166,19 @@ struct OrchestrationSummary {
     /// to a different owner pod during the run. Always serialized — never
     /// gated by `skip_serializing_if`.
     redirects_followed: u64,
+    /// vc-1re: highest media sequence observed across all bots, surfaced at
+    /// the root. FIXED-SHAPE — always serialized, even at zero, so a
+    /// dashboard reading `.media_seq_max` never sees the key vanish.
+    media_seq_max: u64,
+    /// vc-1re: total distinct verified media payloads across all bots.
+    /// FIXED-SHAPE root field.
+    media_received_distinct: u64,
+    /// vc-1re: total CRC mismatches across all bots. MUST be 0 on a clean
+    /// integrity run. FIXED-SHAPE root field.
+    crc_mismatches: u64,
+    /// vc-1re: total unexplained sequence gaps across all bots. FIXED-SHAPE
+    /// root field.
+    unexplained_gaps: u64,
     totals: Totals,
     sender_totals: Totals,
     listener_totals: Totals,
@@ -189,10 +217,17 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
         let insecure = cfg.insecure;
         let audio_path = cfg.audio_path.clone();
         let image_dir = cfg.image_dir.clone();
+        let verify_integrity = cfg.verify_integrity;
 
         join_handles.push(tokio::spawn(async move {
             if let Err(e) = run_sender(
-                client_cfg, server_url, insecure, stats, audio_path, image_dir,
+                client_cfg,
+                server_url,
+                insecure,
+                stats,
+                audio_path,
+                image_dir,
+                verify_integrity,
             )
             .await
             {
@@ -214,9 +249,12 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
         };
         let server_url = cfg.server_url.clone();
         let insecure = cfg.insecure;
+        let verify_integrity = cfg.verify_integrity;
 
         join_handles.push(tokio::spawn(async move {
-            if let Err(e) = run_listener(client_cfg, server_url, insecure, stats).await {
+            if let Err(e) =
+                run_listener(client_cfg, server_url, insecure, stats, verify_integrity).await
+            {
                 error!("Listener failed: {}", e);
             }
         }));
@@ -261,6 +299,13 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
     // mirrors the receive-side `.drops`.
     let tx_drops = totals.tx_drops;
     let redirects_followed = totals.redirects_followed;
+    // vc-1re: hoist the integrity aggregates out before moving `totals` so
+    // the root-level fixed-shape fields stay in lock-step with the totals
+    // sub-object.
+    let media_seq_max = totals.media_seq_max;
+    let media_received_distinct = totals.media_received_distinct;
+    let crc_mismatches = totals.crc_mismatches;
+    let unexplained_gaps = totals.unexplained_gaps;
 
     let summary = OrchestrationSummary {
         senders: cfg.senders,
@@ -273,6 +318,10 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
         tx_drops_send_error,
         tx_drops,
         redirects_followed,
+        media_seq_max,
+        media_received_distinct,
+        crc_mismatches,
+        unexplained_gaps,
         totals,
         sender_totals,
         listener_totals,
@@ -323,6 +372,10 @@ fn empty_totals() -> Totals {
         tx_drops_send_error: 0,
         tx_drops: 0,
         redirects_followed: 0,
+        media_seq_max: 0,
+        media_received_distinct: 0,
+        crc_mismatches: 0,
+        unexplained_gaps: 0,
     }
 }
 
@@ -346,6 +399,13 @@ fn accumulate(t: &mut Totals, snap: &BotStatsSnapshot) {
     // invariant. Equivalent to `snap.tx_drops.unwrap_or(0)` today.
     t.tx_drops += snap.tx_drops_channel_full.unwrap_or(0) + snap.tx_drops_send_error.unwrap_or(0);
     t.redirects_followed += snap.redirects_followed.unwrap_or(0);
+    // vc-1re integrity rollup. `media_seq_max` is a max (highest observed
+    // sequence), not a sum; the other three are sums. All four are
+    // fixed-shape `u64` so they always serialize.
+    t.media_seq_max = t.media_seq_max.max(snap.media_seq_max);
+    t.media_received_distinct += snap.media_received_distinct;
+    t.crc_mismatches += snap.crc_mismatches;
+    t.unexplained_gaps += snap.unexplained_gaps;
 }
 
 fn finalise_avg(t: &mut Totals, duration_s: f64) {
@@ -373,6 +433,33 @@ pub(crate) fn compute_redirect_url(original: &Url, redirect_target: &str) -> any
     Ok(url)
 }
 
+/// Wall-clock unix-millis. Mirrors the helper in `failover.rs` /
+/// `webtransport_client.rs`; kept local so orchestrate doesn't depend on
+/// either module's private fn.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// vc-1re: record which pod the bot's media session landed on, and — if this
+/// connect closes out a pending redirect — append the hop to the redirect
+/// chain with its measured latency.
+///
+/// `pending_redirect_at_ms` is the timestamp captured when the bot observed
+/// the `ADMISSION_DECISION{REDIRECT}`. It is `Some` only between observing a
+/// redirect and the next successful connect; this fn clears it. A direct
+/// (first) connect leaves the chain empty and only sets `joined_pod`.
+fn record_landing(stats: &BotStats, current_url: &Url, pending_redirect_at_ms: &mut Option<u64>) {
+    let pod = current_url.host_str().unwrap_or("unknown").to_string();
+    stats.set_joined_pod(pod.clone());
+    if let Some(started) = pending_redirect_at_ms.take() {
+        let latency = now_ms().saturating_sub(started);
+        stats.record_redirect_hop(pod, latency);
+    }
+}
+
 async fn run_sender(
     config: ClientConfig,
     server_url: Url,
@@ -380,9 +467,13 @@ async fn run_sender(
     stats: Arc<BotStats>,
     audio_path: String,
     image_dir: String,
+    verify_integrity: bool,
 ) -> anyhow::Result<()> {
     let user_id = config.user_id.clone();
     info!("Initialising sender {}", user_id);
+    if verify_integrity {
+        stats.enable_verify_integrity();
+    }
 
     // vc-kni: drive connect+publish inside a reconnect-on-REDIRECT loop. The
     // SFU emits `ADMISSION_DECISION{REDIRECT}` when this bot lands on a
@@ -395,12 +486,20 @@ async fn run_sender(
     let original_url = server_url.clone();
     let mut current_url = server_url;
     let mut hops: u32 = 0;
+    // vc-1re: wall-clock ms at which we observed a REDIRECT, so the next
+    // successful connect can record the hop latency. `None` on the first
+    // (direct) connect.
+    let mut pending_redirect_at_ms: Option<u64> = None;
     loop {
         let signal = Arc::new(SessionEndSignal::default());
         let mut client = WebTransportClient::new(config.clone())
             .with_stats(stats.clone())
-            .with_session_end_signal(signal.clone());
+            .with_session_end_signal(signal.clone())
+            .with_verify_integrity(verify_integrity);
         client.connect(&current_url, insecure).await?;
+        // vc-1re: record the pod we actually landed on, and close out any
+        // pending redirect hop with its measured latency.
+        record_landing(&stats, &current_url, &mut pending_redirect_at_ms);
 
         let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
         client.start_packet_sender(packet_rx).await;
@@ -411,6 +510,7 @@ async fn run_sender(
             &audio_path,
             packet_tx.clone(),
             Some(stats.clone()),
+            verify_integrity,
         ) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -425,6 +525,7 @@ async fn run_sender(
             &image_dir,
             packet_tx.clone(),
             Some(stats.clone()),
+            verify_integrity,
         ) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -456,6 +557,10 @@ async fn run_sender(
                             user_id, next, hops, MAX_REDIRECT_HOPS
                         );
                         stats.record_redirect_followed();
+                        // vc-1re: start the hop stopwatch. The latency is
+                        // closed out (and the chain entry appended) when the
+                        // next connect lands, in `record_landing`.
+                        pending_redirect_at_ms = Some(now_ms());
                         current_url = next;
                         client.stop();
                         // Drop client + producers explicitly: producers stop
@@ -503,9 +608,13 @@ async fn run_listener(
     server_url: Url,
     insecure: bool,
     stats: Arc<BotStats>,
+    verify_integrity: bool,
 ) -> anyhow::Result<()> {
     let user_id = config.user_id.clone();
     info!("Initialising listener {}", user_id);
+    if verify_integrity {
+        stats.enable_verify_integrity();
+    }
 
     // vc-kni: same reconnect-on-REDIRECT loop as `run_sender`. Listeners
     // decode by default (vc-86j) so each iteration also re-arms the per-
@@ -514,13 +623,16 @@ async fn run_listener(
     let original_url = server_url.clone();
     let mut current_url = server_url;
     let mut hops: u32 = 0;
+    let mut pending_redirect_at_ms: Option<u64> = None;
     loop {
         let signal = Arc::new(SessionEndSignal::default());
         let mut client = WebTransportClient::new(config.clone())
             .with_stats(stats.clone())
             .with_session_end_signal(signal.clone())
-            .with_decode(true);
+            .with_decode(true)
+            .with_verify_integrity(verify_integrity);
         client.connect(&current_url, insecure).await?;
+        record_landing(&stats, &current_url, &mut pending_redirect_at_ms);
 
         let notified = signal.notify.notified();
         tokio::pin!(notified);
@@ -539,6 +651,7 @@ async fn run_listener(
                             user_id, next, hops, MAX_REDIRECT_HOPS
                         );
                         stats.record_redirect_followed();
+                        pending_redirect_at_ms = Some(now_ms());
                         current_url = next;
                         client.stop();
                         drop(client);
@@ -598,6 +711,10 @@ mod tests {
         let tx_drops_send_error = totals.tx_drops_send_error;
         let tx_drops = totals.tx_drops;
         let redirects_followed = totals.redirects_followed;
+        let media_seq_max = totals.media_seq_max;
+        let media_received_distinct = totals.media_received_distinct;
+        let crc_mismatches = totals.crc_mismatches;
+        let unexplained_gaps = totals.unexplained_gaps;
 
         let summary = OrchestrationSummary {
             senders: 0,
@@ -610,6 +727,10 @@ mod tests {
             tx_drops_send_error,
             tx_drops,
             redirects_followed,
+            media_seq_max,
+            media_received_distinct,
+            crc_mismatches,
+            unexplained_gaps,
             totals,
             sender_totals,
             listener_totals,
@@ -712,5 +833,95 @@ mod tests {
     fn compute_redirect_url_rejects_empty_target() {
         let original = Url::parse("https://lb-host:8443/").unwrap();
         assert!(compute_redirect_url(&original, "").is_err());
+    }
+
+    /// vc-1re: the four integrity counters MUST be present at the summary
+    /// root AND in all three Totals roll-ups (`totals`, `sender_totals`,
+    /// `listener_totals`), even when every value is zero. This test FAILS if
+    /// any of the four fixed-shape fields disappears from any of those four
+    /// JSON objects. Together with the failover-side test, this fulfils the
+    /// vc-1re counter contract: one increment site (BotStats), one snapshot
+    /// field (BotStatsSnapshot), one rollup+root serializer entry.
+    #[test]
+    fn integrity_counters_fixed_shape_at_root_and_all_totals_vc_1re() {
+        let stats = BotStats::new("listener-0".to_string(), BotRole::Listener);
+        let per_bot = vec![stats.snapshot(1.0)];
+        let (sender_totals, listener_totals, totals) = aggregate(&per_bot, 1.0);
+
+        let summary = OrchestrationSummary {
+            senders: 0,
+            listeners: 1,
+            duration_s: 1,
+            room: "room-a".into(),
+            server_url: "https://example".into(),
+            tx_packets_enqueued: totals.tx_packets_enqueued,
+            tx_drops_channel_full: totals.tx_drops_channel_full,
+            tx_drops_send_error: totals.tx_drops_send_error,
+            tx_drops: totals.tx_drops,
+            redirects_followed: totals.redirects_followed,
+            media_seq_max: totals.media_seq_max,
+            media_received_distinct: totals.media_received_distinct,
+            crc_mismatches: totals.crc_mismatches,
+            unexplained_gaps: totals.unexplained_gaps,
+            totals,
+            sender_totals,
+            listener_totals,
+            per_bot,
+        };
+
+        let value: serde_json::Value =
+            serde_json::to_value(&summary).expect("serialize summary to value");
+        let fields = [
+            "media_seq_max",
+            "media_received_distinct",
+            "crc_mismatches",
+            "unexplained_gaps",
+        ];
+        // Root.
+        for f in fields {
+            assert!(
+                value.get(f).and_then(|v| v.as_u64()) == Some(0),
+                "root must carry fixed-shape integrity field {}, got: {}",
+                f,
+                value
+            );
+        }
+        // All three Totals roll-ups.
+        for rollup in ["totals", "sender_totals", "listener_totals"] {
+            let obj = value.get(rollup).expect("rollup object present");
+            for f in fields {
+                assert!(
+                    obj.get(f).and_then(|v| v.as_u64()) == Some(0),
+                    "{} rollup must carry fixed-shape integrity field {}, got: {}",
+                    rollup,
+                    f,
+                    obj
+                );
+            }
+        }
+    }
+
+    /// vc-1re: the integrity rollup must take the MAX of `media_seq_max`
+    /// across bots (not the sum) and SUM the other three. Proves the
+    /// accumulate path is wired with the correct reduction per field.
+    #[test]
+    fn integrity_rollup_maxes_seq_and_sums_the_rest_vc_1re() {
+        let mut a = empty_totals();
+        let mut snap_lo = BotStats::new("s0".into(), BotRole::Sender).snapshot(1.0);
+        let mut snap_hi = BotStats::new("s1".into(), BotRole::Sender).snapshot(1.0);
+        snap_lo.media_seq_max = 10;
+        snap_lo.media_received_distinct = 11;
+        snap_lo.crc_mismatches = 1;
+        snap_lo.unexplained_gaps = 2;
+        snap_hi.media_seq_max = 99;
+        snap_hi.media_received_distinct = 100;
+        snap_hi.crc_mismatches = 3;
+        snap_hi.unexplained_gaps = 4;
+        accumulate(&mut a, &snap_lo);
+        accumulate(&mut a, &snap_hi);
+        assert_eq!(a.media_seq_max, 99, "media_seq_max must be a max");
+        assert_eq!(a.media_received_distinct, 111);
+        assert_eq!(a.crc_mismatches, 4);
+        assert_eq!(a.unexplained_gaps, 6);
     }
 }

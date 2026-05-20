@@ -44,3 +44,8 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1.0"
+
+# Integrity trailer CRC (vc-1re). Already in the workspace lockfile; pinned
+# here as a direct dep so the bot's `--verify-integrity` path can recompute
+# CRC32 over the codec payload without relying on a transitive-only crate.
+crc32fast = "1.5"

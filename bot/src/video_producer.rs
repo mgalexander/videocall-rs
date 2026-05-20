@@ -48,6 +48,7 @@ impl VideoProducer {
         image_dir: &str,
         packet_sender: Sender<Vec<u8>>,
         stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -55,9 +56,14 @@ impl VideoProducer {
         let image_dir = image_dir.to_string();
 
         let handle = thread::spawn(move || {
-            if let Err(e) =
-                Self::video_loop(user_id_clone, &image_dir, packet_sender, quit_clone, stats)
-            {
+            if let Err(e) = Self::video_loop(
+                user_id_clone,
+                &image_dir,
+                packet_sender,
+                quit_clone,
+                stats,
+                verify_integrity,
+            ) {
                 error!("Video producer error: {}", e);
             }
         });
@@ -75,6 +81,7 @@ impl VideoProducer {
         packet_sender: Sender<Vec<u8>>,
         quit: Arc<AtomicBool>,
         stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<()> {
         // Video configuration - targeting 30fps (~33ms packets)
         let width = 1280u32;
@@ -123,7 +130,18 @@ impl VideoProducer {
         video_encoder.update_bitrate_kbps(500)?; // 500kbps default like videocall-cli
 
         let mut frame_iterator = frames.into_iter().cycle();
+        // `sequence` is the per-EMITTED-packet monotonic counter. It must be
+        // 1:1 with MediaPackets on the wire so the integrity instrument can do
+        // honest completeness accounting (`expected = max - min + 1`). A single
+        // `encode()` call can yield more than one compressed packet (VP9
+        // alt-ref / invisible frames), so we increment this once per emitted
+        // frame, NOT once per source frame (vc-1re).
         let mut sequence = 0u64;
+        // `pts` is the presentation timestamp fed to the encoder, advanced once
+        // per source frame. Kept separate from `sequence` so the encoder still
+        // sees monotonic per-source-frame timestamps regardless of how many
+        // packets each encode produces.
+        let mut pts = 0i64;
 
         loop {
             if quit.load(Ordering::Relaxed) {
@@ -135,13 +153,23 @@ impl VideoProducer {
             let frame_data = frame_iterator.next().unwrap();
 
             // Encode to VP9 (exactly same as videocall-cli)
-            let frames_result = video_encoder.encode(sequence as i64, &frame_data)?;
+            let frames_result = video_encoder.encode(pts, &frame_data)?;
 
             // Send each encoded frame (exactly same as videocall-cli)
             for frame in frames_result {
+                // vc-1re: when integrity verification is on, append a fixed
+                // `[magic][seq][crc32]` trailer to the codec payload. We do
+                // NOT set a RoutingHeader — that would flip the SFU off the
+                // legacy passthrough path onto the untested P4 layer-drop
+                // branch, making integrity runs incomparable to baseline.
+                // The seq reuses the VideoMetadata.sequence semantics.
+                let mut data = frame.data.to_vec(); // Real VP9 encoded data!
+                if verify_integrity {
+                    crate::integrity::append_trailer(&mut data, sequence);
+                }
                 let media_packet = MediaPacket {
                     media_type: MediaType::VIDEO.into(),
-                    data: frame.data.to_vec(), // Real VP9 encoded data!
+                    data,
                     user_id: user_id.clone().into_bytes(),
                     frame_type: if frame.key { "key" } else { "delta" }.to_string(),
                     timestamp: get_timestamp_ms(),
@@ -197,9 +225,13 @@ impl VideoProducer {
                         return Ok(());
                     }
                 }
+
+                // One distinct seq per EMITTED packet so the trailer seq and
+                // VideoMetadata.sequence stay 1:1 with packets-on-wire (vc-1re).
+                sequence += 1;
             }
 
-            sequence += 1;
+            pts += 1;
             thread::sleep(packet_interval);
         }
 

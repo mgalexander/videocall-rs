@@ -1028,6 +1028,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "crc32fast",
  "dotenv",
  "env-libvpx-sys",
  "futures",

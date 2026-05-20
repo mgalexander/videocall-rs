@@ -77,6 +77,8 @@ pub struct FailoverConfig {
     /// user_id (e.g. with `index_offset = 100` the first listener becomes
     /// `listener-100`).
     pub index_offset: usize,
+    /// vc-1re: enable byte-fidelity integrity verification. Off by default.
+    pub verify_integrity: bool,
 }
 
 /// Per-bot snapshot plus the aggregate failover metrics.
@@ -118,6 +120,16 @@ struct FailoverSummary {
     /// fields above are retained for attribution. Always serialized — never
     /// gated by `skip_serializing_if`.
     tx_drops: u64,
+    /// vc-1re: highest media sequence observed across all bots. FIXED-SHAPE
+    /// — always serialized, even at zero.
+    media_seq_max: u64,
+    /// vc-1re: total distinct verified media payloads. FIXED-SHAPE.
+    media_received_distinct: u64,
+    /// vc-1re: total CRC mismatches across all bots. MUST be 0 on a clean
+    /// integrity run. FIXED-SHAPE.
+    crc_mismatches: u64,
+    /// vc-1re: total unexplained sequence gaps across all bots. FIXED-SHAPE.
+    unexplained_gaps: u64,
     per_bot: Vec<BotStatsSnapshot>,
 }
 
@@ -154,10 +166,17 @@ pub async fn run(cfg: FailoverConfig) -> anyhow::Result<()> {
         let insecure = cfg.insecure;
         let audio_path = cfg.audio_path.clone();
         let image_dir = cfg.image_dir.clone();
+        let verify_integrity = cfg.verify_integrity;
 
         join_handles.push(tokio::spawn(async move {
             if let Err(e) = run_sender(
-                client_cfg, server_url, insecure, stats, audio_path, image_dir,
+                client_cfg,
+                server_url,
+                insecure,
+                stats,
+                audio_path,
+                image_dir,
+                verify_integrity,
             )
             .await
             {
@@ -234,6 +253,10 @@ pub async fn run(cfg: FailoverConfig) -> anyhow::Result<()> {
         tx_drops_channel_full: tx_totals.tx_drops_channel_full,
         tx_drops_send_error: tx_totals.tx_drops_send_error,
         tx_drops: tx_totals.tx_drops,
+        media_seq_max: tx_totals.media_seq_max,
+        media_received_distinct: tx_totals.media_received_distinct,
+        crc_mismatches: tx_totals.crc_mismatches,
+        unexplained_gaps: tx_totals.unexplained_gaps,
         per_bot,
     };
 
@@ -277,6 +300,16 @@ struct TxTotals {
     /// surfaced at the failover summary root so jq dashboards can read
     /// `.tx_drops` as a single number.
     tx_drops: u64,
+    /// vc-1re: integrity rollup — highest media sequence observed (a max, not
+    /// a sum). FIXED-SHAPE on the summary root.
+    media_seq_max: u64,
+    /// vc-1re: total distinct verified media payloads. FIXED-SHAPE.
+    media_received_distinct: u64,
+    /// vc-1re: total CRC mismatches. MUST be 0 on a clean integrity run.
+    /// FIXED-SHAPE.
+    crc_mismatches: u64,
+    /// vc-1re: total unexplained sequence gaps. FIXED-SHAPE.
+    unexplained_gaps: u64,
 }
 
 fn aggregate_tx_totals(per_bot: &[BotStatsSnapshot]) -> TxTotals {
@@ -290,6 +323,11 @@ fn aggregate_tx_totals(per_bot: &[BotStatsSnapshot]) -> TxTotals {
         // (today it always is, but this avoids coupling to that invariant).
         totals.tx_drops +=
             snap.tx_drops_channel_full.unwrap_or(0) + snap.tx_drops_send_error.unwrap_or(0);
+        // vc-1re integrity rollup. `media_seq_max` is a max; the rest sum.
+        totals.media_seq_max = totals.media_seq_max.max(snap.media_seq_max);
+        totals.media_received_distinct += snap.media_received_distinct;
+        totals.crc_mismatches += snap.crc_mismatches;
+        totals.unexplained_gaps += snap.unexplained_gaps;
     }
     totals
 }
@@ -301,12 +339,21 @@ async fn run_sender(
     stats: Arc<BotStats>,
     audio_path: String,
     image_dir: String,
+    verify_integrity: bool,
 ) -> anyhow::Result<()> {
     let user_id = config.user_id.clone();
     info!("Initialising sender {} (failover-test)", user_id);
+    if verify_integrity {
+        stats.enable_verify_integrity();
+    }
 
-    let mut client = WebTransportClient::new(config.clone()).with_stats(stats.clone());
+    let mut client = WebTransportClient::new(config.clone())
+        .with_stats(stats.clone())
+        .with_verify_integrity(verify_integrity);
     client.connect(&server_url, insecure).await?;
+    // vc-1re: record the pod this sender landed on. Failover senders are not
+    // wrapped in a redirect loop, so the chain stays empty (direct connect).
+    stats.set_joined_pod(server_url.host_str().unwrap_or("unknown").to_string());
 
     let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
     client.start_packet_sender(packet_rx).await;
@@ -316,6 +363,7 @@ async fn run_sender(
         &audio_path,
         packet_tx.clone(),
         Some(stats.clone()),
+        verify_integrity,
     ) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -329,6 +377,7 @@ async fn run_sender(
         &image_dir,
         packet_tx.clone(),
         Some(stats.clone()),
+        verify_integrity,
     ) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -505,6 +554,11 @@ mod tests {
                 tx_drops_send_error: 9,
                 // vc-020: unified aggregate = channel_full + send_error.
                 tx_drops: 14,
+                // vc-1re: no integrity activity in this fixture.
+                media_seq_max: 0,
+                media_received_distinct: 0,
+                crc_mismatches: 0,
+                unexplained_gaps: 0,
             }
         );
     }
@@ -533,6 +587,10 @@ mod tests {
             tx_drops_channel_full: totals.tx_drops_channel_full,
             tx_drops_send_error: totals.tx_drops_send_error,
             tx_drops: totals.tx_drops,
+            media_seq_max: totals.media_seq_max,
+            media_received_distinct: totals.media_received_distinct,
+            crc_mismatches: totals.crc_mismatches,
+            unexplained_gaps: totals.unexplained_gaps,
             per_bot,
         };
 
@@ -569,5 +627,56 @@ mod tests {
             tx_drops_idx < per_bot_idx,
             "tx_drops must appear at the root (before \"per_bot\"), got: {json}"
         );
+    }
+
+    /// vc-1re: the four integrity counters MUST be present at the failover
+    /// summary root even when zero. This is the failover-side half of the
+    /// fixed-shape contract (the orchestrate roll-ups are covered in
+    /// `orchestrate.rs`). FAILS if any of the four disappears from the root.
+    #[test]
+    fn failover_summary_integrity_counters_fixed_shape_vc_1re() {
+        let per_bot = vec![snap_with_tx("listener-0", BotRole::Listener, 0, 0, 0)];
+        let totals = aggregate_tx_totals(&per_bot);
+        // Aggregator zeros for all four integrity fields.
+        assert_eq!(totals.media_seq_max, 0);
+        assert_eq!(totals.media_received_distinct, 0);
+        assert_eq!(totals.crc_mismatches, 0);
+        assert_eq!(totals.unexplained_gaps, 0);
+
+        let summary = FailoverSummary {
+            senders: 0,
+            listeners: 1,
+            duration_s: 30,
+            room: "room-a".into(),
+            server_url: "https://example".into(),
+            max_downtime_ms: None,
+            listeners_with_gap: 0,
+            listeners_recovered: 0,
+            tx_packets_enqueued: totals.tx_packets_enqueued,
+            tx_drops_channel_full: totals.tx_drops_channel_full,
+            tx_drops_send_error: totals.tx_drops_send_error,
+            tx_drops: totals.tx_drops,
+            media_seq_max: totals.media_seq_max,
+            media_received_distinct: totals.media_received_distinct,
+            crc_mismatches: totals.crc_mismatches,
+            unexplained_gaps: totals.unexplained_gaps,
+            per_bot,
+        };
+
+        let value: serde_json::Value =
+            serde_json::to_value(&summary).expect("serialize failover summary");
+        for f in [
+            "media_seq_max",
+            "media_received_distinct",
+            "crc_mismatches",
+            "unexplained_gaps",
+        ] {
+            assert!(
+                value.get(f).and_then(|v| v.as_u64()) == Some(0),
+                "failover root must carry fixed-shape integrity field {}, got: {}",
+                f,
+                value
+            );
+        }
     }
 }

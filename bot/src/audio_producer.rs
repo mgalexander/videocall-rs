@@ -46,14 +46,22 @@ impl AudioProducer {
         audio_data: Vec<f32>,
         packet_sender: Sender<Vec<u8>>,
         stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
         let user_id_clone = user_id.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                Self::audio_loop(user_id_clone, audio_data, packet_sender, quit_clone, stats).await
+            if let Err(e) = Self::audio_loop(
+                user_id_clone,
+                audio_data,
+                packet_sender,
+                quit_clone,
+                stats,
+                verify_integrity,
+            )
+            .await
             {
                 error!("Audio producer error: {}", e);
             }
@@ -71,6 +79,7 @@ impl AudioProducer {
         wav_path: &str,
         packet_sender: Sender<Vec<u8>>,
         stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<Self> {
         info!("Loading WAV file for {}: {}", user_id, wav_path);
 
@@ -115,7 +124,7 @@ impl AudioProducer {
             wav_samples.len() as f32 / sample_rate as f32 / channels as f32
         );
 
-        Self::new(user_id, wav_samples, packet_sender, stats)
+        Self::new(user_id, wav_samples, packet_sender, stats, verify_integrity)
     }
 
     async fn audio_loop(
@@ -124,6 +133,7 @@ impl AudioProducer {
         packet_sender: Sender<Vec<u8>>,
         quit: Arc<AtomicBool>,
         stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<()> {
         // Audio configuration - targeting 50fps (20ms packets)
         let sample_rate = 48000u32; // Standard Opus rate
@@ -165,6 +175,14 @@ impl AudioProducer {
             match opus_encoder.encode_float(&packet_samples, &mut encoded) {
                 Ok(bytes_written) => {
                     encoded.truncate(bytes_written);
+
+                    // vc-1re: append the integrity trailer to the codec
+                    // payload when verification is on. No RoutingHeader is
+                    // set (keeps the SFU on legacy passthrough). seq reuses
+                    // AudioMetadata.sequence semantics.
+                    if verify_integrity {
+                        crate::integrity::append_trailer(&mut encoded, sequence);
+                    }
 
                     // Create media packet
                     let media_packet = MediaPacket {
@@ -284,9 +302,14 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
         let stats = BotStats::new("sender-test".into(), BotRole::Sender);
 
-        let producer =
-            AudioProducer::new("sender-test".into(), audio_data, tx, Some(stats.clone()))
-                .expect("construct audio producer");
+        let producer = AudioProducer::new(
+            "sender-test".into(),
+            audio_data,
+            tx,
+            Some(stats.clone()),
+            false,
+        )
+        .expect("construct audio producer");
 
         // Producer is 50fps -> ~10 ticks in 200ms. Channel capacity is 1 and
         // nobody is draining, so we expect 1 enqueue and the rest as

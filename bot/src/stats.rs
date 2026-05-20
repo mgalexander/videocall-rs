@@ -27,9 +27,11 @@
 //! and atomic loads/stores are cheap.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+
+use crate::integrity::{IntegritySummary, IntegrityTracker};
 
 /// Role of a bot in the load test. Used solely for the summary JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -118,6 +120,65 @@ pub struct BotStats {
     /// failover-test mode (which logs but does not follow redirects) and for
     /// any bot that never received a redirect.
     pub redirects_followed: AtomicU64,
+
+    // --- Media-vs-control receive split (vc-1re) -----------------------
+    //
+    // `packets_received` (above) counts every inbound unistream, including
+    // 57-byte control packets (heartbeat, SPEAKER_UPDATE, ...). That made it
+    // impossible to tell "media never arrived" from "media arrived but didn't
+    // decode". These split counters classify each decoded wrapper so the
+    // load test can read the media-only signal. `packets_received` stays as
+    // the back-compat total.
+    /// Non-MEDIA wrappers received (heartbeat, SPEAKER_UPDATE, ADMISSION,
+    /// etc.). Classified at the decode dispatch site (vc-1re).
+    pub control_packets_received: AtomicU64,
+    /// MEDIA wrappers received, regardless of inner media type (vc-1re).
+    pub media_packets_received: AtomicU64,
+    /// MEDIA wrappers whose inner `media_type` is VIDEO (vc-1re).
+    pub media_received_video: AtomicU64,
+    /// MEDIA wrappers whose inner `media_type` is AUDIO (vc-1re).
+    pub media_received_audio: AtomicU64,
+    /// MEDIA wrappers whose inner `media_type` is neither VIDEO nor AUDIO
+    /// (SCREEN, RTT, KEYFRAME_REQUEST, HEARTBEAT-as-media, ...) (vc-1re).
+    pub media_received_other: AtomicU64,
+
+    // --- Trailer-CRC integrity (vc-1re) --------------------------------
+    //
+    // Populated only when the bot runs with `--verify-integrity`. The decode
+    // thread strips the payload trailer, recomputes CRC32, and folds the
+    // observation into `integrity`. The snapshot rolls the tracker up into the
+    // four fixed-shape counters.
+    /// Per-(publisher, media_type) completeness + CRC tracker. Behind a
+    /// `Mutex` because the decode thread mutates it and the orchestrator
+    /// reads it at snapshot time. Bounded: O(publishers × media_types), NOT
+    /// duration-dependent.
+    pub integrity: Mutex<IntegrityTracker>,
+    /// `true` once `--verify-integrity` wiring is active on this bot. The four
+    /// integrity counters serialize either way (fixed-shape); this is purely
+    /// for clarity in the rollup.
+    pub verify_integrity: AtomicBool,
+
+    // --- joined_pod + redirect_chain (vc-1re) --------------------------
+    /// Pod hostname the bot's media session actually landed on after any
+    /// redirect. Set as the connection target / ADMISSION_DECISION target
+    /// resolves. `None` until the first successful connect.
+    pub joined_pod: Mutex<Option<String>>,
+    /// Ordered list of redirect hops the bot traversed, with per-hop latency.
+    /// A clean direct connect leaves this empty. Bounded by the orchestrate
+    /// loop's `MAX_REDIRECT_HOPS`.
+    pub redirect_chain: Mutex<Vec<RedirectHop>>,
+}
+
+/// One hop in a bot's redirect chain (vc-1re). Records the pod the bot was
+/// redirected to and the wall-clock latency of that hop (time from observing
+/// the `ADMISSION_DECISION{REDIRECT}` to the next session being established).
+#[derive(Debug, Clone, Serialize)]
+pub struct RedirectHop {
+    /// Target pod hostname carried by `ADMISSION_DECISION{REDIRECT}`.
+    pub to_pod: String,
+    /// Latency of this hop in milliseconds: teardown + reconnect to the
+    /// redirect target. Asserted against the §3.2 responsiveness budgets.
+    pub redirect_latency_ms: u64,
 }
 
 impl BotStats {
@@ -231,6 +292,53 @@ impl BotStats {
         self.redirects_followed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one inbound non-MEDIA control wrapper (vc-1re). Single
+    /// increment site for `control_packets_received`.
+    pub fn record_control_packet(&self) {
+        self.control_packets_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one inbound MEDIA wrapper, classified by inner media type
+    /// (vc-1re). Single increment site for `media_packets_received` plus the
+    /// video/audio/other split. `is_video`/`is_audio` are mutually
+    /// exclusive; both false means "other".
+    pub fn record_media_packet(&self, is_video: bool, is_audio: bool) {
+        self.media_packets_received.fetch_add(1, Ordering::Relaxed);
+        if is_video {
+            self.media_received_video.fetch_add(1, Ordering::Relaxed);
+        } else if is_audio {
+            self.media_received_audio.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.media_received_other.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Enable integrity tracking on this bot (vc-1re). Called by the
+    /// orchestrate/failover wiring when `--verify-integrity` is set.
+    pub fn enable_verify_integrity(&self) {
+        self.verify_integrity.store(true, Ordering::Relaxed);
+    }
+
+    /// Set the pod the bot's media session landed on (vc-1re). Idempotent;
+    /// the orchestrate loop calls this after each successful connect with the
+    /// current target host.
+    pub fn set_joined_pod(&self, pod: String) {
+        *self.joined_pod.lock().unwrap_or_else(|p| p.into_inner()) = Some(pod);
+    }
+
+    /// Append one hop to the redirect chain (vc-1re). Called by the
+    /// orchestrate reconnect loop once it has measured the hop latency.
+    pub fn record_redirect_hop(&self, to_pod: String, redirect_latency_ms: u64) {
+        self.redirect_chain
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(RedirectHop {
+                to_pod,
+                redirect_latency_ms,
+            });
+    }
+
     /// Capture a serializable snapshot of the current counters.
     pub fn snapshot(&self, duration_s: f64) -> BotStatsSnapshot {
         let bytes = self.bytes_received.load(Ordering::Relaxed);
@@ -264,13 +372,49 @@ impl BotStats {
         // remain for attribution.
         let tx_drops = tx_drops_channel_full + tx_drops_send_error;
         let redirects_followed = self.redirects_followed.load(Ordering::Relaxed);
+
+        // vc-1re: media-vs-control receive split.
+        let control_packets_received = self.control_packets_received.load(Ordering::Relaxed);
+        let media_packets_received = self.media_packets_received.load(Ordering::Relaxed);
+        let media_received_video = self.media_received_video.load(Ordering::Relaxed);
+        let media_received_audio = self.media_received_audio.load(Ordering::Relaxed);
+        let media_received_other = self.media_received_other.load(Ordering::Relaxed);
+
+        // vc-1re: roll the integrity tracker up into the four fixed-shape
+        // counters. On legacy passthrough the dominant accounted drop is the
+        // receive-side `drops` counter (AllowSet unsubscribed); subtract it so
+        // `unexplained_gaps` isolates losses we cannot explain.
+        let drops = self.drops.load(Ordering::Relaxed);
+        let IntegritySummary {
+            media_seq_max,
+            media_received_distinct,
+            crc_mismatches,
+            unexplained_gaps,
+        } = self
+            .integrity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .summarize(drops);
+
+        // vc-1re: redirect chain + joined pod.
+        let redirect_chain = self
+            .redirect_chain
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let joined_pod = self
+            .joined_pod
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+
         BotStatsSnapshot {
             user_id: self.user_id.clone(),
             role: self.role,
             connected: self.connected.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
             bytes_received: bytes,
-            drops: self.drops.load(Ordering::Relaxed),
+            drops,
             avg_bandwidth_bps,
             disconnect_at_ms: if disconnect_at_ms == 0 {
                 None
@@ -328,6 +472,48 @@ impl BotStats {
                 None
             } else {
                 Some(redirects_followed)
+            },
+            // vc-1re media-vs-control split: omit-when-zero, same pattern as
+            // the other optional counters.
+            control_packets_received: if control_packets_received == 0 {
+                None
+            } else {
+                Some(control_packets_received)
+            },
+            media_packets_received: if media_packets_received == 0 {
+                None
+            } else {
+                Some(media_packets_received)
+            },
+            media_received_video: if media_received_video == 0 {
+                None
+            } else {
+                Some(media_received_video)
+            },
+            media_received_audio: if media_received_audio == 0 {
+                None
+            } else {
+                Some(media_received_audio)
+            },
+            media_received_other: if media_received_other == 0 {
+                None
+            } else {
+                Some(media_received_other)
+            },
+            // vc-1re integrity: FIXED-SHAPE. These four MUST serialize even
+            // when zero (plain u64, no skip_serializing_if) so the integrity
+            // contract is always visible in the summary root and rollups.
+            media_seq_max,
+            media_received_distinct,
+            crc_mismatches,
+            unexplained_gaps,
+            // vc-1re joined_pod + redirect_chain (per-bot). Omit when absent /
+            // empty: a clean direct connect has no chain.
+            joined_pod,
+            redirect_chain: if redirect_chain.is_empty() {
+                None
+            } else {
+                Some(redirect_chain)
             },
         }
     }
@@ -388,6 +574,51 @@ pub struct BotStatsSnapshot {
     /// `ADMISSION_DECISION{REDIRECT}` target during the run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirects_followed: Option<u64>,
+
+    // --- Media-vs-control receive split (vc-1re) -----------------------
+    // Omit-when-zero, matching the existing optional counters.
+    /// Non-MEDIA control wrappers received (heartbeat, SPEAKER_UPDATE, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_packets_received: Option<u64>,
+    /// MEDIA wrappers received (any inner media type).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_packets_received: Option<u64>,
+    /// MEDIA wrappers with inner `media_type == VIDEO`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_received_video: Option<u64>,
+    /// MEDIA wrappers with inner `media_type == AUDIO`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_received_audio: Option<u64>,
+    /// MEDIA wrappers whose inner media type is neither VIDEO nor AUDIO.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_received_other: Option<u64>,
+
+    // --- Trailer-CRC integrity (vc-1re): FIXED-SHAPE ----------------------
+    // These four are plain `u64` (NOT `Option<u64>`) and carry NO
+    // `skip_serializing_if`, so they ALWAYS appear in the JSON — even at
+    // zero. This is the load-bearing integrity contract: a dashboard reading
+    // `.crc_mismatches` must never see the key vanish.
+    /// Highest media sequence observed across all (publisher, media_type)
+    /// keys. `0` if integrity was off or nothing was tracked.
+    pub media_seq_max: u64,
+    /// Total distinct media payloads with a verified trailer.
+    pub media_received_distinct: u64,
+    /// Trailers whose recomputed CRC32 did not match the stamped value. MUST
+    /// be 0 on a clean run.
+    pub crc_mismatches: u64,
+    /// `expected - received - accounted_drops` summed across keys, clamped at
+    /// 0. Isolates losses not explained by the AllowSet `unsubscribed` drop.
+    pub unexplained_gaps: u64,
+
+    // --- joined_pod + redirect_chain (vc-1re) ---------------------------
+    /// Pod the bot's media session landed on after any redirect. `None` until
+    /// the first successful connect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joined_pod: Option<String>,
+    /// Ordered redirect hops with per-hop latency. `None` for a clean direct
+    /// connect (empty chain).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_chain: Option<Vec<RedirectHop>>,
 }
 
 #[cfg(test)]
@@ -479,5 +710,109 @@ mod tests {
         assert!(json.contains("\"tx_drops_channel_full\":1"));
         assert!(json.contains("\"tx_drops_send_error\":3"));
         assert!(json.contains("\"tx_drops\":4"));
+    }
+
+    /// vc-1re: the four integrity counters MUST serialize at the snapshot
+    /// root even when zero (fixed-shape contract). This test FAILS if any of
+    /// `media_seq_max`, `media_received_distinct`, `crc_mismatches`, or
+    /// `unexplained_gaps` disappears from the JSON. Guards against a future
+    /// regression that adds `skip_serializing_if` to (or removes) any of the
+    /// four. The Totals roll-up equivalents are guarded in `orchestrate.rs`
+    /// and `failover.rs`.
+    #[test]
+    fn integrity_counters_are_fixed_shape_in_snapshot_root_vc_1re() {
+        let stats = BotStats::new("listener-0".into(), BotRole::Listener);
+        let snap = stats.snapshot(1.0);
+        // Plain u64 at zero (not Option), so the values are present.
+        assert_eq!(snap.media_seq_max, 0);
+        assert_eq!(snap.media_received_distinct, 0);
+        assert_eq!(snap.crc_mismatches, 0);
+        assert_eq!(snap.unexplained_gaps, 0);
+
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        for key in [
+            "\"media_seq_max\":0",
+            "\"media_received_distinct\":0",
+            "\"crc_mismatches\":0",
+            "\"unexplained_gaps\":0",
+        ] {
+            assert!(
+                json.contains(key),
+                "integrity counter {} must serialize even when zero, got: {}",
+                key,
+                json
+            );
+        }
+    }
+
+    /// vc-1re: the media-vs-control split counters follow the omit-when-zero
+    /// pattern, and the `record_*` helpers route to the right buckets.
+    #[test]
+    fn media_control_split_counters_route_and_omit_vc_1re() {
+        let stats = BotStats::new("listener-0".into(), BotRole::Listener);
+        // Zero state: split fields omitted from JSON.
+        let json = serde_json::to_string(&stats.snapshot(1.0)).unwrap();
+        assert!(!json.contains("control_packets_received"));
+        assert!(!json.contains("media_packets_received"));
+
+        stats.record_control_packet();
+        stats.record_media_packet(true, false); // video
+        stats.record_media_packet(false, true); // audio
+        stats.record_media_packet(false, false); // other
+
+        let snap = stats.snapshot(1.0);
+        assert_eq!(snap.control_packets_received, Some(1));
+        assert_eq!(snap.media_packets_received, Some(3));
+        assert_eq!(snap.media_received_video, Some(1));
+        assert_eq!(snap.media_received_audio, Some(1));
+        assert_eq!(snap.media_received_other, Some(1));
+    }
+
+    /// vc-1re §3.2 responsiveness contract: redirect-chain hop latencies must
+    /// be present and bounded by the budgets. We assert each recorded hop's
+    /// `redirect_latency_ms` is within the 2.0s total-recovery budget (the
+    /// strictest single-number bound on a per-hop latency in the §3.2 table:
+    /// 100ms detect / 500ms reconnect / 1.5s first media / 2.0s total). The
+    /// `record_redirect_hop` helper is the single increment site.
+    #[test]
+    fn redirect_chain_hops_carry_latency_within_budget_vc_1re() {
+        // §3.2 budgets in milliseconds.
+        const DETECT_MS: u64 = 100;
+        const RECONNECT_MS: u64 = 500;
+        const FIRST_MEDIA_MS: u64 = 1_500;
+        const TOTAL_MS: u64 = 2_000;
+        // Sanity: the budgets are ordered as documented.
+        assert!(DETECT_MS < RECONNECT_MS);
+        assert!(RECONNECT_MS < FIRST_MEDIA_MS);
+        assert!(FIRST_MEDIA_MS < TOTAL_MS);
+
+        let stats = BotStats::new("listener-0".into(), BotRole::Listener);
+        // Empty chain on a clean direct connect.
+        assert!(stats.snapshot(1.0).redirect_chain.is_none());
+
+        // Record two hops with realistic sub-budget latencies.
+        stats.set_joined_pod("pod-a".into());
+        stats.record_redirect_hop("pod-b".into(), 420);
+        stats.record_redirect_hop("pod-c".into(), 1_300);
+
+        let snap = stats.snapshot(1.0);
+        assert_eq!(snap.joined_pod.as_deref(), Some("pod-a"));
+        let chain = snap.redirect_chain.expect("redirect chain present");
+        assert_eq!(chain.len(), 2);
+        for hop in &chain {
+            // The latency field exists and is bounded by the §3.2 total
+            // recovery budget.
+            assert!(
+                hop.redirect_latency_ms <= TOTAL_MS,
+                "hop to {} latency {}ms exceeds {}ms total budget",
+                hop.to_pod,
+                hop.redirect_latency_ms,
+                TOTAL_MS
+            );
+        }
+        // Per-hop reconnect detail: first media within budget for the slower
+        // hop, reconnect window for the faster one.
+        assert!(chain[0].redirect_latency_ms <= RECONNECT_MS);
+        assert!(chain[1].redirect_latency_ms <= FIRST_MEDIA_MS);
     }
 }
