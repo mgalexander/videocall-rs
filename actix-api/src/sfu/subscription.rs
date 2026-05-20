@@ -284,6 +284,29 @@ impl SubscriptionStore {
 
         // Miss: compute, store, return.
         let allow = Arc::new(self.resolve_inner(receiver, current_members, speaker_set));
+        // vc-8wd Layer 1: observe the resolved AllowSet size only on the
+        // actual (re)compute — NOT on cache hits — so the histogram tracks
+        // resolve events without per-packet cost. Catches empty-AllowSet
+        // regressions (a pile-up at bucket 0 = receivers seeing nobody).
+        crate::metrics::SFU_ALLOWSET_SIZE.observe(allow.video.len() as f64);
+        // vc-8wd Layer 2: targeted AllowSet trace for the configured room.
+        // Gated on the cheap atomic load first. The receiver session is the
+        // natural session key here; the room id is not in scope at this
+        // layer, so we gate on session only (room gating happens upstream in
+        // the forwarder/join paths).
+        if crate::sfu::trace::tracing_enabled()
+            && crate::sfu::trace::traced_session(&receiver.to_string())
+        {
+            tracing::debug!(
+                target: "sfu_trace",
+                receiver,
+                audio_len = allow.audio.len(),
+                video_len = allow.video.len(),
+                members_generation,
+                speakers_generation,
+                "AllowSet resolved"
+            );
+        }
         self.cache.insert(
             receiver,
             CachedAllow {

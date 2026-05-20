@@ -334,6 +334,10 @@ lazy_static! {
         cv.with_label_values(&["self_skip"]).inc_by(0.0);
         cv.with_label_values(&["unsubscribed"]).inc_by(0.0);
         cv.with_label_values(&["layer_budget"]).inc_by(0.0);
+        // vc-8wd: touch `reference_miss` at zero too (the forwarder's
+        // reference-aware drop branch uses it). Makes it dashboard-friendly
+        // and keeps the `sfu_drop_reason` doc honest.
+        cv.with_label_values(&["reference_miss"]).inc_by(0.0);
         cv.with_label_values(&["kfr_unsubscribed"]).inc_by(0.0);
         cv
     };
@@ -421,4 +425,80 @@ lazy_static! {
         "Base-layer (T0+S0) keyframes forwarded by the SFU forwarder (always forwarded, invariant 1)"
     )
     .expect("Failed to create sfu_keyframe_forwarded_total metric");
+
+    // ===== SFU JOIN/SUBSCRIBE/FORWARD OBSERVABILITY (bead vc-8wd, Layer 1) =====
+    //
+    // Always-on aggregate counters/gauges. O(1), no per-packet string
+    // formatting: the forward/drop counters below are CounterVec/Counter
+    // whose label values are STATIC `&'static str` constants resolved at
+    // compile time (see `sfu::forwarder` drop branches) — there is never a
+    // `format!` on the hot path. Registered with the prometheus default
+    // registry, so they appear on the existing `/metrics` endpoint with no
+    // wiring changes.
+
+    /// Owner-pod participant count that the spillover decision reads, per
+    /// room. Lets operators see WHY `is_spilled_over` is/isn't true: this is
+    /// the `owner_count` field of the most recent owner-pod health beacon
+    /// the spillover predicate consulted at JoinRoom time.
+    pub static ref SFU_SPILLOVER_OWNER_COUNT: GaugeVec = register_gauge_vec!(
+        "sfu_spillover_owner_count",
+        "Owner-pod participant count consulted by the spillover decision, per room",
+        &["room"]
+    )
+    .expect("Failed to create sfu_spillover_owner_count metric");
+
+    /// Current spilled-over verdict per room (1 = spilled over, 0 = not).
+    /// Set each time the JoinRoom spillover predicate is evaluated.
+    pub static ref SFU_SPILLOVER_STATE: GaugeVec = register_gauge_vec!(
+        "sfu_spillover_state",
+        "Current SpilledOver verdict per room (1=spilled over, 0=not)",
+        &["room"]
+    )
+    .expect("Failed to create sfu_spillover_state metric");
+
+    /// AllowSet size (video membership) observed at resolve time. Catches
+    /// empty-AllowSet regressions: a sustained pile-up at bucket 0 means
+    /// receivers are resolving to "see nobody".
+    pub static ref SFU_ALLOWSET_SIZE: Histogram = register_histogram!(
+        "sfu_allowset_size",
+        "Resolved AllowSet video membership size at resolve time",
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0]
+    )
+    .expect("Failed to create sfu_allowset_size metric");
+
+    /// Increment-only count of packets the forwarder decided to FORWARD.
+    ///
+    /// The bead (vc-8wd) asks for a plain `sfu_forward_total` counter on the
+    /// forward path. The pre-existing [`SFU_FORWARDED_TOTAL`] is a
+    /// `CounterVec` labeled by packet type; this is the un-labeled aggregate
+    /// the bead specifies, incremented once per forwarded packet alongside
+    /// it. Drops are already counted by [`SFU_DROPPED_TOTAL`] (the
+    /// `sfu_dropped_total{reason}` CounterVec just above), whose reason
+    /// labels already cover the bead's required set
+    /// (`unsubscribed`/`layer_budget`/`reference_miss`/`self_skip`); we reuse
+    /// it rather than register a second metric of the same name (which would
+    /// panic the default registry on a duplicate).
+    pub static ref SFU_FORWARD_TOTAL: Counter = register_counter!(
+        "sfu_forward_total",
+        "Total packets the SFU forwarder decided to forward (increment-only)"
+    )
+    .expect("Failed to create sfu_forward_total metric");
+}
+
+/// Static drop-reason label constants for the existing
+/// [`SFU_DROPPED_TOTAL`] `sfu_dropped_total{reason}` CounterVec.
+///
+/// Exposed as `&'static str` so the forwarder hot path passes a compile-time
+/// constant to `with_label_values` and NEVER formats a string per packet.
+/// These match the labels already touched-at-zero on `SFU_DROPPED_TOTAL`
+/// init, so `/metrics` shows them before the first real drop.
+pub mod sfu_drop_reason {
+    /// Sender not in the receiver's resolved AllowSet.
+    pub const UNSUBSCRIBED: &str = "unsubscribed";
+    /// VP9 SVC layer exceeds the receiver's bandwidth budget.
+    pub const LAYER_BUDGET: &str = "layer_budget";
+    /// T1/T2 frame whose referenced T0 was not forwarded to this receiver.
+    pub const REFERENCE_MISS: &str = "reference_miss";
+    /// Sender == receiver (own echo).
+    pub const SELF_SKIP: &str = "self_skip";
 }

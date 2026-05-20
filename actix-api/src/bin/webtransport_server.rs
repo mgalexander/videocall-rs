@@ -41,6 +41,10 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // vc-8wd: arm targeted SFU tracing from SFU_TRACE_ROOM/SESSION (read
+    // once). No-op when unset, which is the default.
+    sec_api::sfu::trace::init();
+
     info!("Starting WebTransport server with actor-based session handling");
 
     // SFU_TRANSPORT_KIND identifies this binary's transport family for the

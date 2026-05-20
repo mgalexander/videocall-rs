@@ -1582,6 +1582,24 @@ impl Handler<JoinRoom> for ChatServer {
             let replicas = crate::sfu::affinity::replicas_from_env();
             let self_ord = crate::sfu::affinity::self_ordinal_from_env();
             let spilled_over = self.spillover_store.is_spilled_over(&room);
+            // vc-8wd Layer 1: surface WHY the spillover verdict is what it is.
+            // `owner_count` is the participant count from the owner-pod beacon
+            // the predicate just consulted (0 when no fresh beacon exists);
+            // `state` is the boolean verdict. Both are O(1) gauge sets on the
+            // (low-rate) JoinRoom path — not the per-packet hot path.
+            {
+                let owner_count = self
+                    .spillover_store
+                    .snapshot(&room)
+                    .map(|s| s.owner_count)
+                    .unwrap_or(0);
+                crate::metrics::SFU_SPILLOVER_OWNER_COUNT
+                    .with_label_values(&[room.as_str()])
+                    .set(owner_count as f64);
+                crate::metrics::SFU_SPILLOVER_STATE
+                    .with_label_values(&[room.as_str()])
+                    .set(if spilled_over { 1.0 } else { 0.0 });
+            }
             // Compute the redirect target once: needed both for the spill
             // observability log (when this pod is a non-owner) and for the
             // actual redirect on the non-spill path.
@@ -1611,6 +1629,31 @@ impl Handler<JoinRoom> for ChatServer {
                         room, session, user_id,
                     ),
                 }
+                // vc-8wd Layer 2: targeted join trace (only for the
+                // configured room/session). Gated on the cheap atomic load
+                // first so unset = zero cost.
+                if crate::sfu::trace::tracing_enabled()
+                    && crate::sfu::trace::traced_room(&room)
+                    && crate::sfu::trace::traced_session(&session.to_string())
+                {
+                    let owner_count = self
+                        .spillover_store
+                        .snapshot(&room)
+                        .map(|s| s.owner_count)
+                        .unwrap_or(0);
+                    tracing::debug!(
+                        target: "sfu_trace",
+                        room = %room,
+                        session,
+                        %user_id,
+                        decision = "admit_local",
+                        reason = "spilled_over",
+                        spilled_over,
+                        self_ordinal = ?self_ord,
+                        owner_count,
+                        "JoinRoom decision"
+                    );
+                }
                 // Fall through to the local-admit path below.
             } else if let Some(target) = redirect_target {
                 info!(
@@ -1618,6 +1661,23 @@ impl Handler<JoinRoom> for ChatServer {
                      redirecting session {} (user {}) to {}",
                     room, self_ord, session, user_id, target,
                 );
+                if crate::sfu::trace::tracing_enabled()
+                    && crate::sfu::trace::traced_room(&room)
+                    && crate::sfu::trace::traced_session(&session.to_string())
+                {
+                    tracing::debug!(
+                        target: "sfu_trace",
+                        room = %room,
+                        session,
+                        %user_id,
+                        decision = "redirect",
+                        reason = "wrong_owner",
+                        spilled_over,
+                        self_ordinal = ?self_ord,
+                        %target,
+                        "JoinRoom decision"
+                    );
+                }
                 if let Some(recipient) = self.sessions.get(&session) {
                     let bytes =
                         SessionManager::build_admission_redirect_packet(&target, "wrong_owner");

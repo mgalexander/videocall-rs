@@ -273,6 +273,10 @@ async fn main() -> std::io::Result<()> {
         .init();
     info!("start");
 
+    // vc-8wd: arm targeted SFU tracing from SFU_TRACE_ROOM/SESSION (read
+    // once). No-op when unset, which is the default.
+    sec_api::sfu::trace::init();
+
     // SFU_TRANSPORT_KIND identifies this binary's transport family for the
     // wave-3 ADMISSION_DECISION{REDIRECT} DNS template (bead vc-8oa / p6-5).
     // Set unconditionally at startup so the JoinRoom handler doesn't have to

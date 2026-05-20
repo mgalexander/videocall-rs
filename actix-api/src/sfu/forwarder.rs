@@ -29,14 +29,16 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::actors::session_logic::SessionId;
+use crate::metrics::sfu_drop_reason;
 use crate::metrics::{
-    SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL, SFU_KEYFRAME_FORWARDED_TOTAL,
-    SFU_ROOM_SIZE,
+    SFU_DECIDE_LATENCY_US, SFU_DROPPED_TOTAL, SFU_FORWARDED_TOTAL, SFU_FORWARD_TOTAL,
+    SFU_KEYFRAME_FORWARDED_TOTAL, SFU_ROOM_SIZE,
 };
 use crate::sfu::layer_selector::LayerSelector;
 use crate::sfu::room_state::RoomState;
 use crate::sfu::speaker::ActiveSpeakerSet;
 use crate::sfu::subscription::{SubscriptionStore, MAX_VISIBLE_VIDEO};
+use crate::sfu::trace;
 
 /// Map a `PacketWrapper.packet_type` (an `EnumOrUnknown<PacketType>`) to a
 /// stable lowercase string suitable for use as a Prometheus label value.
@@ -315,10 +317,17 @@ impl Forwarder {
         // vc-2cx: capture `members_generation` alongside the snapshot so
         // `SubscriptionStore::resolve_cached` can detect stale cached
         // AllowSets safely (the `Arc` pointer alone is ABA-vulnerable).
-        let (members_snapshot, members_generation, receiver_bw_kbps): (
+        // vc-8wd: capture the room id for the targeted trace gate ONLY when
+        // tracing is globally armed. With tracing OFF (default) this stays
+        // `None` — no `String` clone, no extra work on the hot path. The
+        // single `trace::tracing_enabled()` relaxed atomic load is the only
+        // cost the gate adds per packet.
+        let trace_armed = trace::tracing_enabled();
+        let (members_snapshot, members_generation, receiver_bw_kbps, traced_room): (
             Arc<HashSet<SessionId>>,
             u64,
             Option<u32>,
+            Option<String>,
         ) = {
             let room = match self.room.read() {
                 Ok(g) => g,
@@ -333,12 +342,28 @@ impl Forwarder {
                 .get(&receiver_sid)
                 .and_then(|m| m.bandwidth_estimate.as_ref())
                 .map(|est| est.estimated_downlink_kbps);
-            (members, gen, bw)
+            // Only clone the room id (and only when armed AND this is the
+            // configured room) so the trace path never allocates for an
+            // untraced room.
+            let traced = if trace_armed && trace::traced_room(&room.room_id) {
+                Some(room.room_id.clone())
+            } else {
+                None
+            };
+            (members, gen, bw, traced)
         };
 
         // 1. Self-skip — sender is the receiver itself.
         if packet_wrapper.session_id == receiver_sid {
-            SFU_DROPPED_TOTAL.with_label_values(&["self_skip"]).inc();
+            SFU_DROPPED_TOTAL
+                .with_label_values(&[sfu_drop_reason::SELF_SKIP])
+                .inc();
+            trace_forward_decision(
+                &traced_room,
+                &packet_wrapper.session_id,
+                "drop",
+                sfu_drop_reason::SELF_SKIP,
+            );
             observe_decide_latency(start);
             return ForwardDecision::Drop;
         }
@@ -472,7 +497,15 @@ impl Forwarder {
                         _ => true,
                     };
                     if !allowed {
-                        SFU_DROPPED_TOTAL.with_label_values(&["unsubscribed"]).inc();
+                        SFU_DROPPED_TOTAL
+                            .with_label_values(&[sfu_drop_reason::UNSUBSCRIBED])
+                            .inc();
+                        trace_forward_decision(
+                            &traced_room,
+                            &sender_sid,
+                            "drop",
+                            sfu_drop_reason::UNSUBSCRIBED,
+                        );
                         observe_decide_latency(start);
                         return ForwardDecision::Drop;
                     }
@@ -529,7 +562,15 @@ impl Forwarder {
                                     )
                                 };
                                 if drop {
-                                    SFU_DROPPED_TOTAL.with_label_values(&["layer_budget"]).inc();
+                                    SFU_DROPPED_TOTAL
+                                        .with_label_values(&[sfu_drop_reason::LAYER_BUDGET])
+                                        .inc();
+                                    trace_forward_decision(
+                                        &traced_room,
+                                        &sender_sid,
+                                        "drop",
+                                        sfu_drop_reason::LAYER_BUDGET,
+                                    );
                                     observe_decide_latency(start);
                                     return ForwardDecision::Drop;
                                 }
@@ -567,8 +608,14 @@ impl Forwarder {
                                         .is_some_and(|s| s.contains(rh.picture_id, now));
                                     if !seen {
                                         SFU_DROPPED_TOTAL
-                                            .with_label_values(&["reference_miss"])
+                                            .with_label_values(&[sfu_drop_reason::REFERENCE_MISS])
                                             .inc();
+                                        trace_forward_decision(
+                                            &traced_room,
+                                            &sender_sid,
+                                            "drop",
+                                            sfu_drop_reason::REFERENCE_MISS,
+                                        );
                                         observe_decide_latency(start);
                                         return ForwardDecision::Drop;
                                     }
@@ -584,6 +631,9 @@ impl Forwarder {
         SFU_FORWARDED_TOTAL
             .with_label_values(&[packet_type_label(packet_wrapper)])
             .inc();
+        // vc-8wd Layer 1: un-labeled aggregate forward counter.
+        SFU_FORWARD_TOTAL.inc();
+        trace_forward_decision(&traced_room, &packet_wrapper.session_id, "forward", "ok");
         observe_decide_latency(start);
         ForwardDecision::Forward
     }
@@ -806,4 +856,36 @@ impl Forwarder {
 fn observe_decide_latency(start: std::time::Instant) {
     let elapsed_us = start.elapsed().as_micros() as f64;
     SFU_DECIDE_LATENCY_US.observe(elapsed_us);
+}
+
+/// vc-8wd Layer 2: emit a SAMPLED structured trace for a per-packet forward
+/// decision on the `sfu_trace` target.
+///
+/// `traced_room` is `Some(room)` ONLY when tracing is armed AND this packet
+/// belongs to the configured trace room (resolved once per `decide` under
+/// the room lock). When `None` — the steady-state default — this is a single
+/// branch and returns immediately, doing no formatting and no allocation.
+///
+/// When `Some`, the 1-in-N [`trace::should_sample_forward`] sampler bounds
+/// the log volume so a traced room doesn't flood. Only the sampled lines
+/// touch the `tracing` macro (and thus any formatting).
+#[inline]
+fn trace_forward_decision(
+    traced_room: &Option<String>,
+    sender_sid: &SessionId,
+    decision: &'static str,
+    reason: &'static str,
+) {
+    if let Some(room) = traced_room {
+        if trace::should_sample_forward() {
+            tracing::debug!(
+                target: "sfu_trace",
+                room = %room,
+                sender = sender_sid,
+                decision,
+                reason,
+                "forward decision (sampled)"
+            );
+        }
+    }
 }

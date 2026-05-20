@@ -28,6 +28,7 @@ pub mod room_state;
 pub mod speaker;
 pub mod spillover;
 pub mod subscription;
+pub mod trace;
 
 #[cfg(test)]
 mod tests;
