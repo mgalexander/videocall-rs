@@ -1636,6 +1636,218 @@ mod tests {
     use crate::stats::{BotRole, BotStats};
     use std::sync::atomic::Ordering;
 
+    // ==========================================================================
+    // vc-k4w: end-to-end redirect-follow integration test.
+    //
+    // This is the HIGH-fidelity integration test the bead asks for: it drives a
+    // REAL `web-transport-quinn` / quinn QUIC session end-to-end and proves that
+    // `WebTransportClient::start_inbound_consumer` extracts an
+    // `ADMISSION_DECISION{REDIRECT}` delivered on a unidirectional stream the
+    // instant before the (minimal, in-process) SFU closes the session — i.e.
+    // the exact "bytes reach the extractor over the wire" path the bead is
+    // about, which the existing unit tests (`try_extract_redirect_target_*`,
+    // `handle_inbound_stream_data_*`, `compute_redirect_url`) deliberately do
+    // NOT cover because they call the helpers directly without any QUIC I/O.
+    //
+    // Topology:
+    //   - A minimal SFU: an in-process `web-transport-quinn` Server bound to
+    //     127.0.0.1:0 (ephemeral port), self-signed cert via rcgen. It accepts
+    //     exactly one WebTransport session (the bot's), opens a server→client
+    //     uni-stream, writes a serialized PacketWrapper{ADMISSION_DECISION,
+    //     AdmissionDecision{status=REDIRECT, redirect_to=...}}, finishes the
+    //     stream, then closes the session — mirroring the real SFU's
+    //     redirect-then-close sequence.
+    //   - The bot side is the production `WebTransportClient::connect` path used
+    //     by `orchestrate.rs::run_sender` and `failover.rs`: build the client,
+    //     attach a `SessionEndSignal` via `with_session_end_signal`, connect
+    //     `insecure` (the bot's `with_no_certificate_verification` path).
+    //
+    // This exercises bridge → Session → accept_uni → read_to_end → the inline
+    // redirect-drain arm → `try_extract_redirect_target` → stash, all through
+    // real QUIC. Asserts: (a) `signal.redirect_to` ends up `Some(target)`, and
+    // (b) the session-end notification fires (`ended` flips true).
+    //
+    // Crypto note: web-transport-quinn does not enable a rustls provider feature
+    // itself, so we must install a process-default CryptoProvider (ring) before
+    // building either endpoint — matching what actix-api's WT integration tests
+    // do.
+    // ==========================================================================
+
+    /// Install the process-default rustls crypto provider exactly once. Safe to
+    /// call from multiple `#[tokio::test]`s; the second install is a no-op.
+    fn ensure_crypto_provider() {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            // Ignore the Result: a provider may already be installed by another
+            // test in the same process. We only need *a* provider present.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// Build a minimal in-process `web-transport-quinn` SFU bound to an
+    /// ephemeral loopback port. Returns the bound `SocketAddr` and the
+    /// constructed `Server`. The cert is a throwaway self-signed cert for
+    /// `localhost`; the bot connects `insecure` so the cert contents don't
+    /// matter beyond being a valid chain.
+    ///
+    /// We construct the quinn `Endpoint` ourselves (rather than using
+    /// `ServerBuilder::with_certificate`) for one reason: `web-transport-quinn`
+    /// 0.8's `Server` does not expose its bound address, and we bind to port 0
+    /// so concurrent test runs never collide. Building the endpoint directly
+    /// lets us read `endpoint.local_addr()` before handing it to
+    /// `Server::new`. The rustls/quinn config below mirrors exactly what
+    /// `ServerBuilder::with_certificate` does internally (TLS1.3, no client
+    /// auth, single cert, ALPN = `web_transport_quinn::ALPN`).
+    fn build_test_sfu() -> (std::net::SocketAddr, web_transport_quinn::Server) {
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use web_transport_quinn::quinn;
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+        let cert_der: CertificateDer<'static> = certified.cert.der().clone();
+        let key_der: PrivateKeyDer<'static> =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS1.3 server config")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("single cert server config");
+        tls_config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+
+        let quic_server_config =
+            <quinn::crypto::rustls::QuicServerConfig as std::convert::TryFrom<_>>::try_from(
+                tls_config,
+            )
+            .expect("quic server config");
+        let server_config =
+            quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_server_config));
+
+        // Bind to an ephemeral loopback port so concurrent test runs don't
+        // collide and we never touch a privileged port.
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let endpoint =
+            quinn::Endpoint::server(server_config, bind_addr).expect("bind quinn server endpoint");
+        let local_addr = endpoint.local_addr().expect("endpoint bound addr");
+        let server = web_transport_quinn::Server::new(endpoint);
+        (local_addr, server)
+    }
+
+    /// vc-k4w: REAL QUIC end-to-end. Stand up the in-process SFU, point the
+    /// bot's production `connect()` path at it, have the SFU deliver a
+    /// REDIRECT on a uni-stream then close, and assert the bot extracted and
+    /// stashed the redirect target and fired its session-end signal.
+    #[tokio::test]
+    async fn redirect_follow_end_to_end_over_real_quic_vc_k4w() {
+        ensure_crypto_provider();
+
+        const REDIRECT_TARGET: &str =
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local";
+
+        let (sfu_addr, mut server) = build_test_sfu();
+
+        // SFU task: accept exactly one session, emit one REDIRECT on a
+        // uni-stream, finish it, then close. This is the minimal reproduction
+        // of the real SFU's "owner mismatch → ADMISSION_DECISION{REDIRECT} →
+        // close" behaviour.
+        let server_task = tokio::spawn(async move {
+            let request = server
+                .accept()
+                .await
+                .expect("SFU should receive the bot's WebTransport request");
+            let session = request.ok().await.expect("SFU should accept the session");
+
+            // Build the exact wire shape the SFU emits on owner mismatch.
+            let decision = AdmissionDecision {
+                status: AdmissionStatus::REDIRECT.into(),
+                redirect_to: REDIRECT_TARGET.to_string(),
+                reason: "wrong_owner".to_string(),
+                ..Default::default()
+            };
+            let wrapper = PacketWrapper {
+                packet_type: PacketType::ADMISSION_DECISION.into(),
+                user_id: b"system".to_vec(),
+                data: decision.write_to_bytes().unwrap(),
+                ..Default::default()
+            };
+            let bytes = wrapper.write_to_bytes().unwrap();
+
+            let mut uni = session
+                .open_uni()
+                .await
+                .expect("SFU should open a uni-stream to the bot");
+            uni.write_all(&bytes)
+                .await
+                .expect("SFU should write the REDIRECT packet");
+            uni.finish().expect("SFU should finish the uni-stream");
+
+            // Give the bot a beat to drain the uni-stream before we tear the
+            // session down, then close — mirroring the real SFU which closes
+            // immediately after emitting the redirect.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            session.close(0u32, b"redirect");
+        });
+
+        // Bot side: the production connect path. `connect()` appends
+        // `/lobby/{user_id}/{meeting_id}`; the minimal SFU accepts any path.
+        let config = ClientConfig {
+            user_id: "redirect-bot".to_string(),
+            meeting_id: "vc-k4w-room".to_string(),
+            enable_audio: false,
+            enable_video: false,
+        };
+        let signal = Arc::new(SessionEndSignal::default());
+        let mut client = WebTransportClient::new(config).with_session_end_signal(signal.clone());
+
+        let url = Url::parse(&format!("https://{sfu_addr}")).expect("valid loopback URL");
+        client
+            .connect(&url, true)
+            .await
+            .expect("bot should connect to the in-process SFU");
+
+        // Wait for the inbound consumer to observe the REDIRECT + session close
+        // and fire the signal. Bound the wait so a regression that drops the
+        // redirect (or never fires the signal) fails fast instead of hanging.
+        let fired = tokio::time::timeout(Duration::from_secs(10), signal.notify.notified()).await;
+        assert!(
+            fired.is_ok(),
+            "session-end signal must fire after the SFU closes the redirected session"
+        );
+
+        // (a) The redirect target reached the extractor over real QUIC and was
+        //     stashed onto the SessionEndSignal — the exact byte path vc-k4w
+        //     requires.
+        let stashed = signal.redirect_to.lock().unwrap().clone();
+        assert_eq!(
+            stashed.as_deref(),
+            Some(REDIRECT_TARGET),
+            "the REDIRECT delivered on the uni-stream must be extracted and stashed"
+        );
+        // (b) The terminal `ended` flag is set (so a reconnect loop can observe
+        //     it without racing the notification).
+        assert!(
+            signal.ended.load(Ordering::Relaxed),
+            "session-end signal must mark the session as ended"
+        );
+
+        // Sanity: the redirect target is consumable by the orchestrate
+        // reconnect loop's URL computation — proves the extracted target is a
+        // valid host the loop would actually follow, closing the loop on the
+        // bead's "redirect-follow end-to-end" wording.
+        let next = crate::orchestrate::compute_redirect_url(&url, REDIRECT_TARGET)
+            .expect("extracted redirect target must compute a valid next URL");
+        assert_eq!(next.host_str(), Some(REDIRECT_TARGET));
+        assert_eq!(next.scheme(), "https");
+
+        client.stop();
+        let _ = server_task.await;
+    }
+
+    use crate::config::ClientConfig;
+
     fn empty_pool() -> DecoderPool {
         // Tests don't drain the channel; size doesn't matter because the
         // existing tests never push into it. `try_send` from any new code

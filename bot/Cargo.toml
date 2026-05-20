@@ -49,3 +49,22 @@ anyhow = "1.0"
 # here as a direct dep so the bot's `--verify-integrity` path can recompute
 # CRC32 over the codec payload without relying on a transitive-only crate.
 crc32fast = "1.5"
+
+[dev-dependencies]
+# vc-k4w: the redirect-follow end-to-end test stands up an in-process
+# `web-transport-quinn` server that needs a TLS certificate. rcgen generates a
+# throwaway self-signed cert at test time; rustls-pki-types names the
+# CertificateDer / PrivateKeyDer the server builder consumes. Both are already
+# in the workspace lockfile (transitive deps of web-transport-quinn / rustls),
+# so this adds no new resolved crates — only makes them nameable from the
+# bot's test code.
+rcgen = "0.13"
+rustls-pki-types = "1"
+# Needed to install a process-default rustls CryptoProvider before standing up
+# the in-process web-transport-quinn server/client in the redirect-follow test
+# (web-transport-quinn does not enable a provider feature itself, so without
+# this the rustls ConfigBuilder panics with "CryptoProvider::set_default() must
+# be called"). Matches actix-api's `rustls = { version = "0.23", features =
+# ["ring"] }`.
+rustls = { version = "0.23", features = ["ring"] }
+web-transport-quinn = { workspace = true }
