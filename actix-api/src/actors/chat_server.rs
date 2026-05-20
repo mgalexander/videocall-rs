@@ -22,7 +22,9 @@ use crate::{
         WAITING_ROOM_THRESHOLD, WAITING_ROOM_THRESHOLD_ENV,
     },
     messages::{
-        server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
+        server::{
+            ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, JoinRoomError, Leave,
+        },
         session::Message,
     },
     models::build_subject_and_queue,
@@ -1224,6 +1226,48 @@ impl Handler<HomeRegionResolved> for ChatServer {
              this pod is in {}; redirecting session {} (user {}) to {}",
             room, home_region, current_region, session, user_id, target,
         );
+        // vc-n9o: count BOTH the redirect decision AND its teardown at this
+        // site.
+        //
+        // Why count the teardown HERE (not in the transport actor's
+        // `stopping`, as the synchronous JoinRoom-Err path does):
+        //
+        // Unlike the JoinRoom-Err redirect, this async cross-region redirect
+        // fires AFTER the session was already admitted locally (cache-miss
+        // first-joiner). The session's transport actor is fully running and
+        // the client may already be sending media. We deliver the REDIRECT
+        // over the STILL-OPEN session (the `try_send` below), then synthesize
+        // a `Disconnect` that ONLY cleans up ChatServer-side room state
+        // (`sessions` / `connection_states` / `room_members` / `room_states`).
+        // It does NOT stop the transport actor and does NOT clear that actor's
+        // `accept_inbound` flag.
+        //
+        // The transport actor tears itself down later, on its own stop path
+        // (the client reads the REDIRECT over the open session and closes,
+        // or the heartbeat times out) — which records `reason=normal`, NOT
+        // `redirect`. So if we relied on the actor's `stopping` to count this
+        // redirect's teardown, every async cross-region redirect would leave a
+        // permanent `decision{redirect}` without a matching
+        // `teardown{redirect}` — exactly the false-positive gap that looks
+        // like the vc-n9o regression. Counting `teardown{redirect}` here, at
+        // the authoritative teardown trigger for THIS path, closes that gap.
+        // (The actor's later `reason=normal` count is a genuine normal
+        // disconnect and does not affect the redirect-vs-redirect comparison.)
+        //
+        // Note: this path does NOT suffer the WT mailbox-starvation 0-decode
+        // hang. That hang was caused by the QUIC session never closing, so the
+        // client never learned it was redirected. Here the REDIRECT is
+        // delivered over the live session BEFORE any teardown, so the client
+        // learns of it and disconnects cooperatively. Routing it through the
+        // transport actor's flag-clear + StopSession would be redundant and
+        // would disturb the vc-9g7 cross-region ghost-participant handling, so
+        // we deliberately keep the existing synthesized-Disconnect cleanup.
+        crate::metrics::SFU_JOIN_DECISION_TOTAL
+            .with_label_values(&["redirect"])
+            .inc();
+        crate::metrics::SFU_SESSION_TEARDOWN_TOTAL
+            .with_label_values(&["redirect"])
+            .inc();
         let bytes = SessionManager::build_admission_redirect_packet(&target, "wrong_region");
         if let Err(e) = recipient.try_send(Message {
             msg: bytes::Bytes::from(bytes),
@@ -1240,7 +1284,8 @@ impl Handler<HomeRegionResolved> for ChatServer {
         // it to ourselves rather than calling `leave_rooms` directly so the
         // Disconnect handler's session-state cleanup (sessions /
         // connection_states / suppress_join_broadcast removal) runs in one
-        // place.
+        // place. This cleans up ROOM-SIDE state only; the transport actor
+        // stops on its own stop path once the client follows the REDIRECT.
         //
         // vc-9g7: set `redirect: true` to BYPASS the pending-departure
         // grace window. The client will not reconnect to this pod — it's
@@ -1405,7 +1450,9 @@ impl Handler<JoinRoom> for ChatServer {
         // This ensures we return an error to the client if validation fails,
         // rather than returning Ok and silently failing in the spawned task.
         if user_id == SYSTEM_USER_ID {
-            return MessageResult(Err("Cannot use reserved system user ID".into()));
+            return MessageResult(Err(JoinRoomError::error(
+                "Cannot use reserved system user ID",
+            )));
         }
 
         if self.joined_sessions.contains(&session) {
@@ -1474,10 +1521,17 @@ impl Handler<JoinRoom> for ChatServer {
                             );
                         }
                     }
-                    return MessageResult(Err(format!(
+                    // vc-n9o: count the redirect decision at the actual
+                    // decision site. The matching teardown is counted in the
+                    // transport actor's StopSession handler; a redirect-vs-
+                    // teardown gap is the live multi-pod 0-decode signal.
+                    crate::metrics::SFU_JOIN_DECISION_TOTAL
+                        .with_label_values(&["redirect"])
+                        .inc();
+                    return MessageResult(Err(JoinRoomError::redirect(format!(
                         "Room {room} is homed in region {cached_home}; \
                          redirecting to {target}"
-                    )));
+                    ))));
                 }
                 // Cache hit, same region → fall through to p6-5 below.
             } else {
@@ -1700,9 +1754,14 @@ impl Handler<JoinRoom> for ChatServer {
                 // pod's deferred PARTICIPANT_LEFT still fires after the
                 // grace period if the client doesn't successfully
                 // reconnect on the correct pod.
-                return MessageResult(Err(format!(
+                // vc-n9o: count the pod-ordinal redirect decision here so
+                // it can be compared against the teardown counter.
+                crate::metrics::SFU_JOIN_DECISION_TOTAL
+                    .with_label_values(&["redirect"])
+                    .inc();
+                return MessageResult(Err(JoinRoomError::redirect(format!(
                     "Room {room} is owned by a different pod; redirecting to {target}"
-                )));
+                ))));
             }
         }
 
@@ -1829,9 +1888,13 @@ impl Handler<JoinRoom> for ChatServer {
                 if is_reconnection {
                     self.suppress_join_broadcast.remove(&session);
                 }
-                return MessageResult(Err(format!(
+                // vc-n9o: count the hard-cap reject decision.
+                crate::metrics::SFU_JOIN_DECISION_TOTAL
+                    .with_label_values(&["reject"])
+                    .inc();
+                return MessageResult(Err(JoinRoomError::reject(format!(
                     "Room {room} is at capacity ({hard_cap}); please try again later"
-                )));
+                ))));
             }
             if current >= soft_cap {
                 // 1-based offset into the soft-cap overflow zone:
@@ -1870,7 +1933,7 @@ impl Handler<JoinRoom> for ChatServer {
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
-                return MessageResult(Err("Session not found".into()));
+                return MessageResult(Err(JoinRoomError::error("Session not found")));
             }
         };
 
@@ -2138,6 +2201,11 @@ impl Handler<JoinRoom> for ChatServer {
             }
         });
 
+        // vc-n9o: count the local admission decision (including the
+        // spillover-admit path, which falls through to this Ok return).
+        crate::metrics::SFU_JOIN_DECISION_TOTAL
+            .with_label_values(&["admit_local"])
+            .inc();
         MessageResult(Ok(()))
     }
 }
@@ -3091,10 +3159,12 @@ mod tests {
             "JoinRoom with system user ID should return Err, not Ok"
         );
 
-        let error_msg = result.unwrap_err();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, crate::messages::server::JoinDeclineKind::Error);
         assert!(
-            error_msg.contains("reserved system user ID"),
-            "Error should mention reserved system user ID, got: {error_msg}"
+            error.message.contains("reserved system user ID"),
+            "Error should mention reserved system user ID, got: {}",
+            error.message
         );
     }
 
@@ -3182,7 +3252,7 @@ mod tests {
             "JoinRoom without registered session should return Err"
         );
         assert!(
-            result.unwrap_err().contains("Session not found"),
+            result.unwrap_err().message.contains("Session not found"),
             "Error should mention session not found"
         );
     }
@@ -4462,9 +4532,16 @@ mod tests {
             "Join past cap should return Err, got: {result:?}"
         );
         let err = result.unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::messages::server::JoinDeclineKind::Reject,
+            "hard-cap decline must be classified Reject (vc-n9o: must NOT be \
+             labeled redirect)"
+        );
         assert!(
-            err.contains("capacity"),
-            "Error should mention capacity, got: {err}"
+            err.message.contains("capacity"),
+            "Error should mention capacity, got: {}",
+            err.message
         );
 
         // Observers are not subject to the cap. Register and join a 5th
@@ -5078,7 +5155,7 @@ mod tests {
             .unwrap();
         assert!(result.is_err(), "join at hard cap must be rejected");
         assert!(
-            result.unwrap_err().contains("at capacity"),
+            result.unwrap_err().message.contains("at capacity"),
             "error message should mention capacity"
         );
 
@@ -5323,8 +5400,15 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_err(), "join on non-owner pod must be declined");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::messages::server::JoinDeclineKind::Redirect,
+            "non-owner-pod decline must be classified Redirect so the teardown \
+             counter lines up with the redirect decision (vc-n9o)"
+        );
         assert!(
-            result.unwrap_err().contains("different pod"),
+            err.message.contains("different pod"),
             "error message should mention pod ownership"
         );
 
@@ -6346,9 +6430,15 @@ mod tests {
                 sids[i]
             );
             let err = r.as_ref().unwrap_err();
+            assert_eq!(
+                err.kind,
+                crate::messages::server::JoinDeclineKind::Redirect,
+                "session #{i}: decline must be classified Redirect (vc-n9o)"
+            );
             assert!(
-                err.contains("different pod"),
-                "session #{i}: error must be a pod-ownership redirect, got: {err}"
+                err.message.contains("different pod"),
+                "session #{i}: error must be a pod-ownership redirect, got: {}",
+                err.message
             );
         }
 

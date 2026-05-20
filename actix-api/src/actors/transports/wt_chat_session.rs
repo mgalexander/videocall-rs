@@ -23,20 +23,29 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::parse_and_inspect;
-use crate::actors::session_logic::{InboundAction, SessionLogic};
+use crate::actors::session_logic::{InboundAction, SessionLogic, TeardownReason};
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use crate::sfu::priority_queue::{classify_outbound, Class, PrioritySender, SendOutcome};
+use crate::webtransport::bridge::AcceptInboundFlag;
 use actix::{
     fut, Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, ContextFutureSpawner,
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::{error, info, trace, warn};
+
+/// vc-n9o: how long the actor waits after enqueuing `StopSession` on a
+/// redirect before force-stopping itself, in case the mailbox is still being
+/// fed faster than it drains (deadline-escalation backstop). Bounded well
+/// under the 500ms reconnect-responsiveness budget while leaving ample time
+/// for the queued REDIRECT `Message` to drain and the writer to flush it.
+const REDIRECT_TEARDOWN_DEADLINE: Duration = Duration::from_millis(300);
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
@@ -87,6 +96,16 @@ pub struct WtChatSession {
 
     /// Track if ActivateConnection has been sent
     activated: bool,
+
+    /// vc-n9o: shared flag telling the bridge readers whether to keep
+    /// forwarding inbound client frames. Cleared on a redirect teardown so
+    /// the readers stop feeding the mailbox and the queued `StopSession`
+    /// item can actually run (breaking the mailbox-starvation hang).
+    accept_inbound: AcceptInboundFlag,
+
+    /// vc-n9o: reason recorded for the eventual teardown so `stopping` can
+    /// emit `sfu_session_teardown_total` exactly once with the right label.
+    teardown_reason: TeardownReason,
 }
 
 impl WtChatSession {
@@ -101,6 +120,7 @@ impl WtChatSession {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        accept_inbound: AcceptInboundFlag,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -118,6 +138,8 @@ impl WtChatSession {
             heartbeat: actix::clock::Instant::now(),
             outbound_tx,
             activated: false,
+            accept_inbound,
+            teardown_reason: TeardownReason::Normal,
         }
     }
 
@@ -230,6 +252,7 @@ impl Actor for WtChatSession {
                         .logic
                         .build_meeting_ended(&format!("Session rejected: {e}"));
                     act.send(bytes);
+                    act.teardown_reason = TeardownReason::Error;
                     ctx.stop();
                 }
             }),
@@ -241,9 +264,10 @@ impl Actor for WtChatSession {
             .addr
             .send(self.logic.create_connect_message(addr.recipient()))
             .into_actor(self)
-            .then(|res, _act, ctx| {
+            .then(|res, act, ctx| {
                 if let Err(err) = res {
                     error!("Failed to connect to ChatServer: {:?}", err);
+                    act.teardown_reason = TeardownReason::Error;
                     ctx.stop();
                 }
                 fut::ready(())
@@ -259,6 +283,12 @@ impl Actor for WtChatSession {
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        // vc-n9o: emit the teardown counter exactly once, on whatever stop
+        // path fired. `teardown_reason` defaults to Normal and is set to
+        // Redirect / Error at the specific decision sites below.
+        crate::metrics::SFU_SESSION_TEARDOWN_TOTAL
+            .with_label_values(&[self.teardown_reason.label()])
+            .inc();
         self.logic.on_stopping();
         Running::Stop
     }
@@ -319,6 +349,7 @@ impl Handler<Message> for WtChatSession {
                     "P0Control class queue full for session {} — terminating session per PLAN.md",
                     self.logic.id
                 );
+                self.teardown_reason = TeardownReason::Error;
                 ctx.stop();
             }
         }
@@ -374,6 +405,7 @@ impl Handler<WtInbound> for WtChatSession {
                              terminating session",
                             self.logic.id
                         );
+                        self.teardown_reason = TeardownReason::Error;
                         ctx.stop();
                     }
                 }
@@ -425,7 +457,7 @@ impl WtChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                if act.logic.handle_join_room_result(response) {
+                if let Some(reason) = act.logic.handle_join_room_result(response) {
                     // vc-883: queue StopSession instead of calling ctx.stop()
                     // directly. The JoinRoom rejection path (e.g.
                     // ADMISSION_DECISION{REDIRECT} on a non-owner pod, see
@@ -455,7 +487,53 @@ impl WtChatSession {
                     // because it's a field on the actor, dropped only when
                     // the actor is fully stopped — by which time the writer
                     // has already pulled the REDIRECT off the queue.
+                    //
+                    // vc-n9o: under sustained inbound, the bridge readers keep
+                    // `try_send`ing `WtInbound` into this mailbox, so it is
+                    // never empty and the `StopSession` *item* (which actix
+                    // processes only AFTER the mailbox drains) is starved — the
+                    // actor never stops, `outbound_tx` never drops, the writer
+                    // never sees recv→None, and the QUIC session never closes.
+                    // The redirected sender then hangs on the non-owner pod and
+                    // never publishes to NATS (the multi-pod 0-decode root
+                    // cause).
+                    //
+                    // Breaking the starvation: clear `accept_inbound` so the
+                    // bridge readers immediately STOP forwarding inbound
+                    // frames. The mailbox then drains (the queued REDIRECT
+                    // `Message` runs, placing bytes in `outbound_tx`) and the
+                    // `StopSession` item finally runs. We clear the flag BEFORE
+                    // `notify(StopSession)` so no further `WtInbound` is
+                    // enqueued behind the stop. This does NOT touch the
+                    // outbound/writer path, so the REDIRECT still flushes first
+                    // (vc-883) over its reliable UniStream (vc-xnp) within the
+                    // writer's grace (vc-s9e).
+                    //
+                    // vc-n9o (metric correctness): the teardown reason comes
+                    // from the typed `JoinRoom` decline so it lines up with the
+                    // decision counter — a hard-cap *reject* is labeled `error`,
+                    // NOT `redirect`, so it cannot inflate the redirect teardown
+                    // bucket and mask a real redirect-vs-teardown gap. The
+                    // starvation-breaking flag-clear is applied to EVERY decline
+                    // (redirect and reject both `try_send` a control packet that
+                    // must drain before stop, and a media-sending client can hit
+                    // either), so it is correct and harmless for all of them.
+                    act.teardown_reason = reason;
+                    act.accept_inbound.store(false, Ordering::Release);
                     ctx.notify(StopSession);
+                    // Deadline-escalation backstop: if `StopSession` still
+                    // hasn't run within REDIRECT_TEARDOWN_DEADLINE (e.g. a
+                    // burst of inbound was already queued ahead of the items
+                    // list before the flag took effect), force the stop so the
+                    // teardown chain cannot stall.
+                    ctx.run_later(REDIRECT_TEARDOWN_DEADLINE, |act, ctx| {
+                        warn!(
+                            "Redirect teardown deadline elapsed for session {} — \
+                             forcing stop (mailbox-starvation backstop, vc-n9o)",
+                            act.logic.id
+                        );
+                        ctx.stop();
+                    });
                 }
                 fut::ready(())
             })
@@ -677,6 +755,216 @@ mod tests {
             delivered, 1,
             "ctx.notify(StopSession) MUST allow the queued mailbox Message \
              to run before the actor terminates — this is the vc-883 fix"
+        );
+    }
+
+    // =====================================================================
+    // vc-n9o regression test: redirect teardown under mailbox starvation.
+    //
+    // vc-883 proved the queued REDIRECT drains when the mailbox can empty.
+    // But under sustained inbound, the bridge readers keep `try_send`ing
+    // `WtInbound` into the mailbox, so it NEVER empties and the
+    // `StopSession` *item* (processed only after the mailbox drains) is
+    // starved — the actor never stops, `outbound_tx` never drops, the QUIC
+    // session never closes, and the redirected sender hangs (the multi-pod
+    // 0-decode root cause). The fix is the shared `accept_inbound` flag:
+    // clearing it on the redirect path makes the readers stop feeding the
+    // mailbox so it can drain to the stop.
+    //
+    // This test reproduces the starvation with a "flooder" tokio task that
+    // keeps `try_send`ing inbound messages into the session mailbox while
+    // `accept_inbound` is true (mirroring the bridge readers). It asserts:
+    //   1. The actor terminates despite the flood (starvation broken).
+    //   2. The queued REDIRECT was delivered BEFORE teardown (vc-883 kept).
+    //   3. An `outbound_tx` stand-in held as an actor field is dropped when
+    //      the actor stops (so the real writer would see recv→None and
+    //      `wait_for_disconnect` would return).
+    // =====================================================================
+
+    use std::sync::atomic::AtomicBool;
+
+    /// A flood inbound message (stand-in for `WtInbound` under 30fps load).
+    #[derive(ActixMessage)]
+    #[rtype(result = "()")]
+    struct FloodInbound;
+
+    /// Like `Server`, but its `JoinRoom` handler enqueues the REDIRECT and
+    /// then returns Err after a brief async delay — keeping the session
+    /// parked in `.wait` long enough for the flooder to pack the mailbox
+    /// BEFORE the redirect decision (the realistic ordering: client media is
+    /// already flowing when the server decides to redirect).
+    struct SlowServer;
+    impl Actor for SlowServer {
+        type Context = Context<Self>;
+    }
+    impl Handler<JoinRoom> for SlowServer {
+        type Result = actix::ResponseActFuture<Self, Result<(), ()>>;
+        fn handle(&mut self, msg: JoinRoom, _ctx: &mut Context<Self>) -> Self::Result {
+            // 1. Enqueue the REDIRECT into the session mailbox first.
+            let _ = msg.session_recipient.try_send(OutboundMessage);
+            // 2. Delay the Err so the flood builds up while the session is
+            //    still parked on the JoinRoom response.
+            Box::pin(
+                async {
+                    actix_rt::time::sleep(std::time::Duration::from_millis(40)).await;
+                }
+                .into_actor(self)
+                .map(|_, _, _| Err(())),
+            )
+        }
+    }
+
+    struct StarvedSession {
+        server: Addr<SlowServer>,
+        delivered: Arc<AtomicU32>,
+        /// Set true the instant the actor stops (via `stopping`), so the
+        /// test can confirm the REDIRECT (delivered=1) happened first.
+        stopped: Arc<AtomicBool>,
+        /// vc-n9o flag shared with the flooder task; cleared on redirect.
+        accept_inbound: Arc<AtomicBool>,
+        /// Stand-in for the actor's `outbound_tx` field. Its `Arc` strong
+        /// count drops when the actor (and this field) is dropped on stop —
+        /// mirroring the real `PrioritySender` drop that ends the writer.
+        /// Never read: its drop-on-actor-stop is the whole point.
+        #[allow(dead_code)]
+        outbound_tx: Arc<()>,
+    }
+    impl Actor for StarvedSession {
+        type Context = Context<Self>;
+        fn started(&mut self, ctx: &mut Self::Context) {
+            // Generous mailbox so the flood (and the pre-queued REDIRECT) all
+            // fit; the real bridge mailbox is likewise not the bottleneck —
+            // the bug is item-list starvation, not mailbox-full backpressure.
+            ctx.set_mailbox_capacity(4096);
+            let recipient = ctx.address().recipient::<OutboundMessage>();
+            self.server
+                .send(JoinRoom {
+                    session_recipient: recipient,
+                })
+                .into_actor(self)
+                .then(move |res, act, ctx| {
+                    if let Ok(Err(())) = res {
+                        // Exact mirror of `WtChatSession::join_room` redirect
+                        // path: clear the flag (stop the flood) BEFORE
+                        // notifying StopSession, so the mailbox can drain the
+                        // queued REDIRECT and then run the stop item.
+                        act.accept_inbound.store(false, Ordering::Release);
+                        ctx.notify(StopSession);
+                    } else {
+                        ctx.stop();
+                    }
+                    fut::ready(())
+                })
+                .wait(ctx);
+        }
+        fn stopping(&mut self, _: &mut Self::Context) -> actix::Running {
+            self.stopped.store(true, Ordering::SeqCst);
+            actix::Running::Stop
+        }
+    }
+    impl Handler<OutboundMessage> for StarvedSession {
+        type Result = ();
+        fn handle(&mut self, _msg: OutboundMessage, _ctx: &mut Self::Context) -> Self::Result {
+            // REDIRECT delivery MUST be observed before `stopped` flips.
+            assert!(
+                !self.stopped.load(Ordering::SeqCst),
+                "REDIRECT delivered AFTER teardown — vc-883 ordering violated"
+            );
+            self.delivered.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Handler<StopSession> for StarvedSession {
+        type Result = ();
+        fn handle(&mut self, _msg: StopSession, ctx: &mut Self::Context) -> Self::Result {
+            ctx.stop();
+        }
+    }
+    impl Handler<FloodInbound> for StarvedSession {
+        type Result = ();
+        fn handle(&mut self, _msg: FloodInbound, _ctx: &mut Self::Context) -> Self::Result {
+            // Simulate per-frame inbound processing cost. The point is that
+            // while these keep arriving, the `StopSession` item is starved
+            // unless the flooder is stopped by the flag.
+        }
+    }
+
+    /// vc-n9o: under sustained inbound, the redirect path must still tear the
+    /// session down, deliver the REDIRECT first, and drop `outbound_tx`.
+    #[actix_rt::test]
+    async fn redirect_tears_down_under_mailbox_starvation_vc_n9o() {
+        let delivered = Arc::new(AtomicU32::new(0));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let accept_inbound = Arc::new(AtomicBool::new(true));
+        let outbound_tx = Arc::new(());
+        let outbound_observer = outbound_tx.clone();
+
+        let server = SlowServer.start();
+        let session = StarvedSession {
+            server,
+            delivered: delivered.clone(),
+            stopped: stopped.clone(),
+            accept_inbound: accept_inbound.clone(),
+            outbound_tx,
+        }
+        .start();
+
+        // Flooder: keep the mailbox non-empty (like the bridge readers under
+        // 30fps) until the actor clears `accept_inbound`. Without the flag,
+        // this flood would starve `StopSession` forever.
+        let flood_recipient = session.clone().recipient::<FloodInbound>();
+        let flood_flag = accept_inbound.clone();
+        let flooder = tokio::spawn(async move {
+            while flood_flag.load(Ordering::Acquire) {
+                if flood_recipient.try_send(FloodInbound).is_err() {
+                    break; // mailbox closed → actor stopped.
+                }
+                // Tiny yield so the actor gets scheduling slices; the mailbox
+                // still stays effectively non-empty.
+                actix_rt::time::sleep(std::time::Duration::from_micros(50)).await;
+            }
+        });
+
+        // The actor must terminate despite the flood.
+        let mut terminated = false;
+        for _ in 0..250 {
+            if !session.connected() {
+                terminated = true;
+                break;
+            }
+            actix_rt::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let _ = flooder.await;
+        // Brief settle so the actor's drop (and thus the `outbound_tx` field
+        // drop) completes after the address reports disconnected.
+        actix_rt::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            terminated,
+            "actor did NOT terminate under mailbox starvation — the \
+             accept_inbound flag failed to break the StopSession starvation \
+             (vc-n9o regression: redirected sender would hang on the \
+             non-owner pod)"
+        );
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            1,
+            "the queued REDIRECT must be delivered exactly once, before \
+             teardown (vc-883 preserved under starvation)"
+        );
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "actor stopping hook must have run"
+        );
+        // The actor (and its `outbound_tx` field) is dropped on stop, so the
+        // observer's clone is now the only strong ref — mirroring the real
+        // `PrioritySender` drop that makes the writer's recv return None and
+        // `wait_for_disconnect` return.
+        assert_eq!(
+            Arc::strong_count(&outbound_observer),
+            1,
+            "outbound_tx stand-in was NOT dropped on actor stop — the real \
+             writer would never see recv→None and the QUIC session would \
+             never close (vc-n9o)"
         );
     }
 }

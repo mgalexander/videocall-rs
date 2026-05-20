@@ -16,7 +16,7 @@
  * conditions.
  */
 
-mod bridge;
+pub(crate) mod bridge;
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::transports::wt_chat_session::WtChatSession;
@@ -354,6 +354,12 @@ async fn handle_webtransport_session(
     let (outbound_tx, priority_channels) = PrioritySender::new();
     let outbound_rx = PriorityReceiver::new(priority_channels);
 
+    // vc-n9o: shared "keep accepting inbound" flag. The actor clears it on a
+    // redirect teardown so the bridge readers stop feeding the mailbox and the
+    // queued `StopSession` can run (breaking the mailbox-starvation hang).
+    let accept_inbound: bridge::AcceptInboundFlag =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
         chat_server,
@@ -365,6 +371,7 @@ async fn handle_webtransport_session(
         tracker_sender,
         session_manager,
         observer,
+        accept_inbound.clone(),
     );
     let actor_addr = actor.start();
 
@@ -384,6 +391,7 @@ async fn handle_webtransport_session(
         session,
         actor_addr.clone(),
         outbound_rx,
+        accept_inbound,
         on_packet_sent,
     );
     bridge.wait_for_disconnect().await;

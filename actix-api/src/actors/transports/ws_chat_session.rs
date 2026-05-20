@@ -23,7 +23,7 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::parse_and_inspect;
-use crate::actors::session_logic::{InboundAction, SessionLogic};
+use crate::actors::session_logic::{InboundAction, SessionLogic, TeardownReason};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
@@ -82,6 +82,15 @@ pub struct WsChatSession {
     /// drainer task. `Option` so the receiver — which is single-consumer — can
     /// be handed off exactly once.
     pending_rx: Option<PriorityReceiver>,
+
+    /// vc-n9o: reason recorded for the eventual teardown so `stopping` can
+    /// emit `sfu_session_teardown_total` exactly once with the right label.
+    /// WebSocket sessions go through the SAME `ChatServer::JoinRoom` handler
+    /// as WebTransport, so a WS redirect increments
+    /// `sfu_join_decision_total{outcome=redirect}`; without this field the WS
+    /// teardown would never be counted under `reason=redirect`, leaving a
+    /// permanent false-positive gap that looks like the vc-n9o regression.
+    teardown_reason: TeardownReason,
 }
 
 impl WsChatSession {
@@ -116,6 +125,7 @@ impl WsChatSession {
             activated: false,
             outbound_tx,
             pending_rx,
+            teardown_reason: TeardownReason::Normal,
         }
     }
 
@@ -195,6 +205,7 @@ impl Actor for WsChatSession {
                         code: ws::CloseCode::Policy,
                         description: Some("Session rejected".to_string()),
                     }));
+                    act.teardown_reason = TeardownReason::Error;
                     ctx.stop();
                 }
             }),
@@ -206,9 +217,10 @@ impl Actor for WsChatSession {
             .addr
             .send(self.logic.create_connect_message(addr.recipient()))
             .into_actor(self)
-            .then(|res, _act, ctx| {
+            .then(|res, act, ctx| {
                 if let Err(err) = res {
                     error!("Failed to connect to ChatServer: {:?}", err);
+                    act.teardown_reason = TeardownReason::Error;
                     ctx.stop();
                 }
                 fut::ready(())
@@ -224,6 +236,13 @@ impl Actor for WsChatSession {
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        // vc-n9o: emit the teardown counter exactly once, matching the WT
+        // path, so a WS redirect (counted as a redirect *decision* in the
+        // shared `ChatServer::JoinRoom` handler) has a matching redirect
+        // *teardown* and does not leave a permanent false-positive gap.
+        crate::metrics::SFU_SESSION_TEARDOWN_TOTAL
+            .with_label_values(&[self.teardown_reason.label()])
+            .inc();
         self.logic.on_stopping();
         Running::Stop
     }
@@ -291,6 +310,7 @@ impl Handler<Message> for WsChatSession {
                     "P0Control class full — terminating WS session {}",
                     self.logic.id
                 );
+                self.teardown_reason = TeardownReason::Error;
                 ctx.stop();
             }
         }
@@ -373,6 +393,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                                     "P0Control class full on RTT echo — terminating WS session {}",
                                     self.logic.id
                                 );
+                                self.teardown_reason = TeardownReason::Error;
                                 ctx.stop();
                             }
                         }
@@ -449,7 +470,15 @@ impl WsChatSession {
         let join_room = join_room.into_actor(self);
         join_room
             .then(|response, act, ctx| {
-                if act.logic.handle_join_room_result(response) {
+                if let Some(reason) = act.logic.handle_join_room_result(response) {
+                    // vc-n9o: record the decline reason so `stopping` labels
+                    // the teardown to match the decision counter — a WS
+                    // redirect counts as `reason=redirect`, a reject as
+                    // `error`. Unlike WebTransport, WS has no quinn bridge:
+                    // `ctx.stop()` synchronously ends the actor and closes the
+                    // actix-web-actors stream, so there is no mailbox-
+                    // starvation hang and no `accept_inbound` flag to clear.
+                    act.teardown_reason = reason;
                     ctx.stop();
                 }
                 fut::ready(())

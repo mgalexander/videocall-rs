@@ -33,8 +33,87 @@ pub struct ClientMessage {
     pub msg: Packet,
 }
 
+/// Why a [`JoinRoom`] was declined (the `Err` arm of its result).
+///
+/// vc-n9o: the transport actors map this onto `sfu_session_teardown_total`'s
+/// `reason` label so the teardown counter lines up with the
+/// `sfu_join_decision_total` decision counter — in particular so a `Reject`
+/// teardown is NOT mislabeled `redirect` (which would inflate the teardown
+/// side and mask a real redirect-vs-teardown gap), and so the `redirect`
+/// teardown bucket covers exactly the redirect decisions on BOTH transports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinDeclineKind {
+    /// Pod-ordinal or cross-region `ADMISSION_DECISION{REDIRECT}`: the client
+    /// must reconnect to another pod/region. This is the bucket the vc-n9o
+    /// teardown-reliability fix protects.
+    Redirect,
+    /// Hard-cap `ADMISSION_DECISION{REJECTED}`: the room is full.
+    Reject,
+    /// Validation / internal precondition failure (reserved user id, missing
+    /// session record, etc.).
+    Error,
+}
+
+/// Typed `JoinRoom` decline carrying both a machine-readable [`JoinDeclineKind`]
+/// (for metrics / teardown labeling) and a human-readable message (for logs
+/// and the client-facing error). Replaces the previous bare `String` error so
+/// the transport actors can label teardowns without fragile string matching
+/// (vc-n9o).
+#[derive(Debug, Clone)]
+pub struct JoinRoomError {
+    pub kind: JoinDeclineKind,
+    pub message: String,
+}
+
+impl JoinRoomError {
+    pub fn redirect(message: String) -> Self {
+        Self {
+            kind: JoinDeclineKind::Redirect,
+            message,
+        }
+    }
+    pub fn reject(message: String) -> Self {
+        Self {
+            kind: JoinDeclineKind::Reject,
+            message,
+        }
+    }
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            kind: JoinDeclineKind::Error,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for JoinRoomError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JoinRoomError {}
+
+/// `?`-coercion from `JoinRoomError` into `String`.
+///
+/// USED (do not remove): the `register_and_join` helpers in the SFU
+/// integration tests propagate a `Result<(), JoinRoomError>` with `?` inside
+/// functions that return `Result<(), String>`, e.g.
+/// `tests/sfu_p5_burst_test.rs:438`, `tests/sfu_integration.rs:259`,
+/// `tests/sfu_p4_throttle_test.rs:260`, `tests/sfu_12client_demo.rs:218`.
+/// The `?` operator's implicit `From` conversion is what drives this impl —
+/// there is no explicit `.into()`/`String::from` call site, so it can look
+/// unused at a glance, but removing it fails to compile all four test crates.
+/// The `kind` discriminant is dropped here; only the transport actors consume
+/// it (via `TeardownReason::from_join_decline`).
+impl From<JoinRoomError> for String {
+    fn from(e: JoinRoomError) -> Self {
+        e.message
+    }
+}
+
 #[derive(ActixMessage)]
-#[rtype(result = "Result<(), String>")]
+#[rtype(result = "Result<(), JoinRoomError>")]
 pub struct JoinRoom {
     pub session: SessionId,
     pub room: RoomId,

@@ -55,6 +55,8 @@ use crate::constants::MAX_FRAME_SIZE;
 use crate::sfu::priority_queue::PriorityReceiver;
 use actix::Addr;
 use bytes::Bytes;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use web_transport_quinn::Session;
@@ -90,8 +92,48 @@ pub(crate) const WRITER_DRAIN_GRACE: std::time::Duration = std::time::Duration::
 /// - Read from WebTransport streams/datagrams → send `WtInbound` to actor
 /// - Receive from outbound channel → write to WebTransport streams/datagrams
 pub struct WebTransportBridge {
-    join_set: JoinSet<()>,
+    /// Reader tasks (UniStream + Datagram). They drive `wait_for_disconnect`
+    /// ONLY when they exit because of a QUIC-level error (the client closed /
+    /// the link dropped). When they exit cooperatively because the actor
+    /// cleared [`AcceptInboundFlag`] on a redirect teardown, they park instead
+    /// of returning, so they do NOT prematurely trip `wait_for_disconnect` and
+    /// abort the writer mid-REDIRECT-flush (preserving vc-883 / vc-s9e). They
+    /// are reaped by `shutdown()` once the writer has finished.
+    readers: JoinSet<()>,
+    /// Writer task. On a server-initiated teardown (redirect, error), the
+    /// writer is the authoritative end-of-session signal: it ends only after
+    /// `outbound_tx` has dropped (actor fully stopped, REDIRECT already
+    /// pulled) AND its [`WRITER_DRAIN_GRACE`] flush window elapsed.
+    writer: tokio::task::JoinHandle<()>,
 }
+
+/// vc-n9o: shared "keep accepting inbound" flag between the bridge reader
+/// tasks and the [`WtChatSession`](crate::actors::transports::wt_chat_session::WtChatSession)
+/// actor.
+///
+/// # The mailbox-starvation bug this breaks
+///
+/// On a JoinRoom-Err redirect (an `ADMISSION_DECISION{REDIRECT}` on a
+/// non-owner pod, see chat_server.rs `JoinRoom`), the actor must drain the
+/// pre-queued REDIRECT `Message` from its mailbox (vc-883) and then stop so
+/// `outbound_tx` drops, the writer's `recv()` returns `None`, and
+/// `wait_for_disconnect` returns — closing the QUIC session and letting the
+/// client follow the redirect.
+///
+/// But `ctx.notify(StopSession)` enqueues the stop on the actor *items* list,
+/// which actix only processes once the *mailbox* is fully drained. Under
+/// sustained 30fps inbound, the unistream/datagram readers keep `try_send`ing
+/// `WtInbound` into the mailbox, so it is never empty, so `StopSession` is
+/// starved and the actor never stops — the redirected sender hangs on the
+/// non-owner pod and never publishes to NATS (the multi-pod 0-decode root
+/// cause).
+///
+/// Setting this flag to `false` makes both readers stop forwarding inbound
+/// frames immediately, so the mailbox drains, `StopSession` runs, and the
+/// teardown chain completes — WITHOUT touching the outbound (writer) path, so
+/// the queued REDIRECT still reaches the wire first (vc-883) over its reliable
+/// UniStream (vc-xnp) within the writer's flush grace (vc-s9e).
+pub type AcceptInboundFlag = Arc<AtomicBool>;
 
 impl WebTransportBridge {
     /// Create a new bridge and start I/O tasks.
@@ -101,53 +143,136 @@ impl WebTransportBridge {
     /// * `actor_addr` - Address of the actor to receive inbound messages
     /// * `outbound_rx` - Channel receiver for outbound messages from actor
     #[allow(dead_code)] // Useful API even if currently only new_with_callback is used
-    pub fn new<A>(session: Session, actor_addr: Addr<A>, outbound_rx: PriorityReceiver) -> Self
+    pub fn new<A>(
+        session: Session,
+        actor_addr: Addr<A>,
+        outbound_rx: PriorityReceiver,
+        accept_inbound: AcceptInboundFlag,
+    ) -> Self
     where
         A: actix::Actor<Context = actix::Context<A>> + actix::Handler<WtInbound>,
     {
-        Self::new_with_callback(session, actor_addr, outbound_rx, None)
+        Self::new_with_callback(session, actor_addr, outbound_rx, accept_inbound, None)
     }
 
     /// Create a new bridge with optional callback for packet tracking.
+    ///
+    /// `accept_inbound` is the shared [`AcceptInboundFlag`] (vc-n9o): while
+    /// `true` the readers forward client frames as `WtInbound`; once the
+    /// actor clears it on a redirect teardown the readers stop forwarding so
+    /// the actor mailbox can drain and `StopSession` can run.
     pub fn new_with_callback<A>(
         session: Session,
         actor_addr: Addr<A>,
         outbound_rx: PriorityReceiver,
+        accept_inbound: AcceptInboundFlag,
         on_packet_sent: Option<PacketSentCallback>,
     ) -> Self
     where
         A: actix::Actor<Context = actix::Context<A>> + actix::Handler<WtInbound>,
     {
-        let mut join_set = JoinSet::new();
+        let mut readers = JoinSet::new();
 
-        Self::spawn_unistream_reader(&mut join_set, session.clone(), actor_addr.clone());
-        Self::spawn_datagram_reader(&mut join_set, session.clone(), actor_addr);
-        Self::spawn_writer(&mut join_set, session, outbound_rx, on_packet_sent);
+        Self::spawn_unistream_reader(
+            &mut readers,
+            session.clone(),
+            actor_addr.clone(),
+            accept_inbound.clone(),
+        );
+        Self::spawn_datagram_reader(&mut readers, session.clone(), actor_addr, accept_inbound);
+        let writer = Self::spawn_writer(session, outbound_rx, on_packet_sent);
 
-        Self { join_set }
+        Self { readers, writer }
     }
 
-    /// Wait for any I/O task to complete (indicates session end).
+    /// Wait for the session to end.
+    ///
+    /// Returns when EITHER:
+    /// * a reader task exits because of a QUIC-level error (client-initiated
+    ///   disconnect / link drop), OR
+    /// * the writer task exits (server-initiated teardown: the actor stopped,
+    ///   `outbound_tx` dropped, and the [`WRITER_DRAIN_GRACE`] flush window
+    ///   elapsed — so the trailing REDIRECT is already on the wire).
+    ///
+    /// vc-n9o: a reader that exits *cooperatively* (because the actor cleared
+    /// [`AcceptInboundFlag`] on a redirect teardown) does NOT return from its
+    /// task — it parks — so it can never trip this function and abort the
+    /// writer before the REDIRECT has flushed. On the redirect path the writer
+    /// branch is what fires, after the REDIRECT is safely transmitted.
     pub async fn wait_for_disconnect(&mut self) {
-        self.join_set.join_next().await;
+        tokio::select! {
+            _ = self.readers.join_next() => {}
+            _ = &mut self.writer => {}
+        }
     }
 
-    /// Shutdown all I/O tasks.
+    /// Shutdown all I/O tasks (readers + writer).
     pub async fn shutdown(mut self) {
-        self.join_set.shutdown().await;
+        self.readers.shutdown().await;
+        self.writer.abort();
+        let _ = self.writer.await;
     }
 
     /// Spawn UniStream reader task.
-    fn spawn_unistream_reader<A>(join_set: &mut JoinSet<()>, session: Session, actor_addr: Addr<A>)
-    where
+    ///
+    /// vc-n9o: the loop stops forwarding `WtInbound` once `accept_inbound` is
+    /// cleared. The flag is checked at the top of the loop and again right
+    /// after each `accept_uni()` returns, plus inside the per-stream read task
+    /// before `try_send`, so a stream accepted just before the flag flipped
+    /// cannot slip a frame into the mailbox the actor is trying to drain to a
+    /// stop.
+    ///
+    /// IMPORTANT: a reader currently parked *inside* `accept_uni().await` is
+    /// NOT released by clearing the flag — there is no cancellation signal on
+    /// the await, so the check only fires once `accept_uni` next returns (a new
+    /// stream arrives) or the await ends with a QUIC error. For an actively
+    /// sending client (the bug's scenario) `accept_uni` returns ~30×/s, so the
+    /// flag is observed promptly. For a client that goes silent exactly at the
+    /// redirect, the parked reader is instead reaped by `shutdown()` once the
+    /// writer-driven teardown completes; and because a silent client stops
+    /// feeding the mailbox, `StopSession` is no longer starved anyway. The
+    /// actor-side `REDIRECT_TEARDOWN_DEADLINE` backstop bounds the worst case.
+    fn spawn_unistream_reader<A>(
+        join_set: &mut JoinSet<()>,
+        session: Session,
+        actor_addr: Addr<A>,
+        accept_inbound: AcceptInboundFlag,
+    ) where
         A: actix::Actor<Context = actix::Context<A>> + actix::Handler<WtInbound>,
     {
         join_set.spawn(async move {
-            while let Ok(mut uni_stream) = session.accept_uni().await {
+            // Cooperative-stop bookkeeping: if we exit the accept loop because
+            // the actor cleared `accept_inbound` (redirect teardown), we must
+            // NOT return — returning would trip `wait_for_disconnect` and let
+            // `shutdown()` abort the writer mid-REDIRECT-flush. Instead we park
+            // (`std::future::pending`) until `shutdown()` aborts us, after the
+            // writer has finished. A QUIC-error exit, by contrast, DOES return
+            // so it can drive `wait_for_disconnect` (client-initiated close).
+            let cooperative_stop = loop {
+                // Top-of-loop check catches a flag already cleared before we
+                // re-enter `accept_uni`.
+                if !accept_inbound.load(Ordering::Acquire) {
+                    break true;
+                }
+                let mut uni_stream = match session.accept_uni().await {
+                    Ok(s) => s,
+                    Err(_) => break false, // QUIC-level error: client closed.
+                };
+                // Re-check after the (possibly long) accept await: the actor
+                // may have cleared the flag while we were parked.
+                if !accept_inbound.load(Ordering::Acquire) {
+                    break true;
+                }
                 let actor_addr = actor_addr.clone();
+                let accept_inbound = accept_inbound.clone();
                 tokio::spawn(async move {
                     match uni_stream.read_to_end(MAX_FRAME_SIZE).await {
                         Ok(buf) => {
+                            // Final gate: do not enqueue into a mailbox the
+                            // actor is draining toward StopSession (vc-n9o).
+                            if !accept_inbound.load(Ordering::Acquire) {
+                                return;
+                            }
                             let buf_len = buf.len();
                             if let Err(e) = actor_addr.try_send(WtInbound {
                                 data: Bytes::from(buf),
@@ -164,22 +289,55 @@ impl WebTransportBridge {
                         }
                     }
                 });
+            };
+            if cooperative_stop {
+                // Redirect teardown: park until `shutdown()` aborts us, so we
+                // never trip `wait_for_disconnect` ahead of the writer's
+                // REDIRECT flush (vc-883 / vc-s9e).
+                info!("WebTransport UniStream reader parking on cooperative stop");
+                std::future::pending::<()>().await;
             }
             info!("WebTransport UniStream reader ended");
         });
     }
 
     /// Spawn Datagram reader task.
-    fn spawn_datagram_reader<A>(join_set: &mut JoinSet<()>, session: Session, actor_addr: Addr<A>)
-    where
+    ///
+    /// vc-n9o: same flag discipline as the UniStream reader. A reader parked
+    /// inside `read_datagram().await` is not released by clearing the flag; it
+    /// observes the flag once `read_datagram` next returns, or is reaped by
+    /// `shutdown()`. See `spawn_unistream_reader` for the full rationale.
+    fn spawn_datagram_reader<A>(
+        join_set: &mut JoinSet<()>,
+        session: Session,
+        actor_addr: Addr<A>,
+        accept_inbound: AcceptInboundFlag,
+    ) where
         A: actix::Actor<Context = actix::Context<A>> + actix::Handler<WtInbound>,
     {
         join_set.spawn(async move {
-            while let Ok(buf) = session.read_datagram().await {
+            let cooperative_stop = loop {
+                if !accept_inbound.load(Ordering::Acquire) {
+                    break true;
+                }
+                let buf = match session.read_datagram().await {
+                    Ok(b) => b,
+                    Err(_) => break false, // QUIC-level error: client closed.
+                };
+                if !accept_inbound.load(Ordering::Acquire) {
+                    break true;
+                }
                 let _ = actor_addr.try_send(WtInbound {
                     data: buf,
                     source: WtInboundSource::Datagram,
                 });
+            };
+            if cooperative_stop {
+                // See the UniStream reader: park rather than return so we do
+                // not trip `wait_for_disconnect` before the writer flushes the
+                // REDIRECT (vc-n9o / vc-883 / vc-s9e).
+                info!("WebTransport Datagram reader parking on cooperative stop");
+                std::future::pending::<()>().await;
             }
             info!("WebTransport Datagram reader ended");
         });
@@ -196,12 +354,11 @@ impl WebTransportBridge {
     /// (non-MEDIA small packets via Datagram, MEDIA or large via UniStream)
     /// without a full protobuf parse on the hot egress path.
     fn spawn_writer(
-        join_set: &mut JoinSet<()>,
         session: Session,
         mut outbound_rx: PriorityReceiver,
         on_packet_sent: Option<PacketSentCallback>,
-    ) {
-        join_set.spawn(async move {
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
             while let Some(data) = outbound_rx.recv().await {
                 if is_datagram_eligible(&data) {
                     if let Err(e) = session.send_datagram(data) {
@@ -238,7 +395,7 @@ impl WebTransportBridge {
             // pending stream data before the clone drops at task exit.
             drop(session);
             info!("WebTransport Writer ended");
-        });
+        })
     }
 
     /// vc-s9e: dedicated async helper invoked by [`Self::spawn_writer`]

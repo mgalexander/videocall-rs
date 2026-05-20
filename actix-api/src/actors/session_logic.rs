@@ -30,7 +30,9 @@ use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
 };
-use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
+use crate::messages::server::{
+    ClientMessage, Connect, Disconnect, JoinDeclineKind, JoinRoom, JoinRoomError, Packet,
+};
 use crate::messages::session::Message;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
@@ -75,6 +77,44 @@ pub enum InboundAction {
     Processed,
     /// Keep-alive ping, no action needed
     KeepAlive,
+}
+
+/// vc-n9o: why a transport session is being torn down. Both `WtChatSession`
+/// and `WsChatSession` record this and emit `sfu_session_teardown_total`
+/// exactly once (in their `stopping` hook) with [`TeardownReason::label`], so
+/// the teardown counter lines up with `sfu_join_decision_total`:
+///   * `Redirect` ↔ `sfu_join_decision_total{outcome=redirect}` — the bucket
+///     the vc-n9o teardown-reliability fix protects (must not be missing on
+///     either transport, must not be inflated by non-redirect teardowns).
+///   * `Normal`   — ordinary client-initiated / lifecycle teardown.
+///   * `Error`    — internal error, validation failure, or hard-cap reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownReason {
+    Redirect,
+    Normal,
+    Error,
+}
+
+impl TeardownReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            TeardownReason::Redirect => "redirect",
+            TeardownReason::Normal => "normal",
+            TeardownReason::Error => "error",
+        }
+    }
+
+    /// Map a [`JoinDeclineKind`] (the typed `JoinRoom` decline) onto the
+    /// teardown reason. A `Reject` is bucketed as `Error` for teardown
+    /// purposes — the redirect-vs-teardown invariant only requires that
+    /// `Redirect` declines map to `Redirect` teardowns and that nothing else
+    /// does, so a hard-cap reject must NOT be labeled `redirect`.
+    pub fn from_join_decline(kind: JoinDeclineKind) -> Self {
+        match kind {
+            JoinDeclineKind::Redirect => TeardownReason::Redirect,
+            JoinDeclineKind::Reject | JoinDeclineKind::Error => TeardownReason::Error,
+        }
+    }
 }
 
 // =========================================================================
@@ -518,26 +558,33 @@ impl SessionLogic {
         }
     }
 
-    /// Handle JoinRoom response. Returns true if the session should stop (error case).
+    /// Handle JoinRoom response.
+    ///
+    /// Returns `None` when the session should keep running (join succeeded),
+    /// or `Some(reason)` when it should stop — carrying the [`TeardownReason`]
+    /// so the transport actor can label `sfu_session_teardown_total` to match
+    /// the `sfu_join_decision_total` decision (vc-n9o). A `Redirect` decline
+    /// maps to `TeardownReason::Redirect`; a `Reject` or any error maps to
+    /// `Error`; a mailbox failure maps to `Error`.
     pub fn handle_join_room_result(
         &self,
-        result: Result<Result<(), String>, actix::MailboxError>,
-    ) -> bool {
+        result: Result<Result<(), JoinRoomError>, actix::MailboxError>,
+    ) -> Option<TeardownReason> {
         match result {
             Ok(Ok(())) => {
                 info!(
                     "Successfully joined room {} for session {}",
                     self.room, self.id
                 );
-                false
+                None
             }
             Ok(Err(e)) => {
-                error!("Failed to join room: {}", e);
-                true
+                error!("Failed to join room ({:?}): {}", e.kind, e.message);
+                Some(TeardownReason::from_join_decline(e.kind))
             }
             Err(err) => {
                 error!("Error sending JoinRoom: {:?}", err);
-                true
+                Some(TeardownReason::Error)
             }
         }
     }

@@ -411,6 +411,62 @@ lazy_static! {
         cv
     };
 
+    /// Total JoinRoom admission decisions, labeled by outcome (bead vc-n9o).
+    ///
+    /// Emitted at the `ChatServer::JoinRoom` handler decision sites:
+    ///   - `admit_local` — the joiner is admitted to the local pod (the
+    ///     synchronous `Ok(())` return, including the spillover-admit path).
+    ///   - `redirect`    — the joiner is told to reconnect to another pod
+    ///     (wrong-owner pod-ordinal redirect or cross-region redirect); an
+    ///     `ADMISSION_DECISION{REDIRECT}` packet is enqueued and the join is
+    ///     declined with `Err`.
+    ///   - `reject`      — the room is at hard cap; an
+    ///     `ADMISSION_DECISION{REJECTED}` packet is enqueued and the join is
+    ///     declined with `Err`.
+    ///
+    /// The gap between `redirect` here and `sfu_session_teardown_total{reason=redirect}`
+    /// is the live regression signal for bead vc-n9o: a redirect that never
+    /// produces a teardown means the redirected sender hung on a non-owner
+    /// pod (the multi-pod 0-decode root cause).
+    pub static ref SFU_JOIN_DECISION_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_join_decision_total",
+            "Total JoinRoom admission decisions, labeled by outcome",
+            &["outcome"]
+        )
+        .expect("Failed to create sfu_join_decision_total metric");
+        for label in ["admit_local", "redirect", "reject"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
+    /// Total session teardowns, labeled by reason (bead vc-n9o).
+    ///
+    /// Emitted at the transport-actor `StopSession` / stop sites:
+    ///   - `redirect` — teardown triggered by a JoinRoom-Err redirect
+    ///     decision (the path that vc-n9o makes reliably tear down even
+    ///     while the client keeps sending media).
+    ///   - `normal`   — ordinary client-initiated or lifecycle teardown.
+    ///   - `error`    — teardown forced by an internal error (e.g. P0
+    ///     control queue full, ChatServer connect failure).
+    ///
+    /// Compare `reason=redirect` here against
+    /// `sfu_join_decision_total{outcome=redirect}`: a persistent gap means
+    /// redirected sessions are not tearing down (vc-n9o regression).
+    pub static ref SFU_SESSION_TEARDOWN_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_session_teardown_total",
+            "Total transport session teardowns, labeled by reason",
+            &["reason"]
+        )
+        .expect("Failed to create sfu_session_teardown_total metric");
+        for label in ["redirect", "normal", "error"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
     /// Total base-layer (T0+S0) keyframes forwarded by `Forwarder::decide`.
     ///
     /// Per p4-8 invariant 1: a keyframe at `temporal_layer_id=0 AND
