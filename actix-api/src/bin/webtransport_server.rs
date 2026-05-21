@@ -69,11 +69,11 @@ async fn health_responder() -> impl Responder {
 /// thread/task (per-session bridge writer, per-room dispatcher, health server,
 /// runtime driver) terminates the WHOLE process. tokio's default behavior only
 /// unwinds the panicking task, which is exactly how the
-/// DEFECT-JOINHANDLE-PANIC zombie arose: forwarding tasks died, but the process
-/// + health server survived with a static 200 `/healthz` and 0 k8s restarts.
-/// We chain to the existing default hook so the panic message + location +
-/// backtrace are still printed, THEN `std::process::abort()` to crash non-zero
-/// so k8s restarts the pod and forwarding recovers.
+/// DEFECT-JOINHANDLE-PANIC zombie arose: forwarding tasks died, but the
+/// process and the health server survived with a static 200 `/healthz` and 0
+/// k8s restarts. We chain to the existing default hook so the panic message,
+/// location, and backtrace are still printed, THEN `std::process::abort()` to
+/// crash non-zero so k8s restarts the pod and forwarding recovers.
 ///
 /// We use an explicit hook rather than `panic = "abort"` in the Cargo profile
 /// so unit/integration tests that intentionally panic-and-catch (e.g.
