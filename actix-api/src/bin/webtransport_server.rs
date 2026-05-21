@@ -29,12 +29,83 @@ use sec_api::sfu::{SfuConfig, SfuMode};
 use sec_api::version;
 use sec_api::webtransport::{self, Certs};
 
+/// vc-zf8k (Bead B-b): forwarding-liveness-aware health endpoint.
+///
+/// Returns 200 when the SFU is forwarding in steady state OR when it is
+/// idle/empty (nothing to forward). Returns 503 ONLY when forwarding SHOULD be
+/// happening (a room with receivers + publishers was observed within the
+/// threshold) but no forward has happened within the threshold — i.e. the
+/// "forwarding-dead zombie" condition the DEFECT-JOINHANDLE-PANIC spec calls
+/// out. The decision reuses the vc-9eh liveness semantics via
+/// [`sec_api::sfu::forwarding_health::forwarding_health_decision`].
 async fn health_responder() -> impl Responder {
-    HttpResponse::Ok().body("Ok")
+    use sec_api::sfu::forwarding_health::{
+        forwarding_health_decision, forwarding_silence_threshold, global, now_millis, HealthStatus,
+    };
+    let snap = global().snapshot();
+    let status = forwarding_health_decision(
+        now_millis(),
+        snap.last_forward_ms,
+        snap.last_should_forward_ms,
+        forwarding_silence_threshold(),
+    );
+    match status {
+        HealthStatus::Healthy => HttpResponse::Ok().body("Ok"),
+        HealthStatus::ForwardingStalled => {
+            error!(
+                last_forward_ms = snap.last_forward_ms,
+                last_should_forward_ms = snap.last_should_forward_ms,
+                "/healthz: forwarding stalled while receivers+publishers present \
+                 — reporting 503 so the liveness probe can restart the pod"
+            );
+            HttpResponse::ServiceUnavailable().body("forwarding stalled")
+        }
+    }
+}
+
+/// vc-zf8k (Bead B-a): install the fail-fast panic hook.
+///
+/// Installed FIRST in `main`, before any task is spawned, so a panic on ANY
+/// thread/task (per-session bridge writer, per-room dispatcher, health server,
+/// runtime driver) terminates the WHOLE process. tokio's default behavior only
+/// unwinds the panicking task, which is exactly how the
+/// DEFECT-JOINHANDLE-PANIC zombie arose: forwarding tasks died, but the process
+/// + health server survived with a static 200 `/healthz` and 0 k8s restarts.
+/// We chain to the existing default hook so the panic message + location +
+/// backtrace are still printed, THEN `std::process::abort()` to crash non-zero
+/// so k8s restarts the pod and forwarding recovers.
+///
+/// We use an explicit hook rather than `panic = "abort"` in the Cargo profile
+/// so unit/integration tests that intentionally panic-and-catch (e.g.
+/// `#[should_panic]`, `catch_unwind`) are unaffected — the hook only runs in
+/// this binary's process.
+fn install_fail_fast_panic_hook() {
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Print the standard panic message/location/backtrace first.
+        default_panic_hook(panic_info);
+        // Also surface via tracing for log aggregation, then crash the process.
+        error!(
+            "FATAL: panic in SFU process — aborting so k8s restarts the pod and \
+             forwarding recovers: {}",
+            panic_info
+        );
+        std::process::abort();
+    }));
 }
 
 #[actix_rt::main]
 async fn main() {
+    install_fail_fast_panic_hook();
+
+    // vc-zf8k (Bead B-a): the panic-hook self-test re-execs THIS binary with
+    // `SFU_PANIC_HOOK_SELFTEST=1` set, expecting the hook to abort the process.
+    // Trigger the panic AFTER the hook is installed and return; the integration
+    // test asserts the abnormal (SIGABRT) exit. No-op in normal operation.
+    if std::env::var_os("SFU_PANIC_HOOK_SELFTEST").is_some() {
+        panic!("forwarding-task panic (panic-hook self-test)");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)

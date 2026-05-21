@@ -2497,13 +2497,16 @@ fn spawn_room_dispatcher(
                     let uptime = now.duration_since(subscribe_at);
                     let silence = now.duration_since(last_msg_at);
                     let window = watchdog_silence_window(consecutive_silent_trips);
-                    // Cheap pre-gate: avoid taking the locks at all until we are
-                    // actually past grace AND past the (escalating) silence
-                    // window. The common steady-state path (recent delivery)
-                    // bails here without touching state.
-                    if uptime < WATCHDOG_GRACE || silence < window {
-                        continue;
-                    }
+                    // vc-zf8k: read receiver/publisher presence EVERY tick (one
+                    // read lock each, per room, per 250ms — negligible) so the
+                    // process-global forwarding-health signal knows whether this
+                    // room SHOULD be forwarding right now. This reuses the exact
+                    // vc-9eh `has_receivers && has_publishers` gate, so the
+                    // `/healthz` liveness decision shares the watchdog's
+                    // semantics rather than inventing a parallel heuristic. A
+                    // room that should be forwarding stamps `note_should_forward`
+                    // here; the dispatcher fan-out stamps `note_forward` on the
+                    // hot path, and `forwarding_health_decision` compares the two.
                     let (has_receivers, receiver_count) = {
                         let g = match receivers.read() {
                             Ok(g) => g,
@@ -2518,6 +2521,20 @@ fn spawn_room_dispatcher(
                         };
                         g.has_senders()
                     };
+                    if has_receivers && has_publishers {
+                        crate::sfu::forwarding_health::global().note_should_forward();
+                    }
+                    // Cheap pre-gate for the RESUBSCRIBE path: avoid escalating
+                    // / resubscribing until we are actually past grace AND past
+                    // the (escalating) silence window. The common steady-state
+                    // path (recent delivery) bails here. NOTE: the presence read
+                    // above intentionally runs BEFORE this gate so a healthy,
+                    // actively-forwarding room still stamps `note_should_forward`
+                    // every tick (otherwise the health signal would only ever be
+                    // refreshed while the subscription is silent).
+                    if uptime < WATCHDOG_GRACE || silence < window {
+                        continue;
+                    }
                     if !watchdog_should_resubscribe(
                         uptime,
                         silence,
@@ -2788,6 +2805,11 @@ fn spawn_room_dispatcher(
                 guard.iter().map(|(sid, r)| (*sid, r.clone())).collect()
             };
 
+            // vc-zf8k: track whether THIS inbound message produced at least one
+            // forward. We stamp the process-global forwarding heartbeat once per
+            // message (a single relaxed atomic store), NOT once per receiver, so
+            // the hot-path cost is negligible regardless of room size.
+            let mut forwarded_any = false;
             for (rsid, recipient) in snapshot {
                 if let Some(bytes) = egress_decide_from_parsed(
                     sfu_mode,
@@ -2798,6 +2820,7 @@ fn spawn_room_dispatcher(
                     &msg.payload,
                     parsed.as_ref(),
                 ) {
+                    forwarded_any = true;
                     if let Err(e) = recipient.try_send(Message {
                         msg: bytes,
                         session: rsid,
@@ -2809,6 +2832,9 @@ fn spawn_room_dispatcher(
                         );
                     }
                 }
+            }
+            if forwarded_any {
+                crate::sfu::forwarding_health::global().note_forward();
             }
         }
         // `sub.next()` returned None (the `None` arm `break`s the loop) — the
