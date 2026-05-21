@@ -1657,11 +1657,24 @@ impl Handler<JoinRoom> for ChatServer {
             // Compute the redirect target once: needed both for the spill
             // observability log (when this pod is a non-owner) and for the
             // actual redirect on the non-spill path.
+            // vc-el0: build the FULLY-QUALIFIED per-pod StatefulSet DNS
+            // including the K8s namespace label. A namespace-less name does
+            // not resolve, so redirected/spillover clients would round-robin
+            // back onto random non-owner pods and decode 0 streams. Namespace
+            // is resolved POD_NAMESPACE → service-account file → "default";
+            // the workload (pod-name prefix) comes from SFU_WORKLOAD_NAME
+            // (chart fullname, e.g. webtransport-us-east), defaulting to
+            // rustlemania-{transport_kind} for local/dev.
+            let tk = sfu_transport_kind();
+            let redirect_namespace = crate::sfu::affinity::current_namespace();
+            let redirect_workload = crate::sfu::affinity::workload_from_env(tk);
             let redirect_target = crate::sfu::affinity::compute_redirect_target(
                 &room,
                 self_ord,
                 replicas,
-                sfu_transport_kind(),
+                tk,
+                redirect_namespace,
+                &redirect_workload,
             );
             if spilled_over {
                 // Log the spill admission UNCONDITIONALLY — the predicate
@@ -1729,6 +1742,10 @@ impl Handler<JoinRoom> for ChatServer {
                         spilled_over,
                         self_ordinal = ?self_ord,
                         %target,
+                        // vc-el0: surface the namespace label that this fix
+                        // adds so the FQDN can be validated in the wild.
+                        redirect_namespace = %redirect_namespace,
+                        redirect_workload = %redirect_workload,
                         "JoinRoom decision"
                     );
                 }
@@ -1758,6 +1775,12 @@ impl Handler<JoinRoom> for ChatServer {
                 // it can be compared against the teardown counter.
                 crate::metrics::SFU_JOIN_DECISION_TOTAL
                     .with_label_values(&["redirect"])
+                    .inc();
+                // vc-el0: count the per-pod redirect FQDN emission labeled by
+                // the resolved namespace, so the namespace-label fix is
+                // verifiable in production (real namespace vs. "default").
+                crate::metrics::SFU_REDIRECT_FQDN_EMITTED_TOTAL
+                    .with_label_values(&[redirect_namespace])
                     .inc();
                 return MessageResult(Err(JoinRoomError::redirect(format!(
                     "Room {room} is owned by a different pod; redirecting to {target}"
@@ -5435,11 +5458,31 @@ mod tests {
             "status must be REDIRECT for ownership mismatch"
         );
         assert_eq!(inner.reason, "wrong_owner");
-        let expected_dns =
-            format!("rustlemania-webtransport-{owner_ord}.webtransport-headless.svc.cluster.local");
+        // vc-el0: the redirect FQDN MUST carry the namespace label. The
+        // namespace resolver falls back to "default" when POD_NAMESPACE is
+        // unset AND the in-pod service-account namespace file is absent
+        // (the case in CI). We assert on whatever namespace was actually
+        // resolved by reading it back from the affinity module, and pin
+        // that the FQDN is NOT the namespace-less old form.
+        let ns = crate::sfu::affinity::current_namespace();
+        let expected_dns = format!(
+            "rustlemania-webtransport-{owner_ord}.webtransport-headless.{ns}.svc.cluster.local"
+        );
         assert_eq!(
             inner.redirect_to, expected_dns,
-            "redirect_to must point at the owner pod's headless DNS"
+            "redirect_to must point at the owner pod's fully-qualified headless DNS"
+        );
+        assert!(
+            inner
+                .redirect_to
+                .contains(&format!(".{ns}.svc.cluster.local")),
+            "redirect_to must contain the namespace label (vc-el0): {}",
+            inner.redirect_to
+        );
+        assert!(
+            !inner.redirect_to.contains("-headless.svc.cluster.local"),
+            "redirect_to must NOT be namespace-less (vc-el0 regression): {}",
+            inner.redirect_to
         );
 
         // The redirected session must NOT have been admitted: the room
@@ -5839,9 +5882,17 @@ mod tests {
         let inner =
             found.expect("ADMISSION_DECISION{REDIRECT} must be delivered to redirected session");
         assert_eq!(inner.status.enum_value_or_default(), AdmStatus::REDIRECT);
-        let expected_dns =
-            format!("rustlemania-webtransport-{owner_ord}.webtransport-headless.svc.cluster.local");
+        // vc-el0: FQDN must carry the resolved namespace label.
+        let ns = crate::sfu::affinity::current_namespace();
+        let expected_dns = format!(
+            "rustlemania-webtransport-{owner_ord}.webtransport-headless.{ns}.svc.cluster.local"
+        );
         assert_eq!(inner.redirect_to, expected_dns);
+        assert!(
+            !inner.redirect_to.contains("-headless.svc.cluster.local"),
+            "redirect_to must NOT be namespace-less (vc-el0 regression): {}",
+            inner.redirect_to
+        );
 
         std::env::remove_var("POD_NAME");
         std::env::remove_var("STATEFULSET_REPLICAS");
@@ -6451,8 +6502,11 @@ mod tests {
         // redirect targets, the bot's reconnect logic would split between
         // pods and increment hop counters non-monotonically — the bead's
         // "loop redirect" signature.
-        let expected_dns =
-            format!("rustlemania-webtransport-{owner_ord}.webtransport-headless.svc.cluster.local");
+        // vc-el0: FQDN must carry the resolved namespace label.
+        let ns = crate::sfu::affinity::current_namespace();
+        let expected_dns = format!(
+            "rustlemania-webtransport-{owner_ord}.webtransport-headless.{ns}.svc.cluster.local"
+        );
         for (i, recv) in per_session_received.iter().enumerate() {
             let msgs = recv.lock().unwrap().clone();
             let mut redirects: Vec<AdmissionDecision> = Vec::new();
@@ -6486,6 +6540,11 @@ mod tests {
                 sids[i]
             );
             assert_eq!(dec.reason, "wrong_owner");
+            assert!(
+                !dec.redirect_to.contains("-headless.svc.cluster.local"),
+                "session #{i} redirect_to must NOT be namespace-less (vc-el0): {}",
+                dec.redirect_to
+            );
         }
 
         // ASSERTION 4: NO session was admitted to the room. Both the

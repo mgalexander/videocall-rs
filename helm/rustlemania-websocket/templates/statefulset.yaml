@@ -42,6 +42,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # vc-el0: StatefulSet name (pod-name prefix) for the per-pod
+            # redirect FQDN. Must match this chart's fullname so redirected
+            # clients resolve {workload}-N.{tk}-headless.{ns}.svc.cluster.local.
+            - name: SFU_WORKLOAD_NAME
+              value: "{{ include "rustlemania.fullname" . }}"
             - name: STATEFULSET_REPLICAS
               value: "{{ .Values.replicaCount }}"
             {{- toYaml .Values.env | nindent 12 }}

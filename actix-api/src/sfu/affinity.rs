@@ -127,6 +127,10 @@ struct AffinityConfig {
     replicas: u32,
     region: &'static str,
     base_domain: &'static str,
+    /// Pod's Kubernetes namespace (vc-el0). Resolved POD_NAMESPACE →
+    /// service-account namespace file → `"default"`. Leaked to `&'static`
+    /// so the per-pod redirect DNS can be built without re-reading.
+    namespace: &'static str,
 }
 
 static CONFIG: OnceLock<AffinityConfig> = OnceLock::new();
@@ -149,6 +153,64 @@ fn read_replicas_from_env() -> u32 {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(1)
+}
+
+/// Filesystem path to the in-pod namespace file projected by the K8s
+/// service-account admission controller. Present in EVERY pod that mounts
+/// the default service-account token (the cluster default), and always
+/// contains the pod's real namespace. Used as the second resolution step
+/// after `POD_NAMESPACE`.
+const SERVICEACCOUNT_NAMESPACE_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+
+/// Resolve the Kubernetes namespace of THIS pod, used to build the
+/// fully-qualified per-pod StatefulSet DNS name for redirects. Resolution
+/// order (vc-el0):
+///
+///   1. `POD_NAMESPACE` env (downward API; preferred — explicit, cheap).
+///   2. `/var/run/secrets/kubernetes.io/serviceaccount/namespace` (always
+///      present in-cluster; gives the real namespace even when the chart
+///      forgot to wire the downward-API env var — this is the case the
+///      vc-el0 bug fell into).
+///   3. `"default"` fallback for local/dev runs outside Kubernetes, so
+///      single-pod setups keep working.
+///
+/// Returns an owned `String` (not `&'static str`) because the file read is
+/// fallible and the value is read once at config init; the caller leaks it
+/// into the cache. Trailing whitespace/newline from the file is trimmed.
+fn read_namespace_from_env() -> String {
+    if let Ok(ns) = env::var("POD_NAMESPACE") {
+        if !ns.is_empty() {
+            return ns;
+        }
+    }
+    if let Ok(contents) = std::fs::read_to_string(SERVICEACCOUNT_NAMESPACE_PATH) {
+        let ns = contents.trim();
+        if !ns.is_empty() {
+            return ns.to_string();
+        }
+    }
+    "default".to_string()
+}
+
+/// Resolve the StatefulSet workload name (pod-name prefix) used to build
+/// the per-pod redirect DNS. In production the chart sets
+/// `fullnameOverride` (e.g. `webtransport-us-east` / `websocket-us-east`),
+/// so the pod names are `<fullname>-<ordinal>` — NOT `rustlemania-<tk>-N`.
+///
+/// Resolution order (vc-el0):
+///   1. `SFU_WORKLOAD_NAME` env — the chart-provided release/fullname.
+///   2. `rustlemania-{transport_kind}` default, which exactly reproduces
+///      the previous hardcoded local/dev behavior so non-Helm runs keep
+///      working unchanged.
+///
+/// Takes `transport_kind` so the default can splice it; the env override
+/// fully replaces the prefix when present.
+fn read_workload_from_env(transport_kind: &str) -> String {
+    match env::var("SFU_WORKLOAD_NAME") {
+        Ok(s) if !s.is_empty() => s,
+        _ => format!("rustlemania-{transport_kind}"),
+    }
 }
 
 /// Read `REGION` from env. Defaults to `"local"` when unset so dev/test
@@ -190,6 +252,7 @@ fn config() -> &'static AffinityConfig {
         replicas: read_replicas_from_env(),
         region: read_region_from_env(),
         base_domain: read_region_base_domain_from_env(),
+        namespace: Box::leak(read_namespace_from_env().into_boxed_str()),
     })
 }
 
@@ -241,6 +304,29 @@ pub fn current_region() -> &'static str {
 /// once per process; subsequent calls return the cached `&'static str`.
 pub fn region_base_domain() -> &'static str {
     config().base_domain
+}
+
+/// Kubernetes namespace of this pod (vc-el0), used as the `.{namespace}.`
+/// label of the per-pod StatefulSet redirect FQDN. Resolved once and
+/// cached: `POD_NAMESPACE` env → in-pod service-account namespace file →
+/// `"default"`. See [`read_namespace_from_env`] for the rationale of each
+/// step.
+pub fn current_namespace() -> &'static str {
+    config().namespace
+}
+
+/// StatefulSet workload name (pod-name prefix) for the per-pod redirect
+/// FQDN (vc-el0). Read from `SFU_WORKLOAD_NAME` (the chart's
+/// release/fullname, e.g. `webtransport-us-east`), defaulting to
+/// `rustlemania-{transport_kind}` to reproduce the prior local/dev
+/// behavior when the env var is unset.
+///
+/// Not cached in [`AffinityConfig`] because it depends on the runtime
+/// `transport_kind` the caller already resolves; it is read on the
+/// (low-rate) JoinRoom path only, mirroring how the call site resolves
+/// `transport_kind` itself.
+pub fn workload_from_env(transport_kind: &str) -> String {
+    read_workload_from_env(transport_kind)
 }
 
 /// Abstraction over the NATS JetStream KV bucket that stores each room's
@@ -489,27 +575,47 @@ pub fn is_owner(room_id: &str) -> bool {
 /// rather than risk silently claiming ownership of pod-0's rooms by
 /// coercing `None` to 0 at the call site).
 ///
-/// Returns `Some(dns)` otherwise, where `dns` follows the StatefulSet
-/// headless service DNS template documented in `sfu-update/PLAN.md`
-/// wave 3:
+/// Returns `Some(dns)` otherwise, where `dns` is the FULLY-QUALIFIED
+/// per-pod StatefulSet headless-service DNS name (vc-el0):
 ///
 /// ```text
-/// rustlemania-{transport}-{owner_ord}.{transport}-headless.svc.cluster.local
+/// {workload}-{owner_ord}.{transport_kind}-headless.{namespace}.svc.cluster.local
 /// ```
 ///
-/// `transport_kind` is the literal `"webtransport"` or `"websocket"` —
-/// it is the binary's identity within the cluster. It is the caller's
-/// responsibility to pass a value that matches the deployed StatefulSet
-/// name; this helper just splices.
+/// e.g. `webtransport-us-east-2.webtransport-headless.videocall.svc.cluster.local`.
+///
+/// The `.{namespace}.` label is REQUIRED: a namespace-less name
+/// (`...-headless.svc.cluster.local`) does NOT resolve, so redirected /
+/// spillover clients round-robin back onto random non-owner pods and
+/// decode 0 streams in multi-pod (replicas ≥ 3) deployments. This was the
+/// vc-el0 bug.
+///
+/// Segments:
+///   - `workload` — the StatefulSet name = pod-name prefix. In prod this is
+///     the chart `fullnameOverride` (e.g. `webtransport-us-east`); locally
+///     it defaults to `rustlemania-{transport_kind}`. The caller resolves
+///     it via [`workload_from_env`].
+///   - `transport_kind` — `"webtransport"` / `"websocket"`. The headless
+///     `Service` is named `{transport_kind}-headless` (a literal in the
+///     chart's `headless-service.yaml`, the StatefulSet's `serviceName`),
+///     so this segment is independent of the workload override.
+///   - `namespace` — this pod's K8s namespace, resolved by the caller via
+///     [`current_namespace`].
 ///
 /// No port is appended — the client reconnects on the same port it used
-/// for the original connection. Factored out of the JoinRoom handler so
-/// the logic can be exercised without touching process-wide env vars.
+/// for the original connection.
+///
+/// Kept PURE (no env reads): `namespace` and `workload` are threaded in as
+/// parameters so the logic is testable without process-wide env vars,
+/// mirroring how `self_ordinal_from_env` / `replicas_from_env` separate
+/// env resolution from the pure ownership logic.
 pub fn compute_redirect_target(
     room: &str,
     me: Option<u32>,
     replicas: u32,
     transport_kind: &str,
+    namespace: &str,
+    workload: &str,
 ) -> Option<String> {
     if replicas == 0 {
         return None;
@@ -523,7 +629,7 @@ pub fn compute_redirect_target(
         return None;
     }
     Some(format!(
-        "rustlemania-{transport_kind}-{owner}.{transport_kind}-headless.svc.cluster.local"
+        "{workload}-{owner}.{transport_kind}-headless.{namespace}.svc.cluster.local"
     ))
 }
 
@@ -653,14 +759,28 @@ mod tests {
         for i in 0..50 {
             let room = format!("room-{i}");
             assert_eq!(
-                compute_redirect_target(&room, Some(0), 1, "webtransport"),
+                compute_redirect_target(
+                    &room,
+                    Some(0),
+                    1,
+                    "webtransport",
+                    "videocall",
+                    "rustlemania-webtransport"
+                ),
                 None,
                 "single-pod owner must not redirect {room}"
             );
         }
         // replicas == 0 is treated as "unconfigured" — never redirect.
         assert_eq!(
-            compute_redirect_target("room-x", Some(0), 0, "webtransport"),
+            compute_redirect_target(
+                "room-x",
+                Some(0),
+                0,
+                "webtransport",
+                "videocall",
+                "rustlemania-webtransport"
+            ),
             None
         );
     }
@@ -680,25 +800,135 @@ mod tests {
             })
             .expect("among 100 keys, at least one must hash to a non-zero ordinal");
 
-        let target = compute_redirect_target(&room, Some(0), replicas, "webtransport")
-            .expect("non-owner must produce a redirect target");
-        let expected =
-            format!("rustlemania-webtransport-{owner}.webtransport-headless.svc.cluster.local");
+        let target = compute_redirect_target(
+            &room,
+            Some(0),
+            replicas,
+            "webtransport",
+            "videocall",
+            "rustlemania-webtransport",
+        )
+        .expect("non-owner must produce a redirect target");
+        let expected = format!(
+            "rustlemania-webtransport-{owner}.webtransport-headless.videocall.svc.cluster.local"
+        );
         assert_eq!(target, expected, "DNS must embed owner ordinal");
 
+        // vc-el0 regression guard: the FQDN MUST carry a `.{namespace}.`
+        // label between the headless service and `svc.cluster.local`. The
+        // old namespace-less form (`...-headless.svc.cluster.local`) does
+        // not resolve and is the bug this fixes.
+        assert!(
+            target.contains(".videocall.svc.cluster.local"),
+            "redirect FQDN must contain the namespace label, got {target}"
+        );
+        assert!(
+            !target.contains("-headless.svc.cluster.local"),
+            "redirect FQDN must NOT be namespace-less (vc-el0 regression), got {target}"
+        );
+
         // websocket variant uses the websocket headless name.
-        let target_ws = compute_redirect_target(&room, Some(0), replicas, "websocket")
-            .expect("non-owner must produce a redirect target (ws)");
+        let target_ws = compute_redirect_target(
+            &room,
+            Some(0),
+            replicas,
+            "websocket",
+            "videocall",
+            "rustlemania-websocket",
+        )
+        .expect("non-owner must produce a redirect target (ws)");
         let expected_ws =
-            format!("rustlemania-websocket-{owner}.websocket-headless.svc.cluster.local");
+            format!("rustlemania-websocket-{owner}.websocket-headless.videocall.svc.cluster.local");
         assert_eq!(target_ws, expected_ws);
 
         // When `me == owner`, no redirect.
         assert_eq!(
-            compute_redirect_target(&room, Some(owner), replicas, "webtransport"),
+            compute_redirect_target(
+                &room,
+                Some(owner),
+                replicas,
+                "webtransport",
+                "videocall",
+                "rustlemania-webtransport"
+            ),
             None,
             "pod must not redirect rooms it owns"
         );
+    }
+
+    /// 7b. vc-el0: the per-pod redirect FQDN must embed the resolved
+    ///     namespace AND honour a `SFU_WORKLOAD_NAME`-style workload
+    ///     override (prod uses `fullnameOverride: webtransport-us-east`).
+    ///     Both are threaded in as pure params; this test pins the exact
+    ///     FQDN shape `{workload}-{owner}.{tk}-headless.{ns}.svc.cluster.local`.
+    #[test]
+    fn compute_redirect_target_embeds_namespace_and_workload_override() {
+        let replicas = 3u32;
+        let (room, owner) = (0..100)
+            .find_map(|i| {
+                let r = format!("room-{i}");
+                let o = jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("among 100 keys, at least one must hash to a non-zero ordinal");
+
+        // Prod-shaped inputs: chart fullnameOverride workload + a real
+        // namespace label.
+        let target = compute_redirect_target(
+            &room,
+            Some(0),
+            replicas,
+            "webtransport",
+            "media",
+            "webtransport-us-east",
+        )
+        .expect("non-owner must produce a redirect target");
+
+        let expected =
+            format!("webtransport-us-east-{owner}.webtransport-headless.media.svc.cluster.local");
+        assert_eq!(target, expected);
+
+        // Structural assertions: the FQDN must have exactly the five
+        // dotted segments after the workload-ordinal label, with the
+        // namespace ("media") sitting between the headless service and the
+        // cluster suffix.
+        assert!(
+            target.ends_with(".svc.cluster.local"),
+            "must end with cluster suffix, got {target}"
+        );
+        assert!(
+            target.contains(".webtransport-headless.media."),
+            "headless service must be transport-kind based and followed by namespace, got {target}"
+        );
+        assert!(
+            target.starts_with(&format!("webtransport-us-east-{owner}.")),
+            "workload override must be the pod-name prefix, got {target}"
+        );
+        // The bug form is impossible here.
+        assert!(
+            !target.contains("-headless.svc.cluster.local"),
+            "must not be namespace-less, got {target}"
+        );
+    }
+
+    /// 7c. vc-el0: `read_workload_from_env` default reproduces the prior
+    ///     local behavior `rustlemania-{transport_kind}` when
+    ///     `SFU_WORKLOAD_NAME` is unset, so dev/non-Helm runs are
+    ///     unchanged. (Pure helper — does not mutate process env when the
+    ///     var is absent in the test environment; we only assert the
+    ///     default branch here to avoid env races with parallel tests.)
+    #[test]
+    fn read_workload_from_env_default_reproduces_local_prefix() {
+        // The CI/test environment does not set SFU_WORKLOAD_NAME, so this
+        // exercises the default branch deterministically without touching
+        // process-wide env (which would race other tests).
+        if std::env::var("SFU_WORKLOAD_NAME").is_err() {
+            assert_eq!(
+                read_workload_from_env("webtransport"),
+                "rustlemania-webtransport"
+            );
+            assert_eq!(read_workload_from_env("websocket"), "rustlemania-websocket");
+        }
     }
 
     // ----- p6-9 / vc-hc8: cross-region home-region pinning ----------------
@@ -914,14 +1144,28 @@ mod tests {
             })
             .expect("among 100 keys, at least one must hash to a non-zero ordinal");
         // Sanity: with a parseable ordinal, this room WOULD redirect.
-        let baseline = compute_redirect_target(&room, Some(0), replicas, "webtransport");
+        let baseline = compute_redirect_target(
+            &room,
+            Some(0),
+            replicas,
+            "webtransport",
+            "videocall",
+            "rustlemania-webtransport",
+        );
         assert!(
             baseline.is_some(),
             "baseline: room {room} owned by {owner}, me=0 should redirect"
         );
         // With None, the redirect is suppressed.
         assert_eq!(
-            compute_redirect_target(&room, None, replicas, "webtransport"),
+            compute_redirect_target(
+                &room,
+                None,
+                replicas,
+                "webtransport",
+                "videocall",
+                "rustlemania-webtransport"
+            ),
             None,
             "unparseable POD_NAME must NOT trigger redirect (would split cluster)"
         );

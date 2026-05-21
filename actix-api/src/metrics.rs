@@ -441,6 +441,25 @@ lazy_static! {
         cv
     };
 
+    /// Total per-pod ADMISSION_DECISION{REDIRECT} FQDNs emitted, labeled by
+    /// the resolved Kubernetes `namespace` (bead vc-el0).
+    ///
+    /// vc-el0 fixed a bug where the redirect FQDN omitted the namespace
+    /// label (`...-headless.svc.cluster.local`), which does not resolve, so
+    /// redirected/spillover clients round-robined onto random non-owner pods
+    /// and decoded 0 streams in multi-pod deployments. This counter makes the
+    /// fix verifiable in the wild: a healthy multi-pod deployment shows
+    /// redirects emitted under a REAL namespace label (e.g. `media`), never
+    /// under the local/dev `default` fallback. A spike under `default` in a
+    /// K8s deployment means namespace resolution is failing (POD_NAMESPACE
+    /// unset AND the service-account namespace file unreadable).
+    pub static ref SFU_REDIRECT_FQDN_EMITTED_TOTAL: CounterVec = register_counter_vec!(
+        "sfu_redirect_fqdn_emitted_total",
+        "Total per-pod redirect FQDNs emitted by JoinRoom, labeled by resolved namespace (vc-el0)",
+        &["namespace"]
+    )
+    .expect("Failed to create sfu_redirect_fqdn_emitted_total metric");
+
     /// Total session teardowns, labeled by reason (bead vc-n9o).
     ///
     /// Emitted at the transport-actor `StopSession` / stop sites:
