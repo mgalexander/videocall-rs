@@ -150,7 +150,21 @@ impl VideoEncoder {
         Ok(())
     }
 
-    pub fn encode(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
+    /// Encode one I420 source frame.
+    ///
+    /// When `force_keyframe` is `true`, `VPX_EFLAG_FORCE_KF` is OR-ed into the
+    /// libvpx encode flags so the next emitted frame is a keyframe regardless
+    /// of the periodic `kf_max_dist` cadence. The bot uses this to honor an
+    /// inbound `KEYFRAME_REQUEST` from a mid-stream-joining listener (vc-7zjq):
+    /// without it, a mid-stream joiner has to wait up to `kf_max_dist` frames
+    /// for the next periodic keyframe, which under backpressure may itself be
+    /// dropped, leaving the joiner with an undecodable GOP indefinitely.
+    pub fn encode(
+        &mut self,
+        pts: i64,
+        data: &[u8],
+        force_keyframe: bool,
+    ) -> anyhow::Result<Frames<'_>> {
         let image = MaybeUninit::zeroed();
         let mut image = unsafe { image.assume_init() };
 
@@ -163,7 +177,15 @@ impl VideoEncoder {
             data.as_ptr() as _,
         ));
 
-        let flags: i64 = 0;
+        // `VPX_EFLAG_FORCE_KF` forces this encode to emit a keyframe. We keep
+        // the periodic `kf_max_dist=150` cadence as the always-on fallback
+        // (vc-7zjq fix spec item 3); this flag is purely additive and only set
+        // when an inbound KEYFRAME_REQUEST targeted at us was observed.
+        let flags: i64 = if force_keyframe {
+            VPX_EFLAG_FORCE_KF as i64
+        } else {
+            0
+        };
 
         vpx!(vpx_codec_encode(
             &mut self.ctx,
