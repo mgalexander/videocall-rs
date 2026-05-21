@@ -331,7 +331,12 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
 
-    let chat = ChatServer::new(nats_client.clone()).await.start();
+    // vc-ud6o E3: grab the shared connection-state handle BEFORE `.start()`
+    // consumes the actor. It is cloned into every `SessionLogic` via AppState
+    // so the off-actor media-publish path can read the `Active` gate lock-free.
+    let chat_server = ChatServer::new(nats_client.clone()).await;
+    let connection_states = chat_server.connection_states_handle();
+    let chat = chat_server.start();
 
     // Create SessionManager
     let session_manager = SessionManager::new();
@@ -373,6 +378,7 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
+                    connection_states: connection_states.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)
@@ -391,6 +397,7 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
+                    connection_states: connection_states.clone(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),
@@ -420,6 +427,7 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
+                    connection_states: connection_states.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)

@@ -23,7 +23,9 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::parse_and_inspect;
-use crate::actors::session_logic::{InboundAction, SessionLogic, TeardownReason};
+use crate::actors::session_logic::{
+    InboundAction, SessionLogic, SharedConnectionStates, TeardownReason,
+};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
@@ -104,6 +106,7 @@ impl WsChatSession {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        connection_states: SharedConnectionStates,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -114,6 +117,7 @@ impl WsChatSession {
             tracker_sender,
             session_manager,
             observer,
+            connection_states,
         );
 
         let (outbound_tx, channels) = PrioritySender::new();
@@ -337,9 +341,11 @@ impl Handler<Packet> for WsChatSession {
             self.logic.id,
             self.logic.room
         );
-        self.logic
-            .addr
-            .do_send(self.logic.create_client_message(msg));
+        // vc-ud6o E3: route via SessionLogic. High-volume media publishes to
+        // NATS directly from this task (off the single ChatServer mailbox);
+        // only the rare control packets (SUBSCRIPTION_UPDATE, KEYFRAME_REQUEST)
+        // still go through the actor.
+        self.logic.forward_packet(msg);
     }
 }
 
@@ -522,7 +528,9 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat = ChatServer::new(nats_client.clone()).await.start();
+        let chat_server = ChatServer::new(nats_client.clone()).await;
+        let connection_states = chat_server.connection_states_handle();
+        let chat = chat_server.start();
         let session_manager = SessionManager::new();
 
         let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
@@ -534,6 +542,7 @@ mod tests {
                 let nats_client = nats_client.clone();
                 let tracker_sender = tracker_sender.clone();
                 let session_manager = session_manager.clone();
+                let connection_states = connection_states.clone();
 
                 App::new().route(
                     "/ws/{room}/{user_id}",
@@ -545,6 +554,7 @@ mod tests {
                             let nats_client = nats_client.clone();
                             let tracker_sender = tracker_sender.clone();
                             let session_manager = session_manager.clone();
+                            let connection_states = connection_states.clone();
 
                             async move {
                                 let (room, user_id) = path.into_inner();
@@ -558,6 +568,7 @@ mod tests {
                                     tracker_sender,
                                     session_manager,
                                     false, // tests use non-observer sessions
+                                    connection_states,
                                 );
                                 ws::start(actor, &req, stream)
                                     .map_err(actix_web::error::ErrorInternalServerError)

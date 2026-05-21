@@ -54,7 +54,9 @@ async fn start_real_ws_server(port: u16) {
         .await
         .expect("Failed to connect to NATS");
 
-    let chat = ChatServer::new(nats_client.clone()).await.start();
+    let chat_actor = ChatServer::new(nats_client.clone()).await;
+    let connection_states = chat_actor.connection_states_handle();
+    let chat = chat_actor.start();
     let session_manager = SessionManager::new();
     let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
 
@@ -63,6 +65,7 @@ async fn start_real_ws_server(port: u16) {
         nats_client,
         tracker_sender,
         session_manager,
+        connection_states,
     };
 
     actix_rt::spawn(async move {

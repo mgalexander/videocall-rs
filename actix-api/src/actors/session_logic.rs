@@ -64,6 +64,83 @@ pub enum ConnectionState {
     Active,
 }
 
+/// Bound on the per-session off-actor NATS publish queue (vc-ud6o E3).
+///
+/// Each session has ONE long-lived publisher task draining a bounded channel
+/// of this depth. `Handler<Packet>` `try_send`s prepared media frames into it
+/// and DROPS on full. Under a NATS publish stall the drainer parks on
+/// `Client::publish().await` (the client's own command channel is bounded too),
+/// the queue fills, and new media frames are shed — dropping media under
+/// congestion is the correct SFU behavior. A small bound caps per-session
+/// memory tightly and sheds load fast rather than buffering stale frames.
+const SESSION_PUBLISH_QUEUE_CAP: usize = 64;
+
+/// A media frame prepared for off-actor NATS publish (vc-ud6o E3).
+///
+/// All actor-owned-state-dependent work (the `Active` gate, `session_id`
+/// rewrite, subject construction) is done on the calling transport thread
+/// BEFORE the frame is queued, so the drainer task only performs the
+/// `Client::publish().await`.
+struct PreparedPublish {
+    subject: String,
+    payload: bytes::Bytes,
+}
+
+/// Zero-copy `Bytes` owner wrapping the `Arc<Vec<u8>>` already held by an
+/// inbound [`Packet`] (vc-ud6o item-2).
+///
+/// `bytes::Bytes::from_owner` requires `T: AsRef<[u8]> + Send + 'static`.
+/// `Arc<Vec<u8>>` only implements `AsRef<Vec<u8>>`, so this newtype adapts it
+/// to `AsRef<[u8]>`. Using it as the `Bytes` owner lets the publisher reuse the
+/// existing buffer instead of copying it on the common encrypted-media path.
+struct ArcBufOwner(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for ArcBufOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+/// Build the NATS publish payload for an off-actor media frame (vc-ud6o).
+///
+/// Applies the `session_id == 0` rewrite, exactly matching the former on-actor
+/// `Handler<ClientMessage>`: if the wrapper parses and its `session_id` is
+/// unset, stamp it with `session` and re-serialize. ONLY that branch allocates
+/// a fresh buffer; every other path — `session_id` already set, or opaque /
+/// unparseable bytes (the common encrypted-media case) — returns `Bytes`
+/// borrowed zero-copy over the `Arc<Vec<u8>>` the [`Packet`] already holds (via
+/// [`ArcBufOwner`] + [`bytes::Bytes::from_owner`]), avoiding a per-frame copy.
+fn prepare_publish_payload(session: u64, data: Arc<Vec<u8>>) -> bytes::Bytes {
+    match PacketWrapper::parse_from_bytes(&data) {
+        Ok(mut packet_wrapper) if packet_wrapper.session_id == 0 => {
+            packet_wrapper.session_id = session;
+            match packet_wrapper.write_to_bytes() {
+                Ok(bytes) => bytes::Bytes::from(bytes),
+                Err(e) => {
+                    error!("Failed to serialize PacketWrapper with session_id: {}", e);
+                    bytes::Bytes::from_owner(ArcBufOwner(data))
+                }
+            }
+        }
+        // Parsed but session_id already set, or unparseable opaque bytes:
+        // publish the original buffer as-is (zero-copy over the Arc).
+        _ => bytes::Bytes::from_owner(ArcBufOwner(data)),
+    }
+}
+
+/// Shared, lock-free map of per-session [`ConnectionState`] (vc-ud6o E3).
+///
+/// Owned authoritatively by the single `ChatServer` actor thread (the only
+/// writer: `Connect` inserts `Testing`, `ActivateConnection` promotes to
+/// `Active`, `Disconnect`/`Leave` remove). A `Clone` of the `Arc` is handed to
+/// every [`SessionLogic`] so the off-actor media-publish path can read the
+/// per-session `Active` gate without round-tripping through the actor mailbox.
+///
+/// `DashMap` gives lock-free sharded reads that contend only with a write to
+/// the SAME session's shard — and there is exactly one writer (the actor), so
+/// reads on the hot media path are effectively uncontended.
+pub type SharedConnectionStates = Arc<dashmap::DashMap<SessionId, ConnectionState>>;
+
 /// Result of handling an inbound packet
 #[derive(Debug)]
 pub enum InboundAction {
@@ -455,6 +532,19 @@ pub struct SessionLogic {
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
+    /// Shared, lock-free view of per-session connection states (vc-ud6o E3).
+    ///
+    /// A clone of the `ChatServer`-owned map. Read on the off-actor media-
+    /// publish path to gate publishing on `ConnectionState::Active`, exactly
+    /// as the on-actor `Handler<ClientMessage>` did, but without occupying the
+    /// single actor thread per packet.
+    pub connection_states: SharedConnectionStates,
+    /// Bounded sender into this session's single long-lived publisher task
+    /// (vc-ud6o E3). `forward_packet` `try_send`s prepared media frames here
+    /// and drops on full. This replaces the prior unbounded `tokio::spawn`-
+    /// per-frame model: one task per session, bounded memory, drop-on-full
+    /// backpressure. See [`SESSION_PUBLISH_QUEUE_CAP`].
+    publish_tx: tokio::sync::mpsc::Sender<PreparedPublish>,
 }
 
 impl SessionLogic {
@@ -469,12 +559,26 @@ impl SessionLogic {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
         observer: bool,
+        connection_states: SharedConnectionStates,
     ) -> Self {
         let id = (Uuid::new_v4().as_u128() & 0xffffffffffffffff) as u64;
         info!(
             "new session: room={} user_id={} display_name={} session_id={} observer={}",
             room, user_id, display_name, id, observer
         );
+
+        // vc-ud6o E3: spawn the single long-lived per-session publisher task.
+        // It drains the bounded queue and performs the actual
+        // `Client::publish().await`, applying real backpressure to itself:
+        // when NATS stalls the drainer parks on `publish().await`, the bounded
+        // queue fills, and `forward_packet`'s `try_send` sheds new media. The
+        // task ends when the sender (held in this `SessionLogic`) is dropped,
+        // i.e. on session teardown. `new` is always called from inside a tokio
+        // runtime (async HTTP/WT handlers), so `tokio::spawn` is valid here —
+        // the same precondition `emit_congestion`'s spawn already relies on.
+        let (publish_tx, publish_rx) =
+            tokio::sync::mpsc::channel::<PreparedPublish>(SESSION_PUBLISH_QUEUE_CAP);
+        Self::spawn_publisher(id, nats_client.clone(), publish_rx);
 
         SessionLogic {
             id,
@@ -488,7 +592,34 @@ impl SessionLogic {
             observer,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
+            connection_states,
+            publish_tx,
         }
+    }
+
+    /// Spawn the single long-lived per-session NATS publisher task (vc-ud6o E3).
+    ///
+    /// Drains [`PreparedPublish`] frames in order and awaits each
+    /// `Client::publish`. Because it processes one frame at a time, a NATS
+    /// publish stall blocks the drainer (not the transport actor) and the
+    /// bounded upstream queue applies drop-on-full backpressure. Exits cleanly
+    /// when the channel closes (the `SessionLogic` holding the sender is
+    /// dropped on teardown).
+    fn spawn_publisher(
+        session: u64,
+        nc: async_nats::client::Client,
+        mut rx: tokio::sync::mpsc::Receiver<PreparedPublish>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(PreparedPublish { subject, payload }) = rx.recv().await {
+                if let Err(e) = nc.publish(subject.clone(), payload).await {
+                    error!("error publishing message to {subject}: {e}");
+                } else {
+                    trace!("published message to {subject}");
+                }
+            }
+            trace!("publisher task for session {session} ended (channel closed)");
+        });
     }
 
     // =========================================================================
@@ -555,6 +686,132 @@ impl SessionLogic {
             user: self.user_id.clone(),
             room: self.room.clone(),
             msg,
+        }
+    }
+
+    /// Forward an inbound packet toward the room (vc-ud6o E3).
+    ///
+    /// This replaces the per-packet `addr.do_send(create_client_message(..))`
+    /// that previously funneled EVERY inbound media packet through the single
+    /// `ChatServer` actor mailbox — the throughput bottleneck that starved
+    /// `JoinRoom` registration at scale.
+    ///
+    /// Routing by [`PacketKind`]:
+    ///
+    /// * High-volume media (`PacketKind::Data` — AUDIO/VIDEO/SCREEN, plus
+    ///   opaque CONNECTION packets) is published to NATS **directly from this
+    ///   transport/session task**, never touching the actor. The actor's
+    ///   per-packet load is thereby removed.
+    /// * Control packets that must read/mutate actor-owned state stay on the
+    ///   actor via `do_send(ClientMessage)`:
+    ///   * `PacketKind::SubscriptionUpdate` — applied to the per-room
+    ///     `SubscriptionStore` on the single-writer actor thread, preserving
+    ///     ordering against `JoinRoom` member-table updates and forwarder
+    ///     reads. These are rare (one per subscription change).
+    ///   * `PacketKind::KeyframeRequest` — the layer-aware drop policy reads
+    ///     `room_members` + the forwarder's cached `LayerSelection`. These are
+    ///     rate-limited per session and rare relative to media frames.
+    ///
+    /// The off-actor media path reproduces, exactly, the three media-relevant
+    /// behaviors of the former on-actor `Handler<ClientMessage>`:
+    ///   1. Connection-state gating: publish only when this session is
+    ///      `ConnectionState::Active` (read lock-free from the shared map);
+    ///      otherwise drop, matching the "Testing state" skip.
+    ///   2. `session_id == 0` rewrite to this session's id before publish.
+    ///   3. Subject `room.{room}.{session}` with spaces replaced by `_`.
+    pub fn forward_packet(&self, msg: Packet) {
+        match msg.kind {
+            // Control paths: keep on the actor (rare; need actor-owned state).
+            PacketKind::SubscriptionUpdate | PacketKind::KeyframeRequest => {
+                self.addr.do_send(self.create_client_message(msg));
+            }
+            // High-volume media + opaque CONNECTION packets: publish off-actor.
+            // CONNECTION classifies as `Data` (it is forwarded opaquely so peers
+            // receive the join notification), so it shares the media fast path.
+            PacketKind::Data => self.publish_media_off_actor(msg.data),
+            // RTT / Health / Dropped never reach a `Forward` action (they are
+            // handled inline in `handle_inbound`), so they cannot appear here.
+            // Route them defensively through the actor publish path rather than
+            // silently misclassifying — and log, so a future change that starts
+            // forwarding one of these kinds is caught instead of silently taking
+            // the media fast path.
+            PacketKind::Rtt | PacketKind::Health | PacketKind::Dropped => {
+                warn!(
+                    "forward_packet received unexpected PacketKind {:?} for session {} \
+                     (not produced by handle_inbound's Forward path); routing via actor",
+                    msg.kind, self.id
+                );
+                self.addr.do_send(self.create_client_message(msg));
+            }
+        }
+    }
+
+    /// Off-actor NATS publish for high-volume media packets (vc-ud6o E3).
+    ///
+    /// Mirrors the media branch of the former on-actor `Handler<ClientMessage>`,
+    /// but runs entirely off the single `ChatServer` mailbox. All
+    /// actor-state-dependent work happens synchronously on the calling
+    /// transport thread:
+    ///   1. Connection-state gate — a lock-free `DashMap` read.
+    ///   2. `session_id == 0` rewrite (re-serialize only when it fires).
+    ///   3. Subject construction.
+    ///
+    /// The prepared frame is then `try_send`'d into this session's bounded
+    /// publisher queue and DROPPED on full (NATS publish stall / congestion).
+    /// This replaces the prior unbounded per-frame `tokio::spawn`: one
+    /// long-lived task per session, bounded memory, correct SFU load-shedding.
+    ///
+    /// `data` is the `Arc<Vec<u8>>` already held by the `Packet`, so the common
+    /// encrypted-media path (parse fails, or no rewrite needed) builds `Bytes`
+    /// directly over the shared buffer via `Bytes::from_owner` — zero copy.
+    fn publish_media_off_actor(&self, data: Arc<Vec<u8>>) {
+        let session = self.id;
+
+        // (1) Connection-state gate — only publish when Active. A missing
+        // entry is treated as Testing (the former handler's default), so we
+        // drop, exactly preserving the pre-vc-ud6o behavior.
+        let active = self
+            .connection_states
+            .get(&session)
+            .map(|s| *s == ConnectionState::Active)
+            .unwrap_or(false);
+        if !active {
+            trace!(
+                "Skipping off-actor NATS publish for session {} (not Active)",
+                session
+            );
+            return;
+        }
+
+        // (3) Subject: room.{room}.{session}, spaces -> '_'.
+        let subject = format!("room.{}.{}", self.room, session).replace(' ', "_");
+
+        // (2) session_id == 0 rewrite (see `prepare_publish_payload`).
+        let payload = prepare_publish_payload(session, data);
+
+        // Hand off to the per-session publisher task. Drop-on-full: when the
+        // queue is saturated (NATS stall), shedding media is correct for an
+        // SFU. `Closed` only happens during teardown after the task exits.
+        match self
+            .publish_tx
+            .try_send(PreparedPublish { subject, payload })
+        {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                crate::metrics::SFU_DROPPED_TOTAL
+                    .with_label_values(&["publish_backpressure"])
+                    .inc();
+                trace!(
+                    "Dropping media frame for session {} — publish queue full (NATS backpressure)",
+                    session
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                trace!(
+                    "Publish queue closed for session {} (teardown); dropping frame",
+                    session
+                );
+            }
         }
     }
 
@@ -677,6 +934,20 @@ impl SessionLogic {
                     return InboundAction::Processed;
                 }
                 InboundAction::Forward(Arc::new(data.to_vec()), PacketKind::KeyframeRequest)
+            }
+            PacketKind::SubscriptionUpdate => {
+                // SUBSCRIPTION_UPDATE is a server-local control packet applied
+                // on the ChatServer actor (per-room SubscriptionStore). Pre-
+                // vc-ud6o it classified as `Data`, so observer sessions dropped
+                // it before forwarding — preserve that exactly. Non-observers
+                // forward it with the distinct `SubscriptionUpdate` kind so the
+                // transport routes it through the actor mailbox (NOT the off-
+                // actor media-publish fast path), keeping the store mutation on
+                // the single-writer actor thread.
+                if self.observer {
+                    return InboundAction::Processed;
+                }
+                InboundAction::Forward(Arc::new(data.to_vec()), PacketKind::SubscriptionUpdate)
             }
             PacketKind::Data => {
                 if self.observer {
@@ -1353,5 +1624,59 @@ mod tests {
         assert!(SessionLogic::should_activate_on_action(
             &InboundAction::KeepAlive
         ));
+    }
+
+    // ---- vc-ud6o: off-actor publish payload preparation -----------------
+
+    fn wrapper_bytes(session_id: u64) -> Vec<u8> {
+        let w = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id,
+            data: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        w.write_to_bytes().expect("serialize wrapper")
+    }
+
+    /// session_id == 0 must be rewritten to the session's id before publish,
+    /// matching the former on-actor handler.
+    #[test]
+    fn test_prepare_publish_payload_rewrites_zero_session_id() {
+        let raw = wrapper_bytes(0);
+        let out = prepare_publish_payload(4242, Arc::new(raw));
+        let parsed = PacketWrapper::parse_from_bytes(&out).expect("parse out");
+        assert_eq!(
+            parsed.session_id, 4242,
+            "session_id==0 must be stamped with the publishing session id"
+        );
+    }
+
+    /// A wrapper that already carries a session_id is published unchanged and
+    /// zero-copy (the bytes are byte-identical to the input buffer).
+    #[test]
+    fn test_prepare_publish_payload_preserves_set_session_id_zero_copy() {
+        let raw = wrapper_bytes(9999);
+        let arc = Arc::new(raw.clone());
+        let out = prepare_publish_payload(4242, arc);
+        assert_eq!(
+            out.as_ref(),
+            raw.as_slice(),
+            "already-set session_id frames must pass through unchanged"
+        );
+        let parsed = PacketWrapper::parse_from_bytes(&out).expect("parse out");
+        assert_eq!(parsed.session_id, 9999, "existing session_id must be kept");
+    }
+
+    /// Opaque / unparseable bytes (e.g. the encrypted-media common case) are
+    /// published verbatim over the original Arc buffer (no rewrite, no copy).
+    #[test]
+    fn test_prepare_publish_payload_passes_through_unparseable_bytes() {
+        let raw = vec![0xff, 0xff, 0xff, 0xff];
+        let out = prepare_publish_payload(4242, Arc::new(raw.clone()));
+        assert_eq!(
+            out.as_ref(),
+            raw.as_slice(),
+            "unparseable opaque bytes must be published verbatim"
+        );
     }
 }

@@ -339,6 +339,10 @@ lazy_static! {
         // and keeps the `sfu_drop_reason` doc honest.
         cv.with_label_values(&["reference_miss"]).inc_by(0.0);
         cv.with_label_values(&["kfr_unsubscribed"]).inc_by(0.0);
+        // vc-ud6o E3: media frames dropped when the per-session off-actor NATS
+        // publish queue is full (NATS publish stall / backpressure). Dropping
+        // media under congestion is correct SFU behavior.
+        cv.with_label_values(&["publish_backpressure"]).inc_by(0.0);
         cv
     };
 

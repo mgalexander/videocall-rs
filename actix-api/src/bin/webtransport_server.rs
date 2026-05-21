@@ -165,8 +165,13 @@ async fn main() {
         .expect("Failed to connect to NATS");
     info!("Connected to NATS at {}", nats_url);
 
-    // Start ChatServer actor
-    let chat_server = ChatServer::new(nats_client.clone()).await.start();
+    // Start ChatServer actor.
+    // vc-ud6o E3: grab the shared connection-state handle BEFORE `.start()`
+    // consumes the actor, then thread it through `webtransport::start` so each
+    // `SessionLogic` can read the `Active` gate off-actor.
+    let chat_server_actor = ChatServer::new(nats_client.clone()).await;
+    let connection_states = chat_server_actor.connection_states_handle();
+    let chat_server = chat_server_actor.start();
     info!("ChatServer actor started");
 
     // Create SessionManager
@@ -239,6 +244,7 @@ async fn main() {
             nats_client,
             tracker_sender,
             session_manager,
+            connection_states,
         )
         .await
         {

@@ -115,6 +115,7 @@ pub async fn ws_connect_authenticated(
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
     let session_manager = state.session_manager.clone();
+    let connection_states = state.connection_states.clone();
     let actor = WsChatSession::new(
         chat,
         room,
@@ -124,6 +125,7 @@ pub async fn ws_connect_authenticated(
         tracker_sender,
         session_manager,
         observer,
+        connection_states,
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)
@@ -168,6 +170,7 @@ pub async fn ws_connect(
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
     let session_manager = state.session_manager.clone();
+    let connection_states = state.connection_states.clone();
     let actor = WsChatSession::new(
         chat,
         room_clean,
@@ -177,6 +180,7 @@ pub async fn ws_connect(
         tracker_sender,
         session_manager,
         false, // deprecated path-based endpoint: never observer
+        connection_states,
     );
     let codec = Codec::new().max_size(MAX_FRAME_SIZE);
     start_with_codec(actor, &req, stream, codec)

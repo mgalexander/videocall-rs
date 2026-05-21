@@ -23,7 +23,9 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::parse_and_inspect;
-use crate::actors::session_logic::{InboundAction, SessionLogic, TeardownReason};
+use crate::actors::session_logic::{
+    InboundAction, SessionLogic, SharedConnectionStates, TeardownReason,
+};
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ActivateConnection, Packet};
 use crate::messages::session::Message;
@@ -121,6 +123,7 @@ impl WtChatSession {
         session_manager: SessionManager,
         observer: bool,
         accept_inbound: AcceptInboundFlag,
+        connection_states: SharedConnectionStates,
     ) -> Self {
         let logic = SessionLogic::new(
             addr,
@@ -131,6 +134,7 @@ impl WtChatSession {
             tracker_sender,
             session_manager,
             observer,
+            connection_states,
         );
 
         WtChatSession {
@@ -441,9 +445,11 @@ impl Handler<Packet> for WtChatSession {
             self.logic.id,
             self.logic.room
         );
-        self.logic
-            .addr
-            .do_send(self.logic.create_client_message(msg));
+        // vc-ud6o E3: route via SessionLogic. High-volume media publishes to
+        // NATS directly from this task (off the single ChatServer mailbox);
+        // only the rare control packets (SUBSCRIPTION_UPDATE, KEYFRAME_REQUEST)
+        // still go through the actor.
+        self.logic.forward_packet(msg);
     }
 }
 

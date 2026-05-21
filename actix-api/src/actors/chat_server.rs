@@ -51,7 +51,7 @@ use videocall_types::SYSTEM_USER_ID;
 use super::packet_handler::{
     parse_and_inspect, should_drop_kfr_for_layer_selection, PacketKind, ParsedPacket,
 };
-use super::session_logic::{ConnectionState, SessionId};
+use super::session_logic::{ConnectionState, SessionId, SharedConnectionStates};
 use crate::sfu::forwarder::{ForwardDecision, Forwarder};
 use crate::sfu::health_beacon::{
     spawn_beacon_hub, BeaconHub, EnvOwnerCheck, LinuxCpuLoad, NatsHealthBeaconPublisher,
@@ -215,7 +215,15 @@ pub struct ChatServer {
     /// receiver-side mailbox lives in [`RoomDispatch::receivers`].
     joined_sessions: HashSet<SessionId>,
     session_manager: SessionManager,
-    connection_states: HashMap<SessionId, ConnectionState>,
+    /// Per-session connection state (Testing/Active).
+    ///
+    /// vc-ud6o E3: now a shared, lock-free `Arc<DashMap>` (see
+    /// [`SharedConnectionStates`]). The `ChatServer` actor remains the sole
+    /// writer (Connect / ActivateConnection / Disconnect / Leave), so the
+    /// state machine is unchanged; a clone of the handle is given to every
+    /// `SessionLogic` so the off-actor media-publish path can read the
+    /// `Active` gate without round-tripping through this actor's mailbox.
+    connection_states: SharedConnectionStates,
     /// Track which sessions are in which room, with their user_id and display_name.
     /// Used to send PARTICIPANT_JOINED for existing peers to new joiners.
     room_members: HashMap<String, Vec<(SessionId, String, String)>>,
@@ -392,7 +400,7 @@ impl ChatServer {
             joined_sessions: HashSet::new(),
             sessions: HashMap::new(),
             session_manager: SessionManager::new(),
-            connection_states: HashMap::new(),
+            connection_states: SharedConnectionStates::default(),
             room_members: HashMap::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: HashSet::new(),
@@ -410,6 +418,16 @@ impl ChatServer {
             spillover_store,
             _spillover_ingest: spillover_ingest,
         }
+    }
+
+    /// Clone of the shared connection-state handle (vc-ud6o E3).
+    ///
+    /// Call BEFORE `.start()` consumes the actor; the returned `Arc` is handed
+    /// to every `SessionLogic` so the off-actor media-publish path can read the
+    /// per-session `Active` gate lock-free. There is exactly one `ChatServer`
+    /// per pod, so this single shared map covers all sessions on the pod.
+    pub fn connection_states_handle(&self) -> SharedConnectionStates {
+        self.connection_states.clone()
     }
 
     /// vc-xow8: emit `sfu_join_milestone` for every configured milestone the
@@ -1051,7 +1069,7 @@ impl Handler<ActivateConnection> for ChatServer {
 
     fn handle(&mut self, msg: ActivateConnection, ctx: &mut Self::Context) -> Self::Result {
         let ActivateConnection { session } = msg;
-        let was_testing = if let Some(state) = self.connection_states.get_mut(&session) {
+        let was_testing = if let Some(mut state) = self.connection_states.get_mut(&session) {
             if *state == ConnectionState::Testing {
                 *state = ConnectionState::Active;
                 info!("Session {} activated (Testing -> Active)", session);
@@ -1502,6 +1520,22 @@ impl Handler<HomeRegionResolved> for ChatServer {
 impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
+    /// Handle a packet routed through the actor.
+    ///
+    /// vc-ud6o E3: as of the off-actor publish change, high-volume media
+    /// (`PacketKind::Data`) NO LONGER reaches this handler — the transport
+    /// session task publishes those directly to NATS via
+    /// [`SessionLogic::forward_packet`]. This handler now only sees the rare
+    /// CONTROL packets that genuinely need actor-owned state:
+    ///   * `SUBSCRIPTION_UPDATE` — intercepted and applied to the per-room
+    ///     `SubscriptionStore` (returns without broadcasting).
+    ///   * `KEYFRAME_REQUEST` — subject to the layer-aware drop policy; if it
+    ///     survives, it is published to NATS like before.
+    ///
+    /// The connection-state gate, `session_id == 0` rewrite, and subject
+    /// construction below are preserved unchanged so the KFR publish path is
+    /// byte-for-byte identical to the pre-vc-ud6o behavior. The media-publish
+    /// gate semantics are reproduced off-actor in `publish_media_off_actor`.
     fn handle(&mut self, msg: ClientMessage, ctx: &mut Self::Context) -> Self::Result {
         let ClientMessage {
             session,
@@ -1516,7 +1550,7 @@ impl Handler<ClientMessage> for ChatServer {
         let connection_state = self
             .connection_states
             .get(&session)
-            .copied()
+            .map(|s| *s)
             .unwrap_or(ConnectionState::Testing);
 
         if connection_state != ConnectionState::Active {
@@ -3669,7 +3703,9 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let chat_actor = ChatServer::new(nats_client.clone()).await;
+        let connection_states = chat_actor.connection_states_handle();
+        let chat_server = chat_actor.start();
 
         let (tx, _rx) = mpsc::unbounded_channel::<TrackerMessage>();
         let tracker_sender: TrackerSender = tx;
@@ -3688,6 +3724,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            connection_states.clone(),
         );
 
         let session2 = SessionLogic::new(
@@ -3699,6 +3736,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            connection_states.clone(),
         );
 
         // Verify they have different session IDs
@@ -4763,7 +4801,7 @@ mod tests {
             Ok(self
                 .connection_states
                 .get(&msg.session)
-                .copied()
+                .map(|s| *s)
                 .unwrap_or(ConnectionState::Testing))
         }
     }

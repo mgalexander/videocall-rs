@@ -47,6 +47,11 @@ pub enum PacketKind {
     Dropped,
     /// KEYFRAME_REQUEST packet - subject to per-session rate limiting
     KeyframeRequest,
+    /// SUBSCRIPTION_UPDATE packet - a server-local control packet that is NOT
+    /// broadcast to NATS. It must be applied to the per-room `SubscriptionStore`
+    /// on the `ChatServer` actor thread, so it is routed through the actor
+    /// rather than the off-actor media-publish fast path (vc-ud6o E3).
+    SubscriptionUpdate,
 }
 
 /// Result of classifying an inbound packet, with optional parsed inner
@@ -123,6 +128,22 @@ pub fn classify_and_inspect(data: &[u8]) -> ClassifiedPacket {
     if packet_wrapper.packet_type == PacketType::HEALTH.into() {
         return ClassifiedPacket {
             kind: PacketKind::Health,
+            media_packet: None,
+            connection_packet: None,
+        };
+    }
+
+    // SUBSCRIPTION_UPDATE is a server-local control packet (vc-ud6o E3): it is
+    // intercepted on the `ChatServer` actor and applied to the per-room
+    // `SubscriptionStore` — never broadcast to NATS. Classify it distinctly so
+    // the transport's `Forward` path routes it through the actor mailbox
+    // instead of the off-actor media-publish fast path. Pre-vc-ud6o this fell
+    // through to `PacketKind::Data`; the actor-side `ClientMessage` handler
+    // still re-checks `packet_type == SUBSCRIPTION_UPDATE` so the interception
+    // semantics are unchanged.
+    if packet_wrapper.packet_type == PacketType::SUBSCRIPTION_UPDATE.into() {
+        return ClassifiedPacket {
+            kind: PacketKind::SubscriptionUpdate,
             media_packet: None,
             connection_packet: None,
         };
@@ -444,6 +465,36 @@ mod tests {
     #[test]
     fn test_classify_garbage_as_data() {
         assert_eq!(classify_packet(&[1, 2, 3, 4, 5]), PacketKind::Data);
+    }
+
+    /// vc-ud6o E3: SUBSCRIPTION_UPDATE must classify as its own control kind
+    /// (NOT `Data`) so the transport routes it through the ChatServer actor
+    /// rather than the off-actor media-publish fast path. The actor applies it
+    /// to the per-room SubscriptionStore on the single-writer thread.
+    #[test]
+    fn test_classify_subscription_update_is_control_kind() {
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::SUBSCRIPTION_UPDATE.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::SubscriptionUpdate);
+    }
+
+    /// MEDIA AUDIO/VIDEO/SCREEN payloads keep classifying as `Data` so they
+    /// take the off-actor publish fast path (the vc-ud6o E3 hot path).
+    #[test]
+    fn test_classify_opaque_media_remains_data() {
+        // An encrypted MEDIA payload whose inner MediaPacket fails to parse
+        // classifies as Data (the AUDIO/VIDEO/SCREEN fast path).
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: vec![0xff, 0xff, 0xff, 0xff],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Data);
     }
 
     #[test]

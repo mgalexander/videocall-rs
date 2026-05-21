@@ -19,6 +19,7 @@
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
+use crate::actors::session_logic::SharedConnectionStates;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 
@@ -28,6 +29,10 @@ pub struct AppState {
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
     pub session_manager: SessionManager,
+    /// vc-ud6o E3: shared, lock-free per-session connection-state map handed
+    /// to each `SessionLogic` so the off-actor media-publish path can read the
+    /// `Active` gate without touching the single `ChatServer` mailbox.
+    pub connection_states: SharedConnectionStates,
 }
 
 pub struct AppConfig {

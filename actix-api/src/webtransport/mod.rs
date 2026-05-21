@@ -19,6 +19,7 @@
 pub(crate) mod bridge;
 
 use crate::actors::chat_server::ChatServer;
+use crate::actors::session_logic::SharedConnectionStates;
 use crate::actors::transports::wt_chat_session::WtChatSession;
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
@@ -154,12 +155,14 @@ fn get_key_and_cert_chain<'a>(
 /// * `pool` - Optional database pool
 /// * `tracker_sender` - Server diagnostics tracker
 /// * `session_manager` - Session lifecycle manager
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     opt: WebTransportOpt,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
+    connection_states: SharedConnectionStates,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
@@ -213,6 +216,7 @@ pub async fn start(
         let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
+        let connection_states = connection_states.clone();
         actix_rt::spawn(async move {
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
@@ -220,6 +224,7 @@ pub async fn start(
                 nats_client,
                 tracker_sender,
                 session_manager,
+                connection_states,
             )
             .await
             {
@@ -231,12 +236,14 @@ pub async fn start(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
+    connection_states: SharedConnectionStates,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
     let uri = request.url();
@@ -322,6 +329,7 @@ async fn run_webtransport_connection_from_request(
         tracker_sender,
         session_manager,
         observer,
+        connection_states,
     )
     .await
     {
@@ -334,7 +342,14 @@ async fn run_webtransport_connection_from_request(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     level = "trace",
-    skip(session, chat_server, nats_client, tracker_sender, session_manager)
+    skip(
+        session,
+        chat_server,
+        nats_client,
+        tracker_sender,
+        session_manager,
+        connection_states
+    )
 )]
 async fn handle_webtransport_session(
     session: Session,
@@ -346,6 +361,7 @@ async fn handle_webtransport_session(
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
     observer: bool,
+    connection_states: SharedConnectionStates,
 ) -> anyhow::Result<()> {
     // Build the bandwidth-aware priority queue for actor → WebTransport I/O
     // (p5-4 swap, replacing the legacy mpsc::channel::<WtOutbound>(256)).
@@ -372,6 +388,7 @@ async fn handle_webtransport_session(
         session_manager,
         observer,
         accept_inbound.clone(),
+        connection_states,
     );
     let actor_addr = actor.start();
 
@@ -438,7 +455,9 @@ mod tests {
             .expect("Failed to connect to NATS");
 
         // Start ChatServer actor
-        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let chat_actor = ChatServer::new(nats_client.clone()).await;
+        let connection_states = chat_actor.connection_states_handle();
+        let chat_server = chat_actor.start();
 
         // Create SessionManager
         let session_manager = SessionManager::new();
@@ -482,6 +501,7 @@ mod tests {
                 nats_client,
                 tracker_sender,
                 session_manager,
+                connection_states,
             )
             .await
             {
