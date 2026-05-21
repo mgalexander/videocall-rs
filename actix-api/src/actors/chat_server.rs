@@ -2631,6 +2631,67 @@ fn spawn_room_dispatcher(
                 }
             }
 
+            // vc-54j2: register cross-pod publishers. A MEDIA packet whose
+            // sender is NOT a local room member arrived here via NATS
+            // federation (it joined a different pod). Record it in the room's
+            // bounded remote-publisher registry so local receivers' AllowSets
+            // are augmented with it — otherwise the forwarder hard-drops its
+            // media as `unsubscribed` (the spill-pod 0-media defect). This runs
+            // ONCE per inbound MEDIA message (not per receiver) and the
+            // registry is bounded by sender count + TTL-reaped, so it adds NO
+            // per-receiver O(members) work to the hot path. `note_remote_publisher`
+            // self-skips local members, so intra-pod (owner-pod) forwarding is
+            // unchanged.
+            if sfu_mode == SfuMode::Sfu {
+                if let Some(p) = parsed.as_ref() {
+                    if p.wrapper.packet_type == PacketType::MEDIA.into() {
+                        if let Some(mp) = p.media_packet.as_ref() {
+                            let media_type = mp.media_type.enum_value_or_default();
+                            let is_av = matches!(
+                                media_type,
+                                MediaType::AUDIO | MediaType::VIDEO | MediaType::SCREEN
+                            );
+                            if is_av {
+                                let sender_sid = p.wrapper.session_id;
+                                let is_video =
+                                    matches!(media_type, MediaType::VIDEO | MediaType::SCREEN);
+                                let now = std::time::Instant::now();
+                                // Fast pre-check under a READ lock. On a busy
+                                // spill pod every media packet is from a
+                                // non-local member, so an unthrottled write
+                                // would take the room's RwLock in WRITE mode
+                                // once per packet, contending with the
+                                // per-packet per-receiver `decide` READ fan-out
+                                // on the SAME lock. `remote_publisher_write_needed`
+                                // returns false for the common case (a fresh,
+                                // video-consistent liveness refresh of an
+                                // already-tracked publisher, or a local member)
+                                // so we take the write lock only when the
+                                // registry must actually change: a brand-new
+                                // sid, an audio→video upgrade, or a liveness
+                                // refresh past the throttle window (well below
+                                // the TTL, so a still-publishing sender is never
+                                // reaped for lack of a write).
+                                let write_needed = {
+                                    let g = match room_state.read() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    g.remote_publisher_write_needed(sender_sid, is_video, now)
+                                };
+                                if write_needed {
+                                    let mut g = match room_state.write() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    g.note_remote_publisher(sender_sid, is_video, now);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // p4-4: DiagnosticsPacket ingest — record the sender's most
             // recent receiver-downlink bandwidth estimate on its
             // MemberEntry so the LayerSelector (p4-5) can budget per-

@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -323,11 +323,19 @@ impl Forwarder {
         // single `trace::tracing_enabled()` relaxed atomic load is the only
         // cost the gate adds per packet.
         let trace_armed = trace::tracing_enabled();
-        let (members_snapshot, members_generation, receiver_bw_kbps, traced_room): (
-            Arc<HashSet<SessionId>>,
-            u64,
-            Option<u32>,
-            Option<String>,
+        // vc-54j2: capture the cross-pod remote-publisher snapshot in the SAME
+        // room-lock acquisition as the membership snapshot + generation, so the
+        // forwarder can union those senders into the receiver's AllowSet (they
+        // are delivered over NATS federation but are not local members). The
+        // generation is the SHARED `members_generation`, which the registry
+        // bumps on change — so `resolve_cached` invalidates correctly with no
+        // extra cache-key dimension. Cloning the `Arc` is a refcount bump.
+        let (
+            members_snapshot,
+            members_generation,
+            remote_publishers,
+            receiver_bw_kbps,
+            traced_room,
         ) = {
             let room = match self.room.read() {
                 Ok(g) => g,
@@ -337,6 +345,9 @@ impl Forwarder {
                 .with_label_values(&[room.room_id.as_str()])
                 .set(room.member_count() as f64);
             let (members, gen) = room.members_snapshot_with_generation();
+            // The generation returned here is the same `members_generation`;
+            // take the snapshot under the same lock for a consistent pair.
+            let (remote_pubs, _) = room.remote_publishers_snapshot_with_generation();
             let bw = room
                 .members
                 .get(&receiver_sid)
@@ -350,7 +361,7 @@ impl Forwarder {
             } else {
                 None
             };
-            (members, gen, bw, traced)
+            (members, gen, remote_pubs, bw, traced)
         };
 
         // 1. Self-skip — sender is the receiver itself.
@@ -414,6 +425,7 @@ impl Forwarder {
                             members_generation,
                             &speakers_top,
                             speakers_generation,
+                            &remote_publishers,
                         );
                         let (ra, rv) = store.receive_mode(receiver_sid);
                         (allow, ra, rv)
@@ -664,6 +676,18 @@ impl Forwarder {
             guard.retain(|&(rcv, snd), _| rcv != sid && snd != sid);
         }
         self.layer_selector.prune_stale(sid);
+        // vc-54j2: drop any remote-publisher registry entry for this sid so a
+        // cross-pod sender that departed (or was redirected) stops being
+        // unioned into local receivers' AllowSets. TTL reaping would
+        // eventually remove it, but pruning on the explicit leave path keeps
+        // the registry tight and the AllowSet correct immediately. Idempotent.
+        {
+            let mut guard = match self.room.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.prune_remote_publisher(sid);
+        }
     }
 
     /// Test-only accessor: number of `(receiver, sender)` pairs

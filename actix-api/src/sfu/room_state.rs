@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use videocall_types::protos::diagnostics_packet::BandwidthEstimate;
 
@@ -49,6 +49,37 @@ pub const CAP_SUBSCRIPTION: u32 = 4;
 /// relative to T0/T1/T2 step sizes so legitimate layer transitions are
 /// never masked.
 pub const BWE_INVALIDATE_ABS_KBPS: u32 = 50;
+
+/// vc-54j2: maximum number of distinct cross-pod (non-local-member) MEDIA
+/// publishers tracked per room in the [`RoomState::remote_publishers`]
+/// registry. A federated webinar has a small fixed set of senders (≤ ~10);
+/// listeners never publish, so this set is bounded by sender count, NOT by
+/// receiver count. The hard cap is a DoS backstop against a misbehaving /
+/// spoofing peer minting media from many fabricated session ids — past the
+/// cap, the oldest (least-recently-seen) entry is evicted.
+pub const MAX_REMOTE_PUBLISHERS: usize = 32;
+
+/// vc-54j2: TTL after which a remote-publisher registry entry is reaped if it
+/// has not been refreshed by a fresh MEDIA packet from that sid. A live sender
+/// publishes many packets per second, so a 10s window is far past any
+/// plausible inter-packet gap for an active publisher, while short enough that
+/// a sender who left the federated room drops out of every local receiver's
+/// AllowSet promptly.
+pub const REMOTE_PUBLISHER_TTL: Duration = Duration::from_secs(10);
+
+/// vc-54j2: minimum interval between liveness writes for an already-tracked,
+/// unchanged remote publisher. On a busy spill pod EVERY inbound media packet
+/// is from a non-local member, so an unthrottled `note_remote_publisher` would
+/// take the room's `RwLock` in WRITE mode once per packet, contending with the
+/// per-packet per-receiver `decide` read fan-out on the same lock. The
+/// registry only needs liveness granularity at TTL scale, so we coalesce
+/// liveness refreshes to at most one write per tracked publisher per second.
+///
+/// Kept safely below [`REMOTE_PUBLISHER_TTL`] (10s) so a still-publishing
+/// sender's `last_seen` is refreshed long before it could be reaped. A
+/// brand-new sid and an audio→video upgrade are NEVER throttled — those change
+/// the resolution-relevant snapshot and must land promptly.
+pub const REMOTE_PUBLISHER_LIVENESS_THROTTLE: Duration = Duration::from_secs(1);
 
 /// vc-17e: relative threshold (in percent) used in conjunction with
 /// [`BWE_INVALIDATE_ABS_KBPS`]. Either crossing triggers invalidation, so
@@ -96,6 +127,40 @@ pub struct MemberEntry {
     pub bandwidth_estimate_updated_at: Option<Instant>,
 }
 
+/// vc-54j2: one tracked cross-pod publisher in the [`RoomState`] registry.
+///
+/// A "remote publisher" is a session id whose MEDIA the local dispatcher
+/// receives over NATS federation but which is NOT a local room member (it
+/// joined a different pod). The registry lets local receivers' AllowSets be
+/// augmented with these senders so the forwarder admits their media instead
+/// of hard-dropping it as `unsubscribed`.
+#[derive(Debug, Clone)]
+struct RemotePublisherEntry {
+    /// Wall-clock instant of the most recent MEDIA packet seen from this sid.
+    /// Drives TTL reaping ([`REMOTE_PUBLISHER_TTL`]) and oldest-first eviction
+    /// when the registry is at [`MAX_REMOTE_PUBLISHERS`].
+    last_seen: Instant,
+    /// `true` once a VIDEO/SCREEN MediaPacket has been seen from this sid.
+    /// Audio-only publishers stay `false` so they never consume a slot in the
+    /// visible-video budget. Sticky: once a sender shows video it is counted
+    /// as a video publisher for the rest of its registry lifetime.
+    has_video: bool,
+}
+
+/// vc-54j2: immutable per-room snapshot of the remote-publisher registry,
+/// shared with the forwarder hot path via an `Arc` (one refcount bump per
+/// resolve, no allocation), mirroring the `members_snapshot` pattern.
+///
+/// * `audio` — every tracked remote publisher (all of them are audible to a
+///   receive-all listener; audio is not subject to the visible-video cap).
+/// * `video` — the subset that has shown a VIDEO/SCREEN packet, counted
+///   against [`crate::sfu::subscription::MAX_VISIBLE_VIDEO`].
+#[derive(Debug, Default)]
+pub struct RemotePublishers {
+    pub audio: HashSet<SessionId>,
+    pub video: HashSet<SessionId>,
+}
+
 /// Authoritative per-room state for the SFU.
 ///
 /// The struct does not own any synchronization primitive; wrap it in an
@@ -134,6 +199,19 @@ pub struct RoomState {
     /// pointer (which is vulnerable to ABA reuse if a freshly-allocated
     /// `HashSet` happens to land at the same address as a recycled one).
     members_generation: u64,
+    /// vc-54j2: cross-pod publishers seen on the dispatcher MEDIA ingress that
+    /// are NOT local members. Bounded by [`MAX_REMOTE_PUBLISHERS`] and reaped
+    /// by [`REMOTE_PUBLISHER_TTL`]. Written on the dispatcher's once-per-
+    /// inbound-message path (NOT per receiver) via
+    /// [`Self::note_remote_publisher`]; read on the forwarder's resolve path
+    /// via the [`Self::remote_publishers_snapshot_with_generation`] `Arc`.
+    remote_publishers: HashMap<SessionId, RemotePublisherEntry>,
+    /// Cached snapshot of [`Self::remote_publishers`], rebuilt only when the
+    /// registry's *contents that matter to resolution* change (a new sid, a
+    /// reaped sid, or an audio-only sid gaining video). Hot readers clone the
+    /// `Arc`; a refresh-only `note_remote_publisher` (same sids, same video
+    /// flags) does NOT rebuild, preserving cache stability.
+    remote_publishers_snapshot: Arc<RemotePublishers>,
 }
 
 impl RoomState {
@@ -144,6 +222,8 @@ impl RoomState {
             members: HashMap::new(),
             members_snapshot: Arc::new(HashSet::new()),
             members_generation: 0,
+            remote_publishers: HashMap::new(),
+            remote_publishers_snapshot: Arc::new(RemotePublishers::default()),
         }
     }
 
@@ -190,6 +270,175 @@ impl RoomState {
         (Arc::clone(&self.members_snapshot), self.members_generation)
     }
 
+    /// vc-54j2: lock-free clone of the current remote-publisher snapshot.
+    ///
+    /// The generation returned is the SHARED `members_generation` counter —
+    /// it is bumped by both membership changes AND remote-publisher registry
+    /// changes, because both are inputs to `SubscriptionStore::resolve_inner`.
+    /// Returning it here lets the forwarder feed
+    /// `SubscriptionStore::resolve_cached` a single cache key that invalidates
+    /// whenever EITHER input moves, with no extra counter to thread.
+    pub fn remote_publishers_snapshot_with_generation(&self) -> (Arc<RemotePublishers>, u64) {
+        (
+            Arc::clone(&self.remote_publishers_snapshot),
+            self.members_generation,
+        )
+    }
+
+    /// vc-54j2: read-only predicate the dispatcher uses (under a READ lock) to
+    /// decide whether a `note_remote_publisher` WRITE is actually required for
+    /// an inbound media packet from `sid`. Lets the busy spill-pod hot path
+    /// skip the write lock entirely on the overwhelmingly common case: a
+    /// liveness refresh of an already-tracked publisher whose video flag has
+    /// not changed and whose `last_seen` is younger than
+    /// [`REMOTE_PUBLISHER_LIVENESS_THROTTLE`].
+    ///
+    /// Returns `true` (write needed) when:
+    /// * `sid` is a brand-new remote publisher (not yet tracked) — must land
+    ///   promptly so receivers' AllowSets pick it up, OR
+    /// * an audio→video upgrade is observed (`is_video` and the entry is still
+    ///   audio-only) — changes the resolution-relevant snapshot, must not be
+    ///   throttled, OR
+    /// * the tracked entry's `last_seen` is older than the throttle interval —
+    ///   a liveness refresh to keep TTL reaping from evicting a still-active
+    ///   sender.
+    ///
+    /// Returns `false` (skip the write) for a fresh, video-consistent liveness
+    /// refresh. A sid that IS a local member also returns `false` — the
+    /// membership path owns it and `note_remote_publisher` would self-skip
+    /// anyway.
+    pub fn remote_publisher_write_needed(
+        &self,
+        sid: SessionId,
+        is_video: bool,
+        now: Instant,
+    ) -> bool {
+        if self.members.contains_key(&sid) {
+            return false;
+        }
+        match self.remote_publishers.get(&sid) {
+            // Brand-new publisher — must register promptly.
+            None => true,
+            Some(entry) => {
+                // Audio→video upgrade must not be throttled.
+                if is_video && !entry.has_video {
+                    return true;
+                }
+                // Otherwise only refresh liveness past the throttle window.
+                now.duration_since(entry.last_seen) >= REMOTE_PUBLISHER_LIVENESS_THROTTLE
+            }
+        }
+    }
+
+    /// vc-54j2: rebuild the cached remote-publisher snapshot from the registry
+    /// and bump the shared generation so downstream AllowSet caches invalidate.
+    ///
+    /// Called only when the registry's resolution-relevant contents change (a
+    /// sid added/reaped, or an audio-only sid gaining video) — never on a
+    /// pure liveness refresh of an already-tracked video publisher.
+    fn rebuild_remote_publishers_snapshot(&mut self) {
+        let mut audio = HashSet::with_capacity(self.remote_publishers.len());
+        let mut video = HashSet::new();
+        for (&sid, entry) in &self.remote_publishers {
+            audio.insert(sid);
+            if entry.has_video {
+                video.insert(sid);
+            }
+        }
+        self.remote_publishers_snapshot = Arc::new(RemotePublishers { audio, video });
+        self.members_generation = self.members_generation.wrapping_add(1);
+    }
+
+    /// vc-54j2: register (or refresh) a cross-pod publisher seen on the
+    /// dispatcher MEDIA ingress.
+    ///
+    /// Called once per inbound MEDIA message (NOT per receiver) for a sender
+    /// that is NOT a local room member. Local members are the authoritative
+    /// `JoinRoom` path's responsibility and are excluded here, so a sender that
+    /// is (or becomes) a local member never lands in this registry — the
+    /// forwarder's intra-pod path is unchanged.
+    ///
+    /// Semantics:
+    /// * `is_video` is `true` for VIDEO/SCREEN packets, `false` for AUDIO.
+    /// * A new sid is inserted and the snapshot rebuilt (generation bumps).
+    /// * An existing audio-only sid that now shows video is upgraded to
+    ///   `has_video = true` and the snapshot rebuilt.
+    /// * A pure liveness refresh (already tracked, video flag unchanged) only
+    ///   updates `last_seen` — NO snapshot rebuild, NO generation bump, so the
+    ///   per-receiver AllowSet cache stays hot at steady state.
+    ///
+    /// Bounding + reaping (both O(registry size) ≤ [`MAX_REMOTE_PUBLISHERS`],
+    /// independent of receiver count):
+    /// * Stale entries (older than [`REMOTE_PUBLISHER_TTL`]) are reaped on
+    ///   every call.
+    /// * If, after reaping, inserting a NEW sid would exceed
+    ///   [`MAX_REMOTE_PUBLISHERS`], the least-recently-seen entry is evicted.
+    pub fn note_remote_publisher(&mut self, sid: SessionId, is_video: bool, now: Instant) {
+        // A sender that is a local member is handled by the membership path;
+        // never shadow it in the remote registry.
+        if self.members.contains_key(&sid) {
+            return;
+        }
+
+        // Reap stale entries first (cheap: the map is capped at
+        // MAX_REMOTE_PUBLISHERS). Track whether anything changed so we only
+        // rebuild the snapshot when resolution-relevant state actually moved.
+        let before_len = self.remote_publishers.len();
+        self.remote_publishers
+            .retain(|_, e| now.duration_since(e.last_seen) <= REMOTE_PUBLISHER_TTL);
+        let mut changed = self.remote_publishers.len() != before_len;
+
+        match self.remote_publishers.get_mut(&sid) {
+            Some(entry) => {
+                entry.last_seen = now;
+                if is_video && !entry.has_video {
+                    entry.has_video = true;
+                    changed = true;
+                }
+            }
+            None => {
+                // Eviction backstop: never let a spoofing peer grow the
+                // registry without bound. Drop the least-recently-seen entry.
+                if self.remote_publishers.len() >= MAX_REMOTE_PUBLISHERS {
+                    if let Some((&oldest, _)) = self
+                        .remote_publishers
+                        .iter()
+                        .min_by_key(|(_, e)| e.last_seen)
+                    {
+                        self.remote_publishers.remove(&oldest);
+                    }
+                }
+                self.remote_publishers.insert(
+                    sid,
+                    RemotePublisherEntry {
+                        last_seen: now,
+                        has_video: is_video,
+                    },
+                );
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.rebuild_remote_publishers_snapshot();
+        }
+    }
+
+    /// vc-54j2: drop a session from the remote-publisher registry (called from
+    /// the forwarder's `prune_session` via the chat-server `LeaveRoom` path,
+    /// and whenever a remote publisher becomes a local member). Idempotent.
+    pub fn prune_remote_publisher(&mut self, sid: SessionId) {
+        if self.remote_publishers.remove(&sid).is_some() {
+            self.rebuild_remote_publishers_snapshot();
+        }
+    }
+
+    /// Test-only: number of tracked remote publishers.
+    #[cfg(test)]
+    pub fn remote_publisher_count(&self) -> usize {
+        self.remote_publishers.len()
+    }
+
     /// Insert (or replace) a member with the given capabilities bitmask.
     ///
     /// Re-inserting an existing `session_id` overwrites the previous entry,
@@ -213,6 +462,11 @@ impl RoomState {
         if !was_present {
             self.rebuild_members_snapshot();
         }
+        // vc-54j2: a sid that is now a local member must not also live in the
+        // remote-publisher registry (it would be double-counted against the
+        // visible-video budget and waste a registry slot). Drop it; the
+        // membership path is authoritative for local senders.
+        self.prune_remote_publisher(sid);
     }
 
     /// Update the cached bandwidth estimate for an existing member.
@@ -635,6 +889,182 @@ mod tests {
         assert!(
             !room.update_bandwidth_estimate(1, &second),
             "exactly-50 kbps / 5% diff must not invalidate"
+        );
+    }
+
+    // ---------------- vc-54j2: remote-publisher registry ----------------
+
+    #[test]
+    fn note_remote_publisher_registers_and_snapshots() {
+        let mut room = RoomState::new("r".into());
+        let now = Instant::now();
+        room.note_remote_publisher(2, true, now); // video publisher
+        room.note_remote_publisher(3, false, now); // audio-only publisher
+
+        let (snap, _) = room.remote_publishers_snapshot_with_generation();
+        assert!(snap.audio.contains(&2), "video publisher is also audible");
+        assert!(snap.audio.contains(&3));
+        assert!(snap.video.contains(&2), "video publisher counted for video");
+        assert!(
+            !snap.video.contains(&3),
+            "audio-only publisher must NOT consume a video slot"
+        );
+        assert_eq!(room.remote_publisher_count(), 2);
+    }
+
+    #[test]
+    fn note_remote_publisher_skips_local_member() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(2, 0);
+        room.note_remote_publisher(2, true, Instant::now());
+        assert_eq!(
+            room.remote_publisher_count(),
+            0,
+            "a local member must never be tracked as a remote publisher"
+        );
+    }
+
+    #[test]
+    fn audio_only_publisher_upgrades_to_video() {
+        let mut room = RoomState::new("r".into());
+        let now = Instant::now();
+        room.note_remote_publisher(2, false, now);
+        let (_, gen_after_audio) = room.remote_publishers_snapshot_with_generation();
+        // Same audio refresh — no rebuild, no generation bump.
+        room.note_remote_publisher(2, false, now);
+        let (_, gen_after_refresh) = room.remote_publishers_snapshot_with_generation();
+        assert_eq!(
+            gen_after_audio, gen_after_refresh,
+            "a pure liveness refresh must not bump the generation"
+        );
+        // First video packet upgrades — generation must bump.
+        room.note_remote_publisher(2, true, now);
+        let (snap, gen_after_video) = room.remote_publishers_snapshot_with_generation();
+        assert_ne!(
+            gen_after_refresh, gen_after_video,
+            "an audio->video upgrade must bump the generation (cache invalidation)"
+        );
+        assert!(snap.video.contains(&2));
+    }
+
+    #[test]
+    fn remote_publisher_ttl_reaped() {
+        let mut room = RoomState::new("r".into());
+        let t0 = Instant::now();
+        room.note_remote_publisher(2, true, t0);
+        // A later note for a DIFFERENT sid, past the TTL, must reap sid 2.
+        let later = t0 + REMOTE_PUBLISHER_TTL + Duration::from_secs(1);
+        room.note_remote_publisher(3, true, later);
+        let (snap, _) = room.remote_publishers_snapshot_with_generation();
+        assert!(!snap.video.contains(&2), "stale publisher 2 must be reaped");
+        assert!(snap.video.contains(&3));
+        assert_eq!(room.remote_publisher_count(), 1);
+    }
+
+    #[test]
+    fn remote_publisher_registry_is_bounded() {
+        let mut room = RoomState::new("r".into());
+        let base = Instant::now();
+        // Insert MAX_REMOTE_PUBLISHERS + 5 distinct sids, each newer than the
+        // last (within TTL so none are reaped on age) so the oldest-eviction
+        // backstop is what bounds the set.
+        for i in 0..(MAX_REMOTE_PUBLISHERS as u64 + 5) {
+            room.note_remote_publisher(1000 + i, true, base + Duration::from_millis(i));
+        }
+        assert_eq!(
+            room.remote_publisher_count(),
+            MAX_REMOTE_PUBLISHERS,
+            "registry must never exceed MAX_REMOTE_PUBLISHERS"
+        );
+        let (snap, _) = room.remote_publishers_snapshot_with_generation();
+        // The earliest-seen sids were evicted; the most recent survive.
+        assert!(!snap.video.contains(&1000), "oldest sid must be evicted");
+        assert!(snap
+            .video
+            .contains(&(1000 + MAX_REMOTE_PUBLISHERS as u64 + 4)));
+    }
+
+    #[test]
+    fn insert_member_prunes_remote_publisher() {
+        let mut room = RoomState::new("r".into());
+        room.note_remote_publisher(2, true, Instant::now());
+        assert_eq!(room.remote_publisher_count(), 1);
+        // The same sid joins THIS pod as a local member — it must leave the
+        // remote registry (membership path is authoritative).
+        room.insert_member(2, 0);
+        assert_eq!(
+            room.remote_publisher_count(),
+            0,
+            "a remote publisher promoted to local member must be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_remote_publisher_is_idempotent() {
+        let mut room = RoomState::new("r".into());
+        room.note_remote_publisher(2, true, Instant::now());
+        room.prune_remote_publisher(2);
+        assert_eq!(room.remote_publisher_count(), 0);
+        // Second prune is a no-op (no panic, no generation churn surprise).
+        room.prune_remote_publisher(2);
+        assert_eq!(room.remote_publisher_count(), 0);
+    }
+
+    #[test]
+    fn remote_publisher_write_needed_throttles_liveness_but_not_changes() {
+        let mut room = RoomState::new("r".into());
+        let t0 = Instant::now();
+
+        // Brand-new sid: write needed.
+        assert!(
+            room.remote_publisher_write_needed(2, false, t0),
+            "a brand-new remote publisher must require a write"
+        );
+        room.note_remote_publisher(2, false, t0); // audio-only
+
+        // Same audio packet a moment later (within the throttle window): the
+        // write must be SKIPPED — liveness granularity at TTL scale only.
+        let soon = t0 + Duration::from_millis(100);
+        assert!(
+            !room.remote_publisher_write_needed(2, false, soon),
+            "a fresh, video-consistent liveness refresh must be throttled"
+        );
+
+        // An audio→video UPGRADE within the throttle window must NOT be
+        // throttled — it changes the resolution-relevant snapshot.
+        assert!(
+            room.remote_publisher_write_needed(2, true, soon),
+            "an audio->video upgrade must require a write even within the throttle window"
+        );
+        room.note_remote_publisher(2, true, soon);
+
+        // Now a video liveness refresh within the window is throttled again.
+        let soon2 = soon + Duration::from_millis(100);
+        assert!(
+            !room.remote_publisher_write_needed(2, true, soon2),
+            "a fresh video liveness refresh must be throttled"
+        );
+
+        // Past the throttle window: a liveness write IS needed (keeps the
+        // sender from being TTL-reaped). The throttle is well below the TTL.
+        let later = soon + REMOTE_PUBLISHER_LIVENESS_THROTTLE + Duration::from_millis(1);
+        assert!(
+            later.duration_since(soon) < REMOTE_PUBLISHER_TTL,
+            "throttle window must stay safely below the TTL"
+        );
+        assert!(
+            room.remote_publisher_write_needed(2, true, later),
+            "a liveness refresh past the throttle window must require a write"
+        );
+    }
+
+    #[test]
+    fn remote_publisher_write_needed_false_for_local_member() {
+        let mut room = RoomState::new("r".into());
+        room.insert_member(2, 0);
+        assert!(
+            !room.remote_publisher_write_needed(2, true, Instant::now()),
+            "a local member is owned by the membership path — never a remote write"
         );
     }
 }

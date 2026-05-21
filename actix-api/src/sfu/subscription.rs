@@ -35,6 +35,7 @@ use dashmap::DashMap;
 use videocall_types::protos::subscription_packet::{SubscriptionUpdate, VisibilitySlot};
 
 use crate::actors::session_logic::SessionId;
+use crate::sfu::room_state::RemotePublishers;
 
 /// Maximum number of senders whose video may be forwarded to a single receiver.
 pub const MAX_VISIBLE_VIDEO: u32 = 6;
@@ -246,7 +247,12 @@ impl SubscriptionStore {
         current_members: &HashSet<SessionId>,
         speaker_set: &[SessionId],
     ) -> AllowSet {
-        self.resolve_inner(receiver, current_members, speaker_set)
+        self.resolve_inner(
+            receiver,
+            current_members,
+            speaker_set,
+            &RemotePublishers::default(),
+        )
     }
 
     /// Cached variant of [`Self::resolve`] (vc-2cx).
@@ -262,6 +268,12 @@ impl SubscriptionStore {
     ///
     /// `&self`-only: the inner cache is a [`DashMap`], so the caller may
     /// continue to hold the outer `Arc<RwLock<SubscriptionStore>>` read-only.
+    ///
+    /// vc-54j2: `remote_publishers` is the cross-pod publisher snapshot. It is
+    /// folded into the `members_generation` (see
+    /// `RoomState::remote_publishers_snapshot_with_generation`), so a change to
+    /// the registry invalidates the cache via the SAME counter — no extra
+    /// cache-key dimension is needed.
     pub fn resolve_cached(
         &self,
         receiver: SessionId,
@@ -269,6 +281,7 @@ impl SubscriptionStore {
         members_generation: u64,
         speaker_set: &Arc<Vec<SessionId>>,
         speakers_generation: u64,
+        remote_publishers: &RemotePublishers,
     ) -> Arc<AllowSet> {
         let sub_version = self.sub_version.get(&receiver).copied().unwrap_or(0);
 
@@ -283,7 +296,8 @@ impl SubscriptionStore {
         }
 
         // Miss: compute, store, return.
-        let allow = Arc::new(self.resolve_inner(receiver, current_members, speaker_set));
+        let allow =
+            Arc::new(self.resolve_inner(receiver, current_members, speaker_set, remote_publishers));
         // vc-8wd Layer 1: observe the resolved AllowSet size only on the
         // actual (re)compute — NOT on cache hits — so the histogram tracks
         // resolve events without per-packet cost. Catches empty-AllowSet
@@ -326,17 +340,50 @@ impl SubscriptionStore {
         receiver: SessionId,
         current_members: &HashSet<SessionId>,
         speaker_set: &[SessionId],
+        remote_publishers: &RemotePublishers,
     ) -> AllowSet {
         let Some(sub) = self.per_receiver.get(&receiver) else {
             // Legacy default: forward everyone (minus self) at base layer.
+            //
+            // Local members are added UNCAPPED here, exactly as before — the
+            // owner-pod fan-out is unchanged. The visible-video cap is enforced
+            // downstream (the forwarder's receive-all fallback + the layer
+            // selector budget); the legacy default never capped allow.video and
+            // we deliberately do not start, to avoid a non-deterministic
+            // owner-pod regression.
+            //
+            // vc-54j2: cross-pod VIDEO publishers (delivered over NATS but
+            // absent from this pod's membership) are folded into allow.video so
+            // the forwarder admits them via the `allow.video.contains_key`
+            // branch instead of dropping their media as `unsubscribed`. On a
+            // spill pod, `current_members` is dozens of non-publishing
+            // listeners and the real senders are remote — without this they are
+            // never in allow.video and every packet is dropped. All remote
+            // publishers (audio-only included) are also audible. Local members
+            // shadow any same-id remote entry (the membership path is
+            // authoritative), so there is no double-insert.
             let mut audio = HashSet::with_capacity(current_members.len());
-            let mut video = HashMap::with_capacity(current_members.len());
+            let mut video: HashMap<SessionId, LayerPref> = HashMap::new();
             for &sid in current_members {
                 if sid == receiver {
                     continue;
                 }
                 audio.insert(sid);
                 video.insert(sid, LayerPref::default());
+            }
+            for &sid in &remote_publishers.video {
+                if sid != receiver && !current_members.contains(&sid) {
+                    video.entry(sid).or_default();
+                }
+            }
+            for &sid in remote_publishers
+                .audio
+                .iter()
+                .chain(&remote_publishers.video)
+            {
+                if sid != receiver && !current_members.contains(&sid) {
+                    audio.insert(sid);
+                }
             }
             return AllowSet { audio, video };
         };
@@ -415,7 +462,25 @@ impl SubscriptionStore {
         // current room member. Runs after pinned/slots/speakers so explicit
         // tiers win when the cap is tight. Sorted by SessionId for
         // determinism, just like the other tiers.
+        //
+        // vc-54j2: a `receive_all_video` receiver wants EVERY publisher,
+        // including cross-pod ones that are not local members. Fold the remote
+        // video publishers in alongside the local members, with remote
+        // publishers ordered FIRST so they are not starved by local listeners
+        // under a tight cap (same rationale as the legacy-default path above).
         if sub.receive_all_video && video.len() < cap {
+            let mut remote_video: Vec<SessionId> = remote_publishers
+                .video
+                .iter()
+                .copied()
+                .filter(|&s| s != receiver && !current_members.contains(&s) && !seen.contains(&s))
+                .collect();
+            remote_video.sort_unstable();
+            for sid in remote_video {
+                if !push(sid, &mut video, &mut seen) {
+                    break;
+                }
+            }
             let mut all_sorted: Vec<SessionId> = current_members
                 .iter()
                 .copied()
@@ -429,7 +494,7 @@ impl SubscriptionStore {
             }
         }
 
-        let audio: HashSet<SessionId> = if sub.receive_all_audio {
+        let mut audio: HashSet<SessionId> = if sub.receive_all_audio {
             current_members
                 .iter()
                 .copied()
@@ -438,6 +503,23 @@ impl SubscriptionStore {
         } else {
             video.keys().copied().collect()
         };
+
+        // vc-54j2: a `receive_all_audio` receiver hears every remote publisher
+        // too. A receiver that did NOT opt into receive-all audio keeps audio
+        // mirroring its (capped) video allow-set — including any remote video
+        // publisher that won a slot above — but is not force-fed audio-only
+        // remote senders it never asked for.
+        if sub.receive_all_audio {
+            for &sid in remote_publishers
+                .audio
+                .iter()
+                .chain(&remote_publishers.video)
+            {
+                if sid != receiver && !current_members.contains(&sid) {
+                    audio.insert(sid);
+                }
+            }
+        }
 
         AllowSet { audio, video }
     }
@@ -1032,8 +1114,8 @@ mod tests {
         let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
         store.apply_update(1, update(&[2], vec![], false), &room);
 
-        let a = store.resolve_cached(1, &room, 5, &speakers, 7);
-        let b = store.resolve_cached(1, &room, 5, &speakers, 7);
+        let a = store.resolve_cached(1, &room, 5, &speakers, 7, &RemotePublishers::default());
+        let b = store.resolve_cached(1, &room, 5, &speakers, 7, &RemotePublishers::default());
         assert!(
             Arc::ptr_eq(&a, &b),
             "second resolve_cached must return the same Arc (cache hit)"
@@ -1052,11 +1134,11 @@ mod tests {
         let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
 
         store.apply_update(1, update(&[2], vec![], false), &room);
-        let a = store.resolve_cached(1, &room, 0, &speakers, 0);
+        let a = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
 
         // New subscription: pin 3 instead of 2.
         store.apply_update(1, update(&[3], vec![], false), &room);
-        let b = store.resolve_cached(1, &room, 0, &speakers, 0);
+        let b = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
 
         assert!(!Arc::ptr_eq(&a, &b), "apply_update must invalidate cache");
         assert!(a.video.contains_key(&2));
@@ -1074,8 +1156,8 @@ mod tests {
         let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
         store.apply_update(1, update(&[2], vec![], false), &room);
 
-        let a = store.resolve_cached(1, &room, 1, &speakers, 0);
-        let b = store.resolve_cached(1, &room, 2, &speakers, 0);
+        let a = store.resolve_cached(1, &room, 1, &speakers, 0, &RemotePublishers::default());
+        let b = store.resolve_cached(1, &room, 2, &speakers, 0, &RemotePublishers::default());
         assert!(
             !Arc::ptr_eq(&a, &b),
             "members_generation change must invalidate cache"
@@ -1091,8 +1173,8 @@ mod tests {
         let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
         store.apply_update(1, update(&[2], vec![], false), &room);
 
-        let a = store.resolve_cached(1, &room, 0, &speakers, 1);
-        let b = store.resolve_cached(1, &room, 0, &speakers, 2);
+        let a = store.resolve_cached(1, &room, 0, &speakers, 1, &RemotePublishers::default());
+        let b = store.resolve_cached(1, &room, 0, &speakers, 2, &RemotePublishers::default());
         assert!(
             !Arc::ptr_eq(&a, &b),
             "speakers_generation change must invalidate cache"
@@ -1107,8 +1189,8 @@ mod tests {
         let room = Arc::new(members(&[1, 2, 3, 4]));
         let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
 
-        let a = store.resolve_cached(1, &room, 0, &speakers, 0);
-        let b = store.resolve_cached(1, &room, 0, &speakers, 0);
+        let a = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
+        let b = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
         assert!(Arc::ptr_eq(&a, &b), "default-path resolve must cache");
         // Same legacy semantics: forward everyone (minus self).
         assert_eq!(a.video.len(), 3);
@@ -1123,7 +1205,7 @@ mod tests {
         let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
         store.apply_update(1, update(&[2], vec![], false), &room);
 
-        let _ = store.resolve_cached(1, &room, 0, &speakers, 0);
+        let _ = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
         assert!(store.cache.contains_key(&1));
 
         store.forget(1);
@@ -1141,10 +1223,10 @@ mod tests {
         store.apply_update(1, update(&[2], vec![], false), &room);
         store.apply_update(2, update(&[3], vec![], false), &room);
 
-        let a = store.resolve_cached(1, &room, 0, &speakers, 0);
+        let a = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
         // Mutating receiver 2 must not invalidate receiver 1's entry.
         store.apply_update(2, update(&[1], vec![], false), &room);
-        let b = store.resolve_cached(1, &room, 0, &speakers, 0);
+        let b = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
         assert!(
             Arc::ptr_eq(&a, &b),
             "receiver 1's cache must survive receiver 2's apply_update"
@@ -1192,11 +1274,112 @@ mod tests {
         let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
         store.apply_update(1, update(&[2], vec![], false), &room);
 
-        let a = store.resolve_cached(1, &room, 5, &speakers, 0);
-        let b = store.resolve_cached(1, &room, 3, &speakers, 0);
+        let a = store.resolve_cached(1, &room, 5, &speakers, 0, &RemotePublishers::default());
+        let b = store.resolve_cached(1, &room, 3, &speakers, 0, &RemotePublishers::default());
         assert!(
             !Arc::ptr_eq(&a, &b),
             "lower members_generation must miss (equality, not monotonic-or-greater)"
         );
+    }
+
+    // ---------------- vc-54j2: remote-publisher folding ----------------
+
+    fn remote(audio: &[SessionId], video: &[SessionId]) -> RemotePublishers {
+        RemotePublishers {
+            audio: audio.iter().copied().collect(),
+            video: video.iter().copied().collect(),
+        }
+    }
+
+    /// vc-54j2 core: a spill-pod listener (no SubscriptionUpdate → legacy
+    /// default) with DOZENS of fellow local listeners must still admit a
+    /// cross-pod publisher's audio AND video. Before the fix, the legacy
+    /// default fan-out filled all MAX_VISIBLE_VIDEO slots with non-publishing
+    /// listeners and the cross-pod publisher was dropped as `unsubscribed`.
+    #[test]
+    fn spill_listener_admits_cross_pod_publisher_over_listeners() {
+        let store = SubscriptionStore::new();
+        // Receiver 1 plus 20 fellow LISTENERS (none publish). The cross-pod
+        // publisher 999 is NOT a local member.
+        let mut all: Vec<SessionId> = (1..=21).collect();
+        let room: HashSet<SessionId> = all.drain(..).collect();
+        let pubs = remote(&[999], &[999]);
+
+        let allow = store.resolve_inner(1, &room, &[], &pubs);
+        assert!(
+            allow.audio.contains(&999),
+            "cross-pod publisher audio must be admitted to a legacy-default listener"
+        );
+        assert!(
+            allow.video.contains_key(&999),
+            "cross-pod publisher video must be present so the forwarder admits it \
+             via allow.video.contains_key (not dropped as unsubscribed)"
+        );
+    }
+
+    /// vc-54j2: multiple cross-pod video publishers (≤ cap) all land in
+    /// allow.video so the forwarder admits each of them.
+    #[test]
+    fn multiple_cross_pod_video_publishers_admitted() {
+        let store = SubscriptionStore::new();
+        let mut all: Vec<SessionId> = (1..=20).collect();
+        let room: HashSet<SessionId> = all.drain(..).collect();
+        // 3 cross-pod video publishers.
+        let pubs = remote(&[901, 902, 903], &[901, 902, 903]);
+
+        let allow = store.resolve_inner(1, &room, &[], &pubs);
+        for p in [901, 902, 903] {
+            assert!(
+                allow.video.contains_key(&p),
+                "every cross-pod video publisher must be in allow.video ({p})"
+            );
+        }
+    }
+
+    /// vc-54j2: a `receive_all_video` listener also admits cross-pod video
+    /// publishers (the structured-path counterpart to the legacy default).
+    #[test]
+    fn receive_all_video_admits_cross_pod_publisher() {
+        let mut store = SubscriptionStore::new();
+        let room = members(&[1]);
+        store.apply_update(1, update_all(&[], vec![], true, true), &room);
+        let pubs = remote(&[999], &[999]);
+
+        let allow = store.resolve_inner(1, &room, &[], &pubs);
+        assert!(allow.video.contains_key(&999));
+        assert!(allow.audio.contains(&999));
+    }
+
+    /// vc-54j2 regression guard: a RESTRICTIVE subscription (both receive-all
+    /// flags false, no pins/slots) must NOT be force-fed cross-pod publishers.
+    #[test]
+    fn restrictive_subscription_ignores_cross_pod_publishers() {
+        let mut store = SubscriptionStore::new();
+        let room = members(&[1, 2]);
+        store.apply_update(1, update_all(&[], vec![], false, false), &room);
+        let pubs = remote(&[999], &[999]);
+
+        let allow = store.resolve_inner(1, &room, &[], &pubs);
+        assert!(
+            !allow.video.contains_key(&999),
+            "restrictive subscription must not admit a cross-pod video publisher"
+        );
+        assert!(
+            !allow.audio.contains(&999),
+            "restrictive subscription must not admit a cross-pod audio publisher"
+        );
+    }
+
+    /// vc-54j2: an audio-only cross-pod publisher is audible to a legacy
+    /// listener but must NOT consume a video slot.
+    #[test]
+    fn audio_only_cross_pod_publisher_not_in_video() {
+        let store = SubscriptionStore::new();
+        let room = members(&[1]);
+        let pubs = remote(&[999], &[]); // audio only
+
+        let allow = store.resolve_inner(1, &room, &[], &pubs);
+        assert!(allow.audio.contains(&999));
+        assert!(!allow.video.contains_key(&999));
     }
 }

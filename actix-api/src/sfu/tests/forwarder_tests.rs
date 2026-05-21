@@ -1430,3 +1430,178 @@ fn vc_72a_listener_first_then_publisher_joins_local() {
         "listener-first then publisher-joins: first audio packet must forward"
     );
 }
+
+// ===========================================================================
+// vc-54j2: spill-pod cross-pod data plane. On a SPILL pod the local members
+// are dozens of fellow LISTENERS (no media); the senders are REMOTE (joined
+// the owner pod). Federation delivers their MEDIA over NATS but the sender is
+// not a local member. Once the dispatcher registers the cross-pod publisher
+// in the room's remote-publisher registry, a spill-admitted listener must
+// decode that publisher's AUDIO and VIDEO — the cap must count PUBLISHERS,
+// not the 86 non-publishing listeners.
+// ===========================================================================
+
+/// vc-54j2 acceptance: a legacy-default listener surrounded by many local
+/// listeners receives a REGISTERED cross-pod publisher's audio AND video.
+/// This is the exact spill-pod scenario: pre-fix, `allow.video.len()` was
+/// dominated by listeners (≫ MAX_VISIBLE_VIDEO) and the publisher was dropped
+/// as `unsubscribed`. With the publisher registered it lands in `allow.video`
+/// (winning a slot over listeners) so its media forwards.
+#[test]
+fn vc_54j2_spill_listener_decodes_registered_cross_pod_publisher() {
+    let listener: SessionId = 1;
+    // 20 fellow LOCAL listeners (none publish) — far more than MAX_VISIBLE_VIDEO.
+    let mut local: Vec<SessionId> = vec![listener];
+    local.extend(2..=21);
+    let (fwd, _subs, room) =
+        build_wired_forwarder_with_room("vc-54j2-spill", &local, ActiveSpeakerSet::empty());
+    set_receiver_bandwidth(&room, listener, 2000); // fat pipe → T0+T1+T2 fit
+
+    // The cross-pod publisher is NOT a local member. Register it the way the
+    // dispatcher would on its first MEDIA packet.
+    let publisher: SessionId = 999;
+    {
+        let mut w = room.write().unwrap();
+        w.note_remote_publisher(publisher, true, std::time::Instant::now());
+    }
+
+    // Audio must forward despite 20 fellow local listeners. Audio is uncapped
+    // and a legacy-default listener is in implicit receive-all mode, so the
+    // ONLY way this could fail is the publisher being absent from the AllowSet
+    // (the spill-pod `unsubscribed` defect). A `Forward` decision therefore
+    // directly proves the registered publisher cleared the AllowSet gate.
+    //
+    // Assertions here are all on the `ForwardDecision` RESULT — never on a
+    // process-global counter delta — so this test is robust under the
+    // suite's parallel execution. Only non-keyframe frames are used, so the
+    // global `SFU_KEYFRAME_FORWARDED_TOTAL` counter is never touched
+    // (it would race `p4_8_higher_layer_keyframe_obeys_budget`).
+    let (pw_audio, mp_audio) = build_media(publisher, MediaType::AUDIO);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_audio, Some(&mp_audio)),
+            ForwardDecision::Forward
+        ),
+        "spill listener must hear a registered cross-pod publisher despite 20 local listeners \
+         (audio cleared the AllowSet gate — the load-bearing acceptance metric)"
+    );
+    // Video budget under 21 video entries at this bandwidth is genuinely
+    // diluted, so a T1 may legitimately be `layer_budget`-dropped here — that
+    // is the SAME behavior as a local member and out of scope (the keyframe
+    // defect). The video-forward path with an undiluted budget is pinned by
+    // `vc_54j2_registered_publisher_non_keyframe_forwards_when_budget_allows`,
+    // and the video AllowSet-gate clearance by
+    // `vc_54j2_registered_publisher_clears_unsubscribed_gate`.
+}
+
+/// vc-54j2: when the spill pod is NOT video-budget-diluted (the publisher is
+/// one of only a couple of video sources for this receiver), the registered
+/// cross-pod publisher's NON-keyframe video forwards end-to-end — proving the
+/// fix delivers real (non-keyframe) video, not just keyframes.
+#[test]
+fn vc_54j2_registered_publisher_non_keyframe_forwards_when_budget_allows() {
+    let listener: SessionId = 1;
+    // Only a few local listeners so the per-receiver budget is not diluted.
+    let (fwd, _subs, room) = build_wired_forwarder_with_room(
+        "vc-54j2-budget-ok",
+        &[listener, 2, 3],
+        ActiveSpeakerSet::empty(),
+    );
+    set_receiver_bandwidth(&room, listener, 2000);
+
+    let publisher: SessionId = 999;
+    {
+        let mut w = room.write().unwrap();
+        w.note_remote_publisher(publisher, true, std::time::Instant::now());
+    }
+
+    let (pw_t1, mp_t1) = build_video_with_layer(publisher, 0, 1, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_t1, Some(&mp_t1)),
+            ForwardDecision::Forward
+        ),
+        "registered cross-pod publisher's T1 must forward when the layer budget allows"
+    );
+}
+
+/// vc-54j2: the load-bearing acceptance metric — a registered cross-pod
+/// publisher's video must NOT be dropped as `unsubscribed` — is proven WITHOUT
+/// reading any process-global counter (which would race other parallel tests).
+///
+/// The AllowSet `unsubscribed` gate (forwarder.rs ~499) runs BEFORE the
+/// layer-budget stage. A T0 delta from the publisher, to a receiver with only
+/// a couple of local listeners (so the SVC budget is not diluted) and a fat
+/// downlink, can ONLY be dropped by the `unsubscribed` gate — T0 always fits
+/// the budget. So a `Forward` decision here directly proves the publisher
+/// cleared the AllowSet gate (it is in `allow.video`), i.e. it was NOT counted
+/// as `unsubscribed`. The companion `*_spill_listener_*` test exercises the
+/// 20-listener spill shape; this one isolates the gate from budget dilution.
+#[test]
+fn vc_54j2_registered_publisher_clears_unsubscribed_gate() {
+    let listener: SessionId = 1;
+    // Few local listeners → the SVC budget is not diluted, so T0 always fits
+    // and the ONLY remaining drop reason for a T0 delta is `unsubscribed`.
+    let (fwd, _subs, room) = build_wired_forwarder_with_room(
+        "vc-54j2-gate",
+        &[listener, 2, 3],
+        ActiveSpeakerSet::empty(),
+    );
+    set_receiver_bandwidth(&room, listener, 2000);
+
+    let publisher: SessionId = 999;
+    {
+        let mut w = room.write().unwrap();
+        w.note_remote_publisher(publisher, true, std::time::Instant::now());
+    }
+
+    // T0 delta (non-keyframe → does NOT touch the global keyframe counter).
+    let (pw_t0, mp_t0) = build_video_with_layer(publisher, 0, 0, false);
+    assert!(
+        matches!(
+            fwd.decide(listener, &pw_t0, Some(&mp_t0)),
+            ForwardDecision::Forward
+        ),
+        "a registered cross-pod publisher's T0 must Forward — proving it cleared \
+         the AllowSet gate and was NOT dropped as `unsubscribed`"
+    );
+}
+
+/// vc-54j2 owner-pod no-regression: when the publisher IS a local member
+/// (owner pod), behavior is unchanged and the remote registry stays empty —
+/// `note_remote_publisher` self-skips local members.
+#[test]
+fn vc_54j2_owner_pod_local_publisher_unchanged() {
+    let listener: SessionId = 1;
+    let publisher: SessionId = 2;
+    let (fwd, _subs, room) = build_wired_forwarder_with_room(
+        "vc-54j2-owner",
+        &[listener, publisher],
+        ActiveSpeakerSet::empty(),
+    );
+    set_receiver_bandwidth(&room, listener, 2000);
+
+    // Dispatcher would call note_remote_publisher; it must self-skip the
+    // local member and leave the registry empty.
+    {
+        let mut w = room.write().unwrap();
+        w.note_remote_publisher(publisher, true, std::time::Instant::now());
+        assert_eq!(
+            w.remote_publisher_count(),
+            0,
+            "a local-member publisher must never enter the remote registry"
+        );
+    }
+
+    // Intra-pod forwarding is unchanged: audio + non-keyframe video forward.
+    let (pw_audio, mp_audio) = build_media(publisher, MediaType::AUDIO);
+    assert!(matches!(
+        fwd.decide(listener, &pw_audio, Some(&mp_audio)),
+        ForwardDecision::Forward
+    ));
+    let (pw_t1, mp_t1) = build_video_with_layer(publisher, 0, 1, false);
+    assert!(matches!(
+        fwd.decide(listener, &pw_t1, Some(&mp_t1)),
+        ForwardDecision::Forward
+    ));
+}
