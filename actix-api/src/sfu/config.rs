@@ -43,6 +43,17 @@ impl fmt::Display for SfuMode {
 /// post-processing contract.
 const DEFAULT_JOIN_MILESTONES: &[u64] = &[10, 50, 100, 250, 500, 1000, 2000, 4000, 8000];
 
+/// Default mailbox capacity for the single per-pod `ChatServer` actor, used when
+/// `SFU_CHATSERVER_MAILBOX_CAPACITY` is unset or invalid.
+///
+/// Every inbound transport packet (`ClientMessage`) and every room join
+/// (`JoinRoom`, a bounded awaited `.send()`) funnels through this one mailbox.
+/// The actix default (16) head-of-line stalls `JoinRoom` under a high join rate
+/// (~1000 joins/step) plus a packet flood, so registrations silently cap. A
+/// large mailbox lets the join flood drain instead of blocking on the bound;
+/// the cost is bounded memory (message slots), which is acceptable.
+const DEFAULT_CHATSERVER_MAILBOX_CAPACITY: usize = 8192;
+
 /// SFU runtime configuration, snapshotted from process env once at startup.
 ///
 /// Note: this struct intentionally does NOT derive `Copy` — `milestones` is an
@@ -65,6 +76,16 @@ pub struct SfuConfig {
     /// Wrapped in `Arc<[u64]>` so the `ChatServer` actor can hold a cheap
     /// shared handle without copying the list on every access.
     pub milestones: Arc<[u64]>,
+    /// Mailbox capacity applied to the single per-pod `ChatServer` actor in its
+    /// [`actix::Actor::started`] hook (via `ctx.set_mailbox_capacity`).
+    ///
+    /// Semantics of `SFU_CHATSERVER_MAILBOX_CAPACITY`:
+    ///   - **unset / empty / invalid** → [`DEFAULT_CHATSERVER_MAILBOX_CAPACITY`]
+    ///     (8192). Mirrors the warn-don't-panic philosophy used elsewhere here.
+    ///   - **explicit positive integer** → used verbatim.
+    ///   - **explicit `0`** → warned-and-ignored: a zero-slot mailbox would dead-
+    ///     lock the actor, so we fall back to the default.
+    pub chatserver_mailbox_capacity: usize,
 }
 
 impl SfuConfig {
@@ -81,7 +102,50 @@ impl SfuConfig {
             Err(_) => SfuMode::Legacy,
         };
         let milestones = Self::parse_milestones(std::env::var("SFU_JOIN_MILESTONES").ok());
-        Self { mode, milestones }
+        let chatserver_mailbox_capacity =
+            Self::parse_mailbox_capacity(std::env::var("SFU_CHATSERVER_MAILBOX_CAPACITY").ok());
+        Self {
+            mode,
+            milestones,
+            chatserver_mailbox_capacity,
+        }
+    }
+
+    /// Parse the `SFU_CHATSERVER_MAILBOX_CAPACITY` env value.
+    ///
+    /// See [`SfuConfig::chatserver_mailbox_capacity`] for the unset/empty/zero/
+    /// list semantics. Mirrors the warn-don't-panic philosophy used for
+    /// `SFU_MODE` and `SFU_JOIN_MILESTONES`: a bad value logs a warning and
+    /// falls back to the default rather than taking the server down.
+    fn parse_mailbox_capacity(raw: Option<String>) -> usize {
+        match raw {
+            None => DEFAULT_CHATSERVER_MAILBOX_CAPACITY,
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return DEFAULT_CHATSERVER_MAILBOX_CAPACITY;
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(0) => {
+                        warn!(
+                            "ignoring SFU_CHATSERVER_MAILBOX_CAPACITY=0 (a zero-slot \
+                             mailbox would deadlock the ChatServer); using default {}",
+                            DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+                        );
+                        DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+                    }
+                    Ok(v) => v,
+                    Err(_) => {
+                        warn!(
+                            "ignoring invalid SFU_CHATSERVER_MAILBOX_CAPACITY value {:?} \
+                             (expected a positive integer); using default {}",
+                            trimmed, DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+                        );
+                        DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+                    }
+                }
+            }
+        }
     }
 
     /// Parse the `SFU_JOIN_MILESTONES` env value into a sorted, deduped list.
@@ -298,5 +362,60 @@ mod tests {
         env.set("invalid");
 
         assert_eq!(SfuConfig::from_env().mode, SfuMode::Legacy);
+    }
+
+    // ===== SFU_CHATSERVER_MAILBOX_CAPACITY parsing tests =====
+    //
+    // `parse_mailbox_capacity` takes the raw `Option<String>` directly, so these
+    // tests do NOT touch process-global env state and need no EnvGuard.
+
+    #[test]
+    fn mailbox_capacity_unset_defaults() {
+        assert_eq!(
+            SfuConfig::parse_mailbox_capacity(None),
+            DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+        );
+    }
+
+    #[test]
+    fn mailbox_capacity_empty_or_whitespace_defaults() {
+        assert_eq!(
+            SfuConfig::parse_mailbox_capacity(Some(String::new())),
+            DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+        );
+        assert_eq!(
+            SfuConfig::parse_mailbox_capacity(Some("   ".to_string())),
+            DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+        );
+    }
+
+    #[test]
+    fn mailbox_capacity_explicit_value_parses() {
+        assert_eq!(
+            SfuConfig::parse_mailbox_capacity(Some(" 16384 ".to_string())),
+            16384
+        );
+    }
+
+    #[test]
+    fn mailbox_capacity_zero_falls_back_to_default() {
+        // A zero-slot mailbox would deadlock the actor; warn and use the default.
+        assert_eq!(
+            SfuConfig::parse_mailbox_capacity(Some("0".to_string())),
+            DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+        );
+    }
+
+    #[test]
+    fn mailbox_capacity_invalid_falls_back_to_default() {
+        assert_eq!(
+            SfuConfig::parse_mailbox_capacity(Some("abc".to_string())),
+            DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+        );
+        // Negative is not a valid usize either.
+        assert_eq!(
+            SfuConfig::parse_mailbox_capacity(Some("-5".to_string())),
+            DEFAULT_CHATSERVER_MAILBOX_CAPACITY
+        );
     }
 }

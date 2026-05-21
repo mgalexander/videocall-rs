@@ -826,6 +826,29 @@ impl ChatServer {
 
 impl Actor for ChatServer {
     type Context = Context<Self>;
+
+    /// Raise the actor mailbox above the actix default (16).
+    ///
+    /// There is exactly one `ChatServer` actor per pod and every inbound
+    /// transport packet (`ClientMessage`, `do_send`) plus every room join
+    /// (`JoinRoom`, a bounded awaited `.send()`) funnels through this single
+    /// mailbox on one thread. With the 16-slot default, a high join rate plus a
+    /// packet flood head-of-line stalls the `JoinRoom` `.send()`s, so only a few
+    /// hundred sessions ever register (`room_members` never reaches the join
+    /// count). Sizing the mailbox to
+    /// `sfu_config.chatserver_mailbox_capacity` (default 8192, tunable via
+    /// `SFU_CHATSERVER_MAILBOX_CAPACITY`) lets the flood drain. This hook is
+    /// shared by both the WebTransport and WebSocket binaries, since each starts
+    /// the actor identically via `ChatServer::new(...).start()`.
+    fn started(&mut self, ctx: &mut Self::Context) {
+        let capacity = self.sfu_config.chatserver_mailbox_capacity;
+        ctx.set_mailbox_capacity(capacity);
+        info!(
+            target: "sfu_trace",
+            chatserver_mailbox_capacity = capacity,
+            "ChatServer mailbox capacity set (SFU_CHATSERVER_MAILBOX_CAPACITY; default 8192)"
+        );
+    }
 }
 
 impl Handler<Connect> for ChatServer {
