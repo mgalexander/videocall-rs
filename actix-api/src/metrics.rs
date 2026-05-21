@@ -351,6 +351,37 @@ lazy_static! {
     )
     .expect("Failed to create sfu_room_size metric");
 
+    /// Room member count at the most recent join-milestone crossing, per room
+    /// (bead vc-xow8). This is the authoritative member count
+    /// (`room_members.len()`) — the count the room is "supposed" to fan out
+    /// to. Compare against [`SFU_ROOM_RECEIVER_SET`]: when delivery breaks at
+    /// scale, the receiver-set size diverges from this member count.
+    ///
+    /// Set ONLY at a milestone crossing (10/50/100/... by default), so it is a
+    /// sparse, low-cardinality marker rather than a per-join gauge.
+    pub static ref SFU_ROOM_MEMBERS: GaugeVec = register_gauge_vec!(
+        "sfu_room_members",
+        "SFU room member count sampled at the most recent join-milestone crossing",
+        &["room_id"]
+    )
+    .expect("Failed to create sfu_room_members metric");
+
+    /// Per-room dispatcher receiver-set size at the most recent join-milestone
+    /// crossing, per room (bead vc-xow8). This is
+    /// `room_dispatch[room].receivers.len()` — the size the per-room
+    /// dispatcher actually fans each parsed packet out to.
+    ///
+    /// The delivery-scaling root-cause signal: a healthy room has
+    /// `sfu_room_receiver_set == sfu_room_members`. A persistent gap
+    /// (receiver_set < members) at a milestone means joiners are tracked as
+    /// members but never made delivery-eligible in the dispatcher.
+    pub static ref SFU_ROOM_RECEIVER_SET: GaugeVec = register_gauge_vec!(
+        "sfu_room_receiver_set",
+        "SFU per-room dispatcher receiver-set size sampled at the most recent join-milestone crossing",
+        &["room_id"]
+    )
+    .expect("Failed to create sfu_room_receiver_set metric");
+
     /// Speaker changes per minute. Declared in p2-7; wired in P3.
     pub static ref SFU_SPEAKER_CHANGES_PER_MIN: Gauge = register_gauge!(
         "sfu_speaker_changes_per_min",

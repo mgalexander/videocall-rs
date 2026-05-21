@@ -287,6 +287,20 @@ pub struct ChatServer {
     /// all local receivers). Lazily created on the first `JoinRoom` for a
     /// room and torn down when the room drains. See [`RoomDispatch`].
     room_dispatch: HashMap<String, RoomDispatch>,
+    /// Per-room highest join-milestone already emitted (bead vc-xow8).
+    ///
+    /// Watermark for the "exactly once per room" guarantee on
+    /// `sfu_join_milestone` events. Stores the largest milestone value already
+    /// logged for the room. On each join we emit for every configured
+    /// milestone in `(watermark, member_count]` and advance the watermark to
+    /// the highest milestone crossed. Because the watermark only ever moves
+    /// up, reconnects/replaces (where `member_count` does not increase) and
+    /// non-monotonic edge cases never re-fire a milestone.
+    ///
+    /// Lives in actor state (single-threaded actor → a plain `HashMap` is
+    /// fine, no locking). Cleaned up alongside the room's other per-room state
+    /// when the room drains.
+    sfu_join_milestone_watermark: HashMap<String, u64>,
     /// Synchronous in-actor cache of room → home-region (bead vc-hc8 / p6-9).
     ///
     /// On JoinRoom: if a cached entry exists, the cross-region redirect
@@ -390,11 +404,146 @@ impl ChatServer {
             speaker_ticks: HashMap::new(),
             beacon_hub,
             room_dispatch: HashMap::new(),
+            sfu_join_milestone_watermark: HashMap::new(),
             home_region_cache: HashMap::new(),
             home_region_kv,
             spillover_store,
             _spillover_ingest: spillover_ingest,
         }
+    }
+
+    /// vc-xow8: emit `sfu_join_milestone` for every configured milestone the
+    /// room just crossed on this join, exactly once per room.
+    ///
+    /// Called from the `JoinRoom` handler immediately after the receiver
+    /// insert, only when `sfu_config.milestones` is non-empty. Uses a
+    /// per-room high-watermark (`sfu_join_milestone_watermark`): we emit for
+    /// every milestone in `(watermark, member_count]` and advance the
+    /// watermark to the highest one crossed. The watermark only moves up, so
+    /// reconnects/replaces (member_count unchanged) and any non-monotonic
+    /// edge case never re-fire a milestone — guaranteeing exactly-once.
+    ///
+    /// O(milestones) per crossing (a handful of values), and the common case
+    /// (no crossing) is a single comparison against the watermark before any
+    /// allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_emit_join_milestone(
+        &mut self,
+        room: &str,
+        session: SessionId,
+        member_count: u64,
+        receivers_for_room: &Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+        room_state: &Arc<RwLock<RoomState>>,
+        subscriptions: &Arc<RwLock<SubscriptionStore>>,
+    ) {
+        let watermark = self
+            .sfu_join_milestone_watermark
+            .get(room)
+            .copied()
+            .unwrap_or(0);
+
+        // Fast path: nothing crossed since the last emit. A single comparison
+        // for the overwhelmingly common case — no allocation, no lock.
+        if member_count <= watermark {
+            return;
+        }
+
+        // Collect the milestones in (watermark, member_count]. The list is
+        // sorted + deduped (see SfuConfig::parse_milestones), so this is a
+        // cheap linear scan over a handful of values.
+        let crossed: Vec<u64> = self
+            .sfu_config
+            .milestones
+            .iter()
+            .copied()
+            .filter(|&m| m > watermark && m <= member_count)
+            .collect();
+        if crossed.is_empty() {
+            // member_count grew but didn't pass any configured milestone.
+            // Do NOT advance the watermark past unconfigured ground — only
+            // emitted milestones move it (keeps the invariant simple).
+            return;
+        }
+
+        // The receiver-set size the per-room dispatcher actually fans out to.
+        let receiver_set = match receivers_for_room.read() {
+            Ok(g) => g.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        } as u64;
+
+        // Resolve the new joiner's AllowSet so we can report its audio/video
+        // membership sizes. This is the size the joiner would receive from on
+        // its very first packets. Paid only at a crossing (rare). We resolve
+        // against the current member snapshot with an empty active-speaker set
+        // (the speaker tick has not necessarily produced a set yet at join);
+        // the AllowSet's `receive_all_*` defaults dominate at join time, which
+        // is exactly what we want to confirm for the delivery-scaling probe.
+        let members = match room_state.read() {
+            Ok(g) => g.members_snapshot(),
+            Err(poisoned) => poisoned.into_inner().members_snapshot(),
+        };
+        let (allowset_audio, allowset_video) = match subscriptions.read() {
+            Ok(g) => {
+                let allow = g.resolve(session, &members, &[]);
+                (allow.audio.len(), allow.video.len())
+            }
+            Err(poisoned) => {
+                let g = poisoned.into_inner();
+                let allow = g.resolve(session, &members, &[]);
+                (allow.audio.len(), allow.video.len())
+            }
+        };
+
+        // Current cumulative forward/drop counters (read once at the crossing).
+        let forward_total = crate::metrics::SFU_FORWARD_TOTAL.get();
+        let dropped_total: f64 = crate::metrics::SFU_DROPPED_TOTAL
+            .with_label_values(&[crate::metrics::sfu_drop_reason::UNSUBSCRIBED])
+            .get()
+            + crate::metrics::SFU_DROPPED_TOTAL
+                .with_label_values(&[crate::metrics::sfu_drop_reason::LAYER_BUDGET])
+                .get()
+            + crate::metrics::SFU_DROPPED_TOTAL
+                .with_label_values(&[crate::metrics::sfu_drop_reason::REFERENCE_MISS])
+                .get()
+            + crate::metrics::SFU_DROPPED_TOTAL
+                .with_label_values(&[crate::metrics::sfu_drop_reason::SELF_SKIP])
+                .get();
+
+        // Update the divergence gauges at the crossing point (low-cardinality
+        // sparse markers — set only here, not per join).
+        crate::metrics::SFU_ROOM_MEMBERS
+            .with_label_values(&[room])
+            .set(member_count as f64);
+        crate::metrics::SFU_ROOM_RECEIVER_SET
+            .with_label_values(&[room])
+            .set(receiver_set as f64);
+
+        // Emit ONE structured event per milestone crossed. Reuses the existing
+        // tracing infra (vc-8wd `sfu_trace` target family). The receiver_set
+        // vs member_count gap is the headline delivery-scaling signal.
+        for milestone in &crossed {
+            tracing::info!(
+                target: "sfu_trace",
+                event = "sfu_join_milestone",
+                room = %room,
+                milestone = *milestone,
+                member_count,
+                receiver_set,
+                receiver_set_gap = member_count.saturating_sub(receiver_set),
+                allowset_audio,
+                allowset_video,
+                forward_total,
+                dropped_total,
+                "SFU room crossed join milestone"
+            );
+        }
+
+        // Advance the watermark to the highest milestone crossed (the last
+        // element, since `milestones` is sorted ascending). Each milestone
+        // therefore fires exactly once as the room grows.
+        let highest = *crossed.last().expect("crossed is non-empty");
+        self.sfu_join_milestone_watermark
+            .insert(room.to_string(), highest);
     }
 
     pub fn leave_rooms(
@@ -458,6 +607,18 @@ impl ChatServer {
                     // shared owner-pod beacon hub. Non-owner pods never
                     // registered; `unregister` is a safe no-op there.
                     self.beacon_hub.unregister(room_id);
+                    // vc-xow8: drop the join-milestone watermark so a future
+                    // room that reuses this id re-emits milestones as it grows.
+                    self.sfu_join_milestone_watermark.remove(room_id);
+                    // vc-xow8: also drop the per-room milestone gauge series so
+                    // they don't leak in the Prometheus registry after the room
+                    // drains (unbounded series growth otherwise).
+                    crate::metrics::SFU_ROOM_MEMBERS
+                        .remove_label_values(&[room_id])
+                        .ok();
+                    crate::metrics::SFU_ROOM_RECEIVER_SET
+                        .remove_label_values(&[room_id])
+                        .ok();
                     true
                 } else {
                     false
@@ -1012,6 +1173,16 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                         // shared owner-pod beacon hub. Non-owner pods
                         // never registered; `unregister` is a no-op.
                         self.beacon_hub.unregister(&room);
+                        // vc-xow8: drop the join-milestone watermark on drain.
+                        self.sfu_join_milestone_watermark.remove(&room);
+                        // vc-xow8: drop the per-room milestone gauge series too
+                        // so they don't leak in the Prometheus registry.
+                        crate::metrics::SFU_ROOM_MEMBERS
+                            .remove_label_values(&[room.as_str()])
+                            .ok();
+                        crate::metrics::SFU_ROOM_RECEIVER_SET
+                            .remove_label_values(&[room.as_str()])
+                            .ok();
                     }
                 }
                 return;
@@ -2120,6 +2291,25 @@ impl Handler<JoinRoom> for ChatServer {
             w.insert(session, session_recipient.clone());
         }
         self.joined_sessions.insert(session);
+
+        // vc-xow8: tunable join-milestone markers. Cheap in the common case:
+        // the whole check is guarded behind a non-empty milestone list AND an
+        // actual crossing (a couple of integer comparisons). Only when a
+        // milestone is crossed do we pay for the AllowSet resolve + tracing
+        // event. The receiver-set size + member count are read here precisely
+        // because, when delivery breaks at scale, the dispatcher's receiver
+        // set diverges from the authoritative member count.
+        if !self.sfu_config.milestones.is_empty() {
+            let member_count = self.room_members.get(&room).map(|m| m.len()).unwrap_or(0) as u64;
+            self.maybe_emit_join_milestone(
+                &room,
+                session,
+                member_count,
+                &receivers_for_room,
+                &room_state,
+                &subscriptions,
+            );
+        }
 
         // Wave-1 soft-cap notification (bead vc-69e / p3-13). The joiner is
         // already fully tracked in room_members + room_dispatch above; this
