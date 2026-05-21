@@ -59,6 +59,32 @@ spec:
             - name: wt-api-health
               containerPort: {{ .Values.service.healthPort }}
               protocol: TCP
+          # Process-liveness check on /healthz (currently a static 200; not
+          # yet forwarding-aware — see vc-sfu-failfast-panic). Pull a pod
+          # whose HTTP server stops responding from Service endpoints
+          # quickly (~20s of sustained failure).
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: wt-api-health
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          # Restart a pod whose HTTP server is wedged within a bounded
+          # window (~75s of sustained failure) without flapping under brief
+          # load spikes. Does not detect NATS-disconnect failures yet.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: wt-api-health
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:

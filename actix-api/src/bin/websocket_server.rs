@@ -46,6 +46,17 @@ use videocall_types::truthy;
 const SCOPE: &str = "email profile";
 
 /**
+ * Health check endpoint for k8s liveness/readiness probes.
+ *
+ * Returns HTTP 200 with a plain "Ok" body. Mirrors the webtransport
+ * server's `health_responder`. Requires no auth so probes can reach it
+ * regardless of OAuth/DB configuration.
+ */
+async fn health_responder() -> HttpResponse {
+    HttpResponse::Ok().body("Ok")
+}
+
+/**
  * Query parameters for the login endpoint
  */
 #[derive(Debug, serde::Deserialize)]
@@ -369,6 +380,7 @@ async fn main() -> std::io::Result<()> {
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
+                .route("/healthz", web::get().to(health_responder))
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
@@ -397,6 +409,7 @@ async fn main() -> std::io::Result<()> {
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
+                .route("/healthz", web::get().to(health_responder))
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");
@@ -414,6 +427,7 @@ async fn main() -> std::io::Result<()> {
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
+                .route("/healthz", web::get().to(health_responder))
         }
     })
     .bind((
