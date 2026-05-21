@@ -110,6 +110,35 @@ cargo run -- --orchestrate --room load --senders 5 --listeners 45 \
   --duration 60 --server-url https://... --verify-integrity
 ```
 
+### High-Scale Egress Soak Mode (`--listener-no-decode`)
+
+`--listener-no-decode` (default OFF) makes listener bots skip the expensive
+VP9/Opus codec decode while still doing **everything else** on the receive
+path: connect, subscribe, `accept_uni`, `read_to_end`, the media-vs-control
+packet split, integrity trailer CRC strip+verify (with `--verify-integrity`),
+redirect following, and per-publisher sequence-gap tracking.
+
+Use it for high-scale (10k) SFU egress load/soak tests. A 100-listener pod
+drops from ~2.5 CPU to ~0.1-0.3 CPU because the dominant cost — the libvpx VP9
+decoder threads and per-frame `.decode()` calls — is removed, so a single pod
+can host many more synthetic egress receivers. Decode correctness is verified
+separately by small probe cohorts run **with the flag off**.
+
+What still populates in the summary JSON: `packets_received`, `bytes_received`,
+`media_packets_received` / `control_packets_received`, `crc_mismatches`,
+`media_seq_max`, `media_received_distinct`, `unexplained_gaps`. By design,
+`video_frames_decoded` / `audio_frames_decoded` stay 0 (the codec never runs).
+
+Only the `--orchestrate` listener path honours this flag; it is a no-op in
+`--failover-test` (those listeners already run without decode) and in
+single-bot mode, and senders are never affected. With the flag off, behaviour
+is byte-for-byte identical to the previous full-decode default.
+
+```bash
+cargo run -- --orchestrate --room load --senders 5 --listeners 95 \
+  --duration 300 --server-url https://... --listener-no-decode
+```
+
 ## Media Protocol
 
 - **Audio**: 50fps (20ms Opus packets) following neteq_player.rs pattern

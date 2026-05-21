@@ -71,6 +71,15 @@ struct DecoderPool {
     /// trailer on each MEDIA payload and folds the observation into
     /// `stats.integrity`. Mirrors the `--verify-integrity` flag.
     verify_integrity: bool,
+    /// vc-9d2t: when true, skip ONLY the expensive VP9/Opus codec
+    /// `.decode()` work (and the per-publisher decoder allocation) while
+    /// still running the full receive-path accounting: protobuf parse,
+    /// media-vs-control split, integrity trailer CRC strip+verify, and the
+    /// per-publisher sequence-gap window. Lets a high-scale (10k) SFU egress
+    /// soak test run ~0.1-0.3 CPU/100-listeners instead of ~2.5, with codec
+    /// correctness sampled by separate probe cohorts running with the flag
+    /// OFF. Off by default (full decode), preserving baseline behaviour.
+    skip_codec: bool,
 }
 
 /// Per-publisher rolling counters that drive feedback emission.
@@ -229,6 +238,11 @@ pub struct WebTransportClient {
     /// vc-1re: when true the decode path strips + verifies the integrity
     /// trailer on each MEDIA payload. Threaded into the [`DecoderPool`].
     verify_integrity: bool,
+    /// vc-9d2t: when true, skip ONLY the codec `.decode()` work while keeping
+    /// all receive-path accounting. Threaded into the [`DecoderPool`]. Only
+    /// meaningful when `decode` is also true (the accounting lives inside the
+    /// decode dispatch). Off by default.
+    skip_codec: bool,
     /// vc-7zjq: shared "force keyframe on next encode" flag. When attached
     /// (sender bots), the always-on inbound consumer sets it to `true` the
     /// moment it observes an inbound `KEYFRAME_REQUEST` targeting this bot's
@@ -248,6 +262,7 @@ impl WebTransportClient {
             session_end: None,
             decode: false,
             verify_integrity: false,
+            skip_codec: false,
             keyframe_signal: None,
         }
     }
@@ -283,6 +298,22 @@ impl WebTransportClient {
     /// (the trailer check runs inside the decode dispatch).
     pub fn with_verify_integrity(mut self, verify_integrity: bool) -> Self {
         self.verify_integrity = verify_integrity;
+        self
+    }
+
+    /// vc-9d2t: skip the expensive VP9/Opus codec `.decode()` work (and the
+    /// lazy per-publisher decoder allocation) while still running the full
+    /// receive-path accounting — protobuf parse, media-vs-control split,
+    /// integrity trailer CRC strip+verify, and the per-publisher sequence-gap
+    /// window. Used for high-scale (10k) SFU egress soak tests where decode
+    /// correctness is sampled by separate probe cohorts running with this off.
+    ///
+    /// Only meaningful when [`with_decode`](Self::with_decode) is also on: the
+    /// accounting lives inside the decode dispatch, so the pool must still be
+    /// built. When `skip` is `false` (the default) behaviour is byte-for-byte
+    /// identical to full decode.
+    pub fn with_skip_codec_decode(mut self, skip: bool) -> Self {
+        self.skip_codec = skip;
         self
     }
 
@@ -473,6 +504,7 @@ impl WebTransportClient {
             let session_end = self.session_end.clone();
             let keyframe_signal = self.keyframe_signal.clone();
             let verify_integrity = self.verify_integrity;
+            let skip_codec = self.skip_codec;
             // Decoders only meaningful when both `decode` is on and we have a
             // stats handle to publish counters into.
             //
@@ -496,6 +528,7 @@ impl WebTransportClient {
                         feedback_tx,
                         stats: s.clone(),
                         verify_integrity,
+                        skip_codec,
                     });
                     start_feedback_writer(
                         session.clone(),
@@ -945,6 +978,15 @@ fn decode_video(pool: &DecoderPool, publisher: &str, media: &MediaPacket, payloa
         emit_keyframe_request(pool, publisher, req);
     }
 
+    // vc-9d2t: in skip-codec mode every counter above (media-vs-control split,
+    // integrity CRC, per-publisher sequence-gap window, KFR dispatch) has
+    // already run. Bail before the libvpx decoder allocation + `.decode()` —
+    // the dominant CPU cost — so a high-scale egress soak listener stays cheap.
+    // `video_frames_decoded` stays 0 by design (sampled by probe cohorts).
+    if pool.skip_codec {
+        return;
+    }
+
     // recover from poisoning: decoder ctor on another thread may have panicked, the map state itself is still valid
     let mut map = pool.video.lock().unwrap_or_else(|p| p.into_inner());
     let decoder = map.entry(publisher.to_string()).or_insert_with(|| {
@@ -996,6 +1038,13 @@ fn decode_audio(pool: &DecoderPool, publisher: &str, payload: &[u8]) {
     // `payload` is the codec bytes with any integrity trailer stripped
     // (vc-1re).
     update_publisher_audio_window(pool, publisher, payload.len() as u64);
+
+    // vc-9d2t: skip-codec mode keeps the window counters above but bails before
+    // the Opus decoder allocation + `.decode_float()`. `audio_frames_decoded`
+    // stays 0 by design (sampled by probe cohorts).
+    if pool.skip_codec {
+        return;
+    }
 
     let mut map = pool.audio.lock().unwrap_or_else(|p| p.into_inner());
     let decoder = match map.entry(publisher.to_string()) {
@@ -2191,6 +2240,7 @@ mod tests {
             feedback_tx,
             stats: BotStats::new("test".into(), BotRole::Listener),
             verify_integrity: false,
+            skip_codec: false,
         }
     }
 
@@ -2199,6 +2249,16 @@ mod tests {
     fn empty_pool_with_integrity() -> DecoderPool {
         let mut pool = empty_pool();
         pool.verify_integrity = true;
+        pool
+    }
+
+    /// vc-9d2t: an `empty_pool` variant with skip-codec mode enabled (and
+    /// integrity on) so tests can prove the receive-path accounting still runs
+    /// while the codec `.decode()` is bypassed.
+    fn empty_pool_skip_codec() -> DecoderPool {
+        let mut pool = empty_pool();
+        pool.verify_integrity = true;
+        pool.skip_codec = true;
         pool
     }
 
@@ -2361,6 +2421,7 @@ mod tests {
             feedback_tx,
             stats: BotStats::new("test".into(), BotRole::Listener),
             verify_integrity: false,
+            skip_codec: false,
         };
         (pool, feedback_rx)
     }
@@ -2694,6 +2755,69 @@ mod tests {
             .get("sender-7")
             .expect("publisher tracker materialised on first AUDIO frame");
         assert_eq!(tracker.audio_frames, 1);
+        assert!(tracker.audio_bytes > 0);
+    }
+
+    /// vc-9d2t: in skip-codec mode the SAME trailered Opus frame must still
+    /// drive every receive-path counter — media-vs-control split, the
+    /// integrity CRC/sequence tracker, and the per-publisher diagnostics
+    /// window — while the Opus `.decode_float()` is bypassed (so
+    /// `audio_frames_decoded` stays 0 and the audio decoder map stays empty).
+    /// This is the contract that lets a high-scale egress soak listener run
+    /// cheap without losing observability.
+    #[test]
+    fn skip_codec_keeps_accounting_but_skips_audio_decode_vc_9d2t() {
+        let pool = empty_pool_skip_codec();
+        for seq in 0..5 {
+            let wire = opus_media_wire("sender-9", seq, true);
+            decode_packet(&pool, &wire);
+        }
+
+        // Codec was bypassed: no decoded frames, no allocated opus decoder.
+        assert_eq!(
+            pool.stats.audio_frames_decoded.load(Ordering::Relaxed),
+            0,
+            "skip-codec mode must NOT decode audio"
+        );
+        assert_eq!(
+            pool.stats.decode_errors.load(Ordering::Relaxed),
+            0,
+            "skipping the codec must not be counted as a decode error"
+        );
+        assert!(
+            pool.audio.lock().unwrap().is_empty(),
+            "skip-codec mode must not allocate a per-publisher Opus decoder"
+        );
+
+        // Accounting still ran: media split, integrity, publisher window.
+        assert_eq!(
+            pool.stats.media_packets_received.load(Ordering::Relaxed),
+            5,
+            "media-vs-control split must still count every MEDIA frame"
+        );
+        assert_eq!(
+            pool.stats.control_packets_received.load(Ordering::Relaxed),
+            0
+        );
+        let summary = pool
+            .stats
+            .integrity
+            .lock()
+            .unwrap()
+            .summarize(pool.stats.drops.load(Ordering::Relaxed));
+        assert_eq!(
+            summary.crc_mismatches, 0,
+            "clean trailered frames must verify even with the codec skipped"
+        );
+        assert_eq!(
+            summary.unexplained_gaps, 0,
+            "contiguous sequence must show no gaps in skip-codec mode"
+        );
+        let publishers = pool.publishers.lock().unwrap();
+        let tracker = publishers
+            .get("sender-9")
+            .expect("publisher tracker must materialise in skip-codec mode");
+        assert_eq!(tracker.audio_frames, 5);
         assert!(tracker.audio_bytes > 0);
     }
 

@@ -136,6 +136,22 @@ struct Cli {
     /// `--failover-test`; ignored in single-bot mode.
     #[arg(long, default_value_t = false)]
     verify_integrity: bool,
+
+    /// vc-9d2t: make listener bots skip the expensive VP9/Opus codec decode
+    /// while still doing everything else on the receive path — connect,
+    /// subscribe, accept_uni, read_to_end, the media-vs-control packet split,
+    /// integrity trailer CRC strip+verify (with `--verify-integrity`), and the
+    /// per-publisher sequence-gap tracking. Use this for high-scale (10k) SFU
+    /// egress load/soak tests: a 100-listener pod then costs ~0.1-0.3 CPU
+    /// instead of ~2.5, so a single pod can host far more synthetic egress
+    /// receivers. Decode correctness is verified separately by small probe
+    /// cohorts run with this flag OFF. `video_frames_decoded` /
+    /// `audio_frames_decoded` are 0 by design in this mode; all other counters
+    /// (packets_received, media/control split, crc_mismatches,
+    /// unexplained_gaps) still populate. Off by default (listeners decode —
+    /// unchanged baseline). Senders are unaffected. Applies to `--orchestrate`.
+    #[arg(long, default_value_t = false)]
+    listener_no_decode: bool,
 }
 
 #[tokio::main]
@@ -173,6 +189,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    if cli.listener_no_decode {
+        warn!("--listener-no-decode is ignored in single-bot mode; it only affects --orchestrate");
+    }
+
     info!("Starting videocall synthetic client bot (single-bot mode)");
     run_single_bot_mode().await
 }
@@ -198,6 +218,15 @@ fn build_failover_config(cli: Cli) -> anyhow::Result<FailoverConfig> {
         return Err(anyhow::anyhow!(
             "--listeners must be > 0 in --failover-test mode (downtime is measured on listeners)"
         ));
+    }
+
+    // vc-9d2t: failover-test listeners already run with decode OFF, so
+    // `--listener-no-decode` is a no-op here. Warn rather than silently ignore.
+    if cli.listener_no_decode {
+        warn!(
+            "--listener-no-decode is ignored in --failover-test mode \
+             (those listeners already run without decode); it only affects --orchestrate"
+        );
     }
 
     Ok(FailoverConfig {
@@ -253,6 +282,7 @@ fn build_orchestration_config(cli: Cli) -> anyhow::Result<OrchestrationConfig> {
         user_id_prefix: cli.user_id_prefix,
         index_offset: cli.index_offset,
         verify_integrity: cli.verify_integrity,
+        listener_no_decode: cli.listener_no_decode,
     })
 }
 

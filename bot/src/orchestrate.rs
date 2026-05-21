@@ -76,6 +76,14 @@ pub struct OrchestrationConfig {
     /// vc-1re: enable byte-fidelity integrity verification. Senders append a
     /// trailer; listeners strip + verify it. Off by default.
     pub verify_integrity: bool,
+    /// vc-9d2t: when true, listener bots skip the expensive VP9/Opus codec
+    /// decode while still running the full receive path (connect, subscribe,
+    /// accept_uni, read_to_end, media-vs-control split, integrity CRC,
+    /// sequence-gap tracking). Lets a 100-listener pod cost ~0.1-0.3 CPU
+    /// instead of ~2.5 for high-scale (10k) SFU egress soak tests; decode is
+    /// sampled separately by probe cohorts running with the flag OFF. Off by
+    /// default — listeners decode (unchanged baseline). Senders unaffected.
+    pub listener_no_decode: bool,
 }
 
 /// Aggregate totals across every bot in the run.
@@ -263,10 +271,18 @@ pub async fn run(cfg: OrchestrationConfig) -> anyhow::Result<()> {
         let server_url = cfg.server_url.clone();
         let insecure = cfg.insecure;
         let verify_integrity = cfg.verify_integrity;
+        let no_decode = cfg.listener_no_decode;
 
         join_handles.push(tokio::spawn(async move {
-            if let Err(e) =
-                run_listener(client_cfg, server_url, insecure, stats, verify_integrity).await
+            if let Err(e) = run_listener(
+                client_cfg,
+                server_url,
+                insecure,
+                stats,
+                verify_integrity,
+                no_decode,
+            )
+            .await
             {
                 error!("Listener failed: {}", e);
             }
@@ -665,6 +681,7 @@ async fn run_listener(
     insecure: bool,
     stats: Arc<BotStats>,
     verify_integrity: bool,
+    no_decode: bool,
 ) -> anyhow::Result<()> {
     let user_id = config.user_id.clone();
     info!("Initialising listener {}", user_id);
@@ -676,6 +693,12 @@ async fn run_listener(
     // decode by default (vc-86j) so each iteration also re-arms the per-
     // publisher decoder pool inside the new `WebTransportClient`. Plain
     // disconnects keep the pre-vc-kni "stay idle" behaviour.
+    //
+    // vc-9d2t: the decoder pool is still built (so the full receive-path
+    // accounting runs — media-vs-control split, integrity CRC, sequence-gap
+    // window). `with_skip_codec_decode(no_decode)` then gates ONLY the libvpx
+    // VP9 / Opus `.decode()` work, so a high-scale egress soak listener stays
+    // cheap while keeping every counter except the per-codec decode tallies.
     let original_url = server_url.clone();
     let mut current_url = server_url;
     let mut hops: u32 = 0;
@@ -686,6 +709,7 @@ async fn run_listener(
             .with_stats(stats.clone())
             .with_session_end_signal(signal.clone())
             .with_decode(true)
+            .with_skip_codec_decode(no_decode)
             .with_verify_integrity(verify_integrity);
         client.connect(&current_url, insecure).await?;
         // vc-by0: prefer the resolved peer address (real pod) over the
