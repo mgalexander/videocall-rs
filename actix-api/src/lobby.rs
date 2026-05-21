@@ -111,7 +111,8 @@ pub async fn ws_connect_authenticated(
     debug!(
         "socket connected (token-based) for user_id={user_id}, room={room}, display_name={display_name}, observer={observer}"
     );
-    let chat = state.chat.clone();
+    // vc-8txq: resolve the owning ChatServer shard for this room once, here.
+    let chat = state.chat.addr_for_room(&room);
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
     let session_manager = state.session_manager.clone();
@@ -166,7 +167,8 @@ pub async fn ws_connect(
         "socket connected (deprecated path-based) for user_id={}, room={}",
         user_id_clean, room_clean
     );
-    let chat = state.chat.clone();
+    // vc-8txq: resolve the owning ChatServer shard for this room once, here.
+    let chat = state.chat.addr_for_room(&room_clean);
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
     let session_manager = state.session_manager.clone();

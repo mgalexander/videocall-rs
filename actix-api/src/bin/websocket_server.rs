@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use actix::Actor;
 use actix_cors::Cors;
 use actix_web::{
     cookie::{
@@ -27,7 +26,6 @@ use actix_web::{
 };
 use reqwest::header::LOCATION;
 use sec_api::{
-    actors::chat_server::ChatServer,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
@@ -331,12 +329,22 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
 
-    // vc-ud6o E3: grab the shared connection-state handle BEFORE `.start()`
-    // consumes the actor. It is cloned into every `SessionLogic` via AppState
-    // so the off-actor media-publish path can read the `Active` gate lock-free.
-    let chat_server = ChatServer::new(nats_client.clone()).await;
-    let connection_states = chat_server.connection_states_handle();
-    let chat = chat_server.start();
+    // Start the ChatServer shard pool (bead vc-8txq). SFU_CHATSERVER_SHARDS
+    // actors (default: available_parallelism), each on its own Arbiter thread,
+    // with rooms partitioned by jump-hash. The shared connection-state handle
+    // (vc-ud6o E3) is owned by the pool and cloned into every `SessionLogic`
+    // via AppState so the off-actor media-publish path can read the `Active`
+    // gate lock-free.
+    let chat = sec_api::actors::chat_server::ChatServerPool::new(
+        nats_client.clone(),
+        sfu_config.chatserver_shards,
+    )
+    .await;
+    let connection_states = chat.connection_states_handle();
+    info!(
+        "ChatServerPool started with {} shard(s)",
+        chat.shard_count()
+    );
 
     // Create SessionManager
     let session_manager = SessionManager::new();

@@ -54,6 +54,15 @@ const DEFAULT_JOIN_MILESTONES: &[u64] = &[10, 50, 100, 250, 500, 1000, 2000, 400
 /// the cost is bounded memory (message slots), which is acceptable.
 const DEFAULT_CHATSERVER_MAILBOX_CAPACITY: usize = 8192;
 
+/// Hard ceiling on the number of `ChatServer` shards (bead vc-8txq).
+///
+/// Each shard is a full `ChatServer` actor pinned to its own dedicated
+/// `Arbiter` thread, so the count should track the pod's CPU budget. We cap
+/// it defensively so a misconfigured `SFU_CHATSERVER_SHARDS` (or a host that
+/// reports an absurd `available_parallelism`) cannot spawn an unbounded number
+/// of OS threads.
+const MAX_CHATSERVER_SHARDS: usize = 64;
+
 /// SFU runtime configuration, snapshotted from process env once at startup.
 ///
 /// Note: this struct intentionally does NOT derive `Copy` — `milestones` is an
@@ -86,6 +95,25 @@ pub struct SfuConfig {
     ///   - **explicit `0`** → warned-and-ignored: a zero-slot mailbox would dead-
     ///     lock the actor, so we fall back to the default.
     pub chatserver_mailbox_capacity: usize,
+    /// Number of `ChatServer` shards to spawn on this pod (bead vc-8txq).
+    ///
+    /// Each shard is an independent `ChatServer` actor on its own dedicated
+    /// `Arbiter` thread; rooms are partitioned across shards by jump-consistent
+    /// hash (see [`crate::actors::chat_server::ChatServerPool`]). This
+    /// de-serializes `JoinRoom` handling and per-room state across cores instead
+    /// of funneling every join through one actor on one thread.
+    ///
+    /// Semantics of `SFU_CHATSERVER_SHARDS`:
+    ///   - **unset / empty / invalid** → `available_parallelism()` (clamped to
+    ///     `[1, MAX_CHATSERVER_SHARDS]`). On a 4-CPU pod this yields 4 shards.
+    ///   - **explicit positive integer** → used verbatim, clamped to
+    ///     `[1, MAX_CHATSERVER_SHARDS]`.
+    ///   - **explicit `0`** → warned-and-ignored; falls back to the auto value.
+    ///
+    /// `1` reproduces the prior single-actor behaviour exactly (one shard owns
+    /// every room), which is what the in-process unit/integration tests rely on
+    /// when they talk to a single `Addr<ChatServer>` directly.
+    pub chatserver_shards: usize,
 }
 
 impl SfuConfig {
@@ -104,10 +132,71 @@ impl SfuConfig {
         let milestones = Self::parse_milestones(std::env::var("SFU_JOIN_MILESTONES").ok());
         let chatserver_mailbox_capacity =
             Self::parse_mailbox_capacity(std::env::var("SFU_CHATSERVER_MAILBOX_CAPACITY").ok());
+        let chatserver_shards =
+            Self::parse_shard_count(std::env::var("SFU_CHATSERVER_SHARDS").ok());
         Self {
             mode,
             milestones,
             chatserver_mailbox_capacity,
+            chatserver_shards,
+        }
+    }
+
+    /// Auto-detected shard count from the host's available parallelism, clamped
+    /// to `[1, MAX_CHATSERVER_SHARDS]`. Falls back to 1 if the platform cannot
+    /// report parallelism (the safe single-actor behaviour).
+    fn auto_shard_count() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, MAX_CHATSERVER_SHARDS)
+    }
+
+    /// Parse the `SFU_CHATSERVER_SHARDS` env value.
+    ///
+    /// See [`SfuConfig::chatserver_shards`] for the unset/empty/zero/clamp
+    /// semantics. Mirrors the warn-don't-panic philosophy used elsewhere here:
+    /// a bad value logs a warning and falls back to the auto value rather than
+    /// taking the server down.
+    fn parse_shard_count(raw: Option<String>) -> usize {
+        match raw {
+            None => Self::auto_shard_count(),
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Self::auto_shard_count();
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(0) => {
+                        warn!(
+                            "ignoring SFU_CHATSERVER_SHARDS=0 (need at least one shard); \
+                             using auto value {}",
+                            Self::auto_shard_count()
+                        );
+                        Self::auto_shard_count()
+                    }
+                    Ok(v) => {
+                        let clamped = v.clamp(1, MAX_CHATSERVER_SHARDS);
+                        if clamped != v {
+                            warn!(
+                                "clamping SFU_CHATSERVER_SHARDS={} to {} (valid range \
+                                 1..={})",
+                                v, clamped, MAX_CHATSERVER_SHARDS
+                            );
+                        }
+                        clamped
+                    }
+                    Err(_) => {
+                        warn!(
+                            "ignoring invalid SFU_CHATSERVER_SHARDS value {:?} \
+                             (expected a positive integer); using auto value {}",
+                            trimmed,
+                            Self::auto_shard_count()
+                        );
+                        Self::auto_shard_count()
+                    }
+                }
+            }
         }
     }
 
@@ -417,5 +506,36 @@ mod tests {
             SfuConfig::parse_mailbox_capacity(Some("-5".to_string())),
             DEFAULT_CHATSERVER_MAILBOX_CAPACITY
         );
+    }
+
+    // ===== SFU_CHATSERVER_SHARDS parsing tests =====
+    //
+    // `parse_shard_count` takes the raw `Option<String>` directly, so these
+    // tests do NOT touch process-global env state and need no EnvGuard. The
+    // unset/empty/invalid paths fall back to `auto_shard_count`, which depends
+    // on the host, so we only assert their relationship to the auto value
+    // rather than a fixed number.
+
+    #[test]
+    fn shard_count_explicit_value_is_used_and_clamped() {
+        assert_eq!(SfuConfig::parse_shard_count(Some(" 4 ".to_string())), 4);
+        assert_eq!(SfuConfig::parse_shard_count(Some("1".to_string())), 1);
+        // Above the ceiling clamps down to MAX_CHATSERVER_SHARDS.
+        assert_eq!(
+            SfuConfig::parse_shard_count(Some("1000".to_string())),
+            MAX_CHATSERVER_SHARDS
+        );
+    }
+
+    #[test]
+    fn shard_count_unset_empty_zero_invalid_fall_back_to_auto() {
+        let auto = SfuConfig::auto_shard_count();
+        assert!((1..=MAX_CHATSERVER_SHARDS).contains(&auto));
+        assert_eq!(SfuConfig::parse_shard_count(None), auto);
+        assert_eq!(SfuConfig::parse_shard_count(Some(String::new())), auto);
+        assert_eq!(SfuConfig::parse_shard_count(Some("   ".to_string())), auto);
+        assert_eq!(SfuConfig::parse_shard_count(Some("0".to_string())), auto);
+        assert_eq!(SfuConfig::parse_shard_count(Some("abc".to_string())), auto);
+        assert_eq!(SfuConfig::parse_shard_count(Some("-3".to_string())), auto);
     }
 }

@@ -16,16 +16,18 @@
  * conditions.
  */
 
-use actix::Addr;
-
-use crate::actors::chat_server::ChatServer;
+use crate::actors::chat_server::ChatServerPool;
 use crate::actors::session_logic::SharedConnectionStates;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub chat: Addr<ChatServer>,
+    /// Per-pod pool of `ChatServer` shards (bead vc-8txq). The owning shard for
+    /// each room is resolved by jump-hash at session construction via
+    /// [`ChatServerPool::addr_for_room`]; the WS handlers know the room before
+    /// they build the session actor.
+    pub chat: ChatServerPool,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
     pub session_manager: SessionManager,

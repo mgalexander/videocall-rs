@@ -23,12 +23,10 @@
 //! - The deprecated `GET /lobby/{email}/{room}` works only when FF=off
 //! - The deprecated endpoint returns 410 Gone when FF=on
 
-use actix::Actor;
 use actix_web::{web, App, HttpServer};
 use futures_util::StreamExt;
 use protobuf::Message as ProtoMessage;
 use sec_api::{
-    actors::chat_server::ChatServer,
     lobby::{ws_connect, ws_connect_authenticated},
     models::AppState,
     server_diagnostics::ServerDiagnostics,
@@ -54,9 +52,10 @@ async fn start_real_ws_server(port: u16) {
         .await
         .expect("Failed to connect to NATS");
 
-    let chat_actor = ChatServer::new(nats_client.clone()).await;
-    let connection_states = chat_actor.connection_states_handle();
-    let chat = chat_actor.start();
+    // vc-8txq: drive the production lobby handlers through a single-shard pool
+    // (one shard owns every room, identical to the prior single-actor wiring).
+    let chat = sec_api::actors::chat_server::ChatServerPool::new(nats_client.clone(), 1).await;
+    let connection_states = chat.connection_states_handle();
     let session_manager = SessionManager::new();
     let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
 

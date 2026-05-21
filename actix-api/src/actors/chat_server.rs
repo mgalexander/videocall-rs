@@ -350,10 +350,40 @@ pub struct ChatServer {
     /// keeps the ingest task alive so the store stays populated. Never read
     /// directly — its sole purpose is lifetime ownership.
     _spillover_ingest: SpilloverIngestHandle,
+    /// This shard's ordinal within the per-pod [`ChatServerPool`] (bead
+    /// vc-8txq). `0` for the default single-actor construction. Used only for
+    /// log breadcrumbs — routing is decided by the pool, not the shard.
+    shard_ordinal: usize,
+    /// Total number of shards in this pod's pool (bead vc-8txq). `1` for the
+    /// default single-actor construction. Log breadcrumb only.
+    shard_count: usize,
 }
 
 impl ChatServer {
+    /// Construct a standalone (single-shard) `ChatServer`.
+    ///
+    /// Used by the in-process unit/integration tests, which talk to one
+    /// `Addr<ChatServer>` directly. Equivalent to one shard owning every room:
+    /// it allocates its own private [`SharedConnectionStates`] and reports
+    /// `shard_ordinal = 0`, `shard_count = 1`. Production wiring uses
+    /// [`ChatServerPool::new`] (which calls [`ChatServer::new_shard`]) instead.
     pub async fn new(nats_connection: async_nats::client::Client) -> Self {
+        Self::new_shard(nats_connection, SharedConnectionStates::default(), 0, 1).await
+    }
+
+    /// Construct one shard of a [`ChatServerPool`] (bead vc-8txq).
+    ///
+    /// All shards in a pod share the SAME `connection_states` map: session IDs
+    /// are globally unique and every message for a given session is routed to
+    /// the SAME shard (the one owning the session's room), so the off-actor
+    /// media-publish path can read any session's `Active` gate from the one
+    /// shared handle regardless of which shard owns the room.
+    pub async fn new_shard(
+        nats_connection: async_nats::client::Client,
+        connection_states: SharedConnectionStates,
+        shard_ordinal: usize,
+        shard_count: usize,
+    ) -> Self {
         // vc-c6l: a single owner-pod hub replaces the previous N per-room
         // tasks. The hub always runs (1 task, 1 timer) and stays empty on
         // non-owner pods. Eager-init avoids special-casing `ChatServer::new`
@@ -400,7 +430,7 @@ impl ChatServer {
             joined_sessions: HashSet::new(),
             sessions: HashMap::new(),
             session_manager: SessionManager::new(),
-            connection_states: SharedConnectionStates::default(),
+            connection_states,
             room_members: HashMap::new(),
             pending_departures: HashMap::new(),
             suppress_join_broadcast: HashSet::new(),
@@ -417,6 +447,8 @@ impl ChatServer {
             home_region_kv,
             spillover_store,
             _spillover_ingest: spillover_ingest,
+            shard_ordinal,
+            shard_count,
         }
     }
 
@@ -842,6 +874,141 @@ impl ChatServer {
     }
 }
 
+/// Per-pod pool of `ChatServer` shards (bead vc-8txq).
+///
+/// # Why this exists
+///
+/// Before sharding, every pod ran exactly one `ChatServer` actor on one
+/// thread. Both per-packet control traffic (`ClientMessage`) and every room
+/// join (`JoinRoom`) funneled through that single mailbox, and the heavy
+/// `Handler<JoinRoom>` body (admission, region pinning, per-room state
+/// materialisation, dispatcher spawn) ran serially. At scale this capped
+/// registration at roughly one join per second.
+///
+/// The pool spawns `n_shards` independent `ChatServer` actors, each pinned to
+/// its **own dedicated [`actix::Arbiter`] thread**, and partitions rooms across
+/// them by Lamping & Veach jump-consistent hash
+/// ([`crate::sfu::affinity::jump_hash`]). Because every message for a given
+/// session is routed to the shard that owns the session's room — and a session
+/// belongs to exactly one room for its whole lifetime — `JoinRoom` handling and
+/// per-room state now parallelise across cores instead of serialising on one
+/// thread.
+///
+/// # Routing invariant
+///
+/// All of a session's messages MUST go to the same shard, because per-session
+/// bookkeeping (`sessions`, `joined_sessions`, `suppress_join_broadcast`,
+/// `pending_departures`) lives in that shard's actor state. The transport actor
+/// holds exactly one `Addr<ChatServer>` (selected once via
+/// [`ChatServerPool::addr_for_room`] at session construction) and sends
+/// `Connect`, `JoinRoom`, `ActivateConnection`, `ClientMessage`, and
+/// `Disconnect` through it, so the invariant holds by construction. Reconnects
+/// re-hash the same `room_id` and therefore land on the same shard, keeping the
+/// grace-period `pending_departures` table consistent.
+///
+/// # Global vs per-room state
+///
+/// Cross-room global state is handled two ways:
+///   - `connection_states` is a single [`SharedConnectionStates`] (`Arc<DashMap>`)
+///     created once by the pool and handed to every shard AND every
+///     `SessionLogic`. Session IDs are globally unique and each session writes
+///     only on its owning shard, so the shared map stays consistent and the
+///     off-actor media-publish path can read any session's `Active` gate.
+///   - The owner-pod beacon HUB (publish side) is per-shard but operates on
+///     disjoint room sets: each room is owned by exactly one shard, and the hub
+///     only `register`s rooms this pod owns per `is_owner`, so exactly one
+///     beacon stream per room is published. `is_owner` (cross-*pod* ownership)
+///     is independent of the local shard partition.
+///   - The spillover INGEST (subscribe side) and home-region KV are per-shard
+///     too, but — unlike the hub — the ingest subscribes to the GLOBAL
+///     `room.*.system` wildcard, so every shard ingests every room's beacons,
+///     not a disjoint subset. This replication is intentional and correct (the
+///     `SpilloverStore` writes are idempotent and the read path consults only
+///     the local shard's store), but it costs O(N_shards) ingest subscriptions
+///     per pod instead of one. Hoisting a single pod-wide ingest is tracked as
+///     follow-up bead vc-wdf5.
+///
+/// This single-pod sharding is INDEPENDENT of the cross-pod
+/// [`crate::sfu::affinity::is_owner`] decision. We reuse the `jump_hash`
+/// function but with `n_shards` = local shard count, not the replica count.
+#[derive(Clone)]
+pub struct ChatServerPool {
+    /// One `Addr` per shard. Indexed by `jump_hash(room, shards.len())`.
+    shards: Arc<Vec<actix::Addr<ChatServer>>>,
+    /// The single shared connection-state map handed to every shard and every
+    /// `SessionLogic` (vc-ud6o E3 handle, now pool-owned for vc-8txq).
+    connection_states: SharedConnectionStates,
+}
+
+impl ChatServerPool {
+    /// Build and start the pool: `n_shards` `ChatServer` actors, each on its
+    /// own dedicated `Arbiter` thread, all sharing one `connection_states` map.
+    ///
+    /// `n_shards` is clamped to at least 1; the typical source is
+    /// [`crate::sfu::config::SfuConfig::chatserver_shards`].
+    ///
+    /// Each shard is constructed (its background tasks — beacon hub, spillover
+    /// ingest, home-region KV connect — spawned) on the calling runtime, then
+    /// moved onto its own arbiter via `start_in_arbiter`. We construct
+    /// sequentially because `ChatServer::new_shard` is `async` (it awaits the
+    /// home-region KV connect); the per-shard work is small and one-shot at
+    /// startup.
+    pub async fn new(nats_connection: async_nats::client::Client, n_shards: usize) -> Self {
+        let n_shards = n_shards.max(1);
+        let connection_states = SharedConnectionStates::default();
+        let mut shards = Vec::with_capacity(n_shards);
+        for ordinal in 0..n_shards {
+            let nc = nats_connection.clone();
+            let cs = connection_states.clone();
+            // Build the shard (and spawn its background tasks) on the current
+            // runtime, then hand the constructed actor to a fresh arbiter so
+            // the actor's mailbox is polled on a DEDICATED thread. This is what
+            // gives JoinRoom handling true cross-core parallelism: shard k's
+            // mailbox runs on arbiter k's thread, independent of shard j's.
+            let shard = ChatServer::new_shard(nc, cs, ordinal, n_shards).await;
+            let arbiter = actix::Arbiter::new();
+            let addr = ChatServer::start_in_arbiter(&arbiter.handle(), move |_ctx| shard);
+            shards.push(addr);
+        }
+        info!(
+            target: "sfu_trace",
+            shard_count = n_shards,
+            "ChatServerPool started ({} shard(s), one Arbiter thread each)",
+            n_shards
+        );
+        Self {
+            shards: Arc::new(shards),
+            connection_states,
+        }
+    }
+
+    /// Number of shards in the pool.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Clone of the shared connection-state handle (vc-ud6o E3 / vc-8txq).
+    ///
+    /// Handed to every `SessionLogic` so the off-actor media-publish path can
+    /// read the per-session `Active` gate lock-free, exactly as before — the
+    /// only difference is the map is now owned by the pool and shared across
+    /// all shards rather than owned by a single actor.
+    pub fn connection_states_handle(&self) -> SharedConnectionStates {
+        self.connection_states.clone()
+    }
+
+    /// The `Addr` of the shard that owns `room`, selected by jump-consistent
+    /// hash over the shard count. Deterministic for a given `(room, n_shards)`,
+    /// so all messages for a room — across its whole lifecycle, including
+    /// reconnects — route to the same shard.
+    pub fn addr_for_room(&self, room: &str) -> actix::Addr<ChatServer> {
+        let idx = crate::sfu::affinity::jump_hash(room, self.shards.len() as u32) as usize;
+        // `jump_hash` returns a value in `0..n_shards`, so the index is always
+        // in bounds; clamp defensively rather than risk a panic on a hot path.
+        self.shards[idx.min(self.shards.len() - 1)].clone()
+    }
+}
+
 impl Actor for ChatServer {
     type Context = Context<Self>;
 
@@ -864,7 +1031,10 @@ impl Actor for ChatServer {
         info!(
             target: "sfu_trace",
             chatserver_mailbox_capacity = capacity,
-            "ChatServer mailbox capacity set (SFU_CHATSERVER_MAILBOX_CAPACITY; default 8192)"
+            shard_ordinal = self.shard_ordinal,
+            shard_count = self.shard_count,
+            "ChatServer shard started (mailbox SFU_CHATSERVER_MAILBOX_CAPACITY; \
+             shards SFU_CHATSERVER_SHARDS)"
         );
     }
 }

@@ -18,11 +18,9 @@
 
 use std::net::ToSocketAddrs;
 
-use actix::Actor;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
 
-use sec_api::actors::chat_server::ChatServer;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
 use sec_api::sfu::{SfuConfig, SfuMode};
@@ -165,14 +163,24 @@ async fn main() {
         .expect("Failed to connect to NATS");
     info!("Connected to NATS at {}", nats_url);
 
-    // Start ChatServer actor.
-    // vc-ud6o E3: grab the shared connection-state handle BEFORE `.start()`
-    // consumes the actor, then thread it through `webtransport::start` so each
-    // `SessionLogic` can read the `Active` gate off-actor.
-    let chat_server_actor = ChatServer::new(nats_client.clone()).await;
-    let connection_states = chat_server_actor.connection_states_handle();
-    let chat_server = chat_server_actor.start();
-    info!("ChatServer actor started");
+    // Start the ChatServer shard pool (bead vc-8txq).
+    //
+    // The pool spawns SFU_CHATSERVER_SHARDS `ChatServer` actors (default:
+    // available_parallelism), each on its own Arbiter thread, and partitions
+    // rooms across them by jump-hash so JoinRoom handling parallelises across
+    // cores. The shared connection-state handle (vc-ud6o E3) is owned by the
+    // pool and threaded through `webtransport::start` so each `SessionLogic`
+    // can read the `Active` gate off-actor.
+    let chat_pool = sec_api::actors::chat_server::ChatServerPool::new(
+        nats_client.clone(),
+        sfu_config.chatserver_shards,
+    )
+    .await;
+    let connection_states = chat_pool.connection_states_handle();
+    info!(
+        "ChatServerPool started with {} shard(s)",
+        chat_pool.shard_count()
+    );
 
     // Create SessionManager
     let session_manager = SessionManager::new();
@@ -240,7 +248,7 @@ async fn main() {
     let _ = actix_rt::spawn(async move {
         if let Err(e) = webtransport::start(
             opt,
-            chat_server,
+            chat_pool,
             nats_client,
             tracker_sender,
             session_manager,

@@ -31,8 +31,10 @@
 //!
 //! Lifecycle:
 //!
-//! * The hub is spawned once at [`crate::actors::chat_server::ChatServer::new`]
-//!   and runs for the lifetime of the process.
+//! * One hub is spawned per `ChatServer` shard at
+//!   [`crate::actors::chat_server::ChatServer::new_shard`] (vc-8txq sharding)
+//!   and runs for the lifetime of the process. Each shard's hub only registers
+//!   the rooms that shard owns, so the per-room beacon stream is unique.
 //! * On the first `JoinRoom` for a room (alongside the
 //!   [`crate::sfu::speaker::SpeakerTick`]) the chat-server calls
 //!   [`BeaconHub::register`] when this pod is the room's owner.
