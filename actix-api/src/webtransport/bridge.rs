@@ -207,10 +207,41 @@ impl WebTransportBridge {
     }
 
     /// Shutdown all I/O tasks (readers + writer).
+    ///
+    /// vc-nidq: the writer handle is a bare, non-fused
+    /// [`tokio::task::JoinHandle`]. The normal teardown is
+    /// `wait_for_disconnect().await` (a `select!` over the readers and
+    /// `&mut self.writer`) immediately followed by `shutdown().await`
+    /// (mod.rs ~397). When a *client* disconnect makes the writer arm win
+    /// that `select!`, the writer handle is polled to `Ready` and its output
+    /// is consumed *there*. A bare `JoinHandle` that was polled to completion
+    /// must NEVER be polled again — doing so panics with
+    /// `JoinHandle polled after completion` (tokio `core.rs:412`) on the
+    /// runtime main thread, killing the forwarding loop and leaving a
+    /// zombie. Under churn (500 listeners + 20 presenters) this fired ~115×.
+    ///
+    /// The guard below makes the re-await unconditional-safe:
+    /// [`tokio::task::JoinHandle::is_finished`] returns `true` once the task
+    /// has completed — *including* the case where the winning `select!` arm
+    /// already consumed the output — so a finished handle is never polled a
+    /// second time. `abort()` on a finished task is a no-op anyway, so it is
+    /// pointless (and unsafe via the trailing `await`) to call it here.
+    ///
+    /// The readers are still shut down first and independently of the writer
+    /// guard, preserving the vc-883 / vc-xnp / vc-s9e / vc-n9o
+    /// redirect-flush ordering: on a *server*-initiated teardown the writer
+    /// arm of `wait_for_disconnect` is what fires (after the REDIRECT has
+    /// flushed within [`WRITER_DRAIN_GRACE`]), so the writer is already
+    /// finished by the time we get here and we correctly skip the re-await;
+    /// on a *client*-initiated teardown the readers win the `select!`, the
+    /// writer is still running, and the guard takes the `abort + await` arm
+    /// to reap it.
     pub async fn shutdown(mut self) {
         self.readers.shutdown().await;
-        self.writer.abort();
-        let _ = self.writer.await;
+        if !self.writer.is_finished() {
+            self.writer.abort();
+            let _ = (&mut self.writer).await;
+        }
     }
 
     /// Spawn UniStream reader task.
@@ -779,6 +810,112 @@ mod tests {
             std::sync::Arc::strong_count(&session_proxy),
             1,
             "writer task must eventually drop its session proxy"
+        );
+    }
+
+    // =====================================================================
+    // vc-nidq regression test for the shutdown() re-await guard.
+    //
+    // The bug: the bridge's `writer` field is a bare, non-fused
+    // `tokio::task::JoinHandle<()>`. The teardown sequence at mod.rs ~397 is
+    // `wait_for_disconnect().await; shutdown().await;`. `wait_for_disconnect`
+    // is a `tokio::select!` over the readers' `join_next()` and
+    // `&mut self.writer`. On a *client* disconnect the writer arm can win the
+    // select — which polls the writer handle to `Ready` and CONSUMES its
+    // output. `shutdown()` then did `self.writer.abort(); self.writer.await;`
+    // — re-polling a handle that already completed. A bare `JoinHandle`
+    // panics on that second poll with "JoinHandle polled after completion"
+    // (tokio core.rs:412) on the runtime main thread → forwarding-dead
+    // zombie. Heavy churn (500 listeners + 20 presenters) produced 115 such
+    // panics; this was THE blocker for multi-presenter capacity.
+    //
+    // We can't build a real `WebTransportBridge` in a unit test (it needs a
+    // quinn `Session`), so — mirroring the vc-s9e tests above, which exercise
+    // the extracted `writer_drain_grace` helper directly — we reproduce the
+    // exact race shape on a stand-in `JoinHandle`: drive a writer-shaped task
+    // to completion (so its output is "already there", as if a winning
+    // select arm consumed it), then run the EXACT guard pattern from
+    // `shutdown()` and assert it does not panic. We also assert that the
+    // UNGUARDED pattern (the old code) genuinely panics, so this test
+    // protects against regression rather than passing trivially.
+    //
+    // Deterministic: the core assertion never sleeps. We `.await` the handle
+    // to drive it to completion before exercising the guard, so the race is
+    // forced rather than timing-dependent.
+    // =====================================================================
+
+    /// vc-nidq: the guarded `shutdown()` re-await pattern must NOT panic when
+    /// the writer handle has already been polled to completion (the
+    /// client-disconnect case where the writer arm wins
+    /// `wait_for_disconnect`'s `select!`). This exercises the exact guard
+    /// installed in [`WebTransportBridge::shutdown`].
+    #[tokio::test]
+    async fn shutdown_guard_skips_re_await_of_finished_writer_vc_nidq() {
+        // A writer-shaped task: a `JoinHandle<()>` that completes on its own
+        // (mirrors the writer's recv-loop exiting + drain-grace returning).
+        let mut writer: tokio::task::JoinHandle<()> = tokio::spawn(async {
+            // Trivial body — the writer's *structure* (a `JoinHandle<()>`
+            // that finishes) is what matters for this race, not its I/O.
+        });
+
+        // Stand in for `wait_for_disconnect`'s winning writer arm: poll the
+        // handle to `Ready`, consuming its output. After this the handle is
+        // finished and its output has been taken.
+        (&mut writer).await.expect("writer task should complete");
+        assert!(
+            writer.is_finished(),
+            "precondition: writer handle must report finished after its \
+             output was consumed (this is what JoinHandle::is_finished \
+             guarantees and what the guard relies on)"
+        );
+
+        // The EXACT guard pattern from `shutdown()`. With a finished handle
+        // the `if` body is skipped, so the handle is never re-polled. The
+        // old (unguarded) code did the body unconditionally and panicked.
+        if !writer.is_finished() {
+            writer.abort();
+            let _ = (&mut writer).await;
+        }
+
+        // If we got here without panicking, the guard worked. (A
+        // "JoinHandle polled after completion" panic inside this task would
+        // abort the test thread.)
+    }
+
+    /// vc-nidq companion: proves the test above is non-trivial by showing the
+    /// UNGUARDED pattern (the pre-fix `shutdown()` body) actually panics when
+    /// the handle was already driven to completion. If tokio ever changed
+    /// this behavior, the guard would be unnecessary and this assertion would
+    /// fail — flagging that the fix should be revisited.
+    ///
+    /// We run the offending re-poll inside a dedicated current-thread runtime
+    /// on a `catch_unwind`-wrapped thread so the deliberate panic is contained
+    /// and asserted, not propagated into the test harness.
+    #[test]
+    fn unguarded_re_await_of_finished_writer_panics_vc_nidq() {
+        let result = std::panic::catch_unwind(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime");
+            rt.block_on(async {
+                let mut writer: tokio::task::JoinHandle<()> = tokio::spawn(async {});
+                // Consume the output once (the winning select arm).
+                (&mut writer).await.expect("writer task should complete");
+                // The pre-fix `shutdown()` body: re-poll the completed handle
+                // with NO `is_finished()` guard. This is the line that
+                // panicked with "JoinHandle polled after completion".
+                writer.abort();
+                let _ = (&mut writer).await;
+            });
+        });
+
+        assert!(
+            result.is_err(),
+            "the UNGUARDED re-await of a completed JoinHandle must panic \
+             ('JoinHandle polled after completion'); if it no longer does, \
+             the vc-nidq guard's necessity has changed and the fix should be \
+             re-evaluated"
         );
     }
 }
