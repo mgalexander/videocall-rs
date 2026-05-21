@@ -306,19 +306,27 @@ const KEYFRAME_BLOCK_BUDGET: Duration = Duration::from_millis(250);
 ///   because of a full channel — a lost keyframe leaves every mid-stream
 ///   joiner stuck on `decode_errors` until the next periodic keyframe (which
 ///   is itself likely to be dropped under the same backpressure). So on a full
-///   channel we fall back to `blocking_send_timeout`, which parks the producer
-///   thread until the writer drains a slot (or the budget elapses). This is
-///   safe because the producer owns a dedicated std thread; it does not touch
-///   the tokio runtime. Only if the writer makes no progress for the entire
-///   [`KEYFRAME_BLOCK_BUDGET`] do we concede and report `DroppedFull` — a
-///   pathological case (a wedged writer) that the periodic-keyframe fallback
-///   will retry on the next cadence boundary.
+///   channel we retry `try_send` with a short backoff, parking the producer's
+///   std thread until the writer drains a slot (or the budget elapses). Only if
+///   the writer makes no progress for the entire [`KEYFRAME_BLOCK_BUDGET`] do
+///   we concede and report `DroppedFull` — a pathological case (a wedged
+///   writer) that the periodic `kf_max_dist` cadence will retry on the next
+///   boundary. Under a *persistently* wedged writer this means repeated
+///   per-keyframe stalls are possible, but each is intentionally bounded by
+///   `KEYFRAME_BLOCK_BUDGET` (≤250ms) and backstopped by the periodic cadence,
+///   so the producer can never hang indefinitely.
 ///
-/// We deliberately keep audio on plain `try_send` (unchanged, see
-/// `audio_producer.rs`) and do NOT add eviction of queued P-frames here: the
-/// `tokio::mpsc::Sender` API exposes no peek/evict, and bounded-retry blocking
-/// achieves the same "keyframe survives" guarantee without a second channel or
-/// custom queue, keeping the `tx_*` stat semantics byte-for-byte identical.
+/// Audio safety: audio and video SHARE this one bounded mpsc (the same
+/// `packet_tx` is cloned into both producers, capacity 100). The keyframe stall
+/// does NOT block audio: audio is enqueued with non-blocking `try_send` from
+/// its own tokio task (see `audio_producer.rs`), which is never parked by the
+/// video keyframe block — the block happens on the *video std thread*. Audio
+/// simply contends for freed channel slots exactly as it did before this
+/// change; its drop-under-backpressure behaviour is unchanged. We also do NOT
+/// add eviction of queued P-frames here: the `tokio::mpsc::Sender` API exposes
+/// no peek/evict, and bounded-retry achieves the same "keyframe survives"
+/// guarantee without a second channel or custom queue, keeping the `tx_*` stat
+/// semantics byte-for-byte identical.
 ///
 /// Implementation note: we do not use `Sender::blocking_send` because it
 /// blocks unboundedly (a wedged writer would hang the producer forever) and

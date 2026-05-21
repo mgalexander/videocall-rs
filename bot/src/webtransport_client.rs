@@ -713,36 +713,42 @@ fn try_extract_redirect_target(data: &[u8]) -> Option<String> {
     Some(decision.redirect_to)
 }
 
-/// Parse `data` as a `PacketWrapper` and, if it carries a MEDIA-wrapped
-/// `MediaPacket` whose `media_type == KEYFRAME_REQUEST` and whose `data` is
-/// `b"VIDEO"` (i.e. a video keyframe request, not screen-share), return the
-/// **target publisher** the KFR is aimed at (the inner `MediaPacket.user_id`).
+/// Returns `true` iff `data` is a MEDIA-wrapped `MediaPacket` whose
+/// `media_type == KEYFRAME_REQUEST`, whose `data` is `b"VIDEO"` (a video
+/// keyframe request, not screen-share), AND whose target publisher (`user_id`)
+/// is `me`.
 ///
 /// This is the inverse of [`emit_keyframe_request`]: a listener emits an outer
 /// `PacketWrapper{MEDIA, user_id: <requester>}` wrapping a
 /// `MediaPacket{KEYFRAME_REQUEST, user_id: <target publisher>, data: b"VIDEO"}`.
 /// The SFU routes that wrapper back to the publisher. The sender bot calls this
-/// to learn whether an inbound packet is a KFR aimed at it.
+/// to learn whether an inbound packet is a video KFR aimed at it.
 ///
-/// Cheap: a small protobuf parse plus two field checks — the same "peek without
+/// Cheap: a small protobuf parse plus field checks — the same "peek without
 /// full decode" pattern as [`try_extract_redirect_target`]. This deliberately
 /// does NOT require `decode = true`, so a sender (which runs with decode off to
-/// avoid VP9/Opus CPU) can still honor KFRs (vc-7zjq). Returns `None` for any
-/// other packet type, parse failure, or non-video KFR.
-fn try_extract_keyframe_request_target(data: &[u8]) -> Option<String> {
-    let wrapper = PacketWrapper::parse_from_bytes(data).ok()?;
+/// avoid VP9/Opus CPU) can still honor KFRs (vc-7zjq). The target comparison is
+/// done on raw bytes (`media.user_id == me.as_bytes()`) so no `String` is
+/// allocated on the inbound hot path. Returns `false` for any other packet
+/// type, parse failure, non-video KFR, or a KFR aimed at a different publisher.
+fn inbound_kfr_targets(data: &[u8], me: &str) -> bool {
+    let Ok(wrapper) = PacketWrapper::parse_from_bytes(data) else {
+        return false;
+    };
     if wrapper.packet_type != PacketType::MEDIA.into() {
-        return None;
+        return false;
     }
-    let media = MediaPacket::parse_from_bytes(&wrapper.data).ok()?;
+    let Ok(media) = MediaPacket::parse_from_bytes(&wrapper.data) else {
+        return false;
+    };
     if media.media_type != MediaType::KEYFRAME_REQUEST.into() {
-        return None;
+        return false;
     }
     // Only honor VIDEO KFRs; SCREEN is a separate track the bot doesn't send.
     if media.data != b"VIDEO" {
-        return None;
+        return false;
     }
-    Some(String::from_utf8_lossy(&media.user_id).into_owned())
+    media.user_id == me.as_bytes()
 }
 
 /// Shared per-inbound-stream handling, called from BOTH arms of
@@ -800,14 +806,12 @@ fn handle_inbound_stream_data(
     // what lets a mid-stream-joining listener get a decodable keyframe within a
     // few frames of joining instead of waiting (up to) the periodic cadence.
     if let Some(flag) = keyframe_signal {
-        if let Some(target) = try_extract_keyframe_request_target(&data) {
-            if target == user_id {
-                flag.store(true, Ordering::Relaxed);
-                debug!(
-                    "Sender {} received KEYFRAME_REQUEST; forcing keyframe on next encode",
-                    user_id
-                );
-            }
+        if inbound_kfr_targets(&data, user_id) {
+            flag.store(true, Ordering::Relaxed);
+            debug!(
+                "Sender {} received KEYFRAME_REQUEST; forcing keyframe on next encode",
+                user_id
+            );
         }
     }
     if let Some(signal) = session_end {
@@ -2418,32 +2422,21 @@ mod tests {
     }
 
     /// vc-7zjq: a sender's inbound consumer must recognise a round-tripped
-    /// KEYFRAME_REQUEST and extract the target publisher. We build the exact
-    /// wire format `emit_keyframe_request` produces (the round-trip the SFU
-    /// routes back to the publisher) and assert the extractor returns the
-    /// inner target user_id.
+    /// KEYFRAME_REQUEST aimed at itself. We build the exact wire format
+    /// `emit_keyframe_request` produces (the round-trip the SFU routes back to
+    /// the publisher) and assert `inbound_kfr_targets` returns `true` when the
+    /// inner target matches us and `false` when it targets a different
+    /// publisher.
     #[test]
     fn try_extract_keyframe_request_target_parses_video_kfr_vc_7zjq() {
-        let media = MediaPacket {
-            media_type: MediaType::KEYFRAME_REQUEST.into(),
-            user_id: b"sender-3".to_vec(),
-            data: b"VIDEO".to_vec(),
-            ..Default::default()
-        };
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::MEDIA.into(),
-            user_id: b"listener-9".to_vec(),
-            data: media.write_to_bytes().unwrap(),
-            ..Default::default()
-        };
-        let bytes = wrapper.write_to_bytes().unwrap();
-        assert_eq!(
-            try_extract_keyframe_request_target(&bytes).as_deref(),
-            Some("sender-3")
-        );
+        let bytes = kfr_wire_bytes("sender-3", "listener-9");
+        // Video KFR targeting us → true.
+        assert!(inbound_kfr_targets(&bytes, "sender-3"));
+        // Same KFR but we are a different publisher → false.
+        assert!(!inbound_kfr_targets(&bytes, "sender-0"));
     }
 
-    /// vc-7zjq: the extractor must ignore non-KFR media, non-MEDIA wrappers,
+    /// vc-7zjq: the predicate must ignore non-KFR media, non-MEDIA wrappers,
     /// SCREEN KFRs, and garbage so it never spuriously forces a keyframe.
     #[test]
     fn try_extract_keyframe_request_target_ignores_non_video_kfr_vc_7zjq() {
@@ -2460,7 +2453,10 @@ mod tests {
             data: media.write_to_bytes().unwrap(),
             ..Default::default()
         };
-        assert!(try_extract_keyframe_request_target(&wrapper.write_to_bytes().unwrap()).is_none());
+        assert!(!inbound_kfr_targets(
+            &wrapper.write_to_bytes().unwrap(),
+            "sender-3"
+        ));
 
         // SCREEN KFR — not honored by the camera-video producer.
         let screen = MediaPacket {
@@ -2475,10 +2471,13 @@ mod tests {
             data: screen.write_to_bytes().unwrap(),
             ..Default::default()
         };
-        assert!(try_extract_keyframe_request_target(&wrapper.write_to_bytes().unwrap()).is_none());
+        assert!(!inbound_kfr_targets(
+            &wrapper.write_to_bytes().unwrap(),
+            "sender-3"
+        ));
 
         // Garbage.
-        assert!(try_extract_keyframe_request_target(&[0xff, 0xff, 0xff]).is_none());
+        assert!(!inbound_kfr_targets(&[0xff, 0xff, 0xff], "sender-3"));
     }
 
     /// vc-7zjq (SECONDARY acceptance): the sender's always-on inbound consumer
