@@ -37,6 +37,7 @@
 //! reconnect would muddy the listener downtime measurement (no inbound
 //! traffic to mark recovery against).
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -347,8 +348,12 @@ async fn run_sender(
         stats.enable_verify_integrity();
     }
 
+    // vc-7zjq: shared force-keyframe flag so the inbound consumer can ask the
+    // video producer to emit a keyframe on an inbound KEYFRAME_REQUEST.
+    let force_keyframe = Arc::new(AtomicBool::new(false));
     let mut client = WebTransportClient::new(config.clone())
         .with_stats(stats.clone())
+        .with_keyframe_signal(force_keyframe.clone())
         .with_verify_integrity(verify_integrity);
     client.connect(&server_url, insecure).await?;
     // vc-1re: record the pod this sender landed on. Failover senders are not
@@ -388,6 +393,7 @@ async fn run_sender(
         packet_tx.clone(),
         Some(stats.clone()),
         verify_integrity,
+        force_keyframe.clone(),
     ) {
         Ok(p) => Some(p),
         Err(e) => {

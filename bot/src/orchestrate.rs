@@ -24,7 +24,7 @@
 //!
 //! Invoked from `main.rs` when the `--orchestrate` flag is set.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -537,9 +537,16 @@ async fn run_sender(
     let mut pending_redirect_at_ms: Option<u64> = None;
     loop {
         let signal = Arc::new(SessionEndSignal::default());
+        // vc-7zjq: shared force-keyframe flag wired between the inbound
+        // consumer (which flips it on an inbound KEYFRAME_REQUEST targeting
+        // this sender) and the VideoProducer (which clears it and forces a
+        // keyframe on the next encode). Rebuilt per loop iteration so a
+        // redirect's fresh client + producer share a fresh flag.
+        let force_keyframe = Arc::new(AtomicBool::new(false));
         let mut client = WebTransportClient::new(config.clone())
             .with_stats(stats.clone())
             .with_session_end_signal(signal.clone())
+            .with_keyframe_signal(force_keyframe.clone())
             .with_verify_integrity(verify_integrity);
         client.connect(&current_url, insecure).await?;
         // vc-1re: record the pod we actually landed on, and close out any
@@ -574,6 +581,7 @@ async fn run_sender(
             packet_tx.clone(),
             Some(stats.clone()),
             verify_integrity,
+            force_keyframe.clone(),
         ) {
             Ok(p) => Some(p),
             Err(e) => {

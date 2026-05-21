@@ -229,6 +229,13 @@ pub struct WebTransportClient {
     /// vc-1re: when true the decode path strips + verifies the integrity
     /// trailer on each MEDIA payload. Threaded into the [`DecoderPool`].
     verify_integrity: bool,
+    /// vc-7zjq: shared "force keyframe on next encode" flag. When attached
+    /// (sender bots), the always-on inbound consumer sets it to `true` the
+    /// moment it observes an inbound `KEYFRAME_REQUEST` targeting this bot's
+    /// own `user_id`. The `VideoProducer` checks-and-clears it each iteration
+    /// and forces a keyframe via `VPX_EFLAG_FORCE_KF`. `None` for listeners
+    /// (they don't publish video).
+    keyframe_signal: Option<Arc<AtomicBool>>,
 }
 
 impl WebTransportClient {
@@ -241,6 +248,7 @@ impl WebTransportClient {
             session_end: None,
             decode: false,
             verify_integrity: false,
+            keyframe_signal: None,
         }
     }
 
@@ -275,6 +283,16 @@ impl WebTransportClient {
     /// (the trailer check runs inside the decode dispatch).
     pub fn with_verify_integrity(mut self, verify_integrity: bool) -> Self {
         self.verify_integrity = verify_integrity;
+        self
+    }
+
+    /// Attach the shared force-keyframe signal (vc-7zjq). Sender bots pass the
+    /// same `Arc<AtomicBool>` they handed to `VideoProducer::from_image_sequence`
+    /// so the always-on inbound consumer can flip it when an inbound
+    /// `KEYFRAME_REQUEST` targets this bot, forcing the producer to emit a
+    /// keyframe on its next encode. No-op for listeners.
+    pub fn with_keyframe_signal(mut self, signal: Arc<AtomicBool>) -> Self {
+        self.keyframe_signal = Some(signal);
         self
     }
 
@@ -453,6 +471,7 @@ impl WebTransportClient {
             let quit = self.quit.clone();
             let stats = self.stats.clone();
             let session_end = self.session_end.clone();
+            let keyframe_signal = self.keyframe_signal.clone();
             let verify_integrity = self.verify_integrity;
             // Decoders only meaningful when both `decode` is on and we have a
             // stats handle to publish counters into.
@@ -523,6 +542,7 @@ impl WebTransportClient {
                                         handle_inbound_stream_data(
                                             data,
                                             &session_end,
+                                            &keyframe_signal,
                                             &stats,
                                             &decoders,
                                             &user_id,
@@ -556,6 +576,7 @@ impl WebTransportClient {
                                 let user_id_spawn = user_id.clone();
                                 let decoders_spawn = decoders.clone();
                                 let session_end_spawn = session_end.clone();
+                                let keyframe_signal_spawn = keyframe_signal.clone();
                                 tokio::spawn(async move {
                                     match stream.read_to_end(usize::MAX).await {
                                         Ok(data) => {
@@ -563,6 +584,7 @@ impl WebTransportClient {
                                             handle_inbound_stream_data(
                                                 data,
                                                 &session_end_spawn,
+                                                &keyframe_signal_spawn,
                                                 &stats_spawn,
                                                 &decoders_spawn,
                                                 &user_id_spawn,
@@ -691,6 +713,38 @@ fn try_extract_redirect_target(data: &[u8]) -> Option<String> {
     Some(decision.redirect_to)
 }
 
+/// Parse `data` as a `PacketWrapper` and, if it carries a MEDIA-wrapped
+/// `MediaPacket` whose `media_type == KEYFRAME_REQUEST` and whose `data` is
+/// `b"VIDEO"` (i.e. a video keyframe request, not screen-share), return the
+/// **target publisher** the KFR is aimed at (the inner `MediaPacket.user_id`).
+///
+/// This is the inverse of [`emit_keyframe_request`]: a listener emits an outer
+/// `PacketWrapper{MEDIA, user_id: <requester>}` wrapping a
+/// `MediaPacket{KEYFRAME_REQUEST, user_id: <target publisher>, data: b"VIDEO"}`.
+/// The SFU routes that wrapper back to the publisher. The sender bot calls this
+/// to learn whether an inbound packet is a KFR aimed at it.
+///
+/// Cheap: a small protobuf parse plus two field checks — the same "peek without
+/// full decode" pattern as [`try_extract_redirect_target`]. This deliberately
+/// does NOT require `decode = true`, so a sender (which runs with decode off to
+/// avoid VP9/Opus CPU) can still honor KFRs (vc-7zjq). Returns `None` for any
+/// other packet type, parse failure, or non-video KFR.
+fn try_extract_keyframe_request_target(data: &[u8]) -> Option<String> {
+    let wrapper = PacketWrapper::parse_from_bytes(data).ok()?;
+    if wrapper.packet_type != PacketType::MEDIA.into() {
+        return None;
+    }
+    let media = MediaPacket::parse_from_bytes(&wrapper.data).ok()?;
+    if media.media_type != MediaType::KEYFRAME_REQUEST.into() {
+        return None;
+    }
+    // Only honor VIDEO KFRs; SCREEN is a separate track the bot doesn't send.
+    if media.data != b"VIDEO" {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&media.user_id).into_owned())
+}
+
 /// Shared per-inbound-stream handling, called from BOTH arms of
 /// [`WebTransportClient::start_inbound_consumer`] (the inline-drain arm used
 /// when a [`SessionEndSignal`] is attached, and the spawn-per-stream default
@@ -729,6 +783,7 @@ fn try_extract_redirect_target(data: &[u8]) -> Option<String> {
 fn handle_inbound_stream_data(
     data: Vec<u8>,
     session_end: &Option<Arc<SessionEndSignal>>,
+    keyframe_signal: &Option<Arc<AtomicBool>>,
     stats: &Option<Arc<BotStats>>,
     decoders: &Option<Arc<DecoderPool>>,
     user_id: &str,
@@ -736,6 +791,24 @@ fn handle_inbound_stream_data(
 ) {
     if let Some(stats) = stats {
         stats.record_packet_at(data.len() as u64, t);
+    }
+    // vc-7zjq: sender-side KFR honoring. A sender runs with `decode = false`
+    // (no VP9/Opus decode) but the inbound consumer is always on, so we cheaply
+    // peek every inbound packet for a `KEYFRAME_REQUEST` aimed at this bot. When
+    // one targets `user_id`, flip the shared flag; the `VideoProducer` clears it
+    // and forces a keyframe on its next encode (`VPX_EFLAG_FORCE_KF`). This is
+    // what lets a mid-stream-joining listener get a decodable keyframe within a
+    // few frames of joining instead of waiting (up to) the periodic cadence.
+    if let Some(flag) = keyframe_signal {
+        if let Some(target) = try_extract_keyframe_request_target(&data) {
+            if target == user_id {
+                flag.store(true, Ordering::Relaxed);
+                debug!(
+                    "Sender {} received KEYFRAME_REQUEST; forcing keyframe on next encode",
+                    user_id
+                );
+            }
+        }
     }
     if let Some(signal) = session_end {
         if let Some(target) = try_extract_redirect_target(&data) {
@@ -1572,7 +1645,15 @@ mod tests {
         let data =
             redirect_wrapper_bytes("rustlemania-webtransport-0.webtransport-headless.svc.cluster");
 
-        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 42);
+        handle_inbound_stream_data(
+            data,
+            &session_end,
+            &None,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            42,
+        );
 
         let stashed = signal.redirect_to.lock().unwrap().clone();
         assert_eq!(
@@ -1601,7 +1682,15 @@ mod tests {
         assert!(!signal.ended.load(Ordering::Relaxed));
         assert!(signal.redirect_to.lock().unwrap().is_none());
 
-        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 11);
+        handle_inbound_stream_data(
+            data,
+            &session_end,
+            &None,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            11,
+        );
 
         // The redirect both stashed the target AND marked the session ended,
         // with no server-side close involved.
@@ -1643,7 +1732,15 @@ mod tests {
         let stats_opt = Some(stats.clone());
         let decoders: Option<Arc<DecoderPool>> = None;
         let data = redirect_wrapper_bytes("owner-pod.svc.cluster");
-        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 3);
+        handle_inbound_stream_data(
+            data,
+            &session_end,
+            &None,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            3,
+        );
 
         let released = tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
@@ -1674,7 +1771,15 @@ mod tests {
         .write_to_bytes()
         .unwrap();
 
-        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 5);
+        handle_inbound_stream_data(
+            data,
+            &session_end,
+            &None,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            5,
+        );
 
         assert!(
             !signal.ended.load(Ordering::Relaxed),
@@ -1707,7 +1812,15 @@ mod tests {
         .write_to_bytes()
         .unwrap();
 
-        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 7);
+        handle_inbound_stream_data(
+            data,
+            &session_end,
+            &None,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            7,
+        );
 
         assert!(signal.redirect_to.lock().unwrap().is_none());
         assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
@@ -1733,7 +1846,15 @@ mod tests {
         .write_to_bytes()
         .unwrap();
 
-        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 7);
+        handle_inbound_stream_data(
+            data,
+            &session_end,
+            &None,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            7,
+        );
 
         assert!(signal.redirect_to.lock().unwrap().is_none());
     }
@@ -1749,6 +1870,7 @@ mod tests {
         handle_inbound_stream_data(
             vec![0xff, 0xff, 0xff],
             &session_end,
+            &None,
             &stats_opt,
             &decoders,
             "listener-1",
@@ -1771,7 +1893,15 @@ mod tests {
         let decoders: Option<Arc<DecoderPool>> = None;
         let data = redirect_wrapper_bytes("some-pod.svc.cluster");
 
-        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 9);
+        handle_inbound_stream_data(
+            data,
+            &session_end,
+            &None,
+            &stats_opt,
+            &decoders,
+            "listener-1",
+            9,
+        );
 
         assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
     }
@@ -2285,6 +2415,134 @@ mod tests {
         assert_eq!(inner.user_id, b"publisher-7");
         assert_eq!(inner.data, b"VIDEO");
         assert_eq!(pool.stats.keyframe_requests_sent.load(Ordering::Relaxed), 1);
+    }
+
+    /// vc-7zjq: a sender's inbound consumer must recognise a round-tripped
+    /// KEYFRAME_REQUEST and extract the target publisher. We build the exact
+    /// wire format `emit_keyframe_request` produces (the round-trip the SFU
+    /// routes back to the publisher) and assert the extractor returns the
+    /// inner target user_id.
+    #[test]
+    fn try_extract_keyframe_request_target_parses_video_kfr_vc_7zjq() {
+        let media = MediaPacket {
+            media_type: MediaType::KEYFRAME_REQUEST.into(),
+            user_id: b"sender-3".to_vec(),
+            data: b"VIDEO".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: b"listener-9".to_vec(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(
+            try_extract_keyframe_request_target(&bytes).as_deref(),
+            Some("sender-3")
+        );
+    }
+
+    /// vc-7zjq: the extractor must ignore non-KFR media, non-MEDIA wrappers,
+    /// SCREEN KFRs, and garbage so it never spuriously forces a keyframe.
+    #[test]
+    fn try_extract_keyframe_request_target_ignores_non_video_kfr_vc_7zjq() {
+        // Ordinary VIDEO media frame (not a KFR).
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            user_id: b"sender-3".to_vec(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: b"listener-9".to_vec(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        assert!(try_extract_keyframe_request_target(&wrapper.write_to_bytes().unwrap()).is_none());
+
+        // SCREEN KFR — not honored by the camera-video producer.
+        let screen = MediaPacket {
+            media_type: MediaType::KEYFRAME_REQUEST.into(),
+            user_id: b"sender-3".to_vec(),
+            data: b"SCREEN".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: b"listener-9".to_vec(),
+            data: screen.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        assert!(try_extract_keyframe_request_target(&wrapper.write_to_bytes().unwrap()).is_none());
+
+        // Garbage.
+        assert!(try_extract_keyframe_request_target(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    /// vc-7zjq (SECONDARY acceptance): the sender's always-on inbound consumer
+    /// must flip the shared force-keyframe flag when (and only when) an inbound
+    /// KEYFRAME_REQUEST targets THIS bot's own user_id — without any decoder
+    /// pool (senders run with `decode = false`).
+    #[test]
+    fn handle_inbound_kfr_sets_force_keyframe_flag_for_self_vc_7zjq() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_opt = Some(flag.clone());
+        let session_end: Option<Arc<SessionEndSignal>> = None;
+        let stats_opt: Option<Arc<BotStats>> = None;
+        let decoders: Option<Arc<DecoderPool>> = None;
+
+        // KFR aimed at a DIFFERENT publisher: flag must stay false.
+        let other = kfr_wire_bytes("other-sender", "listener-1");
+        handle_inbound_stream_data(
+            other,
+            &session_end,
+            &flag_opt,
+            &stats_opt,
+            &decoders,
+            "sender-0",
+            1,
+        );
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "KFR for another publisher must not force our keyframe"
+        );
+
+        // KFR aimed at US: flag flips to true.
+        let mine = kfr_wire_bytes("sender-0", "listener-1");
+        handle_inbound_stream_data(
+            mine,
+            &session_end,
+            &flag_opt,
+            &stats_opt,
+            &decoders,
+            "sender-0",
+            2,
+        );
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "KFR targeting our user_id must force a keyframe on next encode"
+        );
+    }
+
+    /// Build the round-tripped KFR wire bytes the SFU routes back to a
+    /// publisher: outer MEDIA wrapper (requester id) wrapping a VIDEO
+    /// KEYFRAME_REQUEST MediaPacket whose user_id is the `target` publisher.
+    fn kfr_wire_bytes(target: &str, requester: &str) -> Vec<u8> {
+        let media = MediaPacket {
+            media_type: MediaType::KEYFRAME_REQUEST.into(),
+            user_id: target.as_bytes().to_vec(),
+            data: b"VIDEO".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: requester.as_bytes().to_vec(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
     }
 
     #[test]

@@ -26,6 +26,8 @@ mod video_encoder; // VP9 encoder from videocall-cli
 mod video_producer;
 mod webtransport_client;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use audio_producer::AudioProducer;
@@ -314,8 +316,14 @@ async fn run_client(
 ) -> anyhow::Result<()> {
     info!("Initializing client: {}", config.user_id);
 
+    // vc-7zjq: shared force-keyframe flag so the always-on inbound consumer
+    // can ask the video producer to emit a keyframe when an inbound
+    // KEYFRAME_REQUEST targets this bot.
+    let force_keyframe = Arc::new(AtomicBool::new(false));
+
     // Create WebTransport client and connect
-    let mut client = WebTransportClient::new(config.clone());
+    let mut client =
+        WebTransportClient::new(config.clone()).with_keyframe_signal(force_keyframe.clone());
     client.connect(&server_url, insecure).await?;
 
     // Create packet channel for media producers
@@ -359,6 +367,7 @@ async fn run_client(
             packet_tx.clone(),
             None,
             false, // single-bot mode does not run integrity (vc-1re)
+            force_keyframe.clone(),
         ) {
             Ok(producer) => {
                 video_producer = Some(producer);

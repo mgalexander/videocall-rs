@@ -243,3 +243,57 @@ impl<'a> Iterator for Frames<'a> {
 
 unsafe impl Send for VideoEncoder {}
 unsafe impl Sync for VideoEncoder {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a small encoder and feed it solid-grey I420 frames.
+    fn solid_i420(width: u32, height: u32) -> Vec<u8> {
+        // I420: full-res Y plane + quarter-res U/V planes. 0x80 is neutral.
+        vec![0x80u8; (width * height * 3 / 2) as usize]
+    }
+
+    /// vc-7zjq: passing `force_keyframe = true` must cause the next emitted
+    /// frame to be a keyframe even when the periodic cadence would not have
+    /// produced one. We encode one source frame to get the encoder past its
+    /// initial (always-key) frame, then a second delta-eligible frame WITHOUT
+    /// the flag (expected: delta), then a third WITH the flag (expected: key).
+    #[test]
+    fn force_keyframe_flag_emits_keyframe_vc_7zjq() {
+        let (w, h) = (160u32, 120u32);
+        let frame = solid_i420(w, h);
+        let mut enc = VideoEncoderBuilder::new(30, 5)
+            .set_resolution(w, h)
+            .build()
+            .expect("build encoder");
+
+        // Frame 0: the first encoded frame is always a keyframe.
+        let first_was_key = enc
+            .encode(0, &frame, false)
+            .expect("encode 0")
+            .any(|f| f.key);
+        assert!(first_was_key, "first frame should be a keyframe");
+
+        // Frame 1: no force flag. With a static scene and kf_max_dist=150 this
+        // must be a delta frame (NOT a keyframe).
+        let second_was_key = enc
+            .encode(1, &frame, false)
+            .expect("encode 1")
+            .any(|f| f.key);
+        assert!(
+            !second_was_key,
+            "second frame without force flag must be a delta frame"
+        );
+
+        // Frame 2: force the keyframe. The emitted frame MUST be a keyframe.
+        let third_was_key = enc
+            .encode(2, &frame, true)
+            .expect("encode 2")
+            .any(|f| f.key);
+        assert!(
+            third_was_key,
+            "VPX_EFLAG_FORCE_KF must force a keyframe on the next encode"
+        );
+    }
+}

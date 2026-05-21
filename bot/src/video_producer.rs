@@ -24,7 +24,7 @@ use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, trace, warn};
@@ -43,12 +43,20 @@ pub struct VideoProducer {
 }
 
 impl VideoProducer {
+    /// Spawn the video producer thread.
+    ///
+    /// `force_keyframe` is a shared flag the bot's inbound consumer flips to
+    /// `true` when it observes an inbound `KEYFRAME_REQUEST` targeted at this
+    /// sender (vc-7zjq). The producer checks-and-clears it each iteration and,
+    /// when set, forces a keyframe on the next encode. Pass a fresh
+    /// `Arc::new(AtomicBool::new(false))` if KFR honoring is not wired up.
     pub fn from_image_sequence(
         user_id: String,
         image_dir: &str,
         packet_sender: Sender<Vec<u8>>,
         stats: Option<Arc<BotStats>>,
         verify_integrity: bool,
+        force_keyframe: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
@@ -63,6 +71,7 @@ impl VideoProducer {
                 quit_clone,
                 stats,
                 verify_integrity,
+                force_keyframe,
             ) {
                 error!("Video producer error: {}", e);
             }
@@ -82,6 +91,7 @@ impl VideoProducer {
         quit: Arc<AtomicBool>,
         stats: Option<Arc<BotStats>>,
         verify_integrity: bool,
+        force_keyframe: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         // Video configuration - targeting 30fps (~33ms packets)
         let width = 1280u32;
@@ -152,8 +162,16 @@ impl VideoProducer {
             // Get next frame
             let frame_data = frame_iterator.next().unwrap();
 
+            // vc-7zjq: honor an inbound KEYFRAME_REQUEST. The inbound consumer
+            // (see `WebTransportClient::with_keyframe_signal`) flips this flag
+            // when it parses a KFR targeting our user_id. We check-and-clear it
+            // atomically (`swap`) so exactly one encode forces a keyframe per
+            // request. The periodic `kf_max_dist=150` cadence remains the
+            // always-on fallback.
+            let force_kf = force_keyframe.swap(false, Ordering::Relaxed);
+
             // Encode to VP9 (exactly same as videocall-cli)
-            let frames_result = video_encoder.encode(pts, &frame_data)?;
+            let frames_result = video_encoder.encode(pts, &frame_data, force_kf)?;
 
             // Send each encoded frame (exactly same as videocall-cli)
             for frame in frames_result {
@@ -191,15 +209,18 @@ impl VideoProducer {
                     ..Default::default()
                 };
 
-                // Send packet. Same bounded-channel drop semantics as the
-                // audio producer (vc-xpf): try_send + per-bucket counters,
-                // and the channel-full path is logged at `debug!` so a
-                // sustained drop storm (30fps × N bots) doesn't spam the
-                // shared log stream. `Closed` keeps a single `warn!` because
-                // it signals the consumer is gone.
+                // vc-7zjq: keyframe-aware backpressure. Keyframes must NEVER
+                // be dropped on the way to the writer — a single dropped
+                // keyframe poisons the GOP for every mid-stream joiner until
+                // the next one (which is also likely to be dropped). P-frames
+                // keep the original non-blocking try_send drop semantics
+                // (dropping a P-frame only loses a single frame of motion).
+                // See `enqueue_packet` for the survival strategy and why we
+                // keep `tx_packets_enqueued` / `tx_drops_channel_full`
+                // semantics intact.
                 let packet_data = packet_wrapper.write_to_bytes()?;
-                match packet_sender.try_send(packet_data) {
-                    Ok(()) => {
+                match enqueue_packet(&packet_sender, packet_data, frame.key) {
+                    EnqueueOutcome::Enqueued => {
                         if let Some(s) = &stats {
                             s.record_tx_packet_enqueued();
                         }
@@ -211,7 +232,7 @@ impl VideoProducer {
                             user_id
                         );
                     }
-                    Err(TrySendError::Full(_)) => {
+                    EnqueueOutcome::DroppedFull => {
                         if let Some(s) = &stats {
                             s.record_tx_drop_channel_full();
                         }
@@ -220,7 +241,7 @@ impl VideoProducer {
                             user_id
                         );
                     }
-                    Err(TrySendError::Closed(_)) => {
+                    EnqueueOutcome::Closed => {
                         warn!("video producer channel closed for {}; stopping", user_id);
                         return Ok(());
                     }
@@ -249,6 +270,103 @@ impl VideoProducer {
 impl Drop for VideoProducer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Outcome of an [`enqueue_packet`] attempt. Maps 1:1 onto the producer-side
+/// stat buckets the orchestrate summary depends on (vc-xpf): `Enqueued` ->
+/// `tx_packets_enqueued`, `DroppedFull` -> `tx_drops_channel_full`, `Closed`
+/// stops the producer. Kept as a small enum (rather than `Result`) so the
+/// keyframe-survival logic is testable without a real WebTransport session.
+#[derive(Debug, PartialEq, Eq)]
+enum EnqueueOutcome {
+    Enqueued,
+    DroppedFull,
+    Closed,
+}
+
+/// Total wall-clock budget a keyframe may block waiting for room on the
+/// producer→writer channel before we give up (vc-7zjq). A keyframe is far more
+/// valuable than realtime cadence for a mid-stream joiner, so we are willing to
+/// stall the producer thread briefly to land it. At 30fps the source-frame
+/// interval is ~33ms; 250ms tolerates a short writer hiccup (a few frames of
+/// jitter) while still bounding the worst case so a permanently-wedged writer
+/// can't hang the producer forever. The producer runs on its own std thread,
+/// so blocking here does not stall the async runtime.
+const KEYFRAME_BLOCK_BUDGET: Duration = Duration::from_millis(250);
+
+/// Enqueue one outbound packet onto the bounded producer→writer channel with
+/// keyframe-aware backpressure (vc-7zjq).
+///
+/// - **Delta / P-frames (`is_keyframe == false`)**: non-blocking `try_send`.
+///   On a full channel the frame is dropped (`DroppedFull`) exactly as before
+///   — losing a P-frame only drops a single frame of motion and the next
+///   frame supersedes it.
+/// - **Keyframes (`is_keyframe == true`)**: a keyframe must NEVER be dropped
+///   because of a full channel — a lost keyframe leaves every mid-stream
+///   joiner stuck on `decode_errors` until the next periodic keyframe (which
+///   is itself likely to be dropped under the same backpressure). So on a full
+///   channel we fall back to `blocking_send_timeout`, which parks the producer
+///   thread until the writer drains a slot (or the budget elapses). This is
+///   safe because the producer owns a dedicated std thread; it does not touch
+///   the tokio runtime. Only if the writer makes no progress for the entire
+///   [`KEYFRAME_BLOCK_BUDGET`] do we concede and report `DroppedFull` — a
+///   pathological case (a wedged writer) that the periodic-keyframe fallback
+///   will retry on the next cadence boundary.
+///
+/// We deliberately keep audio on plain `try_send` (unchanged, see
+/// `audio_producer.rs`) and do NOT add eviction of queued P-frames here: the
+/// `tokio::mpsc::Sender` API exposes no peek/evict, and bounded-retry blocking
+/// achieves the same "keyframe survives" guarantee without a second channel or
+/// custom queue, keeping the `tx_*` stat semantics byte-for-byte identical.
+///
+/// Implementation note: we do not use `Sender::blocking_send` because it
+/// blocks unboundedly (a wedged writer would hang the producer forever) and
+/// panics if a runtime is entered. Instead we poll `try_send` with a short
+/// backoff up to [`KEYFRAME_BLOCK_BUDGET`]. The producer owns a dedicated std
+/// thread, so sleeping here never stalls the tokio runtime.
+fn enqueue_packet(sender: &Sender<Vec<u8>>, packet: Vec<u8>, is_keyframe: bool) -> EnqueueOutcome {
+    enqueue_packet_with_clock(sender, packet, is_keyframe, KEYFRAME_BLOCK_BUDGET, || {
+        thread::sleep(Duration::from_millis(2))
+    })
+}
+
+/// Core of [`enqueue_packet`], parameterised on the keyframe block budget and
+/// a `wait` closure so unit tests can drive the retry loop deterministically
+/// (e.g. draining a slot between polls) without real sleeps (vc-7zjq).
+fn enqueue_packet_with_clock(
+    sender: &Sender<Vec<u8>>,
+    packet: Vec<u8>,
+    is_keyframe: bool,
+    budget: Duration,
+    mut wait: impl FnMut(),
+) -> EnqueueOutcome {
+    let mut packet = match sender.try_send(packet) {
+        Ok(()) => return EnqueueOutcome::Enqueued,
+        Err(TrySendError::Closed(_)) => return EnqueueOutcome::Closed,
+        Err(TrySendError::Full(p)) => p,
+    };
+
+    if !is_keyframe {
+        // P-frame: preserve the original drop-on-full behaviour.
+        return EnqueueOutcome::DroppedFull;
+    }
+
+    // Keyframe: retry within the budget. A keyframe is never dropped while the
+    // writer is making progress; only a fully wedged writer (no slot frees for
+    // the whole budget) concedes to `DroppedFull`, and the periodic-keyframe
+    // cadence then retries on the next boundary.
+    let deadline = Instant::now() + budget;
+    loop {
+        wait();
+        packet = match sender.try_send(packet) {
+            Ok(()) => return EnqueueOutcome::Enqueued,
+            Err(TrySendError::Closed(_)) => return EnqueueOutcome::Closed,
+            Err(TrySendError::Full(p)) => p,
+        };
+        if Instant::now() >= deadline {
+            return EnqueueOutcome::DroppedFull;
+        }
     }
 }
 
@@ -294,4 +412,90 @@ fn get_timestamp_ms() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// vc-7zjq: under a full channel a P-frame is dropped (`DroppedFull`),
+    /// preserving the original non-blocking try_send semantics.
+    #[tokio::test]
+    async fn pframe_dropped_when_channel_full() {
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        // Fill the single slot.
+        assert_eq!(
+            enqueue_packet(&tx, vec![1], false),
+            EnqueueOutcome::Enqueued
+        );
+        // Next P-frame finds the channel full and is dropped immediately.
+        assert_eq!(
+            enqueue_packet(&tx, vec![2], false),
+            EnqueueOutcome::DroppedFull
+        );
+    }
+
+    /// vc-7zjq (PRIMARY acceptance): a keyframe must NOT be dropped under
+    /// backpressure as long as the writer eventually drains a slot. We fill the
+    /// channel, then drive the retry loop with a `wait` closure that drains one
+    /// slot on the first poll — simulating the writer making progress. The
+    /// keyframe must land (`Enqueued`), NOT drop.
+    #[tokio::test]
+    async fn keyframe_survives_backpressure_when_writer_drains() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        // Fill the single slot with a queued P-frame.
+        assert_eq!(
+            enqueue_packet(&tx, vec![1], false),
+            EnqueueOutcome::Enqueued
+        );
+
+        // Keyframe arrives while the channel is full. The `wait` closure drains
+        // one slot, modelling the writer dequeuing the queued P-frame between
+        // polls. The budget is generous; the keyframe must be enqueued.
+        let mut drained_once = false;
+        let outcome =
+            enqueue_packet_with_clock(&tx, vec![0xAA], true, Duration::from_secs(5), || {
+                if !drained_once {
+                    // Writer makes progress: free a slot.
+                    let _ = rx.try_recv();
+                    drained_once = true;
+                }
+            });
+        assert_eq!(
+            outcome,
+            EnqueueOutcome::Enqueued,
+            "keyframe must survive backpressure once the writer drains a slot"
+        );
+    }
+
+    /// vc-7zjq: if the writer is fully wedged (no slot ever frees), a keyframe
+    /// concedes to `DroppedFull` once the budget elapses — bounding the worst
+    /// case so a permanently-stuck writer cannot hang the producer forever. The
+    /// periodic-keyframe cadence retries on the next boundary.
+    #[tokio::test]
+    async fn keyframe_concedes_after_budget_when_writer_wedged() {
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        assert_eq!(
+            enqueue_packet(&tx, vec![1], false),
+            EnqueueOutcome::Enqueued
+        );
+
+        // `wait` does nothing (writer never drains); a zero budget makes the
+        // loop concede on the first deadline check without real sleeping.
+        let outcome =
+            enqueue_packet_with_clock(&tx, vec![2], true, Duration::from_millis(0), || {});
+        assert_eq!(outcome, EnqueueOutcome::DroppedFull);
+    }
+
+    /// vc-7zjq: a closed channel surfaces `Closed` for both frame kinds so the
+    /// producer stops cleanly (matches the original `TrySendError::Closed`
+    /// arm).
+    #[tokio::test]
+    async fn closed_channel_reports_closed() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        drop(rx);
+        assert_eq!(enqueue_packet(&tx, vec![1], false), EnqueueOutcome::Closed);
+        assert_eq!(enqueue_packet(&tx, vec![1], true), EnqueueOutcome::Closed);
+    }
 }
