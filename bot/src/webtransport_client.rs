@@ -416,18 +416,33 @@ impl WebTransportClient {
     /// behaviours on top:
     ///
     /// 1. Each drained stream is parsed as a `PacketWrapper`. If we see an
-    ///    `ADMISSION_DECISION{REDIRECT}`, we stash `redirect_to` on the
-    ///    [`SessionEndSignal`] so the orchestrator can use it on the next
-    ///    reconnect attempt. The redirect packet arrives **immediately
-    ///    before** the SFU closes the session, so we must capture it before
-    ///    treating the subsequent `accept_uni` error as a plain disconnect.
-    ///    For reliability we drain inline (rather than spawn-per-stream) so
-    ///    `read_to_end` and `try_extract_redirect_target` complete before
-    ///    the next `accept_uni` returns an error. Perf trade-off: at the
-    ///    orchestrate workload shape (~12 publishers × ~80 streams/sec/
-    ///    publisher ≈ 1000 streams/sec/listener) `read_to_end` for small
-    ///    media packets returns quickly and decode is already offloaded to
-    ///    `spawn_blocking`, so the marginal latency is acceptable.
+    ///    `ADMISSION_DECISION{REDIRECT}`, we **fire** the [`SessionEndSignal`]
+    ///    right away (vc-w71): `fire(Some(target))` stashes `redirect_to`,
+    ///    sets `ended=true`, and wakes the orchestrator's reconnect loop via
+    ///    `notify_waiters()`. This is the active-wake behaviour — the loop no
+    ///    longer waits for the SFU to close the QUIC session before following
+    ///    the redirect; it `stop()`s and drops the current client and
+    ///    reconnects to the named pod right away. Note this does NOT
+    ///    synchronously close the old QUIC session: this inbound consumer task
+    ///    holds its own `Session` clone and is parked on `accept_uni`, so it
+    ///    lingers until that call errors (when the SFU tears the old session
+    ///    down or the new connection displaces it), at which point its
+    ///    terminal `fire(None)` lands harmlessly on the now-unobserved old
+    ///    signal. The win is that the reconnect no longer *blocks* on that
+    ///    teardown. Previously we only stashed `redirect_to` and relied on the
+    ///    subsequent `accept_uni` error (when the SFU closed the session) to
+    ///    fire the signal, which stranded redirected senders until teardown.
+    ///    The redirect packet
+    ///    still arrives **immediately before** the SFU closes the session, so
+    ///    we must capture it before treating the subsequent `accept_uni`
+    ///    error as a plain disconnect. For reliability we drain inline
+    ///    (rather than spawn-per-stream) so `read_to_end`,
+    ///    `try_extract_redirect_target`, and `fire` complete before the next
+    ///    `accept_uni` returns. Perf trade-off: at the orchestrate workload
+    ///    shape (~12 publishers × ~80 streams/sec/publisher ≈ 1000
+    ///    streams/sec/listener) `read_to_end` for small media packets returns
+    ///    quickly and decode is already offloaded to `spawn_blocking`, so the
+    ///    marginal latency is acceptable.
     /// 2. On any terminal condition (accept-uni error, quit flag) we mark
     ///    the bot as disconnected (sticky first-gap timestamp) and fire the
     ///    session-end notification.
@@ -687,20 +702,30 @@ fn try_extract_redirect_target(data: &[u8]) -> Option<String> {
 ///    bookkeeping is identical regardless of which arm drained the stream.
 /// 2. Peek the payload for an `ADMISSION_DECISION{REDIRECT}` via
 ///    [`try_extract_redirect_target`] and, when a `session_end` clone is
-///    present, stash the target onto `session_end.redirect_to`. This is the
-///    de-coupling / hardening required by vc-k4w: REDIRECT extraction now
-///    happens on whichever arm drained the stream, not only the inline arm.
+///    present, **fire** the signal via `session_end.fire(Some(target))`
+///    (vc-w71). `fire` stashes the target onto `session_end.redirect_to`,
+///    sets `ended=true`, and calls `notify_waiters()` — so the reconnect
+///    loop wakes the instant the redirect arrives rather than only after the
+///    SFU closes the session. This is the de-coupling / hardening required by
+///    vc-k4w: REDIRECT extraction now happens on whichever arm drained the
+///    stream, not only the inline arm.
 /// 3. Offload decode (protobuf parse + VP9/Opus) onto the blocking pool when
 ///    `decoders` is present, so pure-CPU codec work never starves
 ///    `accept_uni`.
 ///
-/// NOTE on routing (vc-k4w / Change Impact Policy): the inline-drain arm
-/// remains the redirect-critical path whenever `session_end` is attached —
-/// see the doc comment on [`WebTransportClient::start_inbound_consumer`]. The
-/// extraction wired into the spawned arm here is strictly defense-in-depth
-/// and must not become the path the orchestrate reconnect loop depends on for
-/// ordering, because the spawned task cannot guarantee the stash completes
-/// before the next `accept_uni` returns its terminal error.
+/// NOTE on routing (vc-k4w / vc-w71 / Change Impact Policy): the inline-drain
+/// arm remains the redirect-critical path whenever `session_end` is attached
+/// — see the doc comment on [`WebTransportClient::start_inbound_consumer`].
+/// Every current caller attaches the signal via the inline arm and passes
+/// `None` on the spawned arm, so `fire` only ever runs on the inline,
+/// in-order path. The extraction (and now `fire`) wired through the spawned
+/// arm here is strictly defense-in-depth and must not become the path the
+/// orchestrate reconnect loop depends on for ordering, because the spawned
+/// task cannot guarantee the `fire` completes before the next `accept_uni`
+/// returns its terminal error. Firing from the spawned arm would still be
+/// *correct* (it only wakes the loop earlier and is idempotent with the
+/// terminal `fire(None)`), just not *ordering-guaranteed* — which is why the
+/// inline arm stays the contractual path.
 fn handle_inbound_stream_data(
     data: Vec<u8>,
     session_end: &Option<Arc<SessionEndSignal>>,
@@ -718,7 +743,21 @@ fn handle_inbound_stream_data(
                 "Listener {} received ADMISSION_DECISION REDIRECT to {}",
                 user_id, target
             );
-            *signal.redirect_to.lock().unwrap() = Some(target);
+            // vc-w71: fire immediately rather than only stashing. `fire`
+            // stashes the target AND sets `ended=true` AND calls
+            // `notify_waiters()`, so the orchestrate / failover reconnect
+            // loop (parked on `signal.notify` / `signal.ended`) wakes the
+            // instant the redirect arrives instead of waiting for the SFU to
+            // close the QUIC session, and reconnects to `redirect_to` without
+            // blocking on teardown. This does not synchronously close the old
+            // session: THIS consumer task still holds its own `Session` clone
+            // and is parked on `accept_uni` (the loop's `quit` flag is checked
+            // only at the top, not while parked), so it drains on its next
+            // `accept_uni` error — when the SFU tears the old session down or
+            // the new connection displaces it — and then calls a harmless
+            // `fire(None)` on this now-unobserved old signal (`ended` is
+            // already true and `fire(None)` never clears `redirect_to`).
+            signal.fire(Some(target));
         }
     }
     if let Some(pool) = decoders {
@@ -1543,6 +1582,110 @@ mod tests {
         // The packet must still be recorded with its timestamp.
         assert_eq!(stats.packets_received.load(Ordering::Relaxed), 1);
         assert_eq!(stats.last_packet_at_ms.load(Ordering::Relaxed), 42);
+    }
+
+    // vc-w71: a REDIRECT must FIRE the signal (stash target + set ended +
+    // wake waiters) the instant it is processed — WITHOUT the server closing
+    // the session first. This proves the reconnect loop can follow a redirect
+    // immediately rather than parking on `notify` until SFU teardown.
+    #[test]
+    fn handle_inbound_stream_data_fires_signal_on_redirect() {
+        let signal = Arc::new(SessionEndSignal::default());
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+        let session_end = Some(signal.clone());
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+        let data = redirect_wrapper_bytes("rustlemania-webtransport-0.svc.cluster");
+
+        // Precondition: signal is fresh (not ended, no target).
+        assert!(!signal.ended.load(Ordering::Relaxed));
+        assert!(signal.redirect_to.lock().unwrap().is_none());
+
+        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 11);
+
+        // The redirect both stashed the target AND marked the session ended,
+        // with no server-side close involved.
+        assert_eq!(
+            signal.redirect_to.lock().unwrap().as_deref(),
+            Some("rustlemania-webtransport-0.svc.cluster")
+        );
+        assert!(
+            signal.ended.load(Ordering::Relaxed),
+            "redirect must set `ended` so the reconnect loop observes it without racing notify"
+        );
+    }
+
+    // vc-w71: a waiter already parked on `signal.notify` must be released by
+    // the redirect's `fire()` call — i.e. `notify_waiters()` actually wakes
+    // the reconnect loop. Mirrors the orchestrate/failover wait shape:
+    // `if !ended { notified.await }`.
+    #[tokio::test]
+    async fn redirect_releases_waiter_without_server_close() {
+        let signal = Arc::new(SessionEndSignal::default());
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+
+        // Park a waiter exactly as run_listener/run_sender do.
+        let waiter_signal = signal.clone();
+        let waiter = tokio::spawn(async move {
+            let notified = waiter_signal.notify.notified();
+            tokio::pin!(notified);
+            if !waiter_signal.ended.load(Ordering::Relaxed) {
+                notified.await;
+            }
+            // Once released, the redirect target is observable.
+            waiter_signal.redirect_to.lock().unwrap().clone()
+        });
+
+        // Let the waiter register its `notified()` future before we fire.
+        tokio::task::yield_now().await;
+
+        let session_end = Some(signal.clone());
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+        let data = redirect_wrapper_bytes("owner-pod.svc.cluster");
+        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 3);
+
+        let released = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must be released by the redirect's notify_waiters() — no server close")
+            .expect("waiter task should not panic");
+        assert_eq!(released.as_deref(), Some("owner-pod.svc.cluster"));
+    }
+
+    // vc-w71 regression guard: the no-redirect (direct-connect) path must NOT
+    // fire the signal. Plain media leaves `ended=false` and no target, so the
+    // reconnect loop keeps parking until a real disconnect calls `fire(None)`.
+    #[test]
+    fn handle_inbound_stream_data_media_does_not_fire_signal() {
+        let signal = Arc::new(SessionEndSignal::default());
+        let stats = BotStats::new("test".into(), BotRole::Listener);
+        let session_end = Some(signal.clone());
+        let stats_opt = Some(stats.clone());
+        let decoders: Option<Arc<DecoderPool>> = None;
+        let media = MediaPacket {
+            media_type: MediaType::VIDEO.into(),
+            ..Default::default()
+        };
+        let data = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            data: media.write_to_bytes().unwrap(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+
+        handle_inbound_stream_data(data, &session_end, &stats_opt, &decoders, "listener-1", 5);
+
+        assert!(
+            !signal.ended.load(Ordering::Relaxed),
+            "a non-redirect packet must not fire the session-end signal (direct-connect case)"
+        );
+        assert!(signal.redirect_to.lock().unwrap().is_none());
+
+        // And a real disconnect still fires with no target (fire(None) path).
+        signal.fire(None);
+        assert!(signal.ended.load(Ordering::Relaxed));
+        assert!(signal.redirect_to.lock().unwrap().is_none());
     }
 
     #[test]
