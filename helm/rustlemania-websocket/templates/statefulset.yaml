@@ -38,6 +38,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: STATEFULSET_REPLICAS
               value: "{{ .Values.replicaCount }}"
             {{- toYaml .Values.env | nindent 12 }}
