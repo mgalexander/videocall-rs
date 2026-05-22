@@ -462,7 +462,7 @@ mod tests {
             .expect("Failed to connect to NATS");
 
         // vc-8txq: drive `start` through a single-shard pool in this smoke test.
-        let chat_pool = ChatServerPool::new(nats_client.clone(), 1).await;
+        let chat_pool = ChatServerPool::new(nats_client.clone(), 1, 1).await;
         let connection_states = chat_pool.connection_states_handle();
 
         // Create SessionManager

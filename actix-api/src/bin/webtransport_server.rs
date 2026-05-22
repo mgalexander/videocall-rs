@@ -185,6 +185,7 @@ async fn main() {
     let chat_pool = sec_api::actors::chat_server::ChatServerPool::new(
         nats_client.clone(),
         sfu_config.chatserver_shards,
+        sfu_config.fanout_worker_threads,
     )
     .await;
     let connection_states = chat_pool.connection_states_handle();

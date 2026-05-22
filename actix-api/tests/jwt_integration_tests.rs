@@ -54,7 +54,7 @@ async fn start_real_ws_server(port: u16) {
 
     // vc-8txq: drive the production lobby handlers through a single-shard pool
     // (one shard owns every room, identical to the prior single-actor wiring).
-    let chat = sec_api::actors::chat_server::ChatServerPool::new(nats_client.clone(), 1).await;
+    let chat = sec_api::actors::chat_server::ChatServerPool::new(nats_client.clone(), 1, 1).await;
     let connection_states = chat.connection_states_handle();
     let session_manager = SessionManager::new();
     let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());

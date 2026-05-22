@@ -377,6 +377,25 @@ pub struct ChatServer {
     /// Total number of shards in this pod's pool (bead vc-8txq). `1` for the
     /// default single-actor construction. Log breadcrumb only.
     shard_count: usize,
+    /// Handle to the per-pod fan-out runtime (bead vc-c609 / ADR-0009 Part A).
+    ///
+    /// Every per-room demux/fan-out task is spawned via `fanout_handle.spawn(..)`
+    /// rather than a bare `tokio::spawn`. A bare `tokio::spawn` from inside a
+    /// `ChatServer` handler inherits THIS shard's `Arbiter` current-thread
+    /// runtime, which serializes ALL fan-out for ALL of the shard's rooms onto
+    /// that single arbiter thread — the bottleneck this bead removes. Spawning
+    /// on the shared multi-thread runtime instead lets fan-out CPU spread across
+    /// cores. The handle is a cheap clone of the `Runtime`'s handle owned by
+    /// [`ChatServerPool`]; the runtime itself outlives every shard (held in an
+    /// `Arc` inside the pool), so spawned tasks always have a live runtime.
+    ///
+    /// For the standalone [`ChatServer::new`] path (unit/integration tests) this
+    /// is `Handle::current()` — those constructors run inside the test's tokio
+    /// runtime (current-thread under `#[actix_rt::test]`), so the fan-out tasks
+    /// land there. A `Send` fan-out future runs fine on a current-thread runtime,
+    /// so this keeps the tests' single-actor behaviour identical while still
+    /// exercising the `Handle::spawn` code path.
+    fanout_handle: tokio::runtime::Handle,
 }
 
 impl ChatServer {
@@ -388,7 +407,18 @@ impl ChatServer {
     /// `shard_ordinal = 0`, `shard_count = 1`. Production wiring uses
     /// [`ChatServerPool::new`] (which calls [`ChatServer::new_shard`]) instead.
     pub async fn new(nats_connection: async_nats::client::Client) -> Self {
-        Self::new_shard(nats_connection, SharedConnectionStates::default(), 0, 1).await
+        // vc-c609: the standalone path always runs inside a tokio runtime (it is
+        // `async`), so the current handle is a valid fan-out spawn target. Tests
+        // run on a multi-thread runtime, so this preserves their behaviour while
+        // exercising the same `Handle::spawn` code path production uses.
+        Self::new_shard(
+            nats_connection,
+            SharedConnectionStates::default(),
+            0,
+            1,
+            tokio::runtime::Handle::current(),
+        )
+        .await
     }
 
     /// Construct one shard of a [`ChatServerPool`] (bead vc-8txq).
@@ -403,6 +433,10 @@ impl ChatServer {
         connection_states: SharedConnectionStates,
         shard_ordinal: usize,
         shard_count: usize,
+        // vc-c609: handle to the pod-wide multi-thread fan-out runtime. The pool
+        // clones one handle into every shard; the standalone `new` passes
+        // `Handle::current()`.
+        fanout_handle: tokio::runtime::Handle,
     ) -> Self {
         // vc-c6l: a single owner-pod hub replaces the previous N per-room
         // tasks. The hub always runs (1 task, 1 timer) and stays empty on
@@ -470,6 +504,7 @@ impl ChatServer {
             _spillover_ingest: spillover_ingest,
             shard_ordinal,
             shard_count,
+            fanout_handle,
         }
     }
 
@@ -1001,6 +1036,27 @@ pub struct ChatServerPool {
     /// The single shared connection-state map handed to every shard and every
     /// `SessionLogic` (vc-ud6o E3 handle, now pool-owned for vc-8txq).
     connection_states: SharedConnectionStates,
+    /// The ONE process-wide multi-thread tokio runtime that runs every room's
+    /// demux/fan-out task (bead vc-c609 / ADR-0009 Part A).
+    ///
+    /// Held in an `Arc` so the runtime outlives every shard and every spawned
+    /// dispatcher: a `ChatServer` shard only retains a `Handle` clone (cheap),
+    /// and the dispatcher tasks are spawned onto this runtime. Keeping the
+    /// `Runtime` here (rather than dropping the return value) is what keeps the
+    /// worker threads alive for the pod's lifetime.
+    ///
+    /// LIFECYCLE NOTE: dropping a `tokio::runtime::Runtime` from WITHIN an async
+    /// context panics. During normal operation this `Arc` lives for the whole
+    /// process, so no live-path drop ever happens. The last `Arc<Runtime>` clone
+    /// actually does live in the per-worker actix `App` factories and IS dropped
+    /// on an async thread — but only at `#[actix_web::main]` runtime teardown on
+    /// process exit, where it is benign because the runtime is already shutting
+    /// down. The pool is `Clone` (the binaries clone the `Addr`s and handles
+    /// around), and cloning the `Arc<Runtime>` does NOT drop the runtime. A
+    /// future graceful-shutdown refactor that dropped this `Arc` during normal
+    /// operation (rather than at process teardown) would need care to avoid
+    /// dropping the `Runtime` from inside an async context.
+    _fanout_runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl ChatServerPool {
@@ -1016,8 +1072,36 @@ impl ChatServerPool {
     /// sequentially because `ChatServer::new_shard` is `async` (it awaits the
     /// home-region KV connect); the per-shard work is small and one-shot at
     /// startup.
-    pub async fn new(nats_connection: async_nats::client::Client, n_shards: usize) -> Self {
+    pub async fn new(
+        nats_connection: async_nats::client::Client,
+        n_shards: usize,
+        // vc-c609: worker-thread count for the pod-wide fan-out runtime, sourced
+        // from `SfuConfig::fanout_worker_threads` (env `SFU_FANOUT_WORKER_THREADS`).
+        // Clamped to at least 1 here defensively.
+        fanout_worker_threads: usize,
+    ) -> Self {
         let n_shards = n_shards.max(1);
+        let fanout_worker_threads = fanout_worker_threads.max(1);
+        // vc-c609 / ADR-0009 Part A: build the ONE process-wide multi-thread
+        // fan-out runtime BEFORE the shards, so each shard can be handed a clone
+        // of its `Handle`. This runtime — NOT the per-shard Arbiter — is where
+        // every room's demux/fan-out task runs, so fan-out CPU scales across
+        // cores instead of being pinned to one arbiter thread per shard.
+        //
+        // We are already inside an async context here (`ChatServerPool::new` is
+        // awaited from the binaries' `#[actix_web::main]`), and BUILDING a
+        // runtime from within another runtime is fine — only DROPPING a runtime
+        // on an async thread panics. We never drop it on an async thread: it is
+        // moved into an `Arc` stored on the pool for the process lifetime.
+        let fanout_runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(fanout_worker_threads)
+                .thread_name("sfu-fanout")
+                .enable_all()
+                .build()
+                .expect("failed to build the SFU fan-out runtime"),
+        );
+        let fanout_handle = fanout_runtime.handle().clone();
         let connection_states = SharedConnectionStates::default();
         let mut shards = Vec::with_capacity(n_shards);
         for ordinal in 0..n_shards {
@@ -1028,7 +1112,12 @@ impl ChatServerPool {
             // the actor's mailbox is polled on a DEDICATED thread. This is what
             // gives JoinRoom handling true cross-core parallelism: shard k's
             // mailbox runs on arbiter k's thread, independent of shard j's.
-            let shard = ChatServer::new_shard(nc, cs, ordinal, n_shards).await;
+            //
+            // vc-c609: each shard also gets a clone of the fan-out runtime
+            // `Handle` so its per-room dispatchers spawn onto the shared
+            // multi-thread runtime instead of the shard's own arbiter thread.
+            let shard =
+                ChatServer::new_shard(nc, cs, ordinal, n_shards, fanout_handle.clone()).await;
             let arbiter = actix::Arbiter::new();
             let addr = ChatServer::start_in_arbiter(&arbiter.handle(), move |_ctx| shard);
             shards.push(addr);
@@ -1036,12 +1125,16 @@ impl ChatServerPool {
         info!(
             target: "sfu_trace",
             shard_count = n_shards,
-            "ChatServerPool started ({} shard(s), one Arbiter thread each)",
-            n_shards
+            fanout_worker_threads = fanout_worker_threads,
+            "ChatServerPool started ({} shard(s), one Arbiter thread each; \
+             {} fan-out worker thread(s) on the shared runtime)",
+            n_shards,
+            fanout_worker_threads
         );
         Self {
             shards: Arc::new(shards),
             connection_states,
+            _fanout_runtime: fanout_runtime,
         }
     }
 
@@ -1597,6 +1690,7 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             receivers.clone(),
             room_state,
             ctx.address(),
+            &self.fanout_handle,
         );
         self.room_dispatch
             .insert(room, RoomDispatch { receivers, task });
@@ -2602,6 +2696,7 @@ impl Handler<JoinRoom> for ChatServer {
                     receivers.clone(),
                     room_state.clone(),
                     ctx.address(),
+                    &self.fanout_handle,
                 );
                 let recvs = receivers.clone();
                 vac.insert(RoomDispatch { receivers, task });
@@ -2922,8 +3017,49 @@ fn spawn_room_dispatcher(
     // owns the same Arc so member inserts/removes remain visible here.
     room_state: Arc<RwLock<RoomState>>,
     chat_server: actix::Addr<ChatServer>,
+    // vc-c609: handle to the pod-wide multi-thread fan-out runtime. The task is
+    // spawned here via `fanout_handle.spawn(..)` (NOT a bare `tokio::spawn`,
+    // which would inherit the calling shard's current-thread Arbiter runtime and
+    // serialize every room's fan-out onto one thread).
+    fanout_handle: &tokio::runtime::Handle,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // ---- vc-c609 Send/Sync audit (the landing gate) -------------------------
+    //
+    // Moving this task from a current-thread Arbiter runtime onto a MULTI-THREAD
+    // runtime requires the spawned future to be `Send` — the executor may move
+    // it between worker threads at any `.await`. `Handle::spawn` enforces this at
+    // compile time, so a clean build IS the proof. Per captured value:
+    //
+    //   * `nc: async_nats::Client` — `Clone + Send + Sync` (an Arc-backed handle
+    //     to the connection task); safe to move and to hold across awaits.
+    //   * `room` / `subject: String` — owned, `Send`.
+    //   * `sfu_mode: SfuMode` — `Copy + Send`.
+    //   * `forwarder: Arc<Forwarder>` — `Send + Sync` (shared read-mostly state).
+    //   * `scorer: Arc<TokioRwLock<SpeakerScorer>>` — `Send + Sync`; its guard is
+    //     held only across the `tokio::RwLock` `.await` (designed for that), so
+    //     no `std` guard crosses an await.
+    //   * `receivers: Arc<std::sync::RwLock<HashMap<.., Recipient<Message>>>>` —
+    //     `Send + Sync` iff `Recipient<Message>` is. `Recipient` is an
+    //     Arc-backed sendable address handle (delivery already crosses task
+    //     boundaries via `try_send`), so it is `Send + Sync`. CRITICAL: the
+    //     `std::sync::RwLock` guard must NOT be held across any `.await`. Audited:
+    //     every `receivers.read()/.write()` is confined to a scoped block that
+    //     drops the guard before the next await — the hot-path snapshot collects
+    //     into a `Vec` and drops the guard, then the fan-out loop (`try_send`,
+    //     all sync) runs guard-free; the watchdog-tick reads also drop in-block.
+    //   * `room_state: Arc<std::sync::RwLock<RoomState>>` — same reasoning; every
+    //     read/write is in a scoped block (`write_needed`, `note_remote_publisher`,
+    //     `should_invalidate`, the watchdog presence reads) with the guard
+    //     dropped before any await.
+    //   * `chat_server: actix::Addr<ChatServer>` — actix `Addr` is `Send + Sync`
+    //     by design (it is the cross-thread handle to the actor's mailbox; the
+    //     pool already shares `Addr`s across arbiter threads).
+    //
+    // Nothing here required `unsafe`; the gate is satisfied by the types alone.
+    // This is a pure execution-context move — the loop body below is byte-for-byte
+    // unchanged, so the watchdog/resubscribe, scorer feed, remote-publisher
+    // registry, diagnostics ingest, and fan-out decision all behave identically.
+    fanout_handle.spawn(async move {
         let mut sub = match nc.subscribe(subject.clone()).await {
             Ok(s) => s,
             Err(e) => {

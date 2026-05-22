@@ -63,6 +63,17 @@ const DEFAULT_CHATSERVER_MAILBOX_CAPACITY: usize = 8192;
 /// of OS threads.
 const MAX_CHATSERVER_SHARDS: usize = 64;
 
+/// Hard ceiling on the per-pod fan-out worker-thread pool (bead vc-c609 /
+/// ADR-0009 Part A).
+///
+/// The fan-out runtime is a single PROCESS-WIDE multi-thread tokio runtime that
+/// runs every room's demux/fan-out task (see
+/// [`crate::actors::chat_server::ChatServerPool`]). Its worker count should
+/// track the pod's CPU budget, but we cap it defensively so a misconfigured
+/// `SFU_FANOUT_WORKER_THREADS` (or a host that reports an absurd
+/// `available_parallelism`) cannot spawn an unbounded number of OS threads.
+const MAX_FANOUT_WORKER_THREADS: usize = 256;
+
 /// SFU runtime configuration, snapshotted from process env once at startup.
 ///
 /// Note: this struct intentionally does NOT derive `Copy` — `milestones` is an
@@ -114,6 +125,27 @@ pub struct SfuConfig {
     /// every room), which is what the in-process unit/integration tests rely on
     /// when they talk to a single `Addr<ChatServer>` directly.
     pub chatserver_shards: usize,
+    /// Worker-thread count for the per-pod fan-out runtime (bead vc-c609 /
+    /// ADR-0009 Part A).
+    ///
+    /// The SFU's per-room demux/fan-out tasks no longer run on the per-shard
+    /// `Arbiter` (current-thread) runtime — they run on ONE process-wide
+    /// multi-thread tokio runtime owned by [`crate::actors::chat_server::ChatServerPool`].
+    /// This lets fan-out CPU (the per-receiver `try_send` storm) spread across
+    /// cores instead of being pinned to one thread per shard.
+    ///
+    /// Semantics of `SFU_FANOUT_WORKER_THREADS`:
+    ///   - **unset / empty / invalid** → `available_parallelism() - 1`, clamped
+    ///     to `[1, MAX_FANOUT_WORKER_THREADS]`. We deliberately subtract one
+    ///     because the arbiter threads, the actix-web HTTP/WS workers, the NATS
+    ///     client task, and the metrics server already consume threads on the
+    ///     same pod; sizing the fan-out pool to the full core count would
+    ///     oversubscribe.
+    ///   - **explicit positive integer** → used verbatim, clamped to
+    ///     `[1, MAX_FANOUT_WORKER_THREADS]`.
+    ///   - **explicit `0`** → warned-and-ignored; falls back to the auto value
+    ///     (a zero-worker runtime cannot make progress).
+    pub fanout_worker_threads: usize,
 }
 
 impl SfuConfig {
@@ -134,11 +166,77 @@ impl SfuConfig {
             Self::parse_mailbox_capacity(std::env::var("SFU_CHATSERVER_MAILBOX_CAPACITY").ok());
         let chatserver_shards =
             Self::parse_shard_count(std::env::var("SFU_CHATSERVER_SHARDS").ok());
+        let fanout_worker_threads =
+            Self::parse_fanout_worker_threads(std::env::var("SFU_FANOUT_WORKER_THREADS").ok());
         Self {
             mode,
             milestones,
             chatserver_mailbox_capacity,
             chatserver_shards,
+            fanout_worker_threads,
+        }
+    }
+
+    /// Auto-detected fan-out worker count: `available_parallelism() - 1`,
+    /// clamped to `[1, MAX_FANOUT_WORKER_THREADS]` (bead vc-c609).
+    ///
+    /// The `-1` leaves headroom for the arbiter threads, the actix HTTP/WS
+    /// workers, and the NATS client task that already run on the pod. Falls
+    /// back to 1 if the platform cannot report parallelism or reports a single
+    /// core (the safe single-worker behaviour).
+    fn auto_fanout_worker_threads() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .clamp(1, MAX_FANOUT_WORKER_THREADS)
+    }
+
+    /// Parse the `SFU_FANOUT_WORKER_THREADS` env value.
+    ///
+    /// See [`SfuConfig::fanout_worker_threads`] for the unset/empty/zero/clamp
+    /// semantics. Mirrors the warn-don't-panic philosophy used elsewhere here:
+    /// a bad value logs a warning and falls back to the auto value rather than
+    /// taking the server down.
+    fn parse_fanout_worker_threads(raw: Option<String>) -> usize {
+        match raw {
+            None => Self::auto_fanout_worker_threads(),
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Self::auto_fanout_worker_threads();
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(0) => {
+                        warn!(
+                            "ignoring SFU_FANOUT_WORKER_THREADS=0 (a zero-worker \
+                             runtime cannot make progress); using auto value {}",
+                            Self::auto_fanout_worker_threads()
+                        );
+                        Self::auto_fanout_worker_threads()
+                    }
+                    Ok(v) => {
+                        let clamped = v.clamp(1, MAX_FANOUT_WORKER_THREADS);
+                        if clamped != v {
+                            warn!(
+                                "clamping SFU_FANOUT_WORKER_THREADS={} to {} (valid \
+                                 range 1..={})",
+                                v, clamped, MAX_FANOUT_WORKER_THREADS
+                            );
+                        }
+                        clamped
+                    }
+                    Err(_) => {
+                        warn!(
+                            "ignoring invalid SFU_FANOUT_WORKER_THREADS value {:?} \
+                             (expected a positive integer); using auto value {}",
+                            trimmed,
+                            Self::auto_fanout_worker_threads()
+                        );
+                        Self::auto_fanout_worker_threads()
+                    }
+                }
+            }
         }
     }
 
@@ -537,5 +635,57 @@ mod tests {
         assert_eq!(SfuConfig::parse_shard_count(Some("0".to_string())), auto);
         assert_eq!(SfuConfig::parse_shard_count(Some("abc".to_string())), auto);
         assert_eq!(SfuConfig::parse_shard_count(Some("-3".to_string())), auto);
+    }
+
+    // ===== SFU_FANOUT_WORKER_THREADS parsing tests (bead vc-c609) =====
+    //
+    // `parse_fanout_worker_threads` takes the raw `Option<String>` directly, so
+    // these tests do NOT touch process-global env state and need no EnvGuard.
+    // The unset/empty/zero/invalid paths fall back to
+    // `auto_fanout_worker_threads`, which depends on the host, so we only assert
+    // their relationship to the auto value rather than a fixed number.
+
+    #[test]
+    fn fanout_worker_threads_explicit_value_is_used_and_clamped() {
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some(" 4 ".to_string())),
+            4
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some("1".to_string())),
+            1
+        );
+        // Above the ceiling clamps down to MAX_FANOUT_WORKER_THREADS.
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some("100000".to_string())),
+            MAX_FANOUT_WORKER_THREADS
+        );
+    }
+
+    #[test]
+    fn fanout_worker_threads_unset_empty_zero_invalid_fall_back_to_auto() {
+        let auto = SfuConfig::auto_fanout_worker_threads();
+        assert!((1..=MAX_FANOUT_WORKER_THREADS).contains(&auto));
+        assert_eq!(SfuConfig::parse_fanout_worker_threads(None), auto);
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some(String::new())),
+            auto
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some("   ".to_string())),
+            auto
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some("0".to_string())),
+            auto
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some("abc".to_string())),
+            auto
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_worker_threads(Some("-3".to_string())),
+            auto
+        );
     }
 }
