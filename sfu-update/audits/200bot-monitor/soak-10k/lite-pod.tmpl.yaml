@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __NAME__
+  namespace: default
+  labels:
+    app.kubernetes.io/name: videocall-staircase
+    app.kubernetes.io/component: bot
+    shard: __SHARD__
+spec:
+  restartPolicy: Never
+  containers:
+    - name: bot
+      image: localhost:5000/videocall-bot:dev
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/sh
+        - -lc
+        - >-
+          exec /usr/local/bin/bot
+          --orchestrate
+          --room "${ROOM}"
+          --senders "${SENDERS}"
+          --listeners "${LISTENERS}"
+          --duration "${DURATION_S}"
+          --server-url "${SERVER_URL}"
+          --user-id-prefix "${USER_ID_PREFIX}"
+          --insecure
+          --audio-path /app/BundyBests2.wav
+          --image-dir /app
+          --verify-integrity
+          --listener-no-decode
+      env:
+        - name: ROOM
+          value: __ROOM__
+        - name: SENDERS
+          value: "__SENDERS__"
+        - name: LISTENERS
+          value: "__LISTENERS__"
+        - name: DURATION_S
+          value: "__DURATION__"
+        - name: SERVER_URL
+          value: https://webtransport-headless.default.svc.cluster.local:443
+        - name: USER_ID_PREFIX
+          value: __SHARD___
+        - name: RUST_LOG
+          value: info,quinn=warn
+      resources:
+        requests:
+          cpu: "200m"
+          memory: 128Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        readOnlyRootFilesystem: false
+        capabilities:
+          drop: ["ALL"]

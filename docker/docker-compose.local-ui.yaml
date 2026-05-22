@@ -1,0 +1,15 @@
+# Override: run ONLY the dioxus-ui from the e2e stack, pointed at the k3d cluster
+# via host port-forwards (meeting-api -> :8081, websocket SFU -> :8080). All-localhost
+# topology (same-site as e2e) so the session cookie + CORS just work; no certs, no
+# /etc/hosts, no WebTransport UDP. Browser -> localhost:3001 (UI) -> localhost:8080/8081
+# (port-forwards) -> k3d SFU.
+services:
+  dioxus-ui:
+    environment:
+      - API_BASE_URL=http://localhost:8081
+      - ACTIX_UI_BACKEND_URL=ws://localhost:8090
+      - LOGIN_URL=http://localhost:8081/login
+      - ENABLE_OAUTH=false
+      - WEBTRANSPORT_ENABLED=false
+      - E2EE_ENABLED=false
+      - TRUNK_SERVE_PORT=3001

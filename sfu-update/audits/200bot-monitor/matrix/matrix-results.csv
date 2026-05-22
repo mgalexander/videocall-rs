@@ -1,0 +1,11 @@
+test,pattern,presenters,peak_users,sfu_cpu_peak_m,sfu_mem_peak_mi,sfu_restarts_delta,video_decoded,audio_decoded,crc_mismatches,unexplained_gaps,listeners_summarized,listeners_with_video,listeners_with_audio
+t1,large-join,4,100,117,347,0,43322,115198,0,1032,100,99,99
+t2,large-join,10,400,778,353,0,708037,1924035,0,7708,400,327,360
+t3,large-join,20,400,915,354,0,896395,2559798,0,6866,400,268,366
+t4,join-depart,10,300,591,356,0,4075,31664,0,1512,250,78,91
+t5,join-depart,20,400,942,356,0,157185,481585,0,4454,400,306,358
+t6,slow-join,4,200,360,358,0,380661,982003,0,3313,200,193,195
+t7,slow-join,10,400,352,357,0,1956,20636,0,936,400,50,50
+t8,join-rejoin,10,200,369,360,0,76108,216346,0,1303,200,84,96
+t9,join-rejoin,20,300,579,360,0,104446,328837,0,3128,300,49,216
+t10,step-ramp,10,400,412,361,0,9976,52211,0,5424,410,10,10

@@ -1,0 +1,7 @@
+# Raw soak/test logs + telemetry dumps are transient — keep the analyses (.md),
+# results (.csv), harness scripts (.sh) and pod templates (.yaml), drop the rest.
+*.log
+*.jsonl
+*.json
+.peak
+.total
