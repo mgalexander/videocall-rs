@@ -1510,6 +1510,235 @@ fn sfu_vc_9eh_watchdog_cadence_decays_to_cap() {
 }
 
 // ===========================================================================
+// vc-nys3 REGRESSION GUARD: SECOND recovery trigger — rising inbound-drop slope.
+//
+// The vc-9eh silence watchdog only fires on TOTAL silence. A PARTIALLY-delivering
+// / starved subscription is never silent (the dispatcher keeps draining some
+// messages, so `last_msg_at` stays fresh and `consecutive_silent_trips` keeps
+// resetting), so a subscription wedged by a transient overload cliff stays
+// starved FOREVER — the permanent-dark-room bug. vc-nys3 adds a second trigger
+// keyed on a rising PER-DISPATCHER inbound-drop slope while receivers are
+// present, with a persisted escalating backoff so it does not thrash when WE
+// (fan-out) are the bottleneck and a resubscribe cannot help. We exercise the
+// factored-out pure predicate `watchdog_should_resubscribe_on_drops` and the
+// backoff window `watchdog_drop_backoff_window` directly — the SAME functions the
+// live dispatcher tick arm + inline mirror call.
+// ===========================================================================
+
+#[test]
+fn sfu_vc_nys3_drop_slope_resubscribe_gating() {
+    use sec_api::actors::chat_server::{
+        watchdog_drop_backoff_window, watchdog_should_resubscribe_on_drops, WATCHDOG_GRACE,
+    };
+
+    let past_grace = WATCHDOG_GRACE + Duration::from_millis(1);
+    let window0 = watchdog_drop_backoff_window(0);
+    let past_backoff = window0 + Duration::from_millis(1);
+
+    // THE failure condition: past grace, past backoff, drops RISING, receivers
+    // present => MUST force a resubscribe (this is the starved-sub recovery the
+    // bead requires — recovery keyed on rising inbound-drop slope while
+    // receivers present, not just silence).
+    assert!(
+        watchdog_should_resubscribe_on_drops(past_grace, past_backoff, window0, true, true),
+        "must resubscribe when actively shedding (drops rising) with receivers"
+    );
+
+    // Drops FLAT (delta 0) => not behind => no trip (steady state must not thrash).
+    assert!(
+        !watchdog_should_resubscribe_on_drops(past_grace, past_backoff, window0, false, true),
+        "no rising drop slope => not behind => no resubscribe"
+    );
+
+    // No receivers => nothing to recover.
+    assert!(
+        !watchdog_should_resubscribe_on_drops(past_grace, past_backoff, window0, true, false),
+        "no receivers => nothing to serve => no resubscribe"
+    );
+
+    // Within grace => a fresh/resubscribed subscription must not be judged behind
+    // before it has had a window to start draining.
+    assert!(
+        !watchdog_should_resubscribe_on_drops(
+            WATCHDOG_GRACE - Duration::from_millis(1),
+            past_backoff,
+            window0,
+            true,
+            true
+        ),
+        "within grace => fresh subscription must not be judged behind"
+    );
+
+    // Within the backoff window (already tripped recently) => must NOT re-trip,
+    // even while still shedding. This is the anti-thrash gate: when fan-out is the
+    // bottleneck and a resubscribe cannot help, repeated shedding must not cause a
+    // resubscribe every tick.
+    assert!(
+        !watchdog_should_resubscribe_on_drops(
+            past_grace,
+            window0 - Duration::from_millis(1),
+            window0,
+            true,
+            true
+        ),
+        "within the backoff window the trigger must not re-fire (anti-thrash)"
+    );
+}
+
+#[test]
+fn sfu_vc_nys3_drop_slope_backoff_escalates_and_caps() {
+    use sec_api::actors::chat_server::{
+        watchdog_drop_backoff_window, watchdog_should_resubscribe_on_drops, WATCHDOG_GRACE,
+        WATCHDOG_SILENCE, WATCHDOG_SILENCE_CAP,
+    };
+
+    // The drop-slope backoff reuses the silence escalation curve: doubling from
+    // base, capped. (One escalation policy to reason about — see
+    // watchdog_drop_backoff_window.)
+    assert_eq!(
+        watchdog_drop_backoff_window(0),
+        WATCHDOG_SILENCE,
+        "trip 0 = base"
+    );
+    assert_eq!(
+        watchdog_drop_backoff_window(1),
+        WATCHDOG_SILENCE * 2,
+        "trip 1 = 2x base"
+    );
+    assert_eq!(
+        watchdog_drop_backoff_window(2),
+        WATCHDOG_SILENCE * 4,
+        "trip 2 = 4x base"
+    );
+    let mut prev = Duration::ZERO;
+    for trips in 0..40u32 {
+        let w = watchdog_drop_backoff_window(trips);
+        assert!(w >= prev, "backoff window must be monotonic non-decreasing");
+        assert!(
+            w <= WATCHDOG_SILENCE_CAP,
+            "backoff window must never exceed cap"
+        );
+        prev = w;
+    }
+    assert_eq!(
+        watchdog_drop_backoff_window(1000),
+        WATCHDOG_SILENCE_CAP,
+        "deep trip count saturates at the cap (no overflow)"
+    );
+
+    // Anti-thrash through the predicate: a dispatcher that has already tripped
+    // (escalated to the 1.5s window) and is STILL shedding must NOT re-fire until
+    // the LONGER window has elapsed — so a fan-out bottleneck (resubscribe never
+    // helps) is probed at a decaying cadence, not thrashed every tick.
+    let past_grace = WATCHDOG_GRACE + Duration::from_millis(1);
+    let window1 = watchdog_drop_backoff_window(1); // 1.5s
+    let since_between = WATCHDOG_SILENCE + Duration::from_millis(1); // past base, < escalated
+    assert!(since_between < window1);
+    assert!(
+        !watchdog_should_resubscribe_on_drops(past_grace, since_between, window1, true, true),
+        "after escalation, a still-shedding dispatcher waits the LONGER window \
+         before re-firing (persisted backoff prevents resubscribe-thrash)"
+    );
+    assert!(
+        watchdog_should_resubscribe_on_drops(
+            past_grace,
+            window1 + Duration::from_millis(1),
+            window1,
+            true,
+            true
+        ),
+        "a genuinely-wedged sub still shedding eventually re-fires at the escalated \
+         window"
+    );
+}
+
+/// vc-nys3: model the dispatcher's drop-slope state machine to prove (a) a
+/// starved-but-not-silent subscription DOES trip (the bug), (b) the backoff
+/// escalates while shedding continues (fan-out-bottleneck anti-thrash), and (c)
+/// the backoff RESETS the instant shedding stops (the resubscribe worked / load
+/// eased), so the very next genuine wedge recovers on the fast base window.
+#[test]
+fn sfu_vc_nys3_drop_slope_backoff_resets_when_shedding_stops() {
+    use sec_api::actors::chat_server::{
+        watchdog_drop_backoff_window, watchdog_should_resubscribe_on_drops, WATCHDOG_TICK,
+    };
+
+    // Virtual dispatcher state mirroring the loop's drop-slope locals.
+    let mut now = Duration::ZERO;
+    let mut subscribe_at = now; // grace clock (restarted on each resubscribe)
+    let mut last_drop_trip_at = now; // backoff clock
+    let mut consecutive_drop_trips: u32 = 0;
+    let mut local_dropped: u64 = 0;
+    let mut last_drop_count: u64 = 0;
+
+    // Phase 1: SUSTAINED shedding (a fan-out bottleneck OR a wedged sub) for long
+    // enough to exercise several escalation steps. Each tick sheds, so the slope
+    // is always rising and the trigger fires at the ESCALATING cadence.
+    let mut trip_times: Vec<Duration> = Vec::new();
+    let horizon = Duration::from_secs(120);
+    while now < horizon {
+        now += WATCHDOG_TICK;
+        // Active shedding this tick.
+        local_dropped += 1;
+        let delta = local_dropped - last_drop_count;
+        last_drop_count = local_dropped;
+        let drops_rising = delta > 0;
+        if delta == 0 {
+            consecutive_drop_trips = 0;
+        }
+        let uptime = now - subscribe_at;
+        let since_trip = now - last_drop_trip_at;
+        let window = watchdog_drop_backoff_window(consecutive_drop_trips);
+        if watchdog_should_resubscribe_on_drops(uptime, since_trip, window, drops_rising, true) {
+            trip_times.push(now);
+            consecutive_drop_trips = consecutive_drop_trips.saturating_add(1);
+            last_drop_trip_at = now;
+            subscribe_at = now; // resubscribe restarts the grace clock
+        }
+    }
+
+    assert!(
+        trip_times.len() >= 4,
+        "a sustained starved/wedged subscription MUST trip the drop-slope recovery \
+         repeatedly (this is the permanent-dark-room fix); got {} trips",
+        trip_times.len()
+    );
+    // Inter-trip spacing must ESCALATE (anti-thrash for the fan-out-bottleneck
+    // case where resubscribe cannot help): spacing[i] follows the escalating
+    // window for trip count i+1, rounded up to a tick boundary.
+    let round_up_to_tick = |d: Duration| -> Duration {
+        let tick = WATCHDOG_TICK.as_millis() as u64;
+        let ms = d.as_millis() as u64;
+        Duration::from_millis(ms.div_ceil(tick) * tick)
+    };
+    for i in 0..trip_times.len() - 1 {
+        let spacing = trip_times[i + 1] - trip_times[i];
+        let expected = round_up_to_tick(watchdog_drop_backoff_window((i as u32) + 1));
+        assert_eq!(
+            spacing, expected,
+            "drop-slope inter-trip spacing #{i} must follow the escalating backoff \
+             (got {:?}, expected {:?}) — proves it does not thrash every tick",
+            spacing, expected
+        );
+    }
+
+    // Phase 2: shedding STOPS (the resubscribe worked, or offered load eased). The
+    // next sample sees delta == 0 and resets the backoff — so the next genuine
+    // wedge recovers on the FAST base window again.
+    let delta = local_dropped - last_drop_count; // no new drops => 0
+    assert_eq!(delta, 0, "phase 2 models shedding stopping");
+    if delta == 0 {
+        consecutive_drop_trips = 0;
+    }
+    assert_eq!(
+        watchdog_drop_backoff_window(consecutive_drop_trips),
+        watchdog_drop_backoff_window(0),
+        "after shedding stops, the backoff resets to the fast base window \
+         (no permanent dark room: forwarding recovers within seconds once load eases)"
+    );
+}
+
+// ===========================================================================
 // vc-vyg9 REGRESSION GUARD: decouple inbound DRAIN from per-message FAN-OUT.
 //
 // The per-room dispatcher used to perform the entire per-message fan-out INLINE

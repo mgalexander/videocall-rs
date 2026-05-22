@@ -3117,6 +3117,78 @@ pub const WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// spam or resubscribe churn.
 pub const WATCHDOG_SILENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
+// --- vc-nys3: SECOND recovery trigger — rising inbound-drop slope ----------
+//
+// ROOT CAUSE (the IRREVERSIBILITY / permanent-dark-room hazard). The vc-9eh
+// silence watchdog above only fires on TOTAL silence (`last_msg_at` stale for a
+// whole window). But a PARTIALLY-delivering / STARVED subscription is never
+// silent: the dispatcher keeps draining SOME messages, so the `Some(msg)` /
+// greedy-drain arms keep stamping `last_msg_at` and resetting
+// `consecutive_silent_trips` to 0 on every drained message. The silence window
+// therefore never elapses, the silence watchdog never trips, and a subscription
+// wedged/degraded by a transient overload cliff (async-nats `SlowConsumer`
+// backpressure) stays starved FOREVER even after the offered load eases. A
+// transient overload permanently darkens the room.
+//
+// FIX. Add a SECOND trigger keyed on "behind" — a RISING per-dispatcher
+// inbound-drop slope WHILE receivers are present — that performs the SAME
+// in-place resubscribe the silence path does, so forwarding resumes once the
+// offered load drops. The drop signal is the THIS-DISPATCHER shed count
+// (`local_inbound_dropped`, bumped at our own `shed_inbound` call sites), NOT
+// the process-global `SFU_DISPATCHER_INBOUND_DROPPED_TOTAL` counter — using the
+// global would make every room's watchdog trip the instant ANY room sheds, a
+// synchronized resubscribe-wave against an already-stressed NATS connection
+// (the exact thundering-herd hazard the per-room timer jitter exists to avoid).
+//
+// ANTI-THRASH (the load-bearing subtlety, paired with lj-7 raise-cliff). A
+// resubscribe of the UPSTREAM NATS sub only helps when the SUBSCRIPTION is
+// wedged. When WE (fan-out) are the bottleneck, the shed IS the correct
+// backpressure and resubscribing does NOTHING to relieve it — so a naive
+// "trip whenever shedding" would resubscribe-thrash every tick for the entire
+// duration of a legitimate fan-out overload. We cannot distinguish the two
+// cases cheaply from inside the dispatcher (both manifest as a rising local
+// drop count). The resolution is a persisted ESCALATING backoff, exactly like
+// the silence path's `consecutive_silent_trips`: the FIRST drop-slope trip
+// fires fast (recover a genuinely-wedged sub quickly), but repeated trips that
+// do NOT stop the shedding decay in cadence toward a 30s cap — so a fan-out
+// bottleneck (where resubscribe never helps) is probed at most ~once/30s rather
+// than thrashed every tick, while a wedged subscription (where the first
+// resubscribe DOES restore drain and the drop slope flattens) recovers in
+// seconds and the backoff RESETS the moment shedding stops.
+//
+//   * DROP_BACKOFF_BASE = 750ms — minimum interval between drop-slope
+//     resubscribes for the FIRST trip. Matches WATCHDOG_SILENCE so a genuinely-
+//     wedged subscription recovers on the same fast budget as the silence path.
+//   * The interval ESCALATES per consecutive drop trip (750ms, 1.5s, 3s, 6s,
+//     12s, 24s, capped at 30s) and RESETS to base the instant the drop delta
+//     returns to 0 (shedding stopped — either the resubscribe worked or load
+//     eased). Reuses WATCHDOG_SILENCE / WATCHDOG_SILENCE_CAP semantics via
+//     `watchdog_drop_backoff_window` so there is ONE escalation policy to reason
+//     about, not two divergent ones.
+//   * GATED behind WATCHDOG_GRACE uptime since the last (re)subscribe, exactly
+//     like the silence path — never resubscribe a fresh subscription before it
+//     has had a grace window to start delivering.
+
+/// vc-nys3: pure escalating-backoff window for the inbound-drop-slope recovery
+/// trigger. Identical doubling-from-base-capped policy as
+/// [`watchdog_silence_window`], driven by a SEPARATE `consecutive_drop_trips`
+/// counter so the two triggers escalate independently (a flapping fan-out
+/// bottleneck must not perturb the silence cadence and vice-versa). Factored out
+/// so the cadence is unit-testable without provoking real backpressure.
+///
+/// | trips | window |
+/// |-------|--------|
+/// | 0     | 750ms  |
+/// | 1     | 1.5s   |
+/// | 2     | 3s     |
+/// | ...   | ...    |
+/// | >=6   | 30s (cap) |
+pub fn watchdog_drop_backoff_window(trips: u32) -> std::time::Duration {
+    // Identical saturating-shift-then-clamp as the silence window; the policy is
+    // deliberately shared (one escalation curve to reason about).
+    watchdog_silence_window(trips)
+}
+
 /// vc-kcpg: hard cap on the per-dispatcher scorer batch length before an inline
 /// flush is forced, independent of the 200ms flush timer.
 ///
@@ -3401,6 +3473,48 @@ pub fn watchdog_should_resubscribe(
     uptime >= WATCHDOG_GRACE && silence >= silence_window && has_receivers && has_publishers
 }
 
+/// vc-nys3: pure drop-slope-watchdog decision — the SECOND recovery trigger,
+/// keyed on a rising per-dispatcher inbound-drop slope WHILE receivers are
+/// present, rather than on total silence. Factored out alongside
+/// [`watchdog_should_resubscribe`] so the gating is unit-testable without
+/// provoking real async-nats backpressure.
+///
+/// Returns `true` IFF the dispatcher should force an in-place resubscribe
+/// BECAUSE it is actively shedding inbound (a starved/wedged subscription that
+/// never goes silent and so is invisible to the silence watchdog). All gates
+/// must hold:
+///
+///   * `uptime >= WATCHDOG_GRACE` — never judge a freshly (re)subscribed
+///     subscription before it has had a grace window to start delivering.
+///   * `since_last_trip >= backoff_window` — the persisted ESCALATING anti-thrash
+///     interval (from [`watchdog_drop_backoff_window`]). This is the load-bearing
+///     gate that prevents resubscribe-thrash when WE (fan-out) are the bottleneck
+///     and a resubscribe cannot help: repeated trips that don't stop the shedding
+///     decay toward the 30s cap, so a fan-out overload is probed at most ~once/30s
+///     while a genuinely-wedged subscription (whose drop slope flattens after the
+///     first successful resubscribe) recovers fast and resets the backoff.
+///   * `drops_rising` — this dispatcher's OWN shed count increased over the last
+///     sample interval (a positive local-drop delta). NOT the process-global drop
+///     counter (that would synchronize a resubscribe-wave across all rooms).
+///   * `has_receivers` — nobody to serve ⇒ nothing to recover.
+///
+/// NOTE: there is intentionally NO `has_publishers` gate here. Active shedding
+/// (`drops_rising`) is itself proof that inbound media is arriving faster than we
+/// drain it, which strictly implies publishers — a stronger, self-evident
+/// liveness signal than the coarse member-count gate the silence path uses.
+///
+/// ZERO per-receiver / per-message cost: evaluated only on the watchdog tick (one
+/// per room per 250ms) and the inline mirror, against task-local counters.
+pub fn watchdog_should_resubscribe_on_drops(
+    uptime: std::time::Duration,
+    since_last_trip: std::time::Duration,
+    backoff_window: std::time::Duration,
+    drops_rising: bool,
+    has_receivers: bool,
+) -> bool {
+    uptime >= WATCHDOG_GRACE && since_last_trip >= backoff_window && drops_rising && has_receivers
+}
+
 /// Spawn the per-room demux subscription task (vc-q0v).
 ///
 /// One task per room. Subscribes once to `room.<room>.*`, parses each
@@ -3656,6 +3770,33 @@ fn spawn_room_dispatcher(
         // single subtraction + divide once per tick per room.
         let mut inbound_msg_count: u64 = 0;
         let mut last_rate_sample: (u64, std::time::Instant) = (0, std::time::Instant::now());
+        // vc-nys3: TASK-LOCAL inbound-drop counter — the "behind" signal that
+        // drives the SECOND (drop-slope) recovery trigger. Bumped O(1) at each of
+        // THIS dispatcher's `shed_inbound` call sites on the (already-cold)
+        // overflow path. Deliberately PER-DISPATCHER, not the process-global
+        // `SFU_DISPATCHER_INBOUND_DROPPED_TOTAL`: keying the per-room trigger on
+        // the global counter would make every room's watchdog trip the instant
+        // ANY room sheds — a synchronized resubscribe-wave against an already-
+        // stressed NATS connection (the thundering-herd hazard the per-room timer
+        // jitter exists to avoid). `(count, instant)` is the previous sample; a
+        // positive delta over the sample interval = this dispatcher is actively
+        // shedding = "behind".
+        let mut local_inbound_dropped: u64 = 0;
+        let mut last_drop_sample: (u64, std::time::Instant) = (0, std::time::Instant::now());
+        // vc-nys3: consecutive drop-slope resubscribes NOT followed by the
+        // shedding stopping. Drives the escalating `watchdog_drop_backoff_window`
+        // so a fan-out bottleneck (where resubscribe cannot help) decays to ~one
+        // probe per WATCHDOG_SILENCE_CAP instead of thrashing every tick. Reset to
+        // 0 the moment the drop delta returns to 0 (shedding stopped — the
+        // resubscribe worked or load eased), exactly like `consecutive_silent_trips`
+        // resets on real traffic.
+        let mut consecutive_drop_trips: u32 = 0;
+        // vc-nys3: instant of the last drop-slope resubscribe (or initial
+        // subscribe). The anti-thrash gate measures `since_last_trip` from here so
+        // repeated trips honour the ESCALATED backoff window. Initialised to the
+        // subscribe instant so the very first trip is governed by GRACE + the base
+        // backoff window, never sooner.
+        let mut last_drop_trip_at = subscribe_at;
         let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
         // The first tick fires immediately; skip it so the very first watchdog
         // evaluation happens one full TICK in (and is anyway gated by GRACE).
@@ -3759,6 +3900,85 @@ fn spawn_room_dispatcher(
                 }
                 last_rate_sample = (inbound_msg_count, now);
             }};
+        }
+
+        // vc-nys3: sample THIS dispatcher's inbound-drop SLOPE over the interval
+        // since `last_drop_sample` and return whether it is RISING (a positive
+        // local-drop delta). Also folds in the backoff RESET: when the delta is 0
+        // the shedding has stopped (the resubscribe worked, or the offered load
+        // eased), so `consecutive_drop_trips` resets to base — mirroring the way
+        // the `Some(msg)` arm resets `consecutive_silent_trips` on real traffic.
+        // O(1): one wrapping subtraction, no locks. Computed on the watchdog tick
+        // AND the inline message-path mirror (both pass `$now`), so the slope is
+        // sampled at ~tick cadence on both the timer arm and the starved-timer
+        // overload path. Evaluates to a `bool` (`drops_rising`).
+        macro_rules! sample_drop_slope {
+            ($now:expr) => {{
+                let now = $now;
+                let (prev_count, _prev_at) = last_drop_sample;
+                let delta = local_inbound_dropped.wrapping_sub(prev_count);
+                last_drop_sample = (local_inbound_dropped, now);
+                if delta == 0 {
+                    // Shedding stopped between samples — recovery achieved (or load
+                    // eased). Reset the escalating backoff so the NEXT genuine wedge
+                    // is recovered on the fast base window again.
+                    consecutive_drop_trips = 0;
+                }
+                delta > 0
+            }};
+        }
+
+        // vc-nys3: perform the in-place drop-slope resubscribe. SAME mechanism as
+        // the silence path's resubscribe arm: drop the old (starved) merged
+        // `Subscriber`(s) and re-establish the FULL filter set for this shard on
+        // the SAME task, then restart the grace clock so the fresh subscription
+        // gets a full window to drain before it can be judged behind again. We do
+        // NOT touch `last_msg_at` / `consecutive_silent_trips` (the silence path's
+        // state) — the two triggers are independent. On a resubscribe FAILURE we
+        // fall back to the actor respawn path and EXIT the task (`return`),
+        // identical to the silence path. A macro (not a fn) because the resubscribe
+        // must mutate the loop's `sub` and the per-task clocks in place and may
+        // `return` from the dispatcher future.
+        //
+        // Caller contract: only invoke after `watchdog_should_resubscribe_on_drops`
+        // has returned true and AFTER bumping `consecutive_drop_trips` +
+        // `last_drop_trip_at` (so the escalating backoff persists across trips).
+        macro_rules! drop_slope_resubscribe {
+            () => {
+                match subscribe_all(&nc, &subjects).await {
+                    Ok(fresh) => {
+                        let now = std::time::Instant::now();
+                        sub = fresh;
+                        subscribe_at = now;
+                        // Restart the silence clock too: a freshly-attached
+                        // subscription must not be instantly judged silent by the
+                        // OTHER watchdog the tick after a drop-slope resubscribe.
+                        last_msg_at = now;
+                        // Flush the scorer batch before looping on the fresh sub so
+                        // the resubscribe doesn't drop a tick of observations
+                        // (mirrors the silence path).
+                        flush_scorer_batch!();
+                        last_scorer_flush = now;
+                        info!(
+                            "Per-room demux drop-slope resubscribed in place to \
+                             {:?} (room {}, shard {}/{}, consecutive drop trip #{})",
+                            subjects, room, ingest_shard, n_ingest_shards,
+                            consecutive_drop_trips
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Per-room demux failed to drop-slope resubscribe to \
+                             {:?} (room {}, shard {}/{}): {} — handing off to actor \
+                             respawn",
+                            subjects, room, ingest_shard, n_ingest_shards, e
+                        );
+                        flush_scorer_batch!();
+                        let _ = chat_server.try_send(RoomDispatcherExited { room: room.clone() });
+                        return;
+                    }
+                }
+            };
         }
 
         // --- vc-vyg9: decouple inbound DRAIN from per-message FAN-OUT ----------
@@ -3993,6 +4213,49 @@ fn spawn_room_dispatcher(
                     // path (after the scorer flush) so the gauge stays fresh even
                     // when a sustained backlog starves THIS timer arm.
                     sample_inbound_rate!(now);
+                    // vc-nys3: SECOND recovery trigger — rising inbound-drop slope.
+                    // Evaluated EVERY tick, BEFORE the silence pre-gate below,
+                    // because a STARVED (partially-delivering) subscription is
+                    // never silent — `last_msg_at` stays fresh, so `silence` never
+                    // reaches the window and the silence path would `continue` past
+                    // this case forever (the permanent-dark-room bug). We instead
+                    // key on whether THIS dispatcher is actively shedding. Sample
+                    // the local-drop slope (also resets `consecutive_drop_trips`
+                    // when shedding has stopped) and resubscribe if past grace AND
+                    // past the escalating anti-thrash backoff window.
+                    let drops_rising = sample_drop_slope!(now);
+                    let drop_backoff = watchdog_drop_backoff_window(consecutive_drop_trips);
+                    let since_last_drop_trip = now.duration_since(last_drop_trip_at);
+                    if watchdog_should_resubscribe_on_drops(
+                        uptime,
+                        since_last_drop_trip,
+                        drop_backoff,
+                        drops_rising,
+                        has_receivers,
+                    ) {
+                        // Escalate the drop-slope backoff and stamp the trip
+                        // instant so repeated trips honour the longer window.
+                        // Resets via `sample_drop_slope!` when the delta returns to
+                        // 0 (shedding stopped). NOTE: we do NOT reset `last_msg_at`
+                        // / `consecutive_silent_trips` — the silence trigger's state
+                        // is independent.
+                        consecutive_drop_trips = consecutive_drop_trips.saturating_add(1);
+                        last_drop_trip_at = now;
+                        warn!(
+                            "Per-room demux for room {} is actively shedding inbound \
+                             (local drop slope rising, backoff window {}ms, \
+                             consecutive drop trip #{}) while {} receiver(s) remain — \
+                             the subscription is starved/wedged (slow-consumer \
+                             backpressure that never goes fully silent); \
+                             resubscribing in place",
+                            room,
+                            drop_backoff.as_millis(),
+                            consecutive_drop_trips,
+                            receiver_count,
+                        );
+                        drop_slope_resubscribe!();
+                        continue;
+                    }
                     // Cheap pre-gate for the RESUBSCRIBE path: avoid escalating
                     // / resubscribing until we are actually past grace AND past
                     // the (escalating) silence window. The common steady-state
@@ -4626,6 +4889,15 @@ fn spawn_room_dispatcher(
                     // does not touch the common hot path.
                     let resident_classes: Vec<crate::sfu::priority_queue::Class> =
                         inbound_queue.iter().map(|item| item.class).collect();
+                    // vc-nys3: every branch below sheds exactly ONE inbound
+                    // message, so bump the TASK-LOCAL drop counter once per shed.
+                    // This is the "behind" signal that drives the drop-slope
+                    // recovery trigger; it is per-dispatcher (NOT the process-global
+                    // counter) so a shedding room only trips ITS OWN watchdog, never
+                    // a synchronized resubscribe-wave across all rooms. O(1) on the
+                    // already-cold overflow path; the steady-state (queue-not-full)
+                    // path above never reaches here.
+                    local_inbound_dropped = local_inbound_dropped.wrapping_add(1);
                     match plan_shed(&resident_classes, class) {
                         (ShedDecision::DropIncoming, _) => {
                             // The incoming message is the lowest-priority
@@ -4653,6 +4925,77 @@ fn spawn_room_dispatcher(
                             // path, still counted.
                             shed_inbound(class);
                         }
+                    }
+                }
+            }
+
+            // vc-nys3: STARVATION-PROOF inline DROP-SLOPE mirror. The drop-slope
+            // recovery trigger lives in the `watchdog.tick()` arm, but the `biased`
+            // `select!` STARVES that timer arm under sustained backlog — and that is
+            // EXACTLY when shedding is happening and we most need to evaluate
+            // recovery. (Unlike the silence trigger, which the greedy drain keeps
+            // alive implicitly via `last_msg_at`, the drop-slope trigger has no such
+            // implicit refresh.) So we mirror it HERE on the message path, after the
+            // greedy drain (so any shed THIS iteration is already counted), gated on
+            // elapsed-since-last-sample like the scorer-flush and rate-sample inline
+            // mirrors above. The single shared `last_drop_sample.1` clock means the
+            // timer arm and this mirror never double-sample within one tick:
+            // whichever runs first advances the baseline, the other sees < TICK
+            // elapsed and skips. The elapsed-tick path itself is O(1) and lock-free
+            // (only `sample_drop_slope!` runs); the `receivers.read()` lock is taken
+            // only when the drop slope is rising AND the grace/backoff gates have
+            // passed — i.e. on the genuine shedding path, never on a healthy room.
+            if last_drop_sample.1.elapsed() >= WATCHDOG_TICK {
+                let now = std::time::Instant::now();
+                // `sample_drop_slope!` MUST run every elapsed tick regardless of the
+                // gates below: it advances the shared `last_drop_sample` clock and
+                // resets `consecutive_drop_trips` on delta==0 (a healthy tick), so
+                // gating the sample itself would freeze the backoff. O(1), no lock.
+                let drops_rising = sample_drop_slope!(now);
+                let uptime = now.duration_since(subscribe_at);
+                let drop_backoff = watchdog_drop_backoff_window(consecutive_drop_trips);
+                let since_last_drop_trip = now.duration_since(last_drop_trip_at);
+                // Receiver presence requires a read lock, so take it ONLY once the
+                // cheap duration gates have passed AND the slope is actually rising —
+                // i.e. only on the genuine shedding path. On a healthy high-traffic
+                // room that never sheds, `drops_rising` is false and we never lock.
+                // `watchdog_should_resubscribe_on_drops` itself requires all of
+                // `drops_rising`, the grace/backoff gates, and `has_receivers`, so
+                // reading receivers before these gates pass is wasted work.
+                if drops_rising
+                    && uptime >= WATCHDOG_GRACE
+                    && since_last_drop_trip >= drop_backoff
+                {
+                    let has_receivers = {
+                        let g = match receivers.read() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        !g.is_empty()
+                    };
+                    if watchdog_should_resubscribe_on_drops(
+                        uptime,
+                        since_last_drop_trip,
+                        drop_backoff,
+                        drops_rising,
+                        has_receivers,
+                    ) {
+                        consecutive_drop_trips = consecutive_drop_trips.saturating_add(1);
+                        last_drop_trip_at = now;
+                        warn!(
+                            "Per-room demux for room {} is actively shedding inbound \
+                             (inline drop-slope mirror; backoff window {}ms, consecutive \
+                             drop trip #{}) — the subscription is starved/wedged under \
+                             sustained overload (timer arm starved by biased select!); \
+                             resubscribing in place",
+                            room,
+                            drop_backoff.as_millis(),
+                            consecutive_drop_trips,
+                        );
+                        // On success the macro restarts the clocks and falls through —
+                        // the outer `loop` re-iterates on the fresh subscription. On
+                        // failure it hands off to the actor respawn and `return`s.
+                        drop_slope_resubscribe!();
                     }
                 }
             }
