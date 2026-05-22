@@ -185,6 +185,29 @@ struct RoomDispatcherExited {
     room: String,
 }
 
+/// vc-zexm: internal message posted by a per-room dispatcher when a cross-pod
+/// remote-publisher registry change bumped the shared `members_generation`,
+/// busting every local receiver's AllowSet cache.
+///
+/// The dispatcher MUST NOT run the O(R·members) `rewarm_subscription_cache`
+/// inline on its inbound-drain loop — that loop is the exact hot path the bead
+/// protects (running it there during a spill-pod federation wave stalls the
+/// drain → async-nats drops at the 16Ki sub → late-joiner media loss). Instead
+/// the dispatcher fires this message (`try_send`, fire-and-forget) and the
+/// `ChatServer` actor performs the re-warm on its OWN thread of execution, off
+/// the dispatcher barrier.
+///
+/// Deferring is always safe: `SubscriptionStore::resolve_cached` self-heals on
+/// a miss, so the worst case while the message is in flight is a few on-hot-path
+/// recomputes — strictly better than stalling the drain. Bursts coalesce
+/// naturally on the actor mailbox; the handler is idempotent (re-warming an
+/// already-warm cache is a no-op via the per-entry generation check).
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct RewarmSubscriptionCache {
+    room: String,
+}
+
 /// Internal message: posted by the spawned NATS-KV lookup task once a
 /// room's home region has been resolved (bead vc-hc8 / p6-9). Carries the
 /// information needed for the actor to either:
@@ -805,6 +828,18 @@ impl ChatServer {
                     // locks for `last_selections`, mutex for hysteresis).
                     fwd.layer_selector().invalidate_all();
                     fwd.prune_session(*session_id);
+                    // vc-zexm: a leave also bumps `members_generation` (via
+                    // `remove_member`), busting every remaining receiver's
+                    // AllowSet cache entry — same thundering herd as a join.
+                    // Re-warm the cache off this cold Leave path so the
+                    // surviving receivers' next media packets hit the cache
+                    // instead of recomputing O(members) inside the fan-out
+                    // barrier. `prune_session` above already pruned the
+                    // departed sid from the remote-publisher registry, so the
+                    // snapshot this re-warm reads is post-departure. The
+                    // leaver's own cache entry was dropped by `forget` earlier
+                    // in this branch.
+                    fwd.rewarm_subscription_cache();
                 }
             }
         }
@@ -1714,6 +1749,34 @@ impl Handler<RoomDispatcherExited> for ChatServer {
         );
         self.room_dispatch
             .insert(room, RoomDispatch { receivers, tasks });
+    }
+}
+
+/// vc-zexm: re-warm a room's per-receiver AllowSet cache OFF the dispatcher
+/// drain loop, after a cross-pod remote-publisher registry change bumped the
+/// shared `members_generation`.
+///
+/// Runs on the `ChatServer` actor thread (a different execution context from
+/// the dispatcher's inbound-drain loop), so the O(R·members) recompute never
+/// stalls the drain barrier. Bursts of these messages from the dispatcher
+/// coalesce on the serialized actor mailbox; the handler is idempotent because
+/// `SubscriptionStore::rewarm_cache` skips entries already fresh for the live
+/// generations, so a redundant re-warm is a cheap pass over the cache keys.
+///
+/// No-op if the room's forwarder is gone (room torn down between the
+/// dispatcher's `try_send` and this handler running) — the re-warm would be
+/// dead work, and `resolve_cached` self-heals regardless.
+impl Handler<RewarmSubscriptionCache> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        RewarmSubscriptionCache { room }: RewarmSubscriptionCache,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        if let Some(forwarder) = self.forwarders.get(&room) {
+            forwarder.rewarm_subscription_cache();
+        }
     }
 }
 
@@ -2692,6 +2755,18 @@ impl Handler<JoinRoom> for ChatServer {
             // concurrency notes for the access pattern.
             forwarder.layer_selector().invalidate_all();
         }
+        // vc-zexm: rebuild the per-receiver AllowSet cache HERE, on the cold
+        // JoinRoom path, against the post-`insert_member` membership generation.
+        // The join just bumped `members_generation`, which would otherwise make
+        // the next media packet for EVERY receiver miss the AllowSet cache and
+        // recompute O(members) inside the dispatcher fan-out barrier (the O(R²)
+        // thundering herd that throttles inbound drain → async-nats drops →
+        // late-joiner media loss). Re-warming now means the post-join media
+        // packets HIT the cache, so the barrier stays cheap. This is a pure
+        // performance warm-up — `resolve_cached` still validates generations on
+        // every lookup, so correctness never depends on the warm-up being
+        // current.
+        forwarder.rewarm_subscription_cache();
         let sfu_mode = self.sfu_config.mode;
 
         // --- vc-q0v: per-room parse-once demux ----------------------------
@@ -3634,11 +3709,52 @@ fn spawn_room_dispatcher(
                                     g.remote_publisher_write_needed(sender_sid, is_video, now)
                                 };
                                 if write_needed {
-                                    let mut g = match room_state.write() {
-                                        Ok(g) => g,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    g.note_remote_publisher(sender_sid, is_video, now);
+                                    // vc-zexm: detect whether this write actually
+                                    // changed the resolution-relevant snapshot
+                                    // (`note_remote_publisher` only bumps
+                                    // `members_generation` on a new sid, an
+                                    // audio→video upgrade, or a TTL reap — NOT on
+                                    // a pure liveness refresh). Capture the
+                                    // generation before/after so we re-warm the
+                                    // AllowSet cache ONLY on a genuine change,
+                                    // never on a throttle-window liveness write.
+                                    let gen_before;
+                                    let gen_after;
+                                    {
+                                        let mut g = match room_state.write() {
+                                            Ok(g) => g,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        let (_, before) = g.members_snapshot_with_generation();
+                                        gen_before = before;
+                                        g.note_remote_publisher(sender_sid, is_video, now);
+                                        let (_, after) = g.members_snapshot_with_generation();
+                                        gen_after = after;
+                                    }
+                                    // vc-zexm: a registry change bumps the SHARED
+                                    // `members_generation`, busting every local
+                                    // receiver's AllowSet cache. We must NOT
+                                    // re-warm inline here — this is the inbound-
+                                    // drain loop, the exact hot path the bead
+                                    // protects. During a spill-pod federation
+                                    // wave (many new cross-pod publishers) an
+                                    // inline O(R·members) re-warm would stall the
+                                    // drain → async-nats drops at the 16Ki sub →
+                                    // late-joiner media loss. Instead fire a
+                                    // fire-and-forget message so the ChatServer
+                                    // actor re-warms on ITS thread, off this
+                                    // barrier. Deferring is safe: `resolve_cached`
+                                    // self-heals on a miss, so the worst case
+                                    // until the re-warm lands is a few on-hot-path
+                                    // recomputes — strictly better than stalling
+                                    // the drain. Skipped on a no-op (liveness-
+                                    // only) write that did not bump the
+                                    // generation.
+                                    if gen_after != gen_before {
+                                        let _ = chat_server.try_send(RewarmSubscriptionCache {
+                                            room: room.clone(),
+                                        });
+                                    }
                                 }
                             }
                         }

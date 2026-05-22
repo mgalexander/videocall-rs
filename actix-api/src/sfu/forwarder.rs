@@ -668,6 +668,73 @@ impl Forwarder {
         ForwardDecision::Forward
     }
 
+    /// vc-zexm: rebuild the per-receiver `AllowSet` cache OFF the media hot
+    /// path after a room membership change (join / leave) or a remote-publisher
+    /// registry change.
+    ///
+    /// Called from the chat-server's cold `JoinRoom` / `Leave` paths — right
+    /// alongside the existing `layer_selector().invalidate_all()` — NOT from
+    /// the per-packet `decide` fan-out. It snapshots the current room
+    /// membership + generation, the active-speaker set + generation, and the
+    /// remote-publisher registry (all three are the inputs to
+    /// [`SubscriptionStore::resolve_inner`]) and re-warms every currently-cached
+    /// receiver's entry against them.
+    ///
+    /// Why this kills the thundering herd: a join bumps the GLOBAL
+    /// `members_generation`, which would otherwise make the very next media
+    /// packet for EVERY receiver miss the `AllowSet` cache and rebuild inside
+    /// the dispatcher fan-out barrier (O(R²) per join wave, throttling inbound
+    /// drain → async-nats drops → late-joiner media loss). By rebuilding here,
+    /// the post-join media packets HIT the cache and the barrier stays cheap.
+    ///
+    /// Correctness is unconditional: [`SubscriptionStore::rewarm_cache`] only
+    /// stamps entries with the snapshot's generations, and
+    /// [`SubscriptionStore::resolve_cached`] still validates all three
+    /// generations per lookup — so a snapshot that is already stale by the time
+    /// a packet arrives just misses and recomputes, never serving a wrong
+    /// AllowSet. The resolution logic (visible-tile cap, cross-pod publisher
+    /// folding, pin/slot/speaker/receive-all tiers) is byte-for-byte the same
+    /// as the hot path.
+    ///
+    /// Best-effort: a failed snapshot or an empty cache makes this a cheap
+    /// no-op. Poison-safe locking, matching the rest of the forwarder.
+    pub fn rewarm_subscription_cache(&self) {
+        // Snapshot membership + remote publishers + generation atomically under
+        // a single room read-lock acquisition, mirroring `decide`. Both
+        // snapshots return the SAME shared `members_generation`.
+        let (members_snapshot, members_generation, remote_publishers) = {
+            let room = match self.room.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (members, gen) = room.members_snapshot_with_generation();
+            let (remote_pubs, _) = room.remote_publishers_snapshot_with_generation();
+            (members, gen, remote_pubs)
+        };
+
+        // Lock-free read of the current speaker set + generation (matches the
+        // hot path's `decide` capture).
+        let (speakers_top, speakers_generation): (Arc<Vec<SessionId>>, u64) = {
+            let snap = self.speakers.borrow();
+            (Arc::clone(&snap.top), snap.generation)
+        };
+
+        // Read lock on the store is sufficient — `rewarm_cache` mutates only the
+        // internal `DashMap` (its own shard locks), reading `per_receiver` /
+        // `sub_version` immutably.
+        let store = match self.subscriptions.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        store.rewarm_cache(
+            &members_snapshot,
+            members_generation,
+            &speakers_top,
+            speakers_generation,
+            &remote_publishers,
+        );
+    }
+
     /// Reap all per-session state held by this forwarder for `sid`.
     ///
     /// Called from the chat-server `LeaveRoom` path so that

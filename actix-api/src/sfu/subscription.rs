@@ -333,6 +333,103 @@ impl SubscriptionStore {
         allow
     }
 
+    /// vc-zexm: rewarm every *currently-cached* receiver's `AllowSet` against a
+    /// fresh `(members, speakers, remote_publishers)` snapshot, OFF the media
+    /// hot path.
+    ///
+    /// ## Problem this solves
+    ///
+    /// The per-receiver cache key folds the GLOBAL `members_generation` counter
+    /// (see [`CachedAllow`]). A single join bumps that counter, so the NEXT
+    /// media packet for EVERY one of the room's `R` receivers misses the cache
+    /// and rebuilds via [`Self::resolve_inner`] (O(members) each) — an O(R²)
+    /// recompute storm executed INSIDE the dispatcher's fan-out barrier. That
+    /// barrier gates inbound drain, so the storm throttles ingest and the
+    /// upstream async-nats subscription silently drops, starving late joiners of
+    /// media (the late-joiner root cause).
+    ///
+    /// ## The fix
+    ///
+    /// Membership changes are rare (cold path) relative to the media packet
+    /// rate. So when membership (or the remote-publisher registry) changes, the
+    /// caller rebuilds the affected cache entries HERE — on the cold
+    /// `JoinRoom` / `Leave` path — using the post-change snapshot + generation.
+    /// The subsequent media packets then HIT the cache (matching generation),
+    /// so no `resolve_inner` runs inside the fan-out barrier. The per-join cost
+    /// is O(hot-receivers × members) paid once, off the media-drain barrier —
+    /// NOT O(R²) per packet on it.
+    ///
+    /// ## Why this is always correct (cannot serve a stale AllowSet)
+    ///
+    /// This method is a pure *performance* warm-up. It only ever writes entries
+    /// stamped with the supplied generations. [`Self::resolve_cached`] STILL
+    /// validates all three generations (`sub_version`, `members_generation`,
+    /// `speakers_generation`) on every lookup. So if the warmed snapshot is
+    /// already stale by the time a media packet arrives (a second membership
+    /// change raced in between), the media path simply misses and recomputes —
+    /// degrading to the pre-fix behavior for that one packet, never serving a
+    /// wrong answer. The visible-tile cap, cross-pod publisher folding, and
+    /// pin/slot/speaker/receive-all resolution are all unchanged because the
+    /// warm-up calls the SAME [`Self::resolve_inner`] the hot path would.
+    ///
+    /// ## Scope: only ALREADY-cached receivers
+    ///
+    /// We iterate the existing cache keys, not `per_receiver` and not the full
+    /// membership. A receiver with no cache entry is "cold" — its first media
+    /// packet computes once and caches, exactly as before (a one-time
+    /// O(members), not a storm). Warming a cold receiver here would be wasted
+    /// work for a receiver that may never receive another packet. Receivers
+    /// whose `sub_version` no longer matches a live subscription are skipped via
+    /// the same equality the hot path uses.
+    ///
+    /// `&self`-only: the cache is a [`DashMap`]; `per_receiver` / `sub_version`
+    /// are read immutably, so a caller holding the outer `RwLock` read-only can
+    /// invoke this. (The membership-change callers happen to hold it for write,
+    /// which is also fine.)
+    pub fn rewarm_cache(
+        &self,
+        current_members: &Arc<HashSet<SessionId>>,
+        members_generation: u64,
+        speaker_set: &Arc<Vec<SessionId>>,
+        speakers_generation: u64,
+        remote_publishers: &RemotePublishers,
+    ) {
+        // Snapshot the cached receiver ids first so we are not iterating the
+        // DashMap while inserting back into it (which would deadlock on the
+        // same shard). The hot-receiver set is bounded by room size.
+        let receivers: Vec<SessionId> = self.cache.iter().map(|e| *e.key()).collect();
+        for receiver in receivers {
+            let sub_version = self.sub_version.get(&receiver).copied().unwrap_or(0);
+            // Skip entries that are already fresh for all three generations —
+            // nothing to rebuild (e.g. a join that did not actually change this
+            // receiver's resolved set still needs the stamp refreshed, so we
+            // only skip on an exact generation match).
+            if let Some(entry) = self.cache.get(&receiver) {
+                if entry.sub_version == sub_version
+                    && entry.members_generation == members_generation
+                    && entry.speakers_generation == speakers_generation
+                {
+                    continue;
+                }
+            }
+            let allow = Arc::new(self.resolve_inner(
+                receiver,
+                current_members,
+                speaker_set,
+                remote_publishers,
+            ));
+            self.cache.insert(
+                receiver,
+                CachedAllow {
+                    allow,
+                    sub_version,
+                    members_generation,
+                    speakers_generation,
+                },
+            );
+        }
+    }
+
     /// Compute a fresh `AllowSet` (no caching). Used by both [`Self::resolve`]
     /// and the miss path of [`Self::resolve_cached`].
     fn resolve_inner(
@@ -1381,5 +1478,203 @@ mod tests {
         let allow = store.resolve_inner(1, &room, &[], &pubs);
         assert!(allow.audio.contains(&999));
         assert!(!allow.video.contains_key(&999));
+    }
+
+    // ---------------- vc-zexm: rewarm_cache (off-hot-path warm-up) ----------------
+
+    /// vc-zexm core: a join bumps `members_generation`. AFTER `rewarm_cache`
+    /// against the new generation, the next `resolve_cached` for an
+    /// already-cached receiver is a CACHE HIT at the new generation (same Arc),
+    /// and its contents reflect the new member. This is the property that keeps
+    /// the post-join media packets off the `resolve_inner` recompute path.
+    #[test]
+    fn rewarm_makes_post_join_resolve_a_hit_with_fresh_contents() {
+        let store = SubscriptionStore::new();
+        // Receiver 1 is a legacy-default receiver (no SubscriptionUpdate).
+        let room_g0 = Arc::new(members(&[1, 2]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+
+        // Prime the cache at generation 0.
+        let a = store.resolve_cached(1, &room_g0, 0, &speakers, 0, &RemotePublishers::default());
+        assert_eq!(a.video.len(), 1);
+        assert!(a.video.contains_key(&2));
+
+        // Member 3 joins → new snapshot, generation bumps to 1. Re-warm the
+        // cache off the hot path (what the JoinRoom handler does).
+        let room_g1 = Arc::new(members(&[1, 2, 3]));
+        store.rewarm_cache(&room_g1, 1, &speakers, 0, &RemotePublishers::default());
+
+        // The very next resolve at the NEW generation must be a HIT (the rewarm
+        // already stamped generation 1) AND must include the new member.
+        let warmed =
+            store.resolve_cached(1, &room_g1, 1, &speakers, 0, &RemotePublishers::default());
+        let again =
+            store.resolve_cached(1, &room_g1, 1, &speakers, 0, &RemotePublishers::default());
+        assert!(
+            Arc::ptr_eq(&warmed, &again),
+            "post-rewarm resolve must hit the warmed entry (no recompute)"
+        );
+        assert!(
+            warmed.video.contains_key(&3),
+            "warmed AllowSet must include the newly-joined member 3"
+        );
+        assert!(warmed.video.contains_key(&2));
+    }
+
+    /// vc-zexm: `rewarm_cache` only touches receivers that ALREADY have a cache
+    /// entry. A cold receiver (never resolved) is not warmed — its first packet
+    /// computes once and caches, exactly as before.
+    #[test]
+    fn rewarm_skips_cold_receivers() {
+        let store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2, 3]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+
+        // Only receiver 1 is primed (has a cache entry); 2 and 3 are cold.
+        let _ = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
+
+        store.rewarm_cache(&room, 1, &speakers, 0, &RemotePublishers::default());
+
+        assert!(
+            store.cache.contains_key(&1),
+            "primed receiver must be warmed"
+        );
+        assert!(
+            !store.cache.contains_key(&2),
+            "cold receiver must NOT be warmed by rewarm_cache"
+        );
+        assert!(!store.cache.contains_key(&3));
+    }
+
+    /// vc-zexm correctness invariant: even if `rewarm_cache` warmed a snapshot
+    /// that is ALREADY stale (a second join raced in), `resolve_cached` still
+    /// validates the generation and recomputes — it never serves the stale
+    /// warmed entry for a different generation.
+    #[test]
+    fn rewarm_never_serves_stale_entry_for_a_newer_generation() {
+        let store = SubscriptionStore::new();
+        let room_g1 = Arc::new(members(&[1, 2]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+
+        // Prime + warm at generation 1.
+        let _ = store.resolve_cached(1, &room_g1, 1, &speakers, 0, &RemotePublishers::default());
+        store.rewarm_cache(&room_g1, 1, &speakers, 0, &RemotePublishers::default());
+
+        // A second join raced in: live generation is now 2 with a bigger room.
+        // The forwarder reads generation 2, so resolve_cached must MISS the
+        // generation-1 warmed entry and recompute against the real membership.
+        let room_g2 = Arc::new(members(&[1, 2, 3]));
+        let fresh =
+            store.resolve_cached(1, &room_g2, 2, &speakers, 0, &RemotePublishers::default());
+        assert!(
+            fresh.video.contains_key(&3),
+            "resolve_cached must recompute (not serve the stale gen-1 entry) when \
+             the live generation moved past the warmed one"
+        );
+    }
+
+    /// vc-zexm: re-warming preserves the visible-tile cap for a
+    /// `receive_all_video` receiver. After a low-id member joins, the warmed
+    /// capped set must reflect the new membership-derived selection (sorted by
+    /// SessionId), proving the warm-up runs the SAME resolution logic as the
+    /// hot path.
+    #[test]
+    fn rewarm_preserves_visible_tile_cap_for_receive_all_video() {
+        let mut store = SubscriptionStore::new();
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+
+        // Room: receiver 1 + senders 20..26 (6 senders) → exactly fills the cap.
+        let mut all: Vec<SessionId> = (20..26).collect();
+        all.push(1);
+        let room_g0 = Arc::new(members(&all));
+        store.apply_update(1, update_all(&[], vec![], false, true), &room_g0);
+        let before =
+            store.resolve_cached(1, &room_g0, 0, &speakers, 0, &RemotePublishers::default());
+        let mut got_before: Vec<SessionId> = before.video.keys().copied().collect();
+        got_before.sort_unstable();
+        assert_eq!(got_before, vec![20, 21, 22, 23, 24, 25]);
+
+        // A LOW-id member (5) joins. It must displace the highest-id member
+        // (25) from the capped visible set after the re-warm.
+        let mut all2 = all.clone();
+        all2.push(5);
+        let room_g1 = Arc::new(members(&all2));
+        store.rewarm_cache(&room_g1, 1, &speakers, 0, &RemotePublishers::default());
+
+        let after =
+            store.resolve_cached(1, &room_g1, 1, &speakers, 0, &RemotePublishers::default());
+        assert_eq!(after.video.len(), MAX_VISIBLE_VIDEO as usize);
+        let mut got_after: Vec<SessionId> = after.video.keys().copied().collect();
+        got_after.sort_unstable();
+        assert_eq!(
+            got_after,
+            vec![5, 20, 21, 22, 23, 24],
+            "low-id joiner must enter the capped visible set, displacing the highest id"
+        );
+    }
+
+    /// vc-zexm: re-warming a legacy-default receiver folds in cross-pod
+    /// publishers exactly as the hot path does (vc-54j2 preserved).
+    #[test]
+    fn rewarm_preserves_cross_pod_publisher_folding() {
+        let store = SubscriptionStore::new();
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        let room = Arc::new(members(&[1, 2]));
+
+        // Prime at gen 0 with no remote publishers.
+        let _ = store.resolve_cached(1, &room, 0, &speakers, 0, &RemotePublishers::default());
+
+        // A cross-pod publisher appears → registry change bumps the shared
+        // generation to 1. Re-warm with the publisher in the snapshot.
+        let pubs = remote(&[999], &[999]);
+        store.rewarm_cache(&room, 1, &speakers, 1, &pubs);
+
+        let warmed = store.resolve_cached(1, &room, 1, &speakers, 1, &pubs);
+        assert!(
+            warmed.video.contains_key(&999),
+            "cross-pod video publisher must be folded into the warmed AllowSet"
+        );
+        assert!(warmed.audio.contains(&999));
+    }
+
+    /// vc-zexm: an explicit (non-receive-all) subscription is warmed using its
+    /// real `sub_version`, so its pin/slot selection is preserved across the
+    /// re-warm and the next resolve is a hit.
+    #[test]
+    fn rewarm_preserves_explicit_subscription() {
+        let mut store = SubscriptionStore::new();
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        let room_g0 = Arc::new(members(&[1, 2, 3]));
+        store.apply_update(1, update(&[2], vec![], false), &room_g0);
+        let _ = store.resolve_cached(1, &room_g0, 0, &speakers, 0, &RemotePublishers::default());
+
+        // Member 4 joins (not pinned by receiver 1). Re-warm.
+        let room_g1 = Arc::new(members(&[1, 2, 3, 4]));
+        store.rewarm_cache(&room_g1, 1, &speakers, 0, &RemotePublishers::default());
+
+        let warmed =
+            store.resolve_cached(1, &room_g1, 1, &speakers, 0, &RemotePublishers::default());
+        let again =
+            store.resolve_cached(1, &room_g1, 1, &speakers, 0, &RemotePublishers::default());
+        assert!(
+            Arc::ptr_eq(&warmed, &again),
+            "explicit receiver must hit post-rewarm"
+        );
+        // Pin-only subscription: only 2 is visible — the unrelated joiner 4 is
+        // NOT smuggled in.
+        assert_eq!(warmed.video.len(), 1);
+        assert!(warmed.video.contains_key(&2));
+        assert!(!warmed.video.contains_key(&4));
+    }
+
+    /// vc-zexm: `rewarm_cache` on an empty cache is a cheap no-op (the common
+    /// case for the first joiner, whose cache is still cold).
+    #[test]
+    fn rewarm_empty_cache_is_noop() {
+        let store = SubscriptionStore::new();
+        let room = Arc::new(members(&[1, 2]));
+        let speakers: Arc<Vec<SessionId>> = Arc::new(vec![]);
+        store.rewarm_cache(&room, 1, &speakers, 0, &RemotePublishers::default());
+        assert!(store.cache.is_empty());
     }
 }
