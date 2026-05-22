@@ -46,12 +46,42 @@ const SCOPE: &str = "email profile";
 /**
  * Health check endpoint for k8s liveness/readiness probes.
  *
- * Returns HTTP 200 with a plain "Ok" body. Mirrors the webtransport
- * server's `health_responder`. Requires no auth so probes can reach it
- * regardless of OAuth/DB configuration.
+ * Forwarding-liveness + inbound-saturation aware (vc-zf8k + vc-m7k6). Mirrors
+ * the webtransport server's `health_responder` EXACTLY: the WebSocket binary
+ * runs the same per-room dispatchers, so it is subject to the same
+ * forwarding-silence (vc-zf8k) and invisible inbound-saturation (vc-m7k6)
+ * failure modes and must report them identically. Returns 200 when forwarding
+ * in steady state OR idle/empty; returns 503 only when a room with
+ * receivers+publishers was observed within the threshold AND either no forward
+ * has happened (silence) OR inbound is being dropped right now (saturation).
+ * Requires no auth so probes can reach it regardless of OAuth/DB config.
  */
 async fn health_responder() -> HttpResponse {
-    HttpResponse::Ok().body("Ok")
+    use sec_api::sfu::forwarding_health::{
+        combined_health_decision, forwarding_silence_threshold, global,
+        inbound_saturation_threshold, now_millis, HealthStatus,
+    };
+    let snap = global().snapshot();
+    let status = combined_health_decision(
+        now_millis(),
+        snap,
+        forwarding_silence_threshold(),
+        inbound_saturation_threshold(),
+    );
+    match status {
+        HealthStatus::Healthy => HttpResponse::Ok().body("Ok"),
+        HealthStatus::ForwardingStalled => {
+            error!(
+                last_forward_ms = snap.last_forward_ms,
+                last_should_forward_ms = snap.last_should_forward_ms,
+                last_inbound_drop_ms = snap.last_inbound_drop_ms,
+                "/healthz: forwarding stalled OR inbound saturated while \
+                 receivers+publishers present — reporting 503 so the liveness \
+                 probe can restart the pod"
+            );
+            HttpResponse::ServiceUnavailable().body("forwarding stalled")
+        }
+    }
 }
 
 /**

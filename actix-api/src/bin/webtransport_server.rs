@@ -27,25 +27,34 @@ use sec_api::sfu::{SfuConfig, SfuMode};
 use sec_api::version;
 use sec_api::webtransport::{self, Certs};
 
-/// vc-zf8k (Bead B-b): forwarding-liveness-aware health endpoint.
+/// vc-zf8k (Bead B-b) + vc-m7k6: forwarding-liveness + inbound-saturation-aware
+/// health endpoint.
 ///
 /// Returns 200 when the SFU is forwarding in steady state OR when it is
-/// idle/empty (nothing to forward). Returns 503 ONLY when forwarding SHOULD be
+/// idle/empty (nothing to forward). Returns 503 when forwarding SHOULD be
 /// happening (a room with receivers + publishers was observed within the
-/// threshold) but no forward has happened within the threshold — i.e. the
-/// "forwarding-dead zombie" condition the DEFECT-JOINHANDLE-PANIC spec calls
-/// out. The decision reuses the vc-9eh liveness semantics via
-/// [`sec_api::sfu::forwarding_health::forwarding_health_decision`].
+/// threshold) AND EITHER no forward has happened within the threshold (the
+/// vc-zf8k "forwarding-dead zombie") OR inbound is being dropped right now (the
+/// vc-m7k6 invisible-saturation case, which the silence path is blind to). The
+/// decision reuses the vc-9eh liveness semantics via
+/// [`sec_api::sfu::forwarding_health::combined_health_decision`].
 async fn health_responder() -> impl Responder {
     use sec_api::sfu::forwarding_health::{
-        forwarding_health_decision, forwarding_silence_threshold, global, now_millis, HealthStatus,
+        combined_health_decision, forwarding_silence_threshold, global,
+        inbound_saturation_threshold, now_millis, HealthStatus,
     };
     let snap = global().snapshot();
-    let status = forwarding_health_decision(
+    // vc-m7k6: the combined decision reports 503 on EITHER forwarding-silence
+    // (vc-zf8k) OR inbound saturation — a dispatcher whose inbound is being
+    // dropped right now while receivers are present, which the silence path is
+    // structurally blind to (async-nats keeps the subscription open so
+    // `last_forward_ms` keeps advancing). Both arms gate on a recent
+    // should-forward observation, so an idle/quiet pod is never falsely 503'd.
+    let status = combined_health_decision(
         now_millis(),
-        snap.last_forward_ms,
-        snap.last_should_forward_ms,
+        snap,
         forwarding_silence_threshold(),
+        inbound_saturation_threshold(),
     );
     match status {
         HealthStatus::Healthy => HttpResponse::Ok().body("Ok"),
@@ -53,8 +62,10 @@ async fn health_responder() -> impl Responder {
             error!(
                 last_forward_ms = snap.last_forward_ms,
                 last_should_forward_ms = snap.last_should_forward_ms,
-                "/healthz: forwarding stalled while receivers+publishers present \
-                 — reporting 503 so the liveness probe can restart the pod"
+                last_inbound_drop_ms = snap.last_inbound_drop_ms,
+                "/healthz: forwarding stalled OR inbound saturated while \
+                 receivers+publishers present — reporting 503 so the liveness \
+                 probe can restart the pod"
             );
             HttpResponse::ServiceUnavailable().body("forwarding stalled")
         }

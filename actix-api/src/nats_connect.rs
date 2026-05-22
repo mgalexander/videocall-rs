@@ -131,13 +131,39 @@ pub async fn connect(url: &str) -> Result<Client, NatsConnectError> {
     let event_handler = |event: async_nats::Event| async move {
         match event {
             async_nats::Event::SlowConsumer(sid) => {
+                // vc-m7k6: make the silent inbound drop OBSERVABLE. async-nats
+                // does not close the subscription on a SlowConsumer, so the
+                // per-room dispatcher keeps draining the messages that DID get
+                // through and the vc-9eh silence watchdog never trips —
+                // late-joiner delivery fails with no signal. Count it
+                // explicitly here.
+                //
+                // PROCESS-GLOBAL granularity is correct: the event carries only
+                // the opaque `sid` (the `Subscriber.sid` field is private and
+                // the event channel is per-`Client`), so it is NOT routable
+                // back to a specific room/dispatcher from here.
+                crate::metrics::SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.inc();
+                // Proxy lag gauge: async-nats exposes no per-subscription
+                // pending depth (the `mpsc::Receiver` is private with no
+                // accessor), so we cannot report true queue depth. Set the
+                // gauge to the cumulative drop count at the trip so a rising
+                // SLOPE marks saturating periods (see metrics.rs doc).
+                crate::metrics::SFU_DISPATCHER_LAG
+                    .set(crate::metrics::SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.get() as i64);
+                // Stamp the saturation heartbeat so the saturation-aware
+                // `/healthz` decision (forwarding_health::saturation_health_decision)
+                // can report unhealthy while drops are happening AND receivers
+                // are present. A drop ages out of the window, so this can never
+                // wedge `/healthz` at 503 forever.
+                crate::sfu::forwarding_health::global().note_inbound_drop();
                 tracing::warn!(
                     target: "nats_connect",
                     sid,
                     "NATS slow-consumer drop on subscription {sid}: a subscriber \
                      channel filled and async-nats dropped a message. If this is \
                      a per-room dispatcher, the vc-9eh liveness watchdog will \
-                     resubscribe in place.",
+                     resubscribe in place and the vc-m7k6 saturation-aware \
+                     /healthz will report unhealthy while receivers are starved.",
                 );
             }
             // ServerError/ClientError are genuine faults — surface at WARN.

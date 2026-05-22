@@ -594,6 +594,16 @@ impl ChatServer {
                 .with_label_values(&[crate::metrics::sfu_drop_reason::SELF_SKIP])
                 .get();
 
+        // vc-m7k6: process-wide inbound slow-consumer drop count, read once at
+        // the crossing. Surfacing it in the milestone payload means a soak
+        // shows "inbound dropped @ N presenters / M receivers" — the
+        // invisible-saturation signal lands right next to the
+        // member_count/receiver_set/forward_total plateau evidence, so one
+        // marker tells whether a stalled room is a registration plateau, a
+        // fan-out plateau, OR inbound saturation (drops climbing while
+        // forward_total flatlines).
+        let inbound_dropped = crate::metrics::SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.get();
+
         // vc-9eve: process-wide connected sessions count, read once at the
         // crossing. Together with join_attempts/member_count/receiver_set in
         // the payload, ONE marker distinguishes the two plateau modes:
@@ -632,6 +642,7 @@ impl ChatServer {
                 allowset_video,
                 forward_total,
                 dropped_total,
+                inbound_dropped,
                 "SFU room crossed join milestone"
             );
         }
@@ -2980,6 +2991,13 @@ fn spawn_room_dispatcher(
         // decays to ~one resubscribe per WATCHDOG_SILENCE_CAP instead of
         // thrashing at a fixed cadence.
         let mut consecutive_silent_trips: u32 = 0;
+        // vc-m7k6: per-dispatcher inbound message count and the
+        // (count, instant) sample from the previous watchdog tick. We derive
+        // `sfu_dispatcher_inbound_rate` (msgs/sec) from the delta over the tick
+        // interval. ZERO per-receiver work: one `+= 1` on the inbound arm and a
+        // single subtraction + divide once per tick per room.
+        let mut inbound_msg_count: u64 = 0;
+        let mut last_rate_sample: (u64, std::time::Instant) = (0, std::time::Instant::now());
         let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
         // The first tick fires immediately; skip it so the very first watchdog
         // evaluation happens one full TICK in (and is anyway gated by GRACE).
@@ -3010,6 +3028,15 @@ fn spawn_room_dispatcher(
                         // 750ms window again.
                         last_msg_at = std::time::Instant::now();
                         consecutive_silent_trips = 0;
+                        // vc-m7k6: count every inbound message this dispatcher
+                        // DRAINS off its subscription, for the inbound-rate
+                        // sample on the watchdog tick. A saturated dispatcher
+                        // keeps draining (so the silence watchdog stays blind)
+                        // even while async-nats drops the overflow — comparing
+                        // this rate against the rising drop counter exposes
+                        // exactly that invisible-saturation condition. Single
+                        // wrapping increment; no per-receiver cost.
+                        inbound_msg_count = inbound_msg_count.wrapping_add(1);
                         msg
                     }
                     // `None` => subscription closed (existing behavior). Break
@@ -3051,6 +3078,24 @@ fn spawn_room_dispatcher(
                     };
                     if has_receivers && has_publishers {
                         crate::sfu::forwarding_health::global().note_should_forward();
+                    }
+                    // vc-m7k6: sample inbound throughput over the elapsed tick
+                    // interval and publish `sfu_dispatcher_inbound_rate`
+                    // (msgs/sec). One subtraction + divide per room per tick —
+                    // O(1), off the per-receiver fan-out path. Done EVERY tick
+                    // (before the pre-gate below) so the rate reflects a
+                    // saturated-but-still-draining dispatcher, not just a silent
+                    // one. Last-writer-wins across rooms (coarse process-level
+                    // throughput signal, paired with the process-global drop
+                    // counter).
+                    {
+                        let (prev_count, prev_at) = last_rate_sample;
+                        let elapsed = now.duration_since(prev_at).as_secs_f64();
+                        if elapsed > 0.0 {
+                            let delta = inbound_msg_count.wrapping_sub(prev_count) as f64;
+                            crate::metrics::SFU_DISPATCHER_INBOUND_RATE.set(delta / elapsed);
+                        }
+                        last_rate_sample = (inbound_msg_count, now);
                     }
                     // Cheap pre-gate for the RESUBSCRIBE path: avoid escalating
                     // / resubscribing until we are actually past grace AND past

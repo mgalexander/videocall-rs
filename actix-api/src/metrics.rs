@@ -646,6 +646,70 @@ lazy_static! {
         "Total packets the SFU forwarder decided to forward (increment-only)"
     )
     .expect("Failed to create sfu_forward_total metric");
+
+    // ===== SFU DISPATCHER INBOUND SATURATION (bead vc-m7k6) =====
+    //
+    // Root cause these expose: the per-room dispatcher's async-nats wildcard
+    // subscription has a BOUNDED pending channel (`subscription_capacity` in
+    // `nats_connect.rs`). Under a publisher storm that channel fills, and
+    // async-nats SILENTLY DROPS the message and fires a connection-global
+    // `Event::SlowConsumer(sid)` — it does NOT close the subscription. The
+    // dispatcher's `sub.next()` keeps yielding the messages that DID get
+    // through, so `last_msg_at` keeps advancing and the vc-9eh silence
+    // watchdog never trips: late-joiner delivery fails with NO signal. These
+    // counters make that saturation observable.
+
+    /// Total inbound NATS messages dropped by async-nats slow-consumer
+    /// backpressure, process-wide (bead vc-m7k6).
+    ///
+    /// Incremented once per `async_nats::Event::SlowConsumer(sid)` in the
+    /// shared `nats_connect` event handler. PROCESS-GLOBAL granularity is
+    /// deliberate and correct: the event carries only the opaque subscription
+    /// `sid` (the `Subscriber.sid` field is private and the event channel is
+    /// per-`Client`), so it is NOT routable back to a specific room/dispatcher
+    /// from the event handler. A non-zero, climbing value means at least one
+    /// subscriber on the shared connection — in practice a per-room dispatcher
+    /// under a publisher storm — is shedding inbound media.
+    pub static ref SFU_DISPATCHER_INBOUND_DROPPED_TOTAL: IntCounter = register_int_counter!(
+        "sfu_dispatcher_inbound_dropped_total",
+        "Total inbound NATS messages dropped by async-nats slow-consumer backpressure (process-wide; SlowConsumer carries only an opaque sid, not routable to a room)"
+    )
+    .expect("Failed to create sfu_dispatcher_inbound_dropped_total metric");
+
+    /// Approximate inbound-queue lag signal for the per-room dispatchers
+    /// (bead vc-m7k6).
+    ///
+    /// LIMITATION (documented, not fabricated): async-nats 0.42 keeps the
+    /// per-subscription pending depth in a PRIVATE `tokio::sync::mpsc::Receiver`
+    /// field on `Subscriber` and exposes NO accessor (`len()`/`capacity()`/
+    /// `pending()`). There is therefore no way to read true per-subscription
+    /// queue depth. Rather than fabricate a number, this gauge is a derived
+    /// PROXY: it is set to the running drop total at the moment a SlowConsumer
+    /// fires (monotone, process-global), so a rising slope of this gauge marks
+    /// the periods the inbound queues were saturating. It is NOT an
+    /// instantaneous queue depth; treat slope, not level, as the signal.
+    pub static ref SFU_DISPATCHER_LAG: IntGauge = register_int_gauge!(
+        "sfu_dispatcher_lag",
+        "Proxy for per-room dispatcher inbound-queue lag (async-nats exposes no per-subscription pending depth; set to the cumulative drop count at each SlowConsumer — read slope, not level)"
+    )
+    .expect("Failed to create sfu_dispatcher_lag metric");
+
+    /// Inbound messages/sec observed by the per-room dispatchers, sampled over
+    /// the watchdog tick interval (bead vc-m7k6).
+    ///
+    /// Derived from a per-dispatcher inbound message counter sampled on the
+    /// existing per-room watchdog tick (one timer per room, no per-receiver
+    /// work). This is the throughput a dispatcher is actually draining off its
+    /// subscription; compared against `sfu_dispatcher_inbound_dropped_total`
+    /// rising, it shows whether a saturated dispatcher is still pulling
+    /// messages (so the silence watchdog cannot see the drops) — exactly the
+    /// invisible-saturation condition vc-m7k6 fixes. Last-writer-wins across
+    /// rooms; it is a coarse process-level throughput sample, not per-room.
+    pub static ref SFU_DISPATCHER_INBOUND_RATE: Gauge = register_gauge!(
+        "sfu_dispatcher_inbound_rate",
+        "Inbound NATS messages/sec drained by the per-room dispatchers, sampled over the watchdog tick interval"
+    )
+    .expect("Failed to create sfu_dispatcher_inbound_rate metric");
 }
 
 /// Static drop-reason label constants for the existing
