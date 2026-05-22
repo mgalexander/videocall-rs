@@ -16,9 +16,11 @@
  * conditions.
  */
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use tokio::sync::watch;
 
@@ -179,12 +181,23 @@ pub struct Forwarder {
     /// bit is set, so we can drop reference-dependent frames whose
     /// reference picture was dropped upstream (e.g. by an AllowSet flip).
     ///
-    /// The lock is taken in `write()` mode unconditionally inside `decide`
-    /// because the critical section is a hash lookup + at most one
-    /// 64-entry VecDeque push/scan — adding a read-then-upgrade dance
-    /// would cost more than it saves at this size. Lock poisoning is
-    /// handled like every other lock in this module (`.into_inner()`).
-    recent_t0: Arc<RwLock<HashMap<(SessionId, SessionId), RecentT0Set>>>,
+    /// vc-9u8e: previously a single per-room `Arc<RwLock<HashMap<..>>>` taken
+    /// in WRITE mode on the per-receiver video T0-delta path. With the egress
+    /// fan-out now sharded across W worker threads (Change 1), every worker
+    /// fanning out the same video frame to a different receiver would serialize
+    /// on that one room-wide write lock. Replaced with a `DashMap` keyed by
+    /// `(receiver, sender)`: each key lives in one of DashMap's internal lock
+    /// shards, so concurrent inserts/reads for *distinct* `(receiver, sender)`
+    /// pairs (the common case — different receivers, same sender) do not
+    /// contend. The per-key critical section is still a hash lookup + at most
+    /// one 64-entry VecDeque push/scan; `RecentT0Set`'s own mutation is done
+    /// while holding the DashMap entry's shard guard, which is never held
+    /// across an `.await` (`decide` is fully synchronous).
+    ///
+    /// This is the VIDEO/SCREEN path only (gated by `matches!(media_type,
+    /// VIDEO | SCREEN)` in `decide`); audio — the dominant traffic — never
+    /// touches this map.
+    recent_t0: Arc<DashMap<(SessionId, SessionId), RecentT0Set>>,
 }
 
 impl Forwarder {
@@ -203,7 +216,7 @@ impl Forwarder {
             subscriptions,
             speakers,
             layer_selector,
-            recent_t0: Arc::new(RwLock::new(HashMap::new())),
+            recent_t0: Arc::new(DashMap::new()),
         }
     }
 
@@ -239,7 +252,7 @@ impl Forwarder {
             subscriptions,
             speakers: rx,
             layer_selector: Arc::new(LayerSelector::new()),
-            recent_t0: Arc::new(RwLock::new(HashMap::new())),
+            recent_t0: Arc::new(DashMap::new()),
         }
     }
 
@@ -605,17 +618,22 @@ impl Forwarder {
                                 let key = (receiver_sid, sender_sid);
                                 let now = Instant::now();
                                 if rh.temporal_layer_id == 0 {
-                                    let mut guard = match self.recent_t0.write() {
-                                        Ok(g) => g,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    guard.entry(key).or_default().insert(rh.picture_id, now);
+                                    // vc-9u8e: DashMap entry — only the shard
+                                    // holding `key` is locked, so concurrent
+                                    // workers fanning the same frame out to
+                                    // distinct receivers (distinct keys) do not
+                                    // serialize. The guard is dropped at the end
+                                    // of this statement; no `.await` follows.
+                                    self.recent_t0
+                                        .entry(key)
+                                        .or_default()
+                                        .insert(rh.picture_id, now);
                                 } else if rh.frame_marker & REFERENCES_T0 != 0 {
-                                    let guard = match self.recent_t0.read() {
-                                        Ok(g) => g,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    let seen = guard
+                                    // vc-9u8e: read this key's shard only. `get`
+                                    // returns a `Ref` guard scoped to this
+                                    // expression.
+                                    let seen = self
+                                        .recent_t0
                                         .get(&key)
                                         .is_some_and(|s| s.contains(rh.picture_id, now));
                                     if !seen {
@@ -668,13 +686,12 @@ impl Forwarder {
     ///
     /// Idempotent: safe to call for a `sid` that has no state.
     pub fn prune_session(&self, sid: SessionId) {
-        {
-            let mut guard = match self.recent_t0.write() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.retain(|&(rcv, snd), _| rcv != sid && snd != sid);
-        }
+        // vc-9u8e: DashMap::retain takes the same `(&K, &mut V) -> bool`
+        // closure and locks each internal shard in turn; semantics are
+        // identical to the previous HashMap::retain (drop every pair whose
+        // receiver OR sender side is `sid`).
+        self.recent_t0
+            .retain(|&(rcv, snd), _| rcv != sid && snd != sid);
         self.layer_selector.prune_stale(sid);
         // vc-54j2: drop any remote-publisher registry entry for this sid so a
         // cross-pod sender that departed (or was redirected) stops being
@@ -695,22 +712,14 @@ impl Forwarder {
     /// pruning side-effect in unit tests.
     #[cfg(test)]
     pub fn recent_t0_pair_count(&self) -> usize {
-        let guard = match self.recent_t0.read() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.len()
+        self.recent_t0.len()
     }
 
     /// Test-only accessor: `true` iff the recent-T0 map currently
     /// holds an entry for the exact `(receiver, sender)` key.
     #[cfg(test)]
     pub fn recent_t0_contains_pair(&self, receiver: SessionId, sender: SessionId) -> bool {
-        let guard = match self.recent_t0.read() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.contains_key(&(receiver, sender))
+        self.recent_t0.contains_key(&(receiver, sender))
     }
 }
 

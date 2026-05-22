@@ -74,6 +74,27 @@ const MAX_CHATSERVER_SHARDS: usize = 64;
 /// `available_parallelism`) cannot spawn an unbounded number of OS threads.
 const MAX_FANOUT_WORKER_THREADS: usize = 256;
 
+/// Default minimum receiver count below which the per-room fan-out stays on the
+/// serial (single-task) path instead of sharding across the fan-out workers
+/// (bead vc-9u8e), used when `SFU_FANOUT_SHARD_MIN_RECEIVERS` is unset/invalid.
+///
+/// SHARDING vs. SERIAL crossover rationale. Sharding the per-receiver
+/// `decide` + `try_send` loop across `W` workers replaces sub-microsecond
+/// serial work with a cross-thread spawn + barrier-join round-trip per shard
+/// per inbound packet. For a *small* room (2-5 receivers) — which dominates
+/// real traffic (2-person calls, small huddles) — that overhead is pure loss:
+/// the serial loop finishes faster than a single scheduler hop, and the
+/// barrier (we await all shards before reading the next message) serializes
+/// the round-trip into per-room throughput. The per-receiver work only
+/// amortizes the spawn+join cost once the room is large enough; below this
+/// threshold the serial loop is strictly cheaper. 16 is a conservative floor
+/// inside the reviewer-suggested 16-32 band: it keeps every small/medium room
+/// byte-for-byte on the old serial path and only spreads across cores when the
+/// receiver count is large enough to pay back the spawn+join. The guard is on
+/// receiver COUNT alone (not media type): a large audio-only room still
+/// benefits from parallel `decide`.
+const DEFAULT_FANOUT_SHARD_MIN_RECEIVERS: usize = 16;
+
 /// SFU runtime configuration, snapshotted from process env once at startup.
 ///
 /// Note: this struct intentionally does NOT derive `Copy` — `milestones` is an
@@ -146,6 +167,22 @@ pub struct SfuConfig {
     ///   - **explicit `0`** → warned-and-ignored; falls back to the auto value
     ///     (a zero-worker runtime cannot make progress).
     pub fanout_worker_threads: usize,
+    /// Minimum receiver count at/above which the per-room fan-out is sharded
+    /// across the fan-out workers (bead vc-9u8e). Below this, the fan-out runs
+    /// on the serial (single-task) path regardless of `fanout_worker_threads`.
+    ///
+    /// See [`DEFAULT_FANOUT_SHARD_MIN_RECEIVERS`] for the spawn-vs-decide
+    /// crossover rationale. The dispatcher takes the serial path when
+    /// `fanout_worker_threads <= 1 || n_receivers < fanout_shard_min_receivers`.
+    ///
+    /// Semantics of `SFU_FANOUT_SHARD_MIN_RECEIVERS`:
+    ///   - **unset / empty / invalid** → [`DEFAULT_FANOUT_SHARD_MIN_RECEIVERS`]
+    ///     (16). Mirrors the warn-don't-panic philosophy used elsewhere here.
+    ///   - **explicit positive integer** → used verbatim.
+    ///   - **explicit `0`** → warned-and-ignored; a `0` threshold would shard a
+    ///     2-person room (the regression this guard exists to prevent), so we
+    ///     fall back to the default.
+    pub fanout_shard_min_receivers: usize,
 }
 
 impl SfuConfig {
@@ -168,12 +205,54 @@ impl SfuConfig {
             Self::parse_shard_count(std::env::var("SFU_CHATSERVER_SHARDS").ok());
         let fanout_worker_threads =
             Self::parse_fanout_worker_threads(std::env::var("SFU_FANOUT_WORKER_THREADS").ok());
+        let fanout_shard_min_receivers = Self::parse_fanout_shard_min_receivers(
+            std::env::var("SFU_FANOUT_SHARD_MIN_RECEIVERS").ok(),
+        );
         Self {
             mode,
             milestones,
             chatserver_mailbox_capacity,
             chatserver_shards,
             fanout_worker_threads,
+            fanout_shard_min_receivers,
+        }
+    }
+
+    /// Parse the `SFU_FANOUT_SHARD_MIN_RECEIVERS` env value (bead vc-9u8e).
+    ///
+    /// See [`SfuConfig::fanout_shard_min_receivers`] for the unset/empty/zero/
+    /// clamp semantics. Mirrors the warn-don't-panic philosophy used elsewhere
+    /// here: a bad value logs a warning and falls back to the default rather
+    /// than taking the server down.
+    fn parse_fanout_shard_min_receivers(raw: Option<String>) -> usize {
+        match raw {
+            None => DEFAULT_FANOUT_SHARD_MIN_RECEIVERS,
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return DEFAULT_FANOUT_SHARD_MIN_RECEIVERS;
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(0) => {
+                        warn!(
+                            "ignoring SFU_FANOUT_SHARD_MIN_RECEIVERS=0 (a zero \
+                             threshold would shard even a 2-person room, the \
+                             regression this guard prevents); using default {}",
+                            DEFAULT_FANOUT_SHARD_MIN_RECEIVERS
+                        );
+                        DEFAULT_FANOUT_SHARD_MIN_RECEIVERS
+                    }
+                    Ok(v) => v,
+                    Err(_) => {
+                        warn!(
+                            "ignoring invalid SFU_FANOUT_SHARD_MIN_RECEIVERS value \
+                             {:?} (expected a positive integer); using default {}",
+                            trimmed, DEFAULT_FANOUT_SHARD_MIN_RECEIVERS
+                        );
+                        DEFAULT_FANOUT_SHARD_MIN_RECEIVERS
+                    }
+                }
+            }
         }
     }
 
@@ -659,6 +738,52 @@ mod tests {
         assert_eq!(
             SfuConfig::parse_fanout_worker_threads(Some("100000".to_string())),
             MAX_FANOUT_WORKER_THREADS
+        );
+    }
+
+    // ===== SFU_FANOUT_SHARD_MIN_RECEIVERS parsing tests (bead vc-9u8e) =====
+    //
+    // `parse_fanout_shard_min_receivers` takes the raw `Option<String>`
+    // directly, so these tests do NOT touch process-global env state and need
+    // no EnvGuard. The unset/empty/zero/invalid paths fall back to the fixed
+    // `DEFAULT_FANOUT_SHARD_MIN_RECEIVERS`, so we assert the concrete default.
+
+    #[test]
+    fn fanout_shard_min_receivers_explicit_value_is_used() {
+        assert_eq!(
+            SfuConfig::parse_fanout_shard_min_receivers(Some(" 32 ".to_string())),
+            32
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_shard_min_receivers(Some("1".to_string())),
+            1
+        );
+    }
+
+    #[test]
+    fn fanout_shard_min_receivers_unset_empty_zero_invalid_fall_back_to_default() {
+        let def = DEFAULT_FANOUT_SHARD_MIN_RECEIVERS;
+        assert_eq!(SfuConfig::parse_fanout_shard_min_receivers(None), def);
+        assert_eq!(
+            SfuConfig::parse_fanout_shard_min_receivers(Some(String::new())),
+            def
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_shard_min_receivers(Some("   ".to_string())),
+            def
+        );
+        // A zero threshold would shard a 2-person room — warn and use default.
+        assert_eq!(
+            SfuConfig::parse_fanout_shard_min_receivers(Some("0".to_string())),
+            def
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_shard_min_receivers(Some("abc".to_string())),
+            def
+        );
+        assert_eq!(
+            SfuConfig::parse_fanout_shard_min_receivers(Some("-3".to_string())),
+            def
         );
     }
 

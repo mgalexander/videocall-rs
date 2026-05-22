@@ -1691,6 +1691,7 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             room_state,
             ctx.address(),
             &self.fanout_handle,
+            self.sfu_config.fanout_shard_min_receivers,
         );
         self.room_dispatch
             .insert(room, RoomDispatch { receivers, task });
@@ -2697,6 +2698,7 @@ impl Handler<JoinRoom> for ChatServer {
                     room_state.clone(),
                     ctx.address(),
                     &self.fanout_handle,
+                    self.sfu_config.fanout_shard_min_receivers,
                 );
                 let recvs = receivers.clone();
                 vac.insert(RoomDispatch { receivers, task });
@@ -3022,6 +3024,12 @@ fn spawn_room_dispatcher(
     // which would inherit the calling shard's current-thread Arbiter runtime and
     // serialize every room's fan-out onto one thread).
     fanout_handle: &tokio::runtime::Handle,
+    // vc-9u8e: minimum receiver count at/above which the per-message fan-out is
+    // sharded across the fan-out workers. Below this the fan-out stays on the
+    // serial path (sharding overhead is a net loss for small rooms). Sourced
+    // from `SfuConfig::fanout_shard_min_receivers` (env
+    // `SFU_FANOUT_SHARD_MIN_RECEIVERS`).
+    shard_min_receivers: usize,
 ) -> JoinHandle<()> {
     // ---- vc-c609 Send/Sync audit (the landing gate) -------------------------
     //
@@ -3059,7 +3067,15 @@ fn spawn_room_dispatcher(
     // This is a pure execution-context move — the loop body below is byte-for-byte
     // unchanged, so the watchdog/resubscribe, scorer feed, remote-publisher
     // registry, diagnostics ingest, and fan-out decision all behave identically.
+    // vc-9u8e: clone the runtime handle INTO the spawned future so the
+    // per-message fan-out can itself spawn W shard subtasks onto the same
+    // pod-wide multi-thread runtime. `W` (the worker count) is read from the
+    // runtime's own metrics so it tracks `SFU_FANOUT_WORKER_THREADS` exactly;
+    // under the standalone/test current-thread runtime it is 1, which
+    // degenerates to the serial loop (no spawn, no behaviour change).
+    let shard_handle = fanout_handle.clone();
     fanout_handle.spawn(async move {
+        let fanout_workers = shard_handle.metrics().num_workers().max(1);
         let mut sub = match nc.subscribe(subject.clone()).await {
             Ok(s) => s,
             Err(e) => {
@@ -3518,30 +3534,149 @@ fn spawn_room_dispatcher(
             // forward. We stamp the process-global forwarding heartbeat once per
             // message (a single relaxed atomic store), NOT once per receiver, so
             // the hot-path cost is negligible regardless of room size.
-            let mut forwarded_any = false;
-            for (rsid, recipient) in snapshot {
-                if let Some(bytes) = egress_decide_from_parsed(
-                    sfu_mode,
-                    &forwarder,
-                    rsid,
-                    &room,
-                    subject_str,
-                    &msg.payload,
-                    parsed.as_ref(),
-                ) {
-                    forwarded_any = true;
-                    if let Err(e) = recipient.try_send(Message {
-                        msg: bytes,
-                        session: rsid,
-                    }) {
-                        warn!(
-                            "Dropping inbound message for session {}: {} \
-                             (mailbox full — subscription continues)",
-                            rsid, e
-                        );
+            //
+            // vc-9u8e: SHARD the per-receiver decide+send fan-out across the W
+            // pod-wide fan-out workers. Each receiver is assigned to shard
+            // `hash(SessionId) % W`; shard `s` runs `egress_decide_from_parsed`
+            // (per-receiver `decide` + alloc-free self-skip) and `try_send` for
+            // its slice in parallel with the other shards, so the previously
+            // serial O(members) loop now spreads across cores.
+            //
+            // PARSE-ONCE is preserved: `parse_and_inspect` ran ONCE above; the
+            // resulting `ParsedPacket` is shared into every shard via an `Arc`
+            // (a refcount bump, not a re-parse). `msg.payload` (`bytes::Bytes`)
+            // and the room string are likewise shared by cheap clone.
+            //
+            // BARRIER model (pipelining explicitly DEFERRED): we `await` ALL
+            // shard tasks for THIS message before pulling the next inbound
+            // message off `sub`. Per-room ordering is therefore unchanged —
+            // message k+1 fan-out never starts before message k's completes.
+            //
+            // SMALL-ROOM GUARD (vc-9u8e perf fix). Sharding replaces sub-µs
+            // serial per-receiver work with a cross-thread spawn + barrier-join
+            // round-trip per packet, which is a NET LOSS for the small rooms
+            // (2-5 receivers) that dominate real traffic. We therefore take the
+            // serial path unless BOTH the runtime is multi-worker AND the room
+            // has at least `shard_min_receivers` receivers — only then is there
+            // enough per-receiver work to amortize the spawn+join. The guard is
+            // on receiver COUNT alone (not media type): a large audio-only room
+            // still benefits from parallel `decide`.
+            //
+            // W==1 (the standalone/test current-thread runtime, or a 1-worker
+            // production config) ALSO degenerates here to the original serial
+            // loop with NO task spawn — byte-for-byte the legacy behaviour.
+            let forwarded_any = if fanout_workers <= 1 || snapshot.len() < shard_min_receivers {
+                let mut any = false;
+                for (rsid, recipient) in snapshot {
+                    if let Some(bytes) = egress_decide_from_parsed(
+                        sfu_mode,
+                        &forwarder,
+                        rsid,
+                        &room,
+                        subject_str,
+                        &msg.payload,
+                        parsed.as_ref(),
+                    ) {
+                        any = true;
+                        if let Err(e) = recipient.try_send(Message {
+                            msg: bytes,
+                            session: rsid,
+                        }) {
+                            warn!(
+                                "Dropping inbound message for session {}: {} \
+                                 (mailbox full — subscription continues)",
+                                rsid, e
+                            );
+                        }
                     }
                 }
-            }
+                any
+            } else {
+                // Partition the snapshot into W buckets by `hash(SessionId) % W`.
+                // A receiver's egress decision depends only on its own
+                // `SessionId`, so any partition is correct; hashing keeps the
+                // buckets balanced regardless of `SessionId` distribution.
+                let w = fanout_workers;
+                let mut buckets: Vec<Vec<(SessionId, Recipient<Message>)>> =
+                    (0..w).map(|_| Vec::new()).collect();
+                for (rsid, recipient) in snapshot {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(&rsid, &mut hasher);
+                    let idx = (std::hash::Hasher::finish(&hasher) % (w as u64)) as usize;
+                    buckets[idx].push((rsid, recipient));
+                }
+
+                // Share the parse-once payload + parsed packet + room across
+                // shards via Arc (refcount bumps — NOT re-parsed/re-copied).
+                // `parsed` is MOVED into the Arc here (this `else` branch is
+                // exclusive with the serial branch that borrows it, and `parsed`
+                // is not used after this fan-out), so there is no extra clone of
+                // the `ParsedPacket` — parse-once is preserved end-to-end.
+                let parsed_shared: Option<Arc<ParsedPacket>> = parsed.map(Arc::new);
+                let payload_shared = msg.payload.clone();
+                let room_shared: Arc<str> = Arc::from(room.as_str());
+                let subject_shared: Arc<str> = Arc::from(subject_str);
+
+                let mut handles = Vec::with_capacity(w);
+                for bucket in buckets {
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    let forwarder = forwarder.clone();
+                    let parsed_shared = parsed_shared.clone();
+                    let payload_shared = payload_shared.clone();
+                    let room_shared = room_shared.clone();
+                    let subject_shared = subject_shared.clone();
+                    handles.push(shard_handle.spawn(async move {
+                        let mut any = false;
+                        for (rsid, recipient) in bucket {
+                            if let Some(bytes) = egress_decide_from_parsed(
+                                sfu_mode,
+                                &forwarder,
+                                rsid,
+                                &room_shared,
+                                &subject_shared,
+                                &payload_shared,
+                                parsed_shared.as_deref(),
+                            ) {
+                                any = true;
+                                if let Err(e) = recipient.try_send(Message {
+                                    msg: bytes,
+                                    session: rsid,
+                                }) {
+                                    warn!(
+                                        "Dropping inbound message for session {}: {} \
+                                         (mailbox full — subscription continues)",
+                                        rsid, e
+                                    );
+                                }
+                            }
+                        }
+                        any
+                    }));
+                }
+
+                // BARRIER: wait for every shard before the next inbound message.
+                // Aggregate `forwarded_any` across shards so the HEALTH_BEACON
+                // heartbeat is stamped exactly once per message iff ANY shard
+                // forwarded at least one packet. A panicked shard task
+                // (JoinError) contributes `false` and is logged; it must not
+                // wedge the dispatcher loop.
+                let mut any = false;
+                for h in handles {
+                    match h.await {
+                        Ok(shard_forwarded) => any |= shard_forwarded,
+                        Err(e) => {
+                            warn!(
+                                "Fan-out shard task failed for room {}: {} \
+                                 (continuing — other shards unaffected)",
+                                room, e
+                            );
+                        }
+                    }
+                }
+                any
+            };
             if forwarded_any {
                 crate::sfu::forwarding_health::global().note_forward();
             }
@@ -3665,8 +3800,49 @@ pub(crate) fn egress_decide_from_parsed(
         }
     }
 
-    let self_subject = format!("room.{room}.{receiver_session}").replace(' ', "_");
-    if subject == self_subject.as_str() {
+    // vc-9u8e: allocation-free self-skip.
+    //
+    // The legacy self-skip built `format!("room.{room}.{receiver_session}")
+    // .replace(' ', "_")` once PER RECEIVER PER PACKET (~2 heap allocs each)
+    // and compared it to the inbound NATS `subject`. At target fan-out rates
+    // that is ~800k allocs/s of pure overhead. Replace it with a
+    // `SessionId`-equality test against the parsed `wrapper.session_id`,
+    // mirroring the forwarder's own self-skip (forwarder.rs:368).
+    //
+    // EQUIVALENCE PROOF. A client publishes on
+    // `format!("room.{room}.{session}").replace(' ', "_")` (chat_server.rs
+    // ~1899), where `session` is the publisher's own SessionId. In the same
+    // path the server stamps `packet_wrapper.session_id = session` only when
+    // it was 0 (chat_server.rs ~1904 / session_logic.rs:115); a well-behaved
+    // client otherwise already sets `session_id` to its own session, so after
+    // this point a benign packet's `wrapper.session_id` equals the publishing
+    // `session` either way. Therefore for any PARSEABLE benign packet the
+    // inbound `subject` is exactly `room.{room}.{wrapper.session_id}` after
+    // the identical whole-string `.replace(' ', "_")`, and
+    // `subject == self_subject`  ⟺  `wrapper.session_id == receiver_session`
+    // for every class (MEDIA, CONGESTION, …): both detect "this is a packet
+    // the receiver itself published". The session_id form is a faithful,
+    // allocation-free replacement (verified consistent for MEDIA and the
+    // CONGESTION carve-out below).
+    //
+    // The only way the two forms could diverge is a malformed/adversarial
+    // packet that carries a NON-ZERO `session_id != session` (so the server's
+    // zero-fill does not normalize it). That case is already neutralized
+    // upstream: the ingress filter drops server-only packet types
+    // (SERVER_ONLY_PACKET_TYPES) before they ever reach egress, and this
+    // session_id-equality test matches the forwarder's own self-skip
+    // (forwarder.rs:368), so egress and the forwarder agree.
+    //
+    // A parse FAILURE leaves `wrapper.session_id` unavailable. The legacy
+    // code still self-skipped such a payload by subject match, so we preserve
+    // that exact outcome by falling back to the old subject comparison only
+    // on the `parsed.is_none()` path — which does not allocate on the common
+    // (parseable) hot path.
+    let is_self = match parsed {
+        Some(p) => p.wrapper.session_id == receiver_session,
+        None => subject == format!("room.{room}.{receiver_session}").replace(' ', "_"),
+    };
+    if is_self {
         // Self-skip prevents echo of our own broadcasts. However,
         // CONGESTION signals published on our subject by a congested
         // receiver must still be delivered — they are not echo.
