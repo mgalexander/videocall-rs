@@ -18,6 +18,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use tracing::warn;
 
@@ -94,6 +95,35 @@ const MAX_FANOUT_WORKER_THREADS: usize = 256;
 /// receiver COUNT alone (not media type): a large audio-only room still
 /// benefits from parallel `decide`.
 const DEFAULT_FANOUT_SHARD_MIN_RECEIVERS: usize = 16;
+
+/// Default number of INGEST subject-shards per room (bead vc-kcpg), used when
+/// `SFU_INGEST_SHARDS` is unset/empty/invalid.
+///
+/// `1` reproduces today's behaviour EXACTLY: a single per-room dispatcher
+/// subscribing the legacy `room.{room}.*` wildcard, publishers emitting the
+/// legacy `room.{room}.{session}` 3-token subject. There is no shard token on
+/// the wire and no second subscription. Sharding only engages when an operator
+/// explicitly sets `K > 1`, so the default deploy is byte-identical to the
+/// pre-vc-kcpg fleet.
+const DEFAULT_INGEST_SHARDS: usize = 1;
+
+/// Hard ceiling on the number of INGEST subject-shards per room (bead vc-kcpg).
+///
+/// WORST-CASE BUFFER MATH. Each shard runs ONE `nc.subscribe(..)`, and every
+/// subscription owns a bounded delivery channel of
+/// [`crate::nats_connect`]'s `.subscription_capacity(16 * 1024)` = 16Ki slots.
+/// With `R` live rooms on a pod and `K` shards per room the per-pod worst-case
+/// buffered-message count is `R × K × 16384` (plus shard 0's extra legacy
+/// migration subscription — see [`SfuConfig::ingest_shards`] — which adds one
+/// more 16Ki channel per room, i.e. `R × 16384`). At ~1.2 KB/media-frame that
+/// is `R × (K + 1) × 16384 × 1.2 KB` of theoretical headroom. We cap `K` at 8
+/// so that even a heavily-loaded pod (hundreds of rooms) cannot multiply the
+/// subscription-buffer footprint without bound: at `K = 8` the per-room
+/// subscription count is `8 + 1 (shard-0 legacy) = 9`, ~9× the single-dispatcher
+/// baseline. 8 also comfortably exceeds the per-pod CPU budget that the
+/// fan-out/arbiter pools already consume, so a larger `K` would not buy ingest
+/// parallelism the pod can actually schedule.
+const MAX_INGEST_SHARDS: usize = 8;
 
 /// SFU runtime configuration, snapshotted from process env once at startup.
 ///
@@ -183,6 +213,38 @@ pub struct SfuConfig {
     ///     2-person room (the regression this guard exists to prevent), so we
     ///     fall back to the default.
     pub fanout_shard_min_receivers: usize,
+    /// Number of INGEST subject-shards per room (bead vc-kcpg).
+    ///
+    /// The per-room NATS ingest used to run through ONE dispatcher draining a
+    /// single `nc.subscribe("room.{room}.*")` stream — every publisher in the
+    /// room funneled through one `sub.next()`. With `K > 1` we spawn `K`
+    /// dispatchers per room, each subscribing a disjoint subject subset
+    /// (`room.{room}.{shard}.*`), where a publisher's shard is
+    /// `jump_hash(session, K)`. This parallelizes the inbound `sub.next()`
+    /// across `K` independent streams so a high-publisher-count room is no
+    /// longer bottlenecked on one task. All `K` dispatchers share the room's
+    /// receivers map / scorer / room_state / forwarder, so fan-out, late-joiner
+    /// service, self-skip, and active-speaker selection are unchanged.
+    ///
+    /// MIGRATION (rolling deploy). NATS `*` matches exactly ONE token, so
+    /// `room.{room}.*` (3 tokens) does NOT match `room.{room}.{shard}.{session}`
+    /// (4 tokens) and vice-versa — the two subject spaces are disjoint. To lose
+    /// no packets when an old (3-token publisher) pod and a new (4-token
+    /// publisher) pod coexist, shard 0 subscribes BOTH `room.{room}.0.*` (new)
+    /// AND the legacy `room.{room}.*` (old). A given on-wire subject has a fixed
+    /// token count, so it matches at most one of shard 0's two filters — no
+    /// double-delivery. Shards `i > 0` subscribe only `room.{room}.{i}.*`.
+    /// Targeted control publishes (KFR/CONGESTION to `sender_sid`) are emitted
+    /// to the SENDER's shard so they still land on a live subscription.
+    ///
+    /// Semantics of `SFU_INGEST_SHARDS`:
+    ///   - **unset / empty / invalid** → [`DEFAULT_INGEST_SHARDS`] (1) — exactly
+    ///     today's single-dispatcher, legacy-subject behaviour.
+    ///   - **explicit positive integer** → used verbatim, clamped to
+    ///     `[1, MAX_INGEST_SHARDS]`.
+    ///   - **explicit `0`** → warned-and-ignored; falls back to the default (a
+    ///     room with zero ingest shards would receive nothing).
+    pub ingest_shards: usize,
 }
 
 impl SfuConfig {
@@ -208,6 +270,7 @@ impl SfuConfig {
         let fanout_shard_min_receivers = Self::parse_fanout_shard_min_receivers(
             std::env::var("SFU_FANOUT_SHARD_MIN_RECEIVERS").ok(),
         );
+        let ingest_shards = Self::parse_ingest_shards(std::env::var("SFU_INGEST_SHARDS").ok());
         Self {
             mode,
             milestones,
@@ -215,6 +278,69 @@ impl SfuConfig {
             chatserver_shards,
             fanout_worker_threads,
             fanout_shard_min_receivers,
+            ingest_shards,
+        }
+    }
+
+    /// Process-wide cached ingest-shard count (bead vc-kcpg).
+    ///
+    /// `K` is fixed at startup (env snapshot), but the publish side lives in the
+    /// off-actor `SessionLogic` path and the targeted-control publishes, which
+    /// do NOT hold an `SfuConfig`. Rather than thread `K` through every
+    /// `SessionLogic::new` / WS / WT handler call site, we cache it once here —
+    /// mirroring the `OnceLock`-cached env snapshot in `crate::sfu::affinity`.
+    /// The subscribe side (the dispatcher in `chat_server`) reads it from its
+    /// owned `SfuConfig` directly; both sides therefore observe the SAME `K`.
+    pub fn ingest_shards_cached() -> usize {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| Self::parse_ingest_shards(std::env::var("SFU_INGEST_SHARDS").ok()))
+    }
+
+    /// Parse the `SFU_INGEST_SHARDS` env value (bead vc-kcpg).
+    ///
+    /// See [`SfuConfig::ingest_shards`] for the unset/empty/zero/clamp
+    /// semantics. Mirrors the warn-don't-panic philosophy used elsewhere here:
+    /// a bad value logs a warning and falls back to the default (1, i.e. the
+    /// legacy single-dispatcher path) rather than taking the server down.
+    fn parse_ingest_shards(raw: Option<String>) -> usize {
+        match raw {
+            None => DEFAULT_INGEST_SHARDS,
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return DEFAULT_INGEST_SHARDS;
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(0) => {
+                        warn!(
+                            "ignoring SFU_INGEST_SHARDS=0 (a room needs at least one \
+                             ingest shard or it receives nothing); using default {}",
+                            DEFAULT_INGEST_SHARDS
+                        );
+                        DEFAULT_INGEST_SHARDS
+                    }
+                    Ok(v) => {
+                        let clamped = v.clamp(1, MAX_INGEST_SHARDS);
+                        if clamped != v {
+                            warn!(
+                                "clamping SFU_INGEST_SHARDS={} to {} (valid range 1..={}; \
+                                 the ceiling bounds the per-pod subscription-buffer \
+                                 footprint — see MAX_INGEST_SHARDS)",
+                                v, clamped, MAX_INGEST_SHARDS
+                            );
+                        }
+                        clamped
+                    }
+                    Err(_) => {
+                        warn!(
+                            "ignoring invalid SFU_INGEST_SHARDS value {:?} (expected a \
+                             positive integer); using default {}",
+                            trimmed, DEFAULT_INGEST_SHARDS
+                        );
+                        DEFAULT_INGEST_SHARDS
+                    }
+                }
+            }
         }
     }
 
@@ -785,6 +911,40 @@ mod tests {
             SfuConfig::parse_fanout_shard_min_receivers(Some("-3".to_string())),
             def
         );
+    }
+
+    // ===== SFU_INGEST_SHARDS parsing tests (bead vc-kcpg) =====
+    //
+    // `parse_ingest_shards` takes the raw `Option<String>` directly, so these
+    // tests do NOT touch process-global env state and need no EnvGuard. The
+    // unset/empty/zero/invalid paths fall back to the fixed
+    // `DEFAULT_INGEST_SHARDS` (1), so we assert the concrete default.
+
+    #[test]
+    fn ingest_shards_explicit_value_is_used_and_clamped() {
+        assert_eq!(SfuConfig::parse_ingest_shards(Some(" 4 ".to_string())), 4);
+        assert_eq!(SfuConfig::parse_ingest_shards(Some("1".to_string())), 1);
+        // Above the ceiling clamps down to MAX_INGEST_SHARDS.
+        assert_eq!(
+            SfuConfig::parse_ingest_shards(Some("1000".to_string())),
+            MAX_INGEST_SHARDS
+        );
+    }
+
+    #[test]
+    fn ingest_shards_unset_empty_zero_invalid_fall_back_to_default() {
+        let def = DEFAULT_INGEST_SHARDS;
+        assert_eq!(
+            def, 1,
+            "default MUST be 1 so the default deploy is unchanged"
+        );
+        assert_eq!(SfuConfig::parse_ingest_shards(None), def);
+        assert_eq!(SfuConfig::parse_ingest_shards(Some(String::new())), def);
+        assert_eq!(SfuConfig::parse_ingest_shards(Some("   ".to_string())), def);
+        // A zero-shard room would receive nothing — warn and use the default.
+        assert_eq!(SfuConfig::parse_ingest_shards(Some("0".to_string())), def);
+        assert_eq!(SfuConfig::parse_ingest_shards(Some("abc".to_string())), def);
+        assert_eq!(SfuConfig::parse_ingest_shards(Some("-3".to_string())), def);
     }
 
     #[test]

@@ -27,7 +27,6 @@ use crate::{
         },
         session::Message,
     },
-    models::build_subject_and_queue,
     session_manager::{SessionEndResult, SessionManager},
 };
 
@@ -146,14 +145,26 @@ struct RoomDispatch {
     /// snapshots this map per-message so writes (join/leave) only block
     /// briefly under a write lock.
     receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
-    /// JoinHandle for the per-room subscription loop. Aborted when the
-    /// room drains so the task exits at its next `.await` and drops its
-    /// `Arc<Forwarder>` reference.
+    /// JoinHandles for the per-room subscription loops. vc-kcpg: there are `K`
+    /// (`SfuConfig::ingest_shards`) dispatcher tasks per room, one per ingest
+    /// shard, all sharing the `receivers` map above (so fan-out reaches every
+    /// receiver regardless of which shard ingested a packet). With the default
+    /// `K == 1` this is a single-element vec — the legacy one-dispatcher case.
     ///
-    /// Must be `.abort()`-ed before drop: tokio `JoinHandle` *detaches*
-    /// on drop, it does not cancel. Replacing or removing this field
-    /// without first aborting the prior handle leaks the task.
-    task: JoinHandle<()>,
+    /// Every handle must be `.abort()`-ed before drop: tokio `JoinHandle`
+    /// *detaches* on drop, it does not cancel. Replacing or removing this field
+    /// without first aborting each prior handle leaks the task(s).
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl RoomDispatch {
+    /// Abort every per-shard dispatcher task (vc-kcpg). Called on normal drain
+    /// and on the respawn path. A finished task aborts as a no-op.
+    fn abort_all(&self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
 }
 
 /// Internal message: posted by the per-room demux task when its
@@ -966,7 +977,8 @@ impl ChatServer {
         };
         if now_empty {
             if let Some(dispatch) = self.room_dispatch.remove(room_id) {
-                dispatch.task.abort();
+                // vc-kcpg: abort ALL K per-shard dispatcher tasks.
+                dispatch.abort_all();
             }
         }
     }
@@ -1620,9 +1632,15 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             // Normal teardown already removed the entry — nothing to do.
             return;
         };
-        // `existing.task` is the handle of the task that just sent this
-        // message. It's already finished; calling abort() on a finished
-        // task is a no-op, and dropping the handle detaches harmlessly.
+        // vc-kcpg: `existing.tasks` are the K per-shard handles. The shard that
+        // sent this message is already finished (abort is a no-op); the OTHER
+        // K-1 shards may still be live. We respawn the WHOLE set below, so abort
+        // the survivors here to avoid leaking detached tasks that would keep
+        // running against the (reused) receivers map. This preserves the
+        // documented room-level recovery blast radius — one shard failing
+        // re-establishes the whole room's ingest rather than leaving a partial,
+        // hard-to-reason-about mix of old and new dispatchers.
+        existing.abort_all();
         let receivers = existing.receivers;
         let has_receivers = {
             let g = match receivers.read() {
@@ -1669,32 +1687,33 @@ impl Handler<RoomDispatcherExited> for ChatServer {
             .entry(room.clone())
             .or_insert_with(|| Arc::new(RwLock::new(RoomState::new(room.clone()))))
             .clone();
-        let subject = format!("room.{room}.*").replace(' ', "_");
         let sfu_mode = self.sfu_config.mode;
         warn!(
-            "Respawning per-room dispatcher for room {} (subscription died with \
-             {} live receivers still attached)",
+            "Respawning per-room dispatchers for room {} (a shard subscription \
+             died with {} live receivers still attached)",
             room,
             receivers
                 .read()
                 .map(|g| g.len())
                 .unwrap_or_else(|p| p.into_inner().len()),
         );
-        let task = spawn_room_dispatcher(
-            self.nats_connection.clone(),
-            room.clone(),
-            subject,
+        // vc-kcpg: respawn ALL K ingest dispatchers (the subject filters are
+        // rebuilt per shard inside `spawn_room_dispatcher`).
+        let tasks = spawn_room_dispatchers(
+            &self.nats_connection,
+            &room,
+            self.sfu_config.ingest_shards,
             sfu_mode,
-            forwarder,
-            scorer,
-            receivers.clone(),
-            room_state,
-            ctx.address(),
+            &forwarder,
+            &scorer,
+            &receivers,
+            &room_state,
+            &ctx.address(),
             &self.fanout_handle,
             self.sfu_config.fanout_shard_min_receivers,
         );
         self.room_dispatch
-            .insert(room, RoomDispatch { receivers, task });
+            .insert(room, RoomDispatch { receivers, tasks });
     }
 }
 
@@ -1897,8 +1916,12 @@ impl Handler<ClientMessage> for ChatServer {
         }
 
         let nc = self.nats_connection.clone();
-        let subject = format!("room.{room}.{session}");
-        let subject = subject.replace(' ', "_");
+        // vc-kcpg: this surviving CONTROL publish (KFR, etc.) is emitted on the
+        // publishing session's own subject. With K>1 it must land on that
+        // session's ingest shard so a dispatcher subscribes it; with K==1 this
+        // collapses to the legacy `room.{room}.{session}` 3-token subject.
+        let subject =
+            crate::models::build_publish_subject(&room, session, self.sfu_config.ingest_shards);
 
         let packet_bytes =
             if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
@@ -2555,11 +2578,12 @@ impl Handler<JoinRoom> for ChatServer {
         let session_id = session;
         let nc = self.nats_connection.clone();
 
-        let session_str = session.to_string();
-        // vc-q0v: only the subject string is needed — the per-room demux
-        // uses a plain `subscribe` rather than `queue_subscribe`. The queue
-        // group was a per-session artifact of the pre-vc-q0v fan-out model.
-        let (subject, _queue) = build_subject_and_queue(&room, &session_str);
+        // vc-kcpg: the per-room demux now builds its own per-shard subscribe
+        // subjects inside `spawn_room_dispatcher` (via
+        // `build_shard_subscribe_subjects`), so the JoinRoom path no longer
+        // pre-computes a subscribe subject here. The legacy
+        // `build_subject_and_queue` helper is retained for the WS/WT handler
+        // paths and the queue group was already a dead per-session artifact.
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
@@ -2687,21 +2711,24 @@ impl Handler<JoinRoom> for ChatServer {
             std::collections::hash_map::Entry::Vacant(vac) => {
                 let receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>> =
                     Arc::new(RwLock::new(HashMap::new()));
-                let task = spawn_room_dispatcher(
-                    self.nats_connection.clone(),
-                    room.clone(),
-                    subject.clone(),
+                // vc-kcpg: spawn K ingest dispatchers (one per subject shard), all
+                // sharing this room's receivers/scorer/room_state/forwarder. K==1
+                // (default) is the legacy single-dispatcher path.
+                let tasks = spawn_room_dispatchers(
+                    &self.nats_connection,
+                    &room,
+                    self.sfu_config.ingest_shards,
                     sfu_mode,
-                    forwarder.clone(),
-                    scorer.clone(),
-                    receivers.clone(),
-                    room_state.clone(),
-                    ctx.address(),
+                    &forwarder,
+                    &scorer,
+                    &receivers,
+                    &room_state,
+                    &ctx.address(),
                     &self.fanout_handle,
                     self.sfu_config.fanout_shard_min_receivers,
                 );
                 let recvs = receivers.clone();
-                vac.insert(RoomDispatch { receivers, task });
+                vac.insert(RoomDispatch { receivers, tasks });
                 recvs
             }
         };
@@ -2911,6 +2938,18 @@ pub const WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// spam or resubscribe churn.
 pub const WATCHDOG_SILENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// vc-kcpg: hard cap on the per-dispatcher scorer batch length before an inline
+/// flush is forced, independent of the 200ms flush timer.
+///
+/// Picked so a NORMAL 200ms flush window never trips it (a single sender emits
+/// audio at ~50 packets/s, so even a busy small room flushes a few dozen
+/// observations per tick), but a SATURATED shard whose `scorer_flush` timer arm
+/// is starved by the `biased` `select!` cannot grow the buffer without bound:
+/// once 512 observations accumulate we flush inline on the message path. At
+/// ~(SessionId, f32, bool, Instant) ≈ 32 B/entry that bounds the buffer at
+/// ~16 KB regardless of inbound rate.
+pub const SCORER_BATCH_FLUSH_CAP: usize = 512;
+
 /// vc-9eh: compute the silence window for the current consecutive-trip count.
 ///
 /// `trips` is the number of consecutive watchdog resubscribes that have NOT
@@ -3004,11 +3043,63 @@ pub fn watchdog_should_resubscribe(
 /// case (1) the abort drops the message channel before the send can race,
 /// which is fine: the handler checks whether the entry is still present
 /// and exits if not.
+/// Spawn ALL `K` per-room ingest dispatchers (bead vc-kcpg).
+///
+/// One [`spawn_room_dispatcher`] per ingest shard `[0, n_ingest_shards)`, each
+/// subscribing its shard's subject filter(s) but ALL sharing the same
+/// `receivers` / `scorer` / `room_state` / `forwarder` Arcs (cheap clones).
+/// With the default `K == 1` this spawns exactly one dispatcher on the legacy
+/// `room.{room}.*` wildcard — byte-identical to the pre-vc-kcpg single-task
+/// path. Returns the `K` handles for the `RoomDispatch` entry.
+#[allow(clippy::too_many_arguments)]
+fn spawn_room_dispatchers(
+    nc: &async_nats::client::Client,
+    room: &str,
+    n_ingest_shards: usize,
+    sfu_mode: SfuMode,
+    forwarder: &Arc<Forwarder>,
+    scorer: &Arc<TokioRwLock<SpeakerScorer>>,
+    receivers: &Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+    room_state: &Arc<RwLock<RoomState>>,
+    chat_server: &actix::Addr<ChatServer>,
+    fanout_handle: &tokio::runtime::Handle,
+    shard_min_receivers: usize,
+) -> Vec<JoinHandle<()>> {
+    let k = n_ingest_shards.max(1);
+    (0..k)
+        .map(|shard| {
+            spawn_room_dispatcher(
+                nc.clone(),
+                room.to_string(),
+                shard,
+                k,
+                sfu_mode,
+                forwarder.clone(),
+                scorer.clone(),
+                receivers.clone(),
+                room_state.clone(),
+                chat_server.clone(),
+                fanout_handle,
+                shard_min_receivers,
+            )
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_room_dispatcher(
     nc: async_nats::client::Client,
     room: String,
-    subject: String,
+    // vc-kcpg: which ingest shard `[0, n_ingest_shards)` this dispatcher serves,
+    // and the total shard count. The dispatcher subscribes the subject filter(s)
+    // for `ingest_shard` via `build_shard_subscribe_subjects` — with K==1 that is
+    // the single legacy `room.{room}.*` wildcard (byte-identical to pre-vc-kcpg);
+    // with K>1, shard 0 also carries the legacy wildcard for rolling-deploy
+    // migration. All K dispatchers share the SAME `receivers` / `scorer` /
+    // `room_state` / `forwarder` Arcs, so fan-out, late-joiner service,
+    // self-skip and active-speaker selection are identical regardless of K.
+    ingest_shard: usize,
+    n_ingest_shards: usize,
     sfu_mode: SfuMode,
     forwarder: Arc<Forwarder>,
     scorer: Arc<TokioRwLock<SpeakerScorer>>,
@@ -3076,13 +3167,39 @@ fn spawn_room_dispatcher(
     let shard_handle = fanout_handle.clone();
     fanout_handle.spawn(async move {
         let fanout_workers = shard_handle.metrics().num_workers().max(1);
-        let mut sub = match nc.subscribe(subject.clone()).await {
+
+        // vc-kcpg: the subject FILTER SET this shard subscribes. For K==1 this is
+        // exactly `["room.{room}.*"]` (the single legacy wildcard — byte-identical
+        // to pre-vc-kcpg). For K>1, shard 0 gets `["room.{room}.0.*",
+        // "room.{room}.*"]` (the new 4-token shard-0 filter plus the legacy
+        // 3-token wildcard for rolling-deploy migration); shards i>0 get
+        // `["room.{room}.{i}.*"]`. The two shard-0 filters are disjoint by token
+        // count, so no message is delivered twice. See
+        // `crate::models::build_shard_subscribe_subjects`.
+        let subjects =
+            crate::models::build_shard_subscribe_subjects(&room, ingest_shard, n_ingest_shards);
+        // Subscribe every filter and MERGE the resulting streams into one. The
+        // merged stream is drained by a single `sub.next()` below, preserving the
+        // existing watchdog / fan-out loop shape exactly; the only difference is
+        // that for shard 0 (K>1) two subscriptions feed the same `next()`.
+        async fn subscribe_all(
+            nc: &async_nats::client::Client,
+            subjects: &[String],
+        ) -> Result<futures::stream::SelectAll<async_nats::Subscriber>, async_nats::SubscribeError>
+        {
+            let mut subs = Vec::with_capacity(subjects.len());
+            for s in subjects {
+                subs.push(nc.subscribe(s.clone()).await?);
+            }
+            Ok(futures::stream::select_all(subs))
+        }
+        let mut sub = match subscribe_all(&nc, &subjects).await {
             Ok(s) => s,
             Err(e) => {
                 error!(
-                    "Per-room demux failed to subscribe to {} (room {}): {} — \
-                     notifying actor for cleanup/respawn",
-                    subject, room, e
+                    "Per-room demux failed to subscribe to {:?} (room {}, shard \
+                     {}/{}): {} — notifying actor for cleanup/respawn",
+                    subjects, room, ingest_shard, n_ingest_shards, e
                 );
                 // try_send is fine here: if the actor mailbox is full or
                 // the actor is gone, recovery on the next JoinRoom for
@@ -3093,8 +3210,8 @@ fn spawn_room_dispatcher(
             }
         };
         info!(
-            "Per-room demux subscribed to {} (room {}, mode {:?})",
-            subject, room, sfu_mode
+            "Per-room demux subscribed to {:?} (room {}, shard {}/{}, mode {:?})",
+            subjects, room, ingest_shard, n_ingest_shards, sfu_mode
         );
 
         // --- vc-9eh: per-room delivery watchdog -------------------------------
@@ -3164,10 +3281,76 @@ fn spawn_room_dispatcher(
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             room.hash(&mut h);
+            // vc-kcpg: also fold the ingest shard into the jitter seed so the K
+            // dispatchers WITHIN a room do not all tick together. Without this,
+            // every shard of a room derives the SAME phase from the room name and
+            // a room-wide silent-subscription event would trip all K resubscribes
+            // in the same sub-tick — the synchronized-wave hazard vc-9eh's jitter
+            // exists to avoid, now reintroduced at the per-room-shard granularity.
+            ingest_shard.hash(&mut h);
             let jitter_ms = h.finish() % (WATCHDOG_TICK.as_millis() as u64);
             if jitter_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
             }
+        }
+
+        // --- vc-kcpg: per-dispatcher (per-shard) scorer batch buffer ----------
+        //
+        // Pre-vc-kcpg the dispatcher wrote `scorer.write().await.observe(..)` on
+        // the SHARED `Arc<TokioRwLock<SpeakerScorer>>` for EVERY inbound audio
+        // packet. With K parallel dispatchers all contending that one write lock
+        // per audio packet, that is a genuine new serialization point. Instead we
+        // accumulate observations in this task-LOCAL buffer (no lock) and flush
+        // the whole batch into the shared scorer at most once per `SPEAKER_FLUSH`
+        // (== the scorer's own 200ms `TICK_INTERVAL`), so the shared write lock is
+        // taken ~5×/s/dispatcher regardless of audio packet rate.
+        //
+        // SEMANTICS PRESERVED EXACTLY. `SpeakerScorer::observe` is NOT
+        // idempotent-latest — the EWMA is `α*level + (1-α)*prev` and it stamps
+        // `last_update` / `last_speaking_hint_at`, so BOTH order and timestamp
+        // matter. We therefore capture each observation's ARRIVAL `Instant` here
+        // and, at flush, replay every observation IN ARRIVAL ORDER via
+        // `observe_at(.., arrival)`. The result is bit-identical to the
+        // per-packet `observe()` path — the flush coalesces the LOCK acquisition,
+        // not the observations.
+        //
+        // STARVATION-PROOF FLUSH (vc-kcpg review fix). The `select!` is `biased`,
+        // so a SATURATED shard — the exact case this bead targets — has
+        // `sub.next()` ready every iteration and the `scorer_flush.tick()` arm
+        // would NEVER be scheduled. Relying on the timer alone would let the batch
+        // grow unbounded (memory pressure precisely when the pod is already
+        // saturated) AND let the shared scorer go stale (active-speaker set frozen
+        // for the duration of the saturation) — a regression vs the old inline
+        // `observe()`. So we ALSO flush INLINE on the message path whenever the
+        // batch is due: either `>= TICK_INTERVAL` has elapsed since the last flush
+        // OR the batch hit the hard cap. The timer arm is kept for the
+        // idle/low-traffic case (no inbound message to piggyback the inline check
+        // on). Net: steady state still takes the lock ~5×/s, but the batch can
+        // never balloon or go stale under load.
+        let mut scorer_batch: Vec<(SessionId, f32, bool, std::time::Instant)> = Vec::new();
+        let mut last_scorer_flush = std::time::Instant::now();
+        let mut scorer_flush = tokio::time::interval(crate::sfu::speaker::TICK_INTERVAL);
+        scorer_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // vc-kcpg: replay the buffered observations into the shared scorer IN
+        // ARRIVAL ORDER (each with its captured arrival instant). A macro (not a
+        // closure) because every call site must borrow `scorer_batch` mutably AND
+        // hold the `scorer.write().await` guard across the same await — a closure
+        // capturing both would fight the borrow checker; the macro inlines the
+        // few lines at each site with no captures. The macro DRAINS only; callers
+        // that loop again (the timer arm, the inline message-path flush, and the
+        // resubscribe-success path) reset `last_scorer_flush` themselves so the
+        // tick clock advances. The TERMINAL sites (post-loop, resubscribe-failure
+        // handoff) do NOT touch the clock — there is no next tick to measure.
+        macro_rules! flush_scorer_batch {
+            () => {
+                if !scorer_batch.is_empty() {
+                    let mut guard = scorer.write().await;
+                    for (sid, level, hint, at) in scorer_batch.drain(..) {
+                        guard.observe_at(sid, level, hint, at);
+                    }
+                }
+            };
         }
 
         loop {
@@ -3285,11 +3468,13 @@ fn spawn_room_dispatcher(
                         consecutive_silent_trips,
                         receiver_count,
                     );
-                    // Resubscribe IN PLACE. Drop the old (silent) `Subscriber`
-                    // and attach a fresh one on the SAME task. On success the
-                    // grace clock restarts so the new subscription gets a full
-                    // window to receive before it can be judged dead again.
-                    match nc.subscribe(subject.clone()).await {
+                    // Resubscribe IN PLACE. Drop the old (silent) merged
+                    // `Subscriber`(s) and re-establish the FULL filter set for
+                    // this shard on the SAME task (vc-kcpg: shard 0 re-attaches
+                    // both its 4-token and legacy filters). On success the grace
+                    // clock restarts so the new subscription gets a full window to
+                    // receive before it can be judged dead again.
+                    match subscribe_all(&nc, &subjects).await {
                         Ok(fresh) => {
                             let now = std::time::Instant::now();
                             sub = fresh;
@@ -3310,10 +3495,15 @@ fn spawn_room_dispatcher(
                             // any real traffic resumes — so genuine-broken recovery
                             // stays fast.
                             last_msg_at = now;
+                            // vc-kcpg: flush the batch before looping on the fresh
+                            // subscription so a stall+resubscribe doesn't drop up
+                            // to a tick of buffered observations.
+                            flush_scorer_batch!();
+                            last_scorer_flush = now;
                             info!(
-                                "Per-room demux resubscribed in place to {} \
-                                 (room {})",
-                                subject, room
+                                "Per-room demux resubscribed in place to {:?} \
+                                 (room {}, shard {}/{})",
+                                subjects, room, ingest_shard, n_ingest_shards
                             );
                             continue;
                         }
@@ -3322,15 +3512,32 @@ fn spawn_room_dispatcher(
                             // actor respawn path (it reuses the same receivers
                             // Arc + forwarder) and exit this task.
                             warn!(
-                                "Per-room demux failed to resubscribe to {} \
-                                 (room {}): {} — handing off to actor respawn",
-                                subject, room, e
+                                "Per-room demux failed to resubscribe to {:?} \
+                                 (room {}, shard {}/{}): {} — handing off to actor \
+                                 respawn",
+                                subjects, room, ingest_shard, n_ingest_shards, e
                             );
+                            // vc-kcpg: flush before handing off so teardown does
+                            // not lose the buffered tail of observations.
+                            flush_scorer_batch!();
                             let _ = chat_server
                                 .try_send(RoomDispatcherExited { room: room.clone() });
                             return;
                         }
                     }
+                }
+                _ = scorer_flush.tick() => {
+                    // vc-kcpg: flush the task-local scorer batch into the shared
+                    // scorer. This arm handles the IDLE / low-traffic case (no
+                    // inbound message to piggyback the inline flush on); the
+                    // message-path inline flush below handles the saturated case
+                    // where this arm is starved by the `biased` `select!`. Replays
+                    // IN ARRIVAL ORDER via `observe_at` with each observation's
+                    // captured arrival instant, so the shared scorer state is
+                    // bit-identical to the pre-batching per-packet path.
+                    flush_scorer_batch!();
+                    last_scorer_flush = std::time::Instant::now();
+                    continue;
                 }
             };
 
@@ -3363,11 +3570,16 @@ fn spawn_room_dispatcher(
                             let sender_sid = p.wrapper.session_id;
                             let level = rh.audio_level;
                             let hint = rh.is_speaking;
-                            // Short critical section: `observe()` is sync.
-                            // The competing acquirer is `tick_once` taking
-                            // a read for a snapshot copy; neither holds
-                            // the lock across other awaits.
-                            scorer.write().await.observe(sender_sid, level, hint);
+                            // vc-kcpg: do NOT take the shared scorer write lock
+                            // per audio packet (the K-dispatcher serialization
+                            // point). Instead buffer the observation with its
+                            // ARRIVAL instant in the task-local batch; the
+                            // `scorer_flush` timer arm above replays the batch
+                            // in order via `observe_at` ~once per 200ms tick,
+                            // preserving today's EWMA/timestamp semantics exactly
+                            // while taking the shared lock ~5×/s instead of per
+                            // packet.
+                            scorer_batch.push((sender_sid, level, hint, std::time::Instant::now()));
                         }
                     }
                 }
@@ -3576,6 +3788,7 @@ fn spawn_room_dispatcher(
                         subject_str,
                         &msg.payload,
                         parsed.as_ref(),
+                        n_ingest_shards,
                     ) {
                         any = true;
                         if let Err(e) = recipient.try_send(Message {
@@ -3638,6 +3851,7 @@ fn spawn_room_dispatcher(
                                 &subject_shared,
                                 &payload_shared,
                                 parsed_shared.as_deref(),
+                                n_ingest_shards,
                             ) {
                                 any = true;
                                 if let Err(e) = recipient.try_send(Message {
@@ -3680,7 +3894,27 @@ fn spawn_room_dispatcher(
             if forwarded_any {
                 crate::sfu::forwarding_health::global().note_forward();
             }
+
+            // vc-kcpg: STARVATION-PROOF inline scorer flush. We reach here only
+            // after handling a real inbound `msg` (the watchdog/flush `select!`
+            // arms `continue`, the `None` arm `break`s). On a saturated shard the
+            // `biased` `select!` keeps `sub.next()` ready and never schedules the
+            // `scorer_flush.tick()` arm, so the batch MUST be drained here too —
+            // when either a full tick has elapsed since the last flush OR the
+            // batch hit the hard cap. Replays in arrival order via `observe_at`,
+            // identical to the timer arm. This bounds the buffer (≤ cap) and keeps
+            // the shared scorer fresh even while the timer arm is starved.
+            if scorer_batch.len() >= SCORER_BATCH_FLUSH_CAP
+                || last_scorer_flush.elapsed() >= crate::sfu::speaker::TICK_INTERVAL
+            {
+                flush_scorer_batch!();
+                last_scorer_flush = std::time::Instant::now();
+            }
         }
+        // vc-kcpg: drain any remaining batched observations before the task
+        // exits via the `None`-closed-subscription `break`, so we don't silently
+        // lose up to one tick of speaker observations on teardown/handoff.
+        flush_scorer_batch!();
         // `sub.next()` returned None (the `None` arm `break`s the loop) — the
         // subscription is closed. This is
         // unexpected during normal operation (async-nats is supposed to
@@ -3757,6 +3991,9 @@ pub(crate) fn egress_decide_bytes(
         subject,
         payload,
         parsed.as_ref(),
+        // vc-kcpg: this test helper is exercised with the legacy 3-token subject,
+        // so K==1 matches the on-wire form the tests build.
+        1,
     )
 }
 
@@ -3772,6 +4009,7 @@ pub(crate) fn egress_decide_bytes(
 /// is who owns the parse. `parsed` is `None` when the wrapper failed to
 /// parse — preserving the pre-existing tolerant "forward as-is" behavior on
 /// the SFU path so we never black-hole encrypted-or-unparseable payloads.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn egress_decide_from_parsed(
     sfu_mode: SfuMode,
     forwarder: &Forwarder,
@@ -3780,6 +4018,14 @@ pub(crate) fn egress_decide_from_parsed(
     subject: &str,
     payload: &bytes::Bytes,
     parsed: Option<&ParsedPacket>,
+    // vc-kcpg: the ingest shard count `K`, needed ONLY for the parse-failure
+    // self-skip fallback (the parseable hot path uses `session_id` equality and
+    // ignores this). Under K>1 the on-wire subject is the 4-token
+    // `room.{room}.{shard}.{session}`, so the fallback comparison subject must be
+    // built with the SAME `build_publish_subject(.., k)` the publisher used or it
+    // would never match and an unparseable self-published packet would be echoed
+    // back to its own publisher.
+    ingest_shards: usize,
 ) -> Option<bytes::Bytes> {
     // p6-7 / vc-kol follow-up: HEALTH_BEACON is server-internal. It is
     // published on `room.{room}.system` by the owner pod for the spill
@@ -3809,21 +4055,20 @@ pub(crate) fn egress_decide_from_parsed(
     // `SessionId`-equality test against the parsed `wrapper.session_id`,
     // mirroring the forwarder's own self-skip (forwarder.rs:368).
     //
-    // EQUIVALENCE PROOF. A client publishes on
-    // `format!("room.{room}.{session}").replace(' ', "_")` (chat_server.rs
-    // ~1899), where `session` is the publisher's own SessionId. In the same
-    // path the server stamps `packet_wrapper.session_id = session` only when
-    // it was 0 (chat_server.rs ~1904 / session_logic.rs:115); a well-behaved
-    // client otherwise already sets `session_id` to its own session, so after
-    // this point a benign packet's `wrapper.session_id` equals the publishing
-    // `session` either way. Therefore for any PARSEABLE benign packet the
-    // inbound `subject` is exactly `room.{room}.{wrapper.session_id}` after
-    // the identical whole-string `.replace(' ', "_")`, and
-    // `subject == self_subject`  ⟺  `wrapper.session_id == receiver_session`
-    // for every class (MEDIA, CONGESTION, …): both detect "this is a packet
-    // the receiver itself published". The session_id form is a faithful,
+    // EQUIVALENCE PROOF. A client publishes on the subject
+    // `build_publish_subject(room, session, K)` (vc-kcpg) — `room.{room}.{session}`
+    // when K==1 and `room.{room}.{shard}.{session}` when K>1 — where `session` is
+    // the publisher's own SessionId. In the same path the server stamps
+    // `packet_wrapper.session_id = session` only when it was 0 (session_logic.rs
+    // ~115); a well-behaved client otherwise already sets `session_id` to its own
+    // session, so after this point a benign packet's `wrapper.session_id` equals
+    // the publishing `session` either way. Therefore for any PARSEABLE benign
+    // packet `subject == self_subject` ⟺ `wrapper.session_id == receiver_session`
+    // for every class (MEDIA, CONGESTION, …): both detect "this is a packet the
+    // receiver itself published". The session_id form is a faithful,
     // allocation-free replacement (verified consistent for MEDIA and the
-    // CONGESTION carve-out below).
+    // CONGESTION carve-out below), and crucially it is INDEPENDENT of the subject
+    // token-count, so the parseable hot path is unaffected by K.
     //
     // The only way the two forms could diverge is a malformed/adversarial
     // packet that carries a NON-ZERO `session_id != session` (so the server's
@@ -3835,12 +4080,18 @@ pub(crate) fn egress_decide_from_parsed(
     //
     // A parse FAILURE leaves `wrapper.session_id` unavailable. The legacy
     // code still self-skipped such a payload by subject match, so we preserve
-    // that exact outcome by falling back to the old subject comparison only
-    // on the `parsed.is_none()` path — which does not allocate on the common
-    // (parseable) hot path.
+    // that exact outcome by falling back to the subject comparison only on the
+    // `parsed.is_none()` path — which does not allocate on the common
+    // (parseable) hot path. vc-kcpg: the fallback comparison subject is built via
+    // `build_publish_subject(.., ingest_shards)` so it matches the REAL on-wire
+    // form under K>1 (the 4-token `room.{room}.{shard}.{session}`); using the bare
+    // 3-token form here would never match and the unparseable self-packet would
+    // be echoed back to its own publisher.
     let is_self = match parsed {
         Some(p) => p.wrapper.session_id == receiver_session,
-        None => subject == format!("room.{room}.{receiver_session}").replace(' ', "_"),
+        None => {
+            subject == crate::models::build_publish_subject(room, receiver_session, ingest_shards)
+        }
     };
     if is_self {
         // Self-skip prevents echo of our own broadcasts. However,

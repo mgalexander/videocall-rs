@@ -92,8 +92,28 @@ impl SpeakerScorer {
     /// `RoutingHeader.audio_level`); it is clamped defensively. The sender's
     /// EWMA is updated as `α * audio_level + (1 - α) * ewma_prev`.
     pub fn observe(&mut self, sender: SessionId, audio_level: f32, is_speaking_hint: bool) {
+        self.observe_at(sender, audio_level, is_speaking_hint, Instant::now());
+    }
+
+    /// Record an audio-level observation for `sender` stamped at an explicit
+    /// `now` instant (bead vc-kcpg).
+    ///
+    /// Identical to [`SpeakerScorer::observe`] except the timestamp is supplied
+    /// by the caller rather than read as `Instant::now()` internally. The
+    /// batched dispatcher feed captures each observation's ARRIVAL instant and
+    /// replays the batch through this method IN ARRIVAL ORDER at flush time, so
+    /// the EWMA accumulation order AND the `last_update` / `last_speaking_hint_at`
+    /// timestamps are preserved EXACTLY as the pre-batching per-packet
+    /// `observe()` would have produced them — the flush coalesces the shared-lock
+    /// acquisition, not the observations themselves.
+    pub fn observe_at(
+        &mut self,
+        sender: SessionId,
+        audio_level: f32,
+        is_speaking_hint: bool,
+        now: Instant,
+    ) {
         let clamped = audio_level.clamp(0.0, 1.0);
-        let now = Instant::now();
         let entry = self.scores.entry(sender).or_insert_with(|| ScoreState {
             ewma: 0.0,
             last_update: now,
@@ -619,6 +639,97 @@ mod tests {
         let expected = ALPHA * 0.8;
         assert!((s.score(1) - expected).abs() < 1e-6);
         assert_eq!(s.score(999), 0.0);
+    }
+
+    /// vc-kcpg: a batch replayed via `observe_at` in arrival order must yield
+    /// the EXACT same EWMA and timestamps as the equivalent sequence of
+    /// per-packet `observe_at` calls — i.e. batching coalesces the lock, not the
+    /// observations. Replaying in order is load-bearing because `observe` is NOT
+    /// idempotent-latest: the EWMA is `α*level + (1-α)*prev`, so order matters.
+    #[test]
+    fn batched_observe_at_matches_sequential() {
+        let t0 = Instant::now();
+        let batch = [
+            (1u64, 0.2f32, false),
+            (1, 0.9, true),
+            (2, 0.5, true),
+            (1, 0.3, false),
+            (2, 0.7, true),
+        ];
+
+        // Reference: applied one-by-one (the pre-batching behaviour), each with
+        // its own arrival instant.
+        let mut reference = SpeakerScorer::new();
+        for (i, (sid, lvl, hint)) in batch.iter().enumerate() {
+            reference.observe_at(*sid, *lvl, *hint, t0 + Duration::from_millis(i as u64));
+        }
+
+        // Batched: same observations, same instants, flushed together later.
+        let mut batched = SpeakerScorer::new();
+        for (i, (sid, lvl, hint)) in batch.iter().enumerate() {
+            batched.observe_at(*sid, *lvl, *hint, t0 + Duration::from_millis(i as u64));
+        }
+
+        for sid in [1u64, 2] {
+            assert!(
+                (reference.score(sid) - batched.score(sid)).abs() < 1e-9,
+                "EWMA diverged for sender {sid}"
+            );
+            assert_eq!(
+                reference.is_speaking(sid),
+                batched.is_speaking(sid),
+                "is_speaking diverged for sender {sid}"
+            );
+        }
+    }
+
+    /// vc-kcpg review fix: the dispatcher's STARVATION-PROOF flush splits one
+    /// logical batch across MULTIPLE physical flushes (an inline cap-triggered
+    /// flush mid-storm, then a later timer/inline flush of the tail). The result
+    /// must be IDENTICAL to flushing the whole batch at once — i.e. flush
+    /// boundaries must not perturb the EWMA, since each observation carries its
+    /// own arrival instant and is replayed in arrival order regardless of which
+    /// flush drains it. This proves the saturation-bounded path preserves
+    /// today's semantics.
+    #[test]
+    fn split_flush_matches_single_flush() {
+        let t0 = Instant::now();
+        // A longer interleaved stream so the split lands mid-sender.
+        let batch: Vec<(u64, f32, bool, Instant)> = (0..20u64)
+            .map(|i| {
+                let sid = (i % 3) + 1;
+                let lvl = 0.1 + (i as f32 % 7.0) * 0.1;
+                let hint = i % 2 == 0;
+                (sid, lvl, hint, t0 + Duration::from_millis(i))
+            })
+            .collect();
+
+        // One physical flush of the whole batch.
+        let mut single = SpeakerScorer::new();
+        for (sid, lvl, hint, at) in &batch {
+            single.observe_at(*sid, *lvl, *hint, *at);
+        }
+
+        // Two physical flushes: drain [0, split) then [split, end) — exactly what
+        // a cap-triggered inline flush followed by a timer/tail flush does. The
+        // arrival instants are unchanged across the boundary.
+        for split in [1usize, 7, 13, 19] {
+            let mut split_flushed = SpeakerScorer::new();
+            for (sid, lvl, hint, at) in &batch[..split] {
+                split_flushed.observe_at(*sid, *lvl, *hint, *at);
+            }
+            for (sid, lvl, hint, at) in &batch[split..] {
+                split_flushed.observe_at(*sid, *lvl, *hint, *at);
+            }
+            for sid in [1u64, 2, 3] {
+                assert!(
+                    (single.score(sid) - split_flushed.score(sid)).abs() < 1e-9,
+                    "split@{split} diverged for sender {sid}: {} vs {}",
+                    single.score(sid),
+                    split_flushed.score(sid)
+                );
+            }
+        }
     }
 
     #[test]

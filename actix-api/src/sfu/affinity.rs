@@ -94,6 +94,24 @@ pub fn jump_hash(room_id: &str, replicas: u32) -> u32 {
     jump_consistent_hash(key, replicas)
 }
 
+/// Consistent hash from a `u64` key to a bucket in `0..buckets` (bead vc-kcpg).
+///
+/// Same jump-consistent-hash as [`jump_hash`] but keyed directly on a `u64`
+/// (e.g. a session id) via the integer's big-endian bytes through FNV-1a, so
+/// the per-packet publish path can compute a publisher's ingest shard WITHOUT
+/// formatting the id to a `String` first. Deterministic and stable across
+/// processes (FNV-1a is not randomized), so the publish side and the subscribe
+/// side always agree on a session's shard.
+///
+/// Defensive: returns 0 when `buckets == 0`.
+pub fn jump_hash_u64(key: u64, buckets: u32) -> u32 {
+    if buckets == 0 {
+        return 0;
+    }
+    let hashed = fnv1a_64(&key.to_be_bytes());
+    jump_consistent_hash(hashed, buckets)
+}
+
 /// Parse the trailing `-<N>` ordinal suffix from a StatefulSet pod name.
 ///
 /// e.g. `"rustlemania-webtransport-2"` → `Some(2)`.
@@ -636,6 +654,29 @@ pub fn compute_redirect_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// vc-kcpg: `jump_hash_u64` is deterministic and stays in range. Used by the
+    /// per-packet ingest-shard assignment in place of `jump_hash(&id.to_string())`
+    /// to avoid a per-frame `String` allocation.
+    #[test]
+    fn jump_hash_u64_is_deterministic_and_in_range() {
+        for buckets in [1u32, 2, 3, 4, 8] {
+            for key in 0u64..500 {
+                let a = jump_hash_u64(key, buckets);
+                let b = jump_hash_u64(key, buckets);
+                assert_eq!(a, b, "non-deterministic for {key} @ {buckets}");
+                assert!(a < buckets, "bucket {a} out of range for {buckets}");
+            }
+        }
+        // Defensive: zero buckets → 0.
+        assert_eq!(jump_hash_u64(123, 0), 0);
+        // Distribution sanity over 4 buckets: every bucket gets some keys.
+        let mut counts = [0u32; 4];
+        for key in 0u64..4000 {
+            counts[jump_hash_u64(key, 4) as usize] += 1;
+        }
+        assert!(counts.iter().all(|&c| c > 0), "uneven: {counts:?}");
+    }
 
     /// 1. `jump_hash` deterministic: same input → same output.
     #[test]

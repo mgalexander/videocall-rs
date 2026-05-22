@@ -123,6 +123,8 @@ fn parse_once_fanout(
                 &subj,
                 &ev.payload,
                 parsed.as_ref(),
+                // vc-kcpg: this oracle builds legacy 3-token subjects, so K==1.
+                1,
             ) {
                 out[i].push(bytes);
             }

@@ -783,8 +783,14 @@ impl SessionLogic {
             return;
         }
 
-        // (3) Subject: room.{room}.{session}, spaces -> '_'.
-        let subject = format!("room.{}.{}", self.room, session).replace(' ', "_");
+        // (3) Subject (vc-kcpg): with K==1 (default) this is the legacy
+        // `room.{room}.{session}` (byte-identical to pre-vc-kcpg); with K>1 the
+        // publisher's media goes to `room.{room}.{shard}.{session}` where
+        // `shard = jump_hash(session, K)`, so the room's publishers are spread
+        // across K ingest dispatchers. `K` is the process-wide env snapshot, so
+        // it matches the subscribe side's `K` exactly.
+        let k = crate::sfu::config::SfuConfig::ingest_shards_cached();
+        let subject = crate::models::build_publish_subject(&self.room, session, k);
 
         // (2) session_id == 0 rewrite (see `prepare_publish_payload`).
         let payload = prepare_publish_payload(session, data);
@@ -1035,11 +1041,18 @@ impl SessionLogic {
 
         match congestion_packet.write_to_bytes() {
             Ok(bytes) => {
-                // Publish to the sender's NATS subject so only the
-                // targeted sender receives the CONGESTION signal.
-                // The sender's subscription filter (`room.{room}.*`)
-                // matches `room.{room}.{sender_sid}`.
-                let subject = format!("room.{}.{}", self.room.replace(' ', "_"), sender_sid);
+                // Publish to the TARGET SENDER's NATS subject so only the
+                // congested-from sender's media path carries the CONGESTION
+                // signal. vc-kcpg: this is a TARGETED publish — it must land on
+                // the SENDER's ingest shard (`jump_hash(sender_sid, K)`), not
+                // ours, so the dispatcher subscribing that shard delivers it.
+                // With K==1 this collapses to the legacy
+                // `room.{room}.{sender_sid}` 3-token subject. (Delivery to the
+                // sender CLIENT still goes through the room's shared fan-out —
+                // every dispatcher fans out to the full receiver set — so the
+                // sender receives this regardless of which shard ingested it.)
+                let k = crate::sfu::config::SfuConfig::ingest_shards_cached();
+                let subject = crate::models::build_publish_subject(&self.room, sender_sid, k);
                 let nc = self.nats_client.clone();
                 let bytes = bytes::Bytes::from(bytes);
                 tokio::spawn(async move {
