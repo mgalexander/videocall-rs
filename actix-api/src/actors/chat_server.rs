@@ -309,6 +309,26 @@ pub struct ChatServer {
     /// fine, no locking). Cleaned up alongside the room's other per-room state
     /// when the room drains.
     sfu_join_milestone_watermark: HashMap<String, u64>,
+    /// Per-room cumulative JoinRoom INTAKE count (bead vc-9eve).
+    ///
+    /// Incremented once per `JoinRoom` handler entry for the room, BEFORE any
+    /// validation/redirect/admission logic — so it climbs on every attempt
+    /// regardless of whether the joiner ever registers into `room_members`.
+    /// This is the value the join-milestone crossing is now driven off (it was
+    /// previously `room_members.len()`), so milestones still fire at
+    /// 1000/2000/... when registration itself is the bottleneck and
+    /// `room_members` plateaus below the first milestone.
+    ///
+    /// Per-room and shard-local: each `ChatServer` shard owns a disjoint set
+    /// of rooms (bead vc-8txq), and every `JoinRoom` for a given room is
+    /// routed to that room's owning shard, so this count is complete and
+    /// authoritative for the room within its shard — no cross-shard
+    /// aggregation is needed (mirrors how `room_members` is per-shard).
+    ///
+    /// Lives in actor state (single-threaded actor → plain `HashMap`, no
+    /// locking). Cleaned up alongside the room's other per-room state when the
+    /// room drains, so a reused room id restarts its milestone progression.
+    sfu_room_join_attempts: HashMap<String, u64>,
     /// Synchronous in-actor cache of room → home-region (bead vc-hc8 / p6-9).
     ///
     /// On JoinRoom: if a cached entry exists, the cross-region redirect
@@ -443,6 +463,7 @@ impl ChatServer {
             beacon_hub,
             room_dispatch: HashMap::new(),
             sfu_join_milestone_watermark: HashMap::new(),
+            sfu_room_join_attempts: HashMap::new(),
             home_region_cache: HashMap::new(),
             home_region_kv,
             spillover_store,
@@ -462,16 +483,27 @@ impl ChatServer {
         self.connection_states.clone()
     }
 
-    /// vc-xow8: emit `sfu_join_milestone` for every configured milestone the
-    /// room just crossed on this join, exactly once per room.
+    /// vc-xow8 / vc-9eve: emit `sfu_join_milestone` for every configured
+    /// milestone the room just crossed on this join, exactly once per room.
     ///
     /// Called from the `JoinRoom` handler immediately after the receiver
-    /// insert, only when `sfu_config.milestones` is non-empty. Uses a
-    /// per-room high-watermark (`sfu_join_milestone_watermark`): we emit for
-    /// every milestone in `(watermark, member_count]` and advance the
-    /// watermark to the highest one crossed. The watermark only moves up, so
-    /// reconnects/replaces (member_count unchanged) and any non-monotonic
-    /// edge case never re-fire a milestone — guaranteeing exactly-once.
+    /// insert, only when `sfu_config.milestones` is non-empty.
+    ///
+    /// vc-9eve CROSSING VALUE: the milestone crossing is driven off
+    /// `join_attempts` — the per-room cumulative INTAKE count — NOT
+    /// `member_count`. Before "Fix E" registration itself is the bottleneck,
+    /// so `room_members` plateaus below the first milestone and the markers
+    /// fired zero times (exactly the failure we needed to see). Driving the
+    /// crossing off intake means milestones fire at 1000/2000/... even when
+    /// joins are not registering. `member_count` and `connected` are still
+    /// emitted in the payload so a single marker distinguishes the two
+    /// plateau modes (registration vs. fan-out).
+    ///
+    /// Uses a per-room high-watermark (`sfu_join_milestone_watermark`): we
+    /// emit for every milestone in `(watermark, join_attempts]` and advance
+    /// the watermark to the highest one crossed. The watermark only moves up
+    /// and `join_attempts` is monotonic (it only ever increments at handler
+    /// entry), so each milestone fires exactly once per room.
     ///
     /// O(milestones) per crossing (a handful of values), and the common case
     /// (no crossing) is a single comparison against the watermark before any
@@ -481,6 +513,7 @@ impl ChatServer {
         &mut self,
         room: &str,
         session: SessionId,
+        join_attempts: u64,
         member_count: u64,
         receivers_for_room: &Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
         room_state: &Arc<RwLock<RoomState>>,
@@ -493,12 +526,14 @@ impl ChatServer {
             .unwrap_or(0);
 
         // Fast path: nothing crossed since the last emit. A single comparison
-        // for the overwhelmingly common case — no allocation, no lock.
-        if member_count <= watermark {
+        // for the overwhelmingly common case — no allocation, no lock. Driven
+        // off `join_attempts` (intake) so it advances even when registration
+        // never lands the joiner in `room_members`.
+        if join_attempts <= watermark {
             return;
         }
 
-        // Collect the milestones in (watermark, member_count]. The list is
+        // Collect the milestones in (watermark, join_attempts]. The list is
         // sorted + deduped (see SfuConfig::parse_milestones), so this is a
         // cheap linear scan over a handful of values.
         let crossed: Vec<u64> = self
@@ -506,10 +541,10 @@ impl ChatServer {
             .milestones
             .iter()
             .copied()
-            .filter(|&m| m > watermark && m <= member_count)
+            .filter(|&m| m > watermark && m <= join_attempts)
             .collect();
         if crossed.is_empty() {
-            // member_count grew but didn't pass any configured milestone.
+            // join_attempts grew but didn't pass any configured milestone.
             // Do NOT advance the watermark past unconfigured ground — only
             // emitted milestones move it (keeps the invariant simple).
             return;
@@ -559,6 +594,16 @@ impl ChatServer {
                 .with_label_values(&[crate::metrics::sfu_drop_reason::SELF_SKIP])
                 .get();
 
+        // vc-9eve: process-wide connected sessions count, read once at the
+        // crossing. Together with join_attempts/member_count/receiver_set in
+        // the payload, ONE marker distinguishes the two plateau modes:
+        //   * registration plateau: connected >> join_attempts is unusual, but
+        //     join_attempts >> member_count ~= receiver_set (joins counted but
+        //     never registered into the room/dispatcher);
+        //   * fan-out plateau: member_count ~= receiver_set climbing while
+        //     forward_total flatlines.
+        let connected = crate::metrics::SFU_SESSIONS_CONNECTED_TOTAL.get();
+
         // Update the divergence gauges at the crossing point (low-cardinality
         // sparse markers — set only here, not per join).
         crate::metrics::SFU_ROOM_MEMBERS
@@ -569,14 +614,17 @@ impl ChatServer {
             .set(receiver_set as f64);
 
         // Emit ONE structured event per milestone crossed. Reuses the existing
-        // tracing infra (vc-8wd `sfu_trace` target family). The receiver_set
-        // vs member_count gap is the headline delivery-scaling signal.
+        // tracing infra (vc-8wd `sfu_trace` target family). vc-9eve: emit
+        // connected + join_attempts ALONGSIDE member_count + receiver_set so a
+        // single marker separates registration plateau from fan-out plateau.
         for milestone in &crossed {
             tracing::info!(
                 target: "sfu_trace",
                 event = "sfu_join_milestone",
                 room = %room,
                 milestone = *milestone,
+                connected,
+                join_attempts,
                 member_count,
                 receiver_set,
                 receiver_set_gap = member_count.saturating_sub(receiver_set),
@@ -660,6 +708,10 @@ impl ChatServer {
                     // vc-xow8: drop the join-milestone watermark so a future
                     // room that reuses this id re-emits milestones as it grows.
                     self.sfu_join_milestone_watermark.remove(room_id);
+                    // vc-9eve: drop the per-room intake-attempt count alongside
+                    // the watermark so a reused room id restarts its milestone
+                    // progression from zero.
+                    self.sfu_room_join_attempts.remove(room_id);
                     // vc-xow8: also drop the per-room milestone gauge series so
                     // they don't leak in the Prometheus registry after the room
                     // drains (unbounded series growth otherwise).
@@ -1044,6 +1096,11 @@ impl Handler<Connect> for ChatServer {
 
     fn handle(&mut self, msg: Connect, _ctx: &mut Self::Context) -> Self::Result {
         let Connect { id, addr } = msg;
+        // vc-9eve: count every transport Connect regardless of whether the
+        // session ever registers into a room. Drives the milestone payload's
+        // `connected` reading so a registration plateau (connected >> members)
+        // is distinguishable from a fan-out plateau.
+        crate::metrics::SFU_SESSIONS_CONNECTED_TOTAL.inc();
         self.sessions.insert(id, addr);
         self.connection_states.insert(id, ConnectionState::Testing);
     }
@@ -1386,6 +1443,8 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                         self.beacon_hub.unregister(&room);
                         // vc-xow8: drop the join-milestone watermark on drain.
                         self.sfu_join_milestone_watermark.remove(&room);
+                        // vc-9eve: drop the per-room intake-attempt count too.
+                        self.sfu_room_join_attempts.remove(&room);
                         // vc-xow8: drop the per-room milestone gauge series too
                         // so they don't leak in the Prometheus registry.
                         crate::metrics::SFU_ROOM_MEMBERS
@@ -1829,6 +1888,28 @@ impl Handler<ClientMessage> for ChatServer {
     }
 }
 
+/// RAII guard for the `sfu_join_inflight` gauge (bead vc-9eve).
+///
+/// Increments the gauge on construction and decrements it on `Drop`, so the
+/// gauge is balanced across EVERY synchronous return path of the `JoinRoom`
+/// handler — including the early `Err`/`Ok` short-circuits — without
+/// hand-threading a decrement through each one. Scoped to the synchronous
+/// handler body only; the post-join spawned task is deliberately out of scope.
+struct JoinInflightGuard;
+
+impl JoinInflightGuard {
+    fn new() -> Self {
+        crate::metrics::SFU_JOIN_INFLIGHT.inc();
+        JoinInflightGuard
+    }
+}
+
+impl Drop for JoinInflightGuard {
+    fn drop(&mut self) {
+        crate::metrics::SFU_JOIN_INFLIGHT.dec();
+    }
+}
+
 impl Handler<JoinRoom> for ChatServer {
     type Result = MessageResult<JoinRoom>;
 
@@ -1844,6 +1925,28 @@ impl Handler<JoinRoom> for ChatServer {
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
+        // vc-9eve: count this intake attempt at handler ENTRY, before any
+        // validation/redirect/admission logic. Both the process-wide counter
+        // and the per-room count climb regardless of whether the join
+        // ultimately registers — so milestones still fire when registration
+        // is the bottleneck and `room_members` plateaus below the first
+        // milestone. The per-room count is the value the milestone crossing is
+        // driven off (see `maybe_emit_join_milestone`).
+        crate::metrics::SFU_JOIN_ATTEMPTS_TOTAL.inc();
+        let room_join_attempts = {
+            let n = self.sfu_room_join_attempts.entry(room.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        // vc-9eve: RAII guard — increments `sfu_join_inflight` now and
+        // decrements it on EVERY synchronous return path below (early Err
+        // returns, the already-joined Ok short-circuit, and the final Ok).
+        // The post-join `tokio::spawn`ed task is intentionally NOT covered:
+        // by the time it runs the joiner is already registered and this
+        // synchronous handler has returned, so the gauge tracks only the
+        // short synchronous admission window.
+        let _join_inflight_guard = JoinInflightGuard::new();
+
         // Validate user_id synchronously BEFORE spawning async task.
         // This ensures we return an error to the client if validation fails,
         // rather than returning Ok and silently failing in the spawned task.
@@ -2519,18 +2622,26 @@ impl Handler<JoinRoom> for ChatServer {
         }
         self.joined_sessions.insert(session);
 
-        // vc-xow8: tunable join-milestone markers. Cheap in the common case:
-        // the whole check is guarded behind a non-empty milestone list AND an
-        // actual crossing (a couple of integer comparisons). Only when a
-        // milestone is crossed do we pay for the AllowSet resolve + tracing
-        // event. The receiver-set size + member count are read here precisely
-        // because, when delivery breaks at scale, the dispatcher's receiver
-        // set diverges from the authoritative member count.
+        // vc-xow8 / vc-9eve: tunable join-milestone markers. Cheap in the
+        // common case: the whole check is guarded behind a non-empty milestone
+        // list AND an actual crossing (a couple of integer comparisons). Only
+        // when a milestone is crossed do we pay for the AllowSet resolve +
+        // tracing event.
+        //
+        // vc-9eve: the crossing is now driven off `room_join_attempts` (the
+        // per-room INTAKE count captured at handler entry), NOT
+        // `member_count`. Intake climbs even when registration is the
+        // bottleneck and `room_members` plateaus, so the markers fire at the
+        // configured milestones regardless of registration success.
+        // `member_count` and `receiver_set` are still read here and emitted in
+        // the payload because, when delivery breaks at scale, the dispatcher's
+        // receiver set diverges from the authoritative member count.
         if !self.sfu_config.milestones.is_empty() {
             let member_count = self.room_members.get(&room).map(|m| m.len()).unwrap_or(0) as u64;
             self.maybe_emit_join_milestone(
                 &room,
                 session,
+                room_join_attempts,
                 member_count,
                 &receivers_for_room,
                 &room_state,
@@ -7079,5 +7190,106 @@ mod tests {
         std::env::remove_var("POD_NAME");
         std::env::remove_var("STATEFULSET_REPLICAS");
         std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // vc-9eve: join-milestone crossing is driven off INTAKE, not room_members
+    // ==========================================================================
+
+    /// Build the three Arc<RwLock<..>> arguments `maybe_emit_join_milestone`
+    /// needs. None of these touch NATS — they're plain in-memory state.
+    type MilestoneArgs = (
+        Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+        Arc<RwLock<RoomState>>,
+        Arc<RwLock<SubscriptionStore>>,
+    );
+
+    fn milestone_args(room: &str) -> MilestoneArgs {
+        (
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(RoomState::new(room.to_string()))),
+            Arc::new(RwLock::new(SubscriptionStore::new())),
+        )
+    }
+
+    /// vc-9eve core invariant: a milestone fires (the watermark advances) when
+    /// the per-room INTAKE count crosses a milestone, even though
+    /// `member_count` stays at 0 — the registration-plateau failure mode that
+    /// the member_count-driven crossing (vc-xow8) could never SEE.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_milestone_fires_off_intake_when_members_plateau() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut chat = ChatServer::new(nats_client).await;
+        chat.sfu_config.milestones = Arc::from(vec![10u64, 50, 100]);
+
+        let room = "intake-plateau-room";
+        let (recv, state, subs) = milestone_args(room);
+
+        // member_count stays 0 throughout (registration is the bottleneck).
+        // join_attempts climbs to 9 — below the first milestone (10): no fire.
+        chat.maybe_emit_join_milestone(room, 1, 9, 0, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            None,
+            "no milestone crossed below the first threshold"
+        );
+
+        // join_attempts crosses 10 while members is still 0 — milestone fires.
+        chat.maybe_emit_join_milestone(room, 1, 10, 0, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10),
+            "watermark must advance off INTAKE even when members==0"
+        );
+
+        // Crossing two milestones in one step advances to the highest crossed.
+        chat.maybe_emit_join_milestone(room, 1, 100, 0, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(100),
+            "watermark advances to the highest milestone crossed"
+        );
+    }
+
+    /// vc-9eve exactly-once: re-invoking with the same (or lower) intake count
+    /// after a crossing must NOT re-fire — the watermark is monotonic.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_milestone_exactly_once_per_room_off_intake() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut chat = ChatServer::new(nats_client).await;
+        chat.sfu_config.milestones = Arc::from(vec![10u64]);
+
+        let room = "exactly-once-room";
+        let (recv, state, subs) = milestone_args(room);
+
+        chat.maybe_emit_join_milestone(room, 1, 10, 5, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10)
+        );
+
+        // Same intake count again (idempotent re-entry) — watermark unchanged.
+        chat.maybe_emit_join_milestone(room, 1, 10, 5, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10),
+            "re-invocation at the same intake count must not re-fire"
+        );
+
+        // A drop in intake (cannot really happen, but the guard must hold).
+        chat.maybe_emit_join_milestone(room, 1, 8, 5, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10),
+            "watermark only moves up"
+        );
     }
 }

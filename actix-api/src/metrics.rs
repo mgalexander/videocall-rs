@@ -21,7 +21,8 @@
 use lazy_static::lazy_static;
 use prometheus::{
     register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
-    Counter, CounterVec, Gauge, GaugeVec, Histogram,
+    register_int_counter, register_int_gauge, Counter, CounterVec, Gauge, GaugeVec, Histogram,
+    IntCounter, IntGauge,
 };
 
 lazy_static! {
@@ -385,6 +386,58 @@ lazy_static! {
         &["room_id"]
     )
     .expect("Failed to create sfu_room_receiver_set metric");
+
+    /// Total JoinRoom intake attempts, process-wide (bead vc-9eve).
+    ///
+    /// Incremented at the ENTRY of `Handler<JoinRoom>` for EVERY join attempt
+    /// — before any validation, redirect, spillover, admission-cap, or
+    /// reconnection logic runs. It therefore climbs even when registration
+    /// never succeeds (e.g. a registration bottleneck where joins are accepted
+    /// at the transport but never make it into `room_members`). This is the
+    /// counterpart to [`SFU_JOIN_DECISION_TOTAL`], which counts only the
+    /// post-decision outcome (`admit_local`/`redirect`/`reject`): a gap
+    /// between this counter and the sum of decisions reveals attempts that
+    /// short-circuit before a decision is reached.
+    pub static ref SFU_JOIN_ATTEMPTS_TOTAL: IntCounter = register_int_counter!(
+        "sfu_join_attempts_total",
+        "Total JoinRoom intake attempts (counted at handler entry, before any admission logic)"
+    )
+    .expect("Failed to create sfu_join_attempts_total metric");
+
+    /// Total transport `Connect` events, process-wide (bead vc-9eve).
+    ///
+    /// Incremented in `Handler<Connect>` for every session that establishes a
+    /// transport connection, regardless of whether it ever registers into a
+    /// room. Together with [`SFU_JOIN_ATTEMPTS_TOTAL`] and
+    /// [`SFU_ROOM_MEMBERS`], this distinguishes the two SFU plateau failure
+    /// modes at a join milestone: a registration plateau shows
+    /// `connected >> members` while a fan-out plateau shows
+    /// `members ~= receiver_set` with `sfu_forward_total` flat.
+    pub static ref SFU_SESSIONS_CONNECTED_TOTAL: IntCounter = register_int_counter!(
+        "sfu_sessions_connected_total",
+        "Total transport Connect events (counted regardless of room registration success)"
+    )
+    .expect("Failed to create sfu_sessions_connected_total metric");
+
+    /// Number of JoinRoom handler invocations currently in flight (bead
+    /// vc-9eve).
+    ///
+    /// Lifecycle: incremented once at the synchronous ENTRY of
+    /// `Handler<JoinRoom>` and decremented exactly once when that synchronous
+    /// handler body returns — on EVERY path (the early `Err` returns for
+    /// reserved-user/redirect/reject, the already-joined `Ok` short-circuit,
+    /// and the final `Ok`). The decrement is driven by an RAII guard so it
+    /// fires even on early returns. The post-join `tokio::spawn`ed task is NOT
+    /// counted as in-flight: by the time it runs the joiner is already
+    /// registered in `room_members`/`room_dispatch` and the synchronous
+    /// handler has returned, so the gauge reflects only the (very short)
+    /// synchronous admission window. A persistently non-zero value indicates
+    /// the actor mailbox is serializing JoinRoom handling under load.
+    pub static ref SFU_JOIN_INFLIGHT: IntGauge = register_int_gauge!(
+        "sfu_join_inflight",
+        "JoinRoom handler invocations currently in flight (synchronous admission window)"
+    )
+    .expect("Failed to create sfu_join_inflight metric");
 
     /// Speaker changes per minute. Declared in p2-7; wired in P3.
     pub static ref SFU_SPEAKER_CHANGES_PER_MIN: Gauge = register_gauge!(
