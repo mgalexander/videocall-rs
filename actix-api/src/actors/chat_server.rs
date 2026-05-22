@@ -208,6 +208,52 @@ struct RewarmSubscriptionCache {
     room: String,
 }
 
+/// vc-j4kz: internal message posted by a per-room dispatcher to register (or
+/// refresh) a cross-pod remote publisher OFF the inbound-drain hot path.
+///
+/// BACKGROUND. On a spill pod the presenters live on OTHER pods, so EVERY
+/// inbound MEDIA packet is from a remote publisher whose sid is not a local
+/// member. Pre-vc-j4kz the dispatcher took the shared `room_state` lock on the
+/// drain task for that registration — a `read()` precheck on every packet plus
+/// a `write()` (and two `members_snapshot_with_generation()` calls) whenever
+/// the registry actually had to change. That lock work sat BETWEEN `sub.next()`
+/// and the next pull, serializing against the per-receiver `decide` read
+/// fan-out on the same lock, so per-message drain service time × inbound rate
+/// could exceed one core → the async-nats 16Ki subscription buffer tail-drops →
+/// SlowConsumer → starved trickle.
+///
+/// FIX. The dispatcher now keeps a TASK-LOCAL dedup view of which remote
+/// publishers it has already registered (and their video flag + last-sent
+/// instant), evaluates the EXACT `remote_publisher_write_needed` predicate
+/// against that lock-free local view, and only when a change is due fires this
+/// fire-and-forget message. The `ChatServer` actor applies it on ITS OWN thread
+/// of execution — taking the `room_state.write()` and, if the registry's shared
+/// `members_generation` actually moved, re-warming the AllowSet cache there —
+/// so NO shared `room_state` lock is ever taken on the drain hot path for
+/// registration.
+///
+/// CORRECTNESS / ORDERING.
+/// * Ingest sharding is keyed on the publisher's session id
+///   ([`crate::models::ingest_shard_for_session`]), so a given remote
+///   publisher's packets always land on exactly ONE shard's dispatcher. The
+///   task-local dedup is therefore complete for that publisher — no other shard
+///   races its registration.
+/// * `note_remote_publisher` self-skips local members, so a sid that is (or
+///   becomes) a local member is a harmless no-op here; the local dedup also
+///   throttles such redundant sends to the liveness window.
+/// * Deferring registration is safe: until the write lands the forwarder's
+///   `resolve_cached` self-heals on a miss (a few on-hot-path recomputes),
+///   strictly better than stalling the drain. Bursts coalesce on the
+///   serialized actor mailbox; the handler is idempotent (a fresh,
+///   video-consistent refresh neither bumps the generation nor re-warms).
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct RegisterRemotePublisher {
+    room: String,
+    sender: SessionId,
+    is_video: bool,
+}
+
 /// Internal message: posted by the spawned NATS-KV lookup task once a
 /// room's home region has been resolved (bead vc-hc8 / p6-9). Carries the
 /// information needed for the actor to either:
@@ -1776,6 +1822,64 @@ impl Handler<RewarmSubscriptionCache> for ChatServer {
     ) -> Self::Result {
         if let Some(forwarder) = self.forwarders.get(&room) {
             forwarder.rewarm_subscription_cache();
+        }
+    }
+}
+
+/// vc-j4kz: apply a cross-pod remote-publisher registration OFF the dispatcher
+/// drain loop.
+///
+/// Runs on the `ChatServer` actor thread, so the `room_state.write()` (and the
+/// AllowSet re-warm it may trigger) never sits on the dispatcher's inbound-drain
+/// barrier. This folds the work that pre-vc-j4kz ran inline on the drain task
+/// (`remote_publisher_write_needed` precheck → `note_remote_publisher` → bump-
+/// gated `RewarmSubscriptionCache`) into a single off-hot-path handler.
+///
+/// The dispatcher already debounced this send against its task-local dedup view,
+/// so by the time we get here a change is almost always genuinely due. We still
+/// gate the re-warm on a real generation bump (`note_remote_publisher` only
+/// bumps `members_generation` on a new sid, an audio→video upgrade, or a TTL
+/// reap — NOT on a pure liveness refresh), so a redundant or liveness-only
+/// message neither re-warms nor mutates the resolution-relevant snapshot.
+///
+/// No-op if the room's `room_state` is gone (room torn down between the
+/// dispatcher's `try_send` and this handler running).
+impl Handler<RegisterRemotePublisher> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        RegisterRemotePublisher {
+            room,
+            sender,
+            is_video,
+        }: RegisterRemotePublisher,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let Some(room_state) = self.room_states.get(&room) else {
+            // Room drained between the dispatcher's try_send and now — the
+            // registry is gone; nothing to register into.
+            return;
+        };
+        let now = std::time::Instant::now();
+        // Capture the resolution-relevant generation before/after so we re-warm
+        // ONLY on a genuine change (new sid / audio→video upgrade / TTL reap),
+        // never on a pure liveness refresh. `note_remote_publisher` self-skips
+        // local members, so a sid that is a local member is a harmless no-op.
+        let (gen_before, gen_after) = {
+            let mut g = match room_state.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (_, before) = g.members_snapshot_with_generation();
+            g.note_remote_publisher(sender, is_video, now);
+            let (_, after) = g.members_snapshot_with_generation();
+            (before, after)
+        };
+        if gen_after != gen_before {
+            if let Some(forwarder) = self.forwarders.get(&room) {
+                forwarder.rewarm_subscription_cache();
+            }
         }
     }
 }
@@ -3709,6 +3813,67 @@ fn spawn_room_dispatcher(
         let mut inbound_queue: std::collections::VecDeque<QueuedInbound> =
             std::collections::VecDeque::new();
 
+        // --- vc-j4kz: task-local remote-publisher dedup (registration off-drain)
+        //
+        // Pre-vc-j4kz the dispatcher took the SHARED `room_state` lock per remote
+        // MEDIA packet to register cross-pod publishers: a `read()` precheck on
+        // EVERY packet (on a spill pod every sender is remote) plus a `write()`
+        // (and two snapshot calls) whenever the registry had to change. That lock
+        // work sat on the drain hot path, contending with the per-receiver
+        // `decide` read fan-out on the same lock and stalling `sub.next()`.
+        //
+        // We now keep a LOCK-FREE task-local view of what this dispatcher has
+        // already registered — `sid -> (has_video, last_sent)` — and evaluate a
+        // LOCAL mirror of the `remote_publisher_write_needed` predicate (new sid
+        // / audio→video upgrade / liveness-throttle-window expiry) against THIS
+        // map. A registration message is fired (fire-and-forget) ONLY when a
+        // change is due; the `ChatServer` actor applies it on its own thread.
+        //
+        // CONSISTENCY (NOT exact — EVENTUALLY-CONSISTENT within one liveness
+        // window). The local view tracks what THIS dispatcher has SENT, not the
+        // shared registry's true state, so the two can diverge briefly:
+        //   * If the shared registry oldest-first-EVICTS a still-live sid at
+        //     `MAX_REMOTE_PUBLISHERS`, the local map still believes it is
+        //     registered and suppresses re-registration for up to one throttle
+        //     window (~1s) until the next liveness send re-asserts it.
+        //   * If membership churn calls `prune_remote_publisher` (a remote
+        //     publisher becoming a local member, or leaving), the local map is
+        //     blind to the prune; a reconnect within the throttle window is
+        //     suppressed for up to ~1s.
+        // Both windows are bounded by `REMOTE_PUBLISHER_LIVENESS_THROTTLE` and
+        // self-heal on the next due send; until they do, `resolve_cached` covers
+        // the gap. The thresholds (`REMOTE_PUBLISHER_LIVENESS_THROTTLE`,
+        // `REMOTE_PUBLISHER_TTL`) match the shared registry so steady-state
+        // cadence is identical.
+        //
+        // SHARDING. Ingest sharding is keyed on the publisher's session id, so a
+        // given remote publisher's packets normally land on this ONE shard — the
+        // local view is complete for the publishers this dispatcher sees. The
+        // ONE exception is a rolling deploy: shard 0 also carries the legacy
+        // 3-token `room.{room}.*` wildcard, which overlaps the 4-token shard a
+        // publisher hashes to, so during migration shard 0 AND that publisher's
+        // own shard may both register it. That double-register is harmless —
+        // `note_remote_publisher` is idempotent and both senders are
+        // throttled — and resolves once the fleet is fully 4-token.
+        //
+        // BOUNDING. TTL-reaped on every send via `REMOTE_PUBLISHER_TTL`, so
+        // distinct sids that go quiet are dropped within the TTL. NOTE: unlike
+        // the shared registry, this map has NO oldest-first eviction cap — a
+        // burst of >MAX_REMOTE_PUBLISHERS distinct STILL-LIVE sids on one shard
+        // could transiently exceed `MAX_REMOTE_PUBLISHERS` entries until the next
+        // reap. The map holds only `(SessionId, bool, Instant)` (~24B) so even a
+        // pathological few-hundred-sid transient is negligible; the entries
+        // self-bound to the live sender set by TTL. Self-skip of LOCAL members is
+        // left to the actor handler (`note_remote_publisher` self-skips) — the
+        // drain path has no lock-free membership view, so it would cost a
+        // per-packet `room_state.read()` to skip them here, the exact cost this
+        // change removes; instead the local throttle caps any redundant
+        // local-member send to once per liveness window and the actor no-ops it.
+        let mut local_remote_pub: std::collections::HashMap<
+            SessionId,
+            (bool, std::time::Instant),
+        > = std::collections::HashMap::new();
+
         loop {
             // vc-vyg9: `prequeued_parsed` carries an already-parsed
             // `ParsedPacket` for a message served from the local backlog
@@ -3989,17 +4154,25 @@ fn spawn_room_dispatcher(
                 }
             }
 
-            // vc-54j2: register cross-pod publishers. A MEDIA packet whose
-            // sender is NOT a local room member arrived here via NATS
-            // federation (it joined a different pod). Record it in the room's
-            // bounded remote-publisher registry so local receivers' AllowSets
-            // are augmented with it — otherwise the forwarder hard-drops its
-            // media as `unsubscribed` (the spill-pod 0-media defect). This runs
-            // ONCE per inbound MEDIA message (not per receiver) and the
-            // registry is bounded by sender count + TTL-reaped, so it adds NO
-            // per-receiver O(members) work to the hot path. `note_remote_publisher`
-            // self-skips local members, so intra-pod (owner-pod) forwarding is
-            // unchanged.
+            // vc-54j2 / vc-j4kz: register cross-pod publishers. A MEDIA packet
+            // whose sender is NOT a local room member arrived here via NATS
+            // federation (it joined a different pod). It must be recorded in the
+            // room's bounded remote-publisher registry so local receivers'
+            // AllowSets are augmented with it — otherwise the forwarder
+            // hard-drops its media as `unsubscribed` (the spill-pod 0-media
+            // defect).
+            //
+            // vc-j4kz: do this WITHOUT touching the shared `room_state` lock on
+            // the drain hot path. We evaluate the EXACT
+            // `remote_publisher_write_needed` predicate against a LOCK-FREE
+            // task-local view (`local_remote_pub`) and only fire a fire-and-
+            // forget `RegisterRemotePublisher` to the `ChatServer` actor — which
+            // takes the `room_state.write()` and (bump-gated) re-warm on its OWN
+            // thread — when a registration change is actually due. On a spill pod
+            // every packet is remote, so the pre-vc-j4kz per-packet READ
+            // precheck on the shared lock was itself a drain-path cost; this
+            // removes it entirely. Runs ONCE per inbound MEDIA message (not per
+            // receiver).
             if sfu_mode == SfuMode::Sfu {
                 if let Some(p) = parsed.as_ref() {
                     if p.wrapper.packet_type == PacketType::MEDIA.into() {
@@ -4014,75 +4187,77 @@ fn spawn_room_dispatcher(
                                 let is_video =
                                     matches!(media_type, MediaType::VIDEO | MediaType::SCREEN);
                                 let now = std::time::Instant::now();
-                                // Fast pre-check under a READ lock. On a busy
-                                // spill pod every media packet is from a
-                                // non-local member, so an unthrottled write
-                                // would take the room's RwLock in WRITE mode
-                                // once per packet, contending with the
-                                // per-packet per-receiver `decide` READ fan-out
-                                // on the SAME lock. `remote_publisher_write_needed`
-                                // returns false for the common case (a fresh,
-                                // video-consistent liveness refresh of an
-                                // already-tracked publisher, or a local member)
-                                // so we take the write lock only when the
-                                // registry must actually change: a brand-new
-                                // sid, an audio→video upgrade, or a liveness
-                                // refresh past the throttle window (well below
-                                // the TTL, so a still-publishing sender is never
-                                // reaped for lack of a write).
-                                let write_needed = {
-                                    let g = match room_state.read() {
-                                        Ok(g) => g,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    g.remote_publisher_write_needed(sender_sid, is_video, now)
+                                // Lock-free local mirror of
+                                // `remote_publisher_write_needed`: a send is due
+                                // for a brand-new sid, an audio→video upgrade, or
+                                // a liveness refresh past the throttle window.
+                                // Same thresholds as the shared registry, so the
+                                // actor (re-)applies an equivalent decision
+                                // (eventually-consistent within one window — see
+                                // the `local_remote_pub` declaration comment).
+                                use crate::sfu::room_state::{
+                                    REMOTE_PUBLISHER_LIVENESS_THROTTLE, REMOTE_PUBLISHER_TTL,
                                 };
-                                if write_needed {
-                                    // vc-zexm: detect whether this write actually
-                                    // changed the resolution-relevant snapshot
-                                    // (`note_remote_publisher` only bumps
-                                    // `members_generation` on a new sid, an
-                                    // audio→video upgrade, or a TTL reap — NOT on
-                                    // a pure liveness refresh). Capture the
-                                    // generation before/after so we re-warm the
-                                    // AllowSet cache ONLY on a genuine change,
-                                    // never on a throttle-window liveness write.
-                                    let gen_before;
-                                    let gen_after;
-                                    {
-                                        let mut g = match room_state.write() {
-                                            Ok(g) => g,
-                                            Err(poisoned) => poisoned.into_inner(),
-                                        };
-                                        let (_, before) = g.members_snapshot_with_generation();
-                                        gen_before = before;
-                                        g.note_remote_publisher(sender_sid, is_video, now);
-                                        let (_, after) = g.members_snapshot_with_generation();
-                                        gen_after = after;
+                                let prior = local_remote_pub.get(&sender_sid).copied();
+                                let is_new = prior.is_none();
+                                let send_needed = match prior {
+                                    None => true,
+                                    Some((had_video, last_sent)) => {
+                                        (is_video && !had_video)
+                                            || now.duration_since(last_sent)
+                                                >= REMOTE_PUBLISHER_LIVENESS_THROTTLE
                                     }
-                                    // vc-zexm: a registry change bumps the SHARED
-                                    // `members_generation`, busting every local
-                                    // receiver's AllowSet cache. We must NOT
-                                    // re-warm inline here — this is the inbound-
-                                    // drain loop, the exact hot path the bead
-                                    // protects. During a spill-pod federation
-                                    // wave (many new cross-pod publishers) an
-                                    // inline O(R·members) re-warm would stall the
-                                    // drain → async-nats drops at the 16Ki sub →
-                                    // late-joiner media loss. Instead fire a
-                                    // fire-and-forget message so the ChatServer
-                                    // actor re-warms on ITS thread, off this
-                                    // barrier. Deferring is safe: `resolve_cached`
-                                    // self-heals on a miss, so the worst case
-                                    // until the re-warm lands is a few on-hot-path
-                                    // recomputes — strictly better than stalling
-                                    // the drain. Skipped on a no-op (liveness-
-                                    // only) write that did not bump the
-                                    // generation.
-                                    if gen_after != gen_before {
-                                        let _ = chat_server.try_send(RewarmSubscriptionCache {
+                                };
+                                if send_needed {
+                                    // Fire-and-forget: the actor applies the write
+                                    // (and bump-gated re-warm) off this barrier.
+                                    // `try_send` never blocks.
+                                    let sent = chat_server
+                                        .try_send(RegisterRemotePublisher {
                                             room: room.clone(),
+                                            sender: sender_sid,
+                                            is_video,
+                                        })
+                                        .is_ok();
+
+                                    // BRAND-NEW publisher whose send was DROPPED
+                                    // (mailbox full — most likely precisely during
+                                    // a federation wave): do NOT record it. Leaving
+                                    // no entry means the VERY NEXT packet retries
+                                    // immediately rather than waiting a full
+                                    // liveness window, so a new cross-pod
+                                    // publisher's media is not stranded
+                                    // `unsubscribed` for ~1s. Skip the reap too —
+                                    // there is nothing to record.
+                                    //
+                                    // Every OTHER case records the send: a
+                                    // successful new/refresh send, and an EXISTING
+                                    // sid even on a DROPPED liveness refresh (the
+                                    // sid is already registered, so missing one
+                                    // refresh causes no media gap — and stamping
+                                    // keeps the dropped-liveness path from spamming
+                                    // the mailbox on every packet; it retries on the
+                                    // next throttle window).
+                                    if !is_new || sent {
+                                        // Reap stale local entries on the (now
+                                        // committed) record path. O(local map size)
+                                        // and only on the throttled send path, never
+                                        // per packet at steady state. TTL-only
+                                        // bounding (no oldest-first cap — see the
+                                        // declaration comment).
+                                        local_remote_pub.retain(|_, (_, last)| {
+                                            now.duration_since(*last) <= REMOTE_PUBLISHER_TTL
                                         });
+                                        let entry = local_remote_pub
+                                            .entry(sender_sid)
+                                            .or_insert((false, now));
+                                        // Track the video flag monotonically (an
+                                        // audio→video upgrade sticks) and stamp the
+                                        // send instant so the throttle measures from
+                                        // the last SEND, mirroring the shared
+                                        // registry's `last_seen` on a write.
+                                        entry.0 = entry.0 || is_video;
+                                        entry.1 = now;
                                     }
                                 }
                             }
