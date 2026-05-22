@@ -1508,3 +1508,276 @@ fn sfu_vc_9eh_watchdog_cadence_decays_to_cap() {
         "within grace, even a base-window silence must not trip"
     );
 }
+
+// ===========================================================================
+// vc-vyg9 REGRESSION GUARD: decouple inbound DRAIN from per-message FAN-OUT.
+//
+// The per-room dispatcher used to perform the entire per-message fan-out INLINE
+// before pulling the next NATS message off `sub`, so a transient egress/recompute
+// spike stalled the drain and async-nats SILENTLY dropped the overflow off its
+// 16Ki subscription buffer (firing only an opaque, non-room-routable
+// SlowConsumer). vc-vyg9 adds a bounded local queue that is drained off the
+// fan-out barrier; on genuine sustained overload it sheds EXPLICITLY by priority
+// class (P4 first) and COUNTS every drop — never silent.
+//
+// Reliably forcing real async-nats slow-consumer backpressure in-process is
+// impractical and timing-dependent (the same reason the vc-9eh watchdog tests
+// drive the pure predicate), so per the bead's allowance we exercise the
+// factored-out PURE shed planner `plan_shed` + classifier `classify_inbound`
+// (the SAME functions the live dispatcher overload path calls). These lock in:
+//   (a) an induced fan-out stall (a full queue) does NOT silently lose inbound
+//       messages — each over-capacity admission resolves to an EXPLICIT shed
+//       decision (DropIncoming / EvictResident), and
+//   (b) the shed prefers P4 (then P3) before higher classes (P2/P1/P0).
+// ===========================================================================
+
+#[test]
+fn sfu_vc_vyg9_classify_inbound_matches_priority_taxonomy() {
+    use sec_api::actors::chat_server::classify_inbound;
+    use sec_api::actors::packet_handler::parse_and_inspect;
+    use videocall_types::protos::media_packet::RoutingHeader;
+    use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+    // Helper: serialize a MEDIA wrapper with an explicit MediaType + optional
+    // RoutingHeader, parse it via the SAME parse path the dispatcher uses, and
+    // classify.
+    fn classify_media(media_type: MediaType, rh: Option<RoutingHeader>) -> Class {
+        let mut media = MediaPacket {
+            media_type: media_type.into(),
+            data: vec![7u8; 16],
+            ..Default::default()
+        };
+        if let Some(h) = rh {
+            media.routing_header = protobuf::MessageField::some(h);
+        }
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: 1,
+            user_id: b"u".to_vec(),
+            data: media.write_to_bytes().expect("encode MediaPacket"),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().expect("encode PacketWrapper");
+        let parsed = parse_and_inspect(&bytes);
+        classify_inbound(parsed.as_ref())
+    }
+
+    use sec_api::sfu::priority_queue::Class;
+
+    // AUDIO -> P1.
+    assert_eq!(classify_media(MediaType::AUDIO, None), Class::P1Audio);
+
+    // VIDEO keyframe T0/S0 -> P2.
+    let kf = RoutingHeader {
+        is_keyframe: true,
+        temporal_layer_id: 0,
+        spatial_layer_id: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_media(MediaType::VIDEO, Some(kf)),
+        Class::P2Keyframe
+    );
+
+    // VIDEO base S0/T0 non-keyframe -> P3.
+    let base = RoutingHeader {
+        is_keyframe: false,
+        temporal_layer_id: 0,
+        spatial_layer_id: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_media(MediaType::VIDEO, Some(base)),
+        Class::P3VideoBase
+    );
+
+    // VIDEO enhancement (S>0) -> P4.
+    let enh = RoutingHeader {
+        is_keyframe: false,
+        temporal_layer_id: 1,
+        spatial_layer_id: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_media(MediaType::VIDEO, Some(enh)),
+        Class::P4Enhancement
+    );
+
+    // SCREEN -> P4 (always, regardless of layer ids).
+    assert_eq!(
+        classify_media(MediaType::SCREEN, None),
+        Class::P4Enhancement
+    );
+
+    // CONGESTION control wrapper -> P0.
+    let congestion = PacketWrapper {
+        packet_type: PacketType::CONGESTION.into(),
+        session_id: 1,
+        ..Default::default()
+    };
+    let bytes = congestion.write_to_bytes().expect("encode");
+    let parsed = parse_and_inspect(&bytes);
+    assert_eq!(classify_inbound(parsed.as_ref()), Class::P0Control);
+}
+
+#[test]
+fn sfu_vc_vyg9_shed_prefers_p4_then_p3_never_audio_or_control() {
+    use sec_api::actors::chat_server::{plan_shed, ShedDecision};
+    use sec_api::sfu::priority_queue::Class;
+
+    // (b) Shed prefers the LOWEST priority class. A queue holding a mix of
+    // classes, when full, evicts P4 first, then P3, before ever touching
+    // P2/P1/P0.
+
+    // Queue with one P4 and several higher classes: an incoming P1 (audio)
+    // must EVICT the P4 resident, not drop the audio.
+    let residents = [
+        Class::P0Control,
+        Class::P1Audio,
+        Class::P2Keyframe,
+        Class::P4Enhancement, // <- the only droppable one
+        Class::P3VideoBase,
+    ];
+    let (decision, victim) = plan_shed(&residents, Class::P1Audio);
+    assert_eq!(decision, ShedDecision::EvictResident);
+    assert_eq!(victim, Some(3), "must evict the P4 resident (index 3)");
+    assert_eq!(residents[victim.unwrap()], Class::P4Enhancement);
+
+    // With NO P4 present, the lowest is P3 — incoming audio evicts the P3.
+    let residents = [Class::P1Audio, Class::P2Keyframe, Class::P3VideoBase];
+    let (decision, victim) = plan_shed(&residents, Class::P1Audio);
+    assert_eq!(decision, ShedDecision::EvictResident);
+    assert_eq!(residents[victim.unwrap()], Class::P3VideoBase);
+
+    // An incoming P4 against an all-higher-priority queue: the incoming itself
+    // is the lowest-priority candidate, so DROP THE INCOMING — never evict a
+    // higher-priority resident to admit a P4.
+    let residents = [Class::P0Control, Class::P1Audio, Class::P2Keyframe];
+    let (decision, victim) = plan_shed(&residents, Class::P4Enhancement);
+    assert_eq!(decision, ShedDecision::DropIncoming);
+    assert_eq!(victim, None);
+
+    // Incoming P3 against a queue whose worst resident is also P3: tie => evict
+    // the (oldest) resident, admit the newer one (forward progress within the
+    // class). Audio/control are never touched.
+    let residents = [Class::P1Audio, Class::P3VideoBase, Class::P3VideoBase];
+    let (decision, victim) = plan_shed(&residents, Class::P3VideoBase);
+    assert_eq!(decision, ShedDecision::EvictResident);
+    assert_eq!(victim, Some(1), "evict the OLDEST (head-most) P3");
+
+    // A queue of ONLY audio + control, incoming audio: no droppable class
+    // exists below audio, so the tie rule evicts the oldest audio (forward
+    // progress) and NEVER control.
+    let residents = [Class::P0Control, Class::P1Audio, Class::P1Audio];
+    let (decision, victim) = plan_shed(&residents, Class::P1Audio);
+    assert_eq!(decision, ShedDecision::EvictResident);
+    assert_eq!(residents[victim.unwrap()], Class::P1Audio);
+    assert_ne!(residents[victim.unwrap()], Class::P0Control);
+}
+
+#[test]
+fn sfu_vc_vyg9_overload_sheds_explicitly_no_silent_loss_and_counts() {
+    // (a) An induced fan-out STALL (modeled as a full local queue) does NOT
+    // silently lose inbound messages: EVERY over-capacity admission resolves to
+    // an EXPLICIT shed decision, and the explicit-shed accounting bumps BOTH the
+    // process-wide inbound-drop counter AND the per-class drop counter. We
+    // simulate the dispatcher's overload loop over a fixed small queue capacity
+    // using the SAME pure planner + counter the live code calls.
+    use sec_api::actors::chat_server::{plan_shed, shed_inbound, ShedDecision};
+    use sec_api::metrics::{SFU_CLASS_DROPPED_TOTAL, SFU_DISPATCHER_INBOUND_DROPPED_TOTAL};
+    use sec_api::sfu::priority_queue::Class;
+    use std::collections::VecDeque;
+
+    const CAP: usize = 4;
+
+    let dropped_before = SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.get();
+    let p4_dropped_before = SFU_CLASS_DROPPED_TOTAL
+        .with_label_values(&[Class::P4Enhancement.metric_label()])
+        .get();
+
+    // Pre-fill the queue to capacity with the lowest-priority class so the next
+    // arrivals MUST shed. This models a fan-out stall: the queue is full because
+    // the consumer (fan-out) is not draining it.
+    let mut queue: VecDeque<Class> = VecDeque::new();
+    for _ in 0..CAP {
+        queue.push_back(Class::P4Enhancement);
+    }
+
+    // A burst of inbound arrives while fan-out is stalled. NONE may be silently
+    // lost: each over-capacity arrival resolves to an explicit shed.
+    let burst = [
+        Class::P1Audio,       // higher prio than residents -> evict a P4
+        Class::P1Audio,       // ditto
+        Class::P4Enhancement, // same as residents -> tie evicts oldest P4
+        Class::P4Enhancement, // ditto
+        Class::P2Keyframe,    // higher prio -> evict remaining lowest
+    ];
+
+    let mut explicit_sheds = 0usize;
+    for incoming in burst {
+        // The queue is at capacity (we keep it full), so the overload branch
+        // runs for every arrival — exactly the live code's `len() == CAP` path.
+        assert_eq!(queue.len(), CAP);
+        let residents: Vec<Class> = queue.iter().copied().collect();
+        match plan_shed(&residents, incoming) {
+            (ShedDecision::DropIncoming, _) => {
+                shed_inbound(incoming);
+                explicit_sheds += 1;
+            }
+            (ShedDecision::EvictResident, Some(idx)) => {
+                let victim = queue.remove(idx).expect("victim present");
+                shed_inbound(victim);
+                explicit_sheds += 1;
+                queue.push_back(incoming);
+            }
+            (ShedDecision::EvictResident, None) => unreachable!("full queue has residents"),
+        }
+    }
+
+    // NO silent loss: every one of the 5 over-capacity arrivals produced an
+    // explicit, counted shed.
+    assert_eq!(
+        explicit_sheds,
+        burst.len(),
+        "every over-capacity arrival must be explicitly shed, never silently lost"
+    );
+
+    // COUNTED: the process-wide inbound-drop counter advanced by AT LEAST the
+    // number of explicit sheds this test produced. `>=` (not `==`) because
+    // `SFU_DISPATCHER_INBOUND_DROPPED_TOTAL` is process-global: integration
+    // tests share one binary and may run concurrently, so another test's shed
+    // could bump the same counter between our before/after reads. We still prove
+    // the intent (this path explicitly counts every shed, no silent loss) — the
+    // exact-count guarantee is carried by the `explicit_sheds == burst.len()`
+    // assertion above, which reads a test-local counter. This matches the `>` /
+    // `>=` style of the per-class check below.
+    let dropped_after = SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.get();
+    assert!(
+        dropped_after - dropped_before >= burst.len() as u64,
+        "SFU_DISPATCHER_INBOUND_DROPPED_TOTAL must count every explicit shed \
+         (before={dropped_before} after={dropped_after} sheds={})",
+        burst.len()
+    );
+
+    // The per-class counter for P4 advanced (P4 is what we shed first), proving
+    // the class label is recorded — drops are attributable, not anonymous.
+    let p4_dropped_after = SFU_CLASS_DROPPED_TOTAL
+        .with_label_values(&[Class::P4Enhancement.metric_label()])
+        .get();
+    assert!(
+        p4_dropped_after > p4_dropped_before,
+        "SFU_CLASS_DROPPED_TOTAL{{class=P4Enhancement}} must record the P4 sheds"
+    );
+
+    // The surviving queue must still hold the HIGHER-priority arrivals (audio +
+    // keyframe) — they were admitted by evicting P4, proving audio is NOT shed
+    // while a droppable class remains.
+    assert!(
+        queue.iter().any(|c| *c == Class::P1Audio),
+        "audio admitted by shedding P4 must survive in the queue"
+    );
+    assert!(
+        queue.iter().any(|c| *c == Class::P2Keyframe),
+        "keyframe admitted by shedding P4 must survive in the queue"
+    );
+}

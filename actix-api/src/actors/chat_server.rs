@@ -3025,6 +3025,216 @@ pub const WATCHDOG_SILENCE_CAP: std::time::Duration = std::time::Duration::from_
 /// ~16 KB regardless of inbound rate.
 pub const SCORER_BATCH_FLUSH_CAP: usize = 512;
 
+/// vc-vyg9: capacity of the per-dispatcher INTERNAL inbound queue that
+/// decouples draining the bounded async-nats subscription from the per-message
+/// fan-out barrier.
+///
+/// ## Why a local queue at all
+///
+/// The dispatcher loop performs the ENTIRE per-message fan-out (per-receiver
+/// `egress_decide_from_parsed` + `try_send`, plus — on the sharded path — an
+/// `await` over a barrier of all shard tasks) INLINE before pulling the next
+/// inbound message off `sub`. Any transient egress/recompute spike (an
+/// AllowSet/layer-selection recompute storm, a late-joiner wave) therefore
+/// stalls the drain of `sub`. While the drain is stalled, the bounded
+/// async-nats subscription buffer (`subscription_capacity(16*1024)`, set in
+/// `nats_connect.rs`) silently overflows — async-nats drops inbound messages
+/// and only fires an opaque process-wide `Event::SlowConsumer(sid)` that is not
+/// routable to a room. That is a SILENT black-hole of media (the lj-2 hazard).
+///
+/// This bounded local queue moves the backpressure boundary OFF async-nats'
+/// invisible 16Ki buffer and ONTO our own queue, where overflow is EXPLICIT,
+/// COUNTED, and shed by priority class (P4 first) rather than indiscriminately.
+///
+/// ## Why this size
+///
+/// 1024 slots ≈ ~20 ms of a single saturated shard's inbound at the worst-case
+/// publisher-storm rate, which is enough to absorb a transient fan-out spike (a
+/// late-joiner re-warm, a keyframe burst) without shedding, while staying small
+/// enough that genuine sustained overload is detected promptly (we shed rather
+/// than letting the queue grow into a latency sink).
+///
+/// ## Per-slot memory
+///
+/// Each slot holds the refcounted `async_nats::Message` (a `Subject` + `Bytes`
+/// payload — both `Arc`/refcount-backed, so the `msg` field is a couple of
+/// pointer clones, NOT a payload copy) PLUS an owned `parsed: Option<ParsedPacket>`.
+/// `ParsedPacket` is NOT free: it owns `wrapper.data: Vec<u8>` and
+/// `media_packet.data: Vec<u8>` — up to TWO payload-sized heap copies per slot.
+/// So worst case (a fully-saturated 1024-slot room of large media packets) the
+/// queue holds ~2 owned payload Vecs × 1024 ≈ ~2–4 MB, dominated by the parsed
+/// copies, not the refcounted `msg`. That is still ~16× smaller than the
+/// async-nats 16Ki subscription buffer this queue replaces as the backpressure
+/// boundary, so even at the worst case it is a net memory win — and unlike that
+/// buffer the overflow here is explicit and class-shed rather than silent.
+pub const DISPATCHER_INBOUND_QUEUE_CAP: usize = 1024;
+
+/// vc-vyg9: pure, unit-testable shed-decision for the per-dispatcher inbound
+/// queue. Factored out of the dispatcher loop exactly like
+/// [`watchdog_should_resubscribe`] so the priority-class shed policy can be
+/// proven in a unit test without provoking real async-nats backpressure.
+///
+/// Called ONLY when the local queue is at capacity ([`DISPATCHER_INBOUND_QUEUE_CAP`])
+/// and a freshly-drained inbound message must be admitted. Given the incoming
+/// message's priority [`Class`] and the lowest-priority (numerically highest)
+/// class currently resident in the queue, it decides what to shed:
+///
+/// * If the incoming message is STRICTLY LOWER priority than the
+///   lowest-priority resident (i.e. the incoming class number is greater),
+///   drop the INCOMING message — never evict a higher-priority queued packet
+///   to make room for a lower-priority new one.
+/// * Otherwise evict the lowest-priority RESIDENT to make room for the
+///   incoming message.
+///
+/// Priority ordering is the existing taxonomy: `Class::all()` is ordered
+/// highest-priority first (P0Control … P4Enhancement), so a larger index =
+/// lower priority = more droppable. This guarantees the bead's "P4 first"
+/// invariant: under sustained overload the queue converges to retaining the
+/// highest-priority classes (audio/keyframe/control) and sheds enhancement /
+/// screenshare (P4), then base video (P3), before ever touching audio (P1) or
+/// control (P0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShedDecision {
+    /// Drop the incoming message (it is the lowest-priority candidate).
+    DropIncoming,
+    /// Evict the lowest-priority resident, then enqueue the incoming message.
+    EvictResident,
+}
+
+/// Rank a [`Class`] by droppability: higher = lower priority = shed first.
+/// P0Control = 0 (least droppable) … P4Enhancement = 4 (most droppable).
+pub fn class_shed_rank(class: crate::sfu::priority_queue::Class) -> u8 {
+    use crate::sfu::priority_queue::Class;
+    match class {
+        Class::P0Control => 0,
+        Class::P1Audio => 1,
+        Class::P2Keyframe => 2,
+        Class::P3VideoBase => 3,
+        Class::P4Enhancement => 4,
+    }
+}
+
+/// vc-vyg9: decide whether to drop the incoming message or evict the
+/// lowest-priority resident, given both classes. See [`ShedDecision`].
+///
+/// `incoming` is the class of the just-drained message; `lowest_resident` is
+/// the lowest-priority class currently in the queue. The full queue is the
+/// precondition for calling this.
+pub fn shed_decision(
+    incoming: crate::sfu::priority_queue::Class,
+    lowest_resident: crate::sfu::priority_queue::Class,
+) -> ShedDecision {
+    // Drop the incoming message ONLY when it is strictly lower priority than
+    // every resident (its rank exceeds the lowest-priority resident's rank).
+    // Otherwise the incoming message deserves a slot more than the worst
+    // resident, so evict that resident. Ties (== rank) evict the resident so
+    // we preserve arrival progress for equal-priority traffic (the incoming
+    // is the newest of its class; head-of-class freshness matters least for
+    // the droppable classes, and for higher classes this keeps forward
+    // progress on the most recent packet).
+    if class_shed_rank(incoming) > class_shed_rank(lowest_resident) {
+        ShedDecision::DropIncoming
+    } else {
+        ShedDecision::EvictResident
+    }
+}
+
+/// vc-vyg9: pure full-queue shed planner, factored out of the dispatcher loop
+/// so the priority-class shed policy is unit-testable over a real sequence of
+/// admissions (not just the binary [`shed_decision`]). The loop calls this when
+/// the local queue is at capacity.
+///
+/// Given the classes currently resident in the queue (`residents`, in arrival
+/// order) and the `incoming` class, it returns:
+///
+/// * `(ShedDecision::DropIncoming, None)` — the incoming message is the
+///   lowest-priority candidate of all; drop IT, keep the queue intact.
+/// * `(ShedDecision::EvictResident, Some(idx))` — evict the resident at `idx`
+///   (the lowest-priority resident, i.e. the first one with maximal shed rank)
+///   to make room, then enqueue the incoming at the tail.
+///
+/// "First one with maximal shed rank": a single forward scan keeps the
+/// FIRST-seen maximum (the `rank <= best` guard only replaces the running best
+/// on a STRICTLY greater rank, so a later equal-rank entry never displaces an
+/// earlier one). Because `residents` is in FIFO/arrival order, the first entry
+/// of the lowest-priority class is its OLDEST member — so we evict the oldest
+/// of the lowest-priority class, preserving freshness within both that class
+/// and the surviving higher-priority classes. Returns `DropIncoming` for an
+/// empty `residents` only as a defensive degenerate (the loop never calls it on
+/// an empty queue).
+pub fn plan_shed(
+    residents: &[crate::sfu::priority_queue::Class],
+    incoming: crate::sfu::priority_queue::Class,
+) -> (ShedDecision, Option<usize>) {
+    // Lowest-priority resident = the head-most entry with the maximal shed
+    // rank. We scan and keep the FIRST max so the oldest of that class is
+    // evicted (FIFO within the shed class).
+    let mut victim: Option<(usize, u8)> = None;
+    for (i, c) in residents.iter().enumerate() {
+        let rank = class_shed_rank(*c);
+        match victim {
+            Some((_, best)) if rank <= best => {}
+            _ => victim = Some((i, rank)),
+        }
+    }
+    let (idx, lowest_class) = match victim {
+        Some((i, _)) => (i, residents[i]),
+        None => return (ShedDecision::DropIncoming, None),
+    };
+    match shed_decision(incoming, lowest_class) {
+        ShedDecision::DropIncoming => (ShedDecision::DropIncoming, None),
+        ShedDecision::EvictResident => (ShedDecision::EvictResident, Some(idx)),
+    }
+}
+
+/// vc-vyg9: account for an EXPLICIT inbound shed. Bumps BOTH:
+///
+/// * [`SFU_DISPATCHER_INBOUND_DROPPED_TOTAL`] — the same process-wide inbound
+///   drop counter that the async-nats `SlowConsumer` handler bumps
+///   (`nats_connect.rs`). Reusing it means a single counter answers "how much
+///   inbound media did the SFU shed?" regardless of WHERE the shed happened
+///   (async-nats' invisible buffer vs. our explicit class-aware queue) — and
+///   this explicit path is the one the bead requires to make the loss visible.
+/// * [`SFU_CLASS_DROPPED_TOTAL`] with the packet's class label — the existing
+///   per-class drop counter (`metrics.rs`), so operators can see WHICH class is
+///   being shed (P4 first under correct policy). This is the same counter the
+///   outbound `PrioritySender` uses, so inbound and outbound class-drop are
+///   reported on one consistent metric.
+///
+/// NEVER SILENT: every explicit drop on the overload path routes through here.
+pub fn shed_inbound(class: crate::sfu::priority_queue::Class) {
+    crate::metrics::SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.inc();
+    crate::metrics::SFU_CLASS_DROPPED_TOTAL
+        .with_label_values(&[class.metric_label()])
+        .inc();
+}
+
+/// vc-vyg9: classify an inbound NATS message into its priority [`Class`] for
+/// the shed policy. Reuses the EXISTING outbound taxonomy
+/// ([`crate::sfu::priority_queue::classify_outbound`]) so the inbound shed and
+/// the outbound priority queue agree on what "P4" means — we do NOT invent a
+/// parallel class scheme.
+///
+/// This is invoked ONLY on the overload path (queue non-empty / shedding), so
+/// the parse cost it incurs never touches the steady-state hot path where the
+/// queue stays empty and messages flow straight to fan-out.
+pub fn classify_inbound(parsed: Option<&ParsedPacket>) -> crate::sfu::priority_queue::Class {
+    use crate::sfu::priority_queue::{classify_outbound, Class};
+    match parsed {
+        Some(p) => {
+            let media_type = p
+                .media_packet
+                .as_ref()
+                .map(|mp| mp.media_type.enum_value_or_default());
+            classify_outbound(&p.wrapper, media_type, p.routing_header())
+        }
+        // Unparseable outer wrapper: treat as base video (the same legacy /
+        // unknown fallback `classify_outbound` itself uses) so a malformed
+        // packet is neither protected as control nor shed first as P4.
+        None => Class::P3VideoBase,
+    }
+}
+
 /// vc-9eh: compute the silence window for the current consecutive-trip count.
 ///
 /// `trips` is the number of consecutive watchdog resubscribes that have NOT
@@ -3428,9 +3638,126 @@ fn spawn_room_dispatcher(
             };
         }
 
+        // vc-vyg9: inbound-rate sample, factored out so the watchdog TIMER arm
+        // and the INLINE message-path mitigation compute it identically. Derives
+        // msgs/sec over the interval since `last_rate_sample`, publishes the
+        // process-global `sfu_dispatcher_inbound_rate` gauge, and advances the
+        // sample baseline. O(1): one subtraction + divide, no locks. The
+        // wrapping subtraction matches `inbound_msg_count`'s wrapping increment.
+        macro_rules! sample_inbound_rate {
+            ($now:expr) => {{
+                let now = $now;
+                let (prev_count, prev_at) = last_rate_sample;
+                let elapsed = now.duration_since(prev_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    let delta = inbound_msg_count.wrapping_sub(prev_count) as f64;
+                    crate::metrics::SFU_DISPATCHER_INBOUND_RATE.set(delta / elapsed);
+                }
+                last_rate_sample = (inbound_msg_count, now);
+            }};
+        }
+
+        // --- vc-vyg9: decouple inbound DRAIN from per-message FAN-OUT ----------
+        //
+        // PROBLEM (lj-2 defense-in-depth). The loop below performs the entire
+        // per-message fan-out (per-receiver `egress_decide_from_parsed` +
+        // `try_send`, and on the sharded path an `await` over a barrier of all
+        // shard tasks) INLINE before pulling the next message off `sub`. A
+        // transient egress/recompute spike (an AllowSet recompute storm, a
+        // late-joiner wave) therefore stalls the drain of `sub`, and async-nats'
+        // bounded 16Ki subscription buffer silently overflows — dropping inbound
+        // media and firing only an opaque, non-room-routable `SlowConsumer`.
+        //
+        // FIX. A bounded LOCAL queue (`inbound_queue`) sits between the
+        // `sub.next()` drain and the fan-out. After each fan-out completes we
+        // GREEDILY drain `sub` (non-blocking, via `now_or_never`) into this
+        // queue, so async-nats' invisible buffer is emptied promptly even while
+        // fan-out is busy. The backpressure boundary thus moves onto OUR queue,
+        // where overflow is EXPLICIT, COUNTED, and shed by priority class (P4
+        // first) — never a silent black hole.
+        //
+        // WHY THIS SHAPE IS LOWEST-OVERHEAD ON THE HOT PATH. We deliberately
+        // keep the fan-out INLINE on the dispatcher task and do NOT introduce a
+        // dedicated drain task feeding a cross-thread mpsc. In the COMMON
+        // (non-overloaded) case the greedy drain finds `sub` not-ready on its
+        // first `now_or_never` poll, the queue stays EMPTY, and every message
+        // flows `sub.next()` -> fan-out with ZERO extra allocation, ZERO
+        // cross-thread hop, and ZERO priority classification (we classify only
+        // when the queue is full and we must choose what to shed). The queue and
+        // its per-class bookkeeping engage ONLY when fan-out is slower than
+        // ingest — exactly the spike the bead targets. A cross-thread mpsc would
+        // add a hop + a channel send/recv to EVERY packet even at idle; this
+        // does not.
+        //
+        // ORDERING. Per-room ordering WITHIN a priority class is preserved: the
+        // queue is FIFO, drained head-first, and the existing fan-out barrier is
+        // unchanged (message k+1 fan-out still never starts before k's
+        // completes). The ONLY ordering change is the documented, intentional
+        // one: under genuine overload we may drop a lower-priority packet out of
+        // the middle of the stream (shed-by-class) instead of letting async-nats
+        // tail-drop an arbitrary one — strictly better than today's silent loss.
+        //
+        // We store the parsed packet ALONGSIDE the message so the queued item is
+        // parsed exactly ONCE (parse-once preserved): classification at
+        // enqueue-under-pressure and the downstream fan-out share the same
+        // `ParsedPacket`.
+        struct QueuedInbound {
+            msg: async_nats::Message,
+            parsed: Option<ParsedPacket>,
+            class: crate::sfu::priority_queue::Class,
+        }
+        let mut inbound_queue: std::collections::VecDeque<QueuedInbound> =
+            std::collections::VecDeque::new();
+
         loop {
+            // vc-vyg9: `prequeued_parsed` carries an already-parsed
+            // `ParsedPacket` for a message served from the local backlog
+            // (parse-once preserved); `None` means the message came straight off
+            // `sub` and must be parsed below.
+            let mut prequeued_parsed: Option<Option<ParsedPacket>> = None;
+
+            // vc-vyg9: drive everything off ONE `select!`. The `biased` order is:
+            //   1. backlog (guarded by `!is_empty()`) — drain our own queue
+            //      first, in arrival order, before pulling more off `sub`. The
+            //      guard makes the `ready` future ineligible when the queue is
+            //      empty, so in STEADY STATE this arm is a no-op and we fall
+            //      through to `sub.next()` exactly as before.
+            //   2. `sub.next()` — the original inbound drain arm (unchanged).
+            //   3. watchdog tick (the liveness/resubscribe + rate-sample TIMER).
+            //   4. scorer-flush tick.
+            //
+            // CRITICAL: the `biased` order means that under SUSTAINED backlog
+            // (queue always non-empty, or `sub` always ready) arms 1/2 win EVERY
+            // iteration and the watchdog TIMER arm (#3) is STARVED — it is never
+            // polled until the drain catches up. So the two pieces of bookkeeping
+            // that arm normally drives are BOTH mitigated INLINE on the message
+            // path instead, after fan-out, so they stay fresh during overload:
+            //   - the vc-kcpg scorer flush (inline block ~after fan-out), and
+            //   - the vc-m7k6 inbound-rate sample (inline block right after it).
+            // Each inline block is gated on elapsed-since-last so it fires at
+            // ~tick cadence, not per message. Do NOT assume the timer arms keep
+            // ticking under load — they do not; the inline mitigations are what
+            // keep these signals live.
+            //
+            // The silence-watchdog resubscribe path (arm #3's later half) needs
+            // no inline mirror: it depends only on `last_msg_at` /
+            // `consecutive_silent_trips`, which the greedy drain already stamps
+            // every time it pulls a real message — so a still-draining (saturated
+            // but alive) dispatcher never looks silent, exactly as intended.
+            //
+            // Liveness/rate bookkeeping (`last_msg_at`, `consecutive_silent_trips`,
+            // `inbound_msg_count`) is stamped at DRAIN time (the `sub.next()` arm
+            // and the greedy drain at the end of the loop), NOT on backlog
+            // dequeue — a backlog item already came off `sub` and was counted
+            // then, so re-counting here would double-count the rate sample.
             let msg = tokio::select! {
                 biased;
+                // 1. Local backlog. `std::future::ready` resolves immediately;
+                //    the `if` guard disables this arm when the queue is empty.
+                Some(item) = std::future::ready(inbound_queue.pop_front()), if !inbound_queue.is_empty() => {
+                    prequeued_parsed = Some(item.parsed);
+                    item.msg
+                }
                 maybe_msg = sub.next() => match maybe_msg {
                     Some(msg) => {
                         // vc-9eh: subscription is alive — refresh liveness and
@@ -3497,16 +3824,10 @@ fn spawn_room_dispatcher(
                     // saturated-but-still-draining dispatcher, not just a silent
                     // one. Last-writer-wins across rooms (coarse process-level
                     // throughput signal, paired with the process-global drop
-                    // counter).
-                    {
-                        let (prev_count, prev_at) = last_rate_sample;
-                        let elapsed = now.duration_since(prev_at).as_secs_f64();
-                        if elapsed > 0.0 {
-                            let delta = inbound_msg_count.wrapping_sub(prev_count) as f64;
-                            crate::metrics::SFU_DISPATCHER_INBOUND_RATE.set(delta / elapsed);
-                        }
-                        last_rate_sample = (inbound_msg_count, now);
-                    }
+                    // counter). The same computation runs INLINE on the message
+                    // path (after the scorer flush) so the gauge stays fresh even
+                    // when a sustained backlog starves THIS timer arm.
+                    sample_inbound_rate!(now);
                     // Cheap pre-gate for the RESUBSCRIBE path: avoid escalating
                     // / resubscribing until we are actually past grace AND past
                     // the (escalating) silence window. The common steady-state
@@ -3620,7 +3941,15 @@ fn spawn_room_dispatcher(
             // `msg.payload` is `bytes::Bytes`; deref to `&[u8]` for the
             // parser. The decision call below takes the `&Bytes` so it
             // can `clone()` a refcount bump per forwarded receiver.
-            let parsed = parse_and_inspect(&msg.payload[..]);
+            //
+            // vc-vyg9: a message served from the local backlog was ALREADY
+            // parsed at enqueue time (parse-once preserved); reuse that
+            // `ParsedPacket` instead of re-parsing. A message straight off `sub`
+            // is parsed here as before.
+            let parsed = match prequeued_parsed {
+                Some(p) => p,
+                None => parse_and_inspect(&msg.payload[..]),
+            };
             let subject_str: &str = msg.subject.as_ref();
 
             // p3-11: feed the per-room SpeakerScorer for every inbound
@@ -4025,6 +4354,132 @@ fn spawn_room_dispatcher(
             {
                 flush_scorer_batch!();
                 last_scorer_flush = std::time::Instant::now();
+            }
+
+            // vc-vyg9: STARVATION-PROOF inline inbound-rate sample. Same hazard
+            // as the scorer flush above: the `biased` `select!` lets the backlog
+            // / `sub.next()` arms win every iteration while there is work, so a
+            // SUSTAINED overload starves the `watchdog.tick()` TIMER arm — the
+            // exact window vc-m7k6's `sfu_dispatcher_inbound_rate` gauge is meant
+            // to expose. Mirror the scorer-flush precedent: re-sample the rate
+            // HERE on the message path once a full `WATCHDOG_TICK` has elapsed
+            // since the last sample, using the identical computation as the timer
+            // arm (`sample_inbound_rate!`). This keeps the gauge fresh during a
+            // saturated drain even though the timer arm never runs. O(1), no
+            // locks. Gated on elapsed so steady state still samples at ~tick
+            // cadence rather than on every message.
+            if last_rate_sample.1.elapsed() >= WATCHDOG_TICK {
+                sample_inbound_rate!(std::time::Instant::now());
+            }
+
+            // --- vc-vyg9: GREEDY non-blocking drain of `sub` -> local queue ----
+            //
+            // This is the decouple. Now that this iteration's fan-out is DONE,
+            // opportunistically pull every message async-nats has ALREADY
+            // buffered for us — WITHOUT awaiting — and stash it on the bounded
+            // local `inbound_queue`. `now_or_never()` polls the `sub.next()`
+            // future exactly once: if a message is immediately ready it is
+            // taken; the moment `sub` would block (the COMMON case — nothing
+            // buffered) the poll returns `None` and we stop. So in steady state
+            // this is a SINGLE non-blocking poll per iteration that finds
+            // nothing, and the queue stays empty.
+            //
+            // Why this defeats the silent black hole: async-nats' 16Ki buffer is
+            // emptied into OUR queue here even though fan-out for the NEXT
+            // message hasn't started. A fan-out spike can no longer let `sub`'s
+            // invisible buffer overflow, because we drain it down promptly right
+            // after each fan-out. The backpressure now lands on `inbound_queue`,
+            // which is bounded by `DISPATCHER_INBOUND_QUEUE_CAP` and shed
+            // EXPLICITLY by priority class below.
+            //
+            // We cap the work per pass at the queue capacity so a relentless
+            // publisher storm can't make this inner loop run unbounded and
+            // starve the watchdog/scorer timer arms of the outer `select!`.
+            {
+                use futures::future::FutureExt;
+                let mut drained_this_pass = 0usize;
+                while drained_this_pass < DISPATCHER_INBOUND_QUEUE_CAP {
+                    // Single non-blocking poll. `None` here means EITHER the
+                    // stream is pending (nothing buffered — stop draining) OR it
+                    // closed. We cannot distinguish without consuming, and a
+                    // genuine close is still surfaced by the blocking `sub.next()`
+                    // arm on the next outer-loop iteration (it returns `None` ->
+                    // `break`), so deferring close-detection to there preserves
+                    // the existing `RoomDispatcherExited` respawn path exactly.
+                    let next = sub.next().now_or_never();
+                    let m = match next {
+                        Some(Some(m)) => m,
+                        // `Some(None)` = stream closed; `None` = pending. Either
+                        // way stop greedy-draining this pass.
+                        _ => break,
+                    };
+                    drained_this_pass += 1;
+                    // Liveness/rate bookkeeping: a greedily-drained message is a
+                    // real inbound message off `sub`, identical to the blocking
+                    // arm — so refresh liveness and count it for the rate sample.
+                    last_msg_at = std::time::Instant::now();
+                    consecutive_silent_trips = 0;
+                    inbound_msg_count = inbound_msg_count.wrapping_add(1);
+
+                    // Parse ONCE here (parse-once preserved end-to-end): the
+                    // dequeue path above reuses this `ParsedPacket` rather than
+                    // re-parsing. Classify into the EXISTING priority taxonomy so
+                    // the shed policy can prefer P4 first.
+                    let parsed = parse_and_inspect(&m.payload[..]);
+                    let class = classify_inbound(parsed.as_ref());
+
+                    if inbound_queue.len() < DISPATCHER_INBOUND_QUEUE_CAP {
+                        // Common (transient-spike) case: room in the queue, just
+                        // enqueue in arrival order.
+                        inbound_queue.push_back(QueuedInbound {
+                            msg: m,
+                            parsed,
+                            class,
+                        });
+                        continue;
+                    }
+
+                    // GENUINE SUSTAINED OVERLOAD: the queue is full. Shed by
+                    // priority class, P4 (lowest) FIRST — never silently. Defer
+                    // to the pure, unit-tested `plan_shed`: it picks the
+                    // lowest-priority resident and decides whether to drop the
+                    // incoming message or evict that resident.
+                    //
+                    // Building the `resident_classes` Vec here is an O(cap)
+                    // allocation, but it occurs ONLY on the genuine-overload
+                    // path (queue at capacity), never in steady state — so it
+                    // does not touch the common hot path.
+                    let resident_classes: Vec<crate::sfu::priority_queue::Class> =
+                        inbound_queue.iter().map(|item| item.class).collect();
+                    match plan_shed(&resident_classes, class) {
+                        (ShedDecision::DropIncoming, _) => {
+                            // The incoming message is the lowest-priority
+                            // candidate of all; drop IT and keep the queue.
+                            shed_inbound(class);
+                        }
+                        (ShedDecision::EvictResident, Some(lowest_idx)) => {
+                            // Evict the lowest-priority resident (its class is
+                            // <= the incoming's priority), then enqueue the
+                            // incoming at the tail (arrival order within the
+                            // surviving classes is preserved).
+                            if let Some(victim) = inbound_queue.remove(lowest_idx) {
+                                shed_inbound(victim.class);
+                            }
+                            inbound_queue.push_back(QueuedInbound {
+                                msg: m,
+                                parsed,
+                                class,
+                            });
+                        }
+                        (ShedDecision::EvictResident, None) => {
+                            // Unreachable in practice (full queue => non-empty
+                            // residents => `plan_shed` returns Some). Defensive:
+                            // drop the incoming rather than panic on the hot
+                            // path, still counted.
+                            shed_inbound(class);
+                        }
+                    }
+                }
             }
         }
         // vc-kcpg: drain any remaining batched observations before the task
