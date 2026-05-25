@@ -185,75 +185,6 @@ struct RoomDispatcherExited {
     room: String,
 }
 
-/// vc-zexm: internal message posted by a per-room dispatcher when a cross-pod
-/// remote-publisher registry change bumped the shared `members_generation`,
-/// busting every local receiver's AllowSet cache.
-///
-/// The dispatcher MUST NOT run the O(R·members) `rewarm_subscription_cache`
-/// inline on its inbound-drain loop — that loop is the exact hot path the bead
-/// protects (running it there during a spill-pod federation wave stalls the
-/// drain → async-nats drops at the 16Ki sub → late-joiner media loss). Instead
-/// the dispatcher fires this message (`try_send`, fire-and-forget) and the
-/// `ChatServer` actor performs the re-warm on its OWN thread of execution, off
-/// the dispatcher barrier.
-///
-/// Deferring is always safe: `SubscriptionStore::resolve_cached` self-heals on
-/// a miss, so the worst case while the message is in flight is a few on-hot-path
-/// recomputes — strictly better than stalling the drain. Bursts coalesce
-/// naturally on the actor mailbox; the handler is idempotent (re-warming an
-/// already-warm cache is a no-op via the per-entry generation check).
-#[derive(ActixMessage)]
-#[rtype(result = "()")]
-struct RewarmSubscriptionCache {
-    room: String,
-}
-
-/// vc-j4kz: internal message posted by a per-room dispatcher to register (or
-/// refresh) a cross-pod remote publisher OFF the inbound-drain hot path.
-///
-/// BACKGROUND. On a spill pod the presenters live on OTHER pods, so EVERY
-/// inbound MEDIA packet is from a remote publisher whose sid is not a local
-/// member. Pre-vc-j4kz the dispatcher took the shared `room_state` lock on the
-/// drain task for that registration — a `read()` precheck on every packet plus
-/// a `write()` (and two `members_snapshot_with_generation()` calls) whenever
-/// the registry actually had to change. That lock work sat BETWEEN `sub.next()`
-/// and the next pull, serializing against the per-receiver `decide` read
-/// fan-out on the same lock, so per-message drain service time × inbound rate
-/// could exceed one core → the async-nats 16Ki subscription buffer tail-drops →
-/// SlowConsumer → starved trickle.
-///
-/// FIX. The dispatcher now keeps a TASK-LOCAL dedup view of which remote
-/// publishers it has already registered (and their video flag + last-sent
-/// instant), evaluates the EXACT `remote_publisher_write_needed` predicate
-/// against that lock-free local view, and only when a change is due fires this
-/// fire-and-forget message. The `ChatServer` actor applies it on ITS OWN thread
-/// of execution — taking the `room_state.write()` and, if the registry's shared
-/// `members_generation` actually moved, re-warming the AllowSet cache there —
-/// so NO shared `room_state` lock is ever taken on the drain hot path for
-/// registration.
-///
-/// CORRECTNESS / ORDERING.
-/// * Ingest sharding is keyed on the publisher's session id
-///   ([`crate::models::ingest_shard_for_session`]), so a given remote
-///   publisher's packets always land on exactly ONE shard's dispatcher. The
-///   task-local dedup is therefore complete for that publisher — no other shard
-///   races its registration.
-/// * `note_remote_publisher` self-skips local members, so a sid that is (or
-///   becomes) a local member is a harmless no-op here; the local dedup also
-///   throttles such redundant sends to the liveness window.
-/// * Deferring registration is safe: until the write lands the forwarder's
-///   `resolve_cached` self-heals on a miss (a few on-hot-path recomputes),
-///   strictly better than stalling the drain. Bursts coalesce on the
-///   serialized actor mailbox; the handler is idempotent (a fresh,
-///   video-consistent refresh neither bumps the generation nor re-warms).
-#[derive(ActixMessage)]
-#[rtype(result = "()")]
-struct RegisterRemotePublisher {
-    room: String,
-    sender: SessionId,
-    is_video: bool,
-}
-
 /// Internal message: posted by the spawned NATS-KV lookup task once a
 /// room's home region has been resolved (bead vc-hc8 / p6-9). Carries the
 /// information needed for the actor to either:
@@ -874,18 +805,6 @@ impl ChatServer {
                     // locks for `last_selections`, mutex for hysteresis).
                     fwd.layer_selector().invalidate_all();
                     fwd.prune_session(*session_id);
-                    // vc-zexm: a leave also bumps `members_generation` (via
-                    // `remove_member`), busting every remaining receiver's
-                    // AllowSet cache entry — same thundering herd as a join.
-                    // Re-warm the cache off this cold Leave path so the
-                    // surviving receivers' next media packets hit the cache
-                    // instead of recomputing O(members) inside the fan-out
-                    // barrier. `prune_session` above already pruned the
-                    // departed sid from the remote-publisher registry, so the
-                    // snapshot this re-warm reads is post-departure. The
-                    // leaver's own cache entry was dropped by `forget` earlier
-                    // in this branch.
-                    fwd.rewarm_subscription_cache();
                 }
             }
         }
@@ -1795,92 +1714,6 @@ impl Handler<RoomDispatcherExited> for ChatServer {
         );
         self.room_dispatch
             .insert(room, RoomDispatch { receivers, tasks });
-    }
-}
-
-/// vc-zexm: re-warm a room's per-receiver AllowSet cache OFF the dispatcher
-/// drain loop, after a cross-pod remote-publisher registry change bumped the
-/// shared `members_generation`.
-///
-/// Runs on the `ChatServer` actor thread (a different execution context from
-/// the dispatcher's inbound-drain loop), so the O(R·members) recompute never
-/// stalls the drain barrier. Bursts of these messages from the dispatcher
-/// coalesce on the serialized actor mailbox; the handler is idempotent because
-/// `SubscriptionStore::rewarm_cache` skips entries already fresh for the live
-/// generations, so a redundant re-warm is a cheap pass over the cache keys.
-///
-/// No-op if the room's forwarder is gone (room torn down between the
-/// dispatcher's `try_send` and this handler running) — the re-warm would be
-/// dead work, and `resolve_cached` self-heals regardless.
-impl Handler<RewarmSubscriptionCache> for ChatServer {
-    type Result = ();
-
-    fn handle(
-        &mut self,
-        RewarmSubscriptionCache { room }: RewarmSubscriptionCache,
-        _ctx: &mut Self::Context,
-    ) -> Self::Result {
-        if let Some(forwarder) = self.forwarders.get(&room) {
-            forwarder.rewarm_subscription_cache();
-        }
-    }
-}
-
-/// vc-j4kz: apply a cross-pod remote-publisher registration OFF the dispatcher
-/// drain loop.
-///
-/// Runs on the `ChatServer` actor thread, so the `room_state.write()` (and the
-/// AllowSet re-warm it may trigger) never sits on the dispatcher's inbound-drain
-/// barrier. This folds the work that pre-vc-j4kz ran inline on the drain task
-/// (`remote_publisher_write_needed` precheck → `note_remote_publisher` → bump-
-/// gated `RewarmSubscriptionCache`) into a single off-hot-path handler.
-///
-/// The dispatcher already debounced this send against its task-local dedup view,
-/// so by the time we get here a change is almost always genuinely due. We still
-/// gate the re-warm on a real generation bump (`note_remote_publisher` only
-/// bumps `members_generation` on a new sid, an audio→video upgrade, or a TTL
-/// reap — NOT on a pure liveness refresh), so a redundant or liveness-only
-/// message neither re-warms nor mutates the resolution-relevant snapshot.
-///
-/// No-op if the room's `room_state` is gone (room torn down between the
-/// dispatcher's `try_send` and this handler running).
-impl Handler<RegisterRemotePublisher> for ChatServer {
-    type Result = ();
-
-    fn handle(
-        &mut self,
-        RegisterRemotePublisher {
-            room,
-            sender,
-            is_video,
-        }: RegisterRemotePublisher,
-        _ctx: &mut Self::Context,
-    ) -> Self::Result {
-        let Some(room_state) = self.room_states.get(&room) else {
-            // Room drained between the dispatcher's try_send and now — the
-            // registry is gone; nothing to register into.
-            return;
-        };
-        let now = std::time::Instant::now();
-        // Capture the resolution-relevant generation before/after so we re-warm
-        // ONLY on a genuine change (new sid / audio→video upgrade / TTL reap),
-        // never on a pure liveness refresh. `note_remote_publisher` self-skips
-        // local members, so a sid that is a local member is a harmless no-op.
-        let (gen_before, gen_after) = {
-            let mut g = match room_state.write() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let (_, before) = g.members_snapshot_with_generation();
-            g.note_remote_publisher(sender, is_video, now);
-            let (_, after) = g.members_snapshot_with_generation();
-            (before, after)
-        };
-        if gen_after != gen_before {
-            if let Some(forwarder) = self.forwarders.get(&room) {
-                forwarder.rewarm_subscription_cache();
-            }
-        }
     }
 }
 
@@ -2859,18 +2692,6 @@ impl Handler<JoinRoom> for ChatServer {
             // concurrency notes for the access pattern.
             forwarder.layer_selector().invalidate_all();
         }
-        // vc-zexm: rebuild the per-receiver AllowSet cache HERE, on the cold
-        // JoinRoom path, against the post-`insert_member` membership generation.
-        // The join just bumped `members_generation`, which would otherwise make
-        // the next media packet for EVERY receiver miss the AllowSet cache and
-        // recompute O(members) inside the dispatcher fan-out barrier (the O(R²)
-        // thundering herd that throttles inbound drain → async-nats drops →
-        // late-joiner media loss). Re-warming now means the post-join media
-        // packets HIT the cache, so the barrier stays cheap. This is a pure
-        // performance warm-up — `resolve_cached` still validates generations on
-        // every lookup, so correctness never depends on the warm-up being
-        // current.
-        forwarder.rewarm_subscription_cache();
         let sfu_mode = self.sfu_config.mode;
 
         // --- vc-q0v: per-room parse-once demux ----------------------------
@@ -3117,78 +2938,6 @@ pub const WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// spam or resubscribe churn.
 pub const WATCHDOG_SILENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
-// --- vc-nys3: SECOND recovery trigger — rising inbound-drop slope ----------
-//
-// ROOT CAUSE (the IRREVERSIBILITY / permanent-dark-room hazard). The vc-9eh
-// silence watchdog above only fires on TOTAL silence (`last_msg_at` stale for a
-// whole window). But a PARTIALLY-delivering / STARVED subscription is never
-// silent: the dispatcher keeps draining SOME messages, so the `Some(msg)` /
-// greedy-drain arms keep stamping `last_msg_at` and resetting
-// `consecutive_silent_trips` to 0 on every drained message. The silence window
-// therefore never elapses, the silence watchdog never trips, and a subscription
-// wedged/degraded by a transient overload cliff (async-nats `SlowConsumer`
-// backpressure) stays starved FOREVER even after the offered load eases. A
-// transient overload permanently darkens the room.
-//
-// FIX. Add a SECOND trigger keyed on "behind" — a RISING per-dispatcher
-// inbound-drop slope WHILE receivers are present — that performs the SAME
-// in-place resubscribe the silence path does, so forwarding resumes once the
-// offered load drops. The drop signal is the THIS-DISPATCHER shed count
-// (`local_inbound_dropped`, bumped at our own `shed_inbound` call sites), NOT
-// the process-global `SFU_DISPATCHER_INBOUND_DROPPED_TOTAL` counter — using the
-// global would make every room's watchdog trip the instant ANY room sheds, a
-// synchronized resubscribe-wave against an already-stressed NATS connection
-// (the exact thundering-herd hazard the per-room timer jitter exists to avoid).
-//
-// ANTI-THRASH (the load-bearing subtlety, paired with lj-7 raise-cliff). A
-// resubscribe of the UPSTREAM NATS sub only helps when the SUBSCRIPTION is
-// wedged. When WE (fan-out) are the bottleneck, the shed IS the correct
-// backpressure and resubscribing does NOTHING to relieve it — so a naive
-// "trip whenever shedding" would resubscribe-thrash every tick for the entire
-// duration of a legitimate fan-out overload. We cannot distinguish the two
-// cases cheaply from inside the dispatcher (both manifest as a rising local
-// drop count). The resolution is a persisted ESCALATING backoff, exactly like
-// the silence path's `consecutive_silent_trips`: the FIRST drop-slope trip
-// fires fast (recover a genuinely-wedged sub quickly), but repeated trips that
-// do NOT stop the shedding decay in cadence toward a 30s cap — so a fan-out
-// bottleneck (where resubscribe never helps) is probed at most ~once/30s rather
-// than thrashed every tick, while a wedged subscription (where the first
-// resubscribe DOES restore drain and the drop slope flattens) recovers in
-// seconds and the backoff RESETS the moment shedding stops.
-//
-//   * DROP_BACKOFF_BASE = 750ms — minimum interval between drop-slope
-//     resubscribes for the FIRST trip. Matches WATCHDOG_SILENCE so a genuinely-
-//     wedged subscription recovers on the same fast budget as the silence path.
-//   * The interval ESCALATES per consecutive drop trip (750ms, 1.5s, 3s, 6s,
-//     12s, 24s, capped at 30s) and RESETS to base the instant the drop delta
-//     returns to 0 (shedding stopped — either the resubscribe worked or load
-//     eased). Reuses WATCHDOG_SILENCE / WATCHDOG_SILENCE_CAP semantics via
-//     `watchdog_drop_backoff_window` so there is ONE escalation policy to reason
-//     about, not two divergent ones.
-//   * GATED behind WATCHDOG_GRACE uptime since the last (re)subscribe, exactly
-//     like the silence path — never resubscribe a fresh subscription before it
-//     has had a grace window to start delivering.
-
-/// vc-nys3: pure escalating-backoff window for the inbound-drop-slope recovery
-/// trigger. Identical doubling-from-base-capped policy as
-/// [`watchdog_silence_window`], driven by a SEPARATE `consecutive_drop_trips`
-/// counter so the two triggers escalate independently (a flapping fan-out
-/// bottleneck must not perturb the silence cadence and vice-versa). Factored out
-/// so the cadence is unit-testable without provoking real backpressure.
-///
-/// | trips | window |
-/// |-------|--------|
-/// | 0     | 750ms  |
-/// | 1     | 1.5s   |
-/// | 2     | 3s     |
-/// | ...   | ...    |
-/// | >=6   | 30s (cap) |
-pub fn watchdog_drop_backoff_window(trips: u32) -> std::time::Duration {
-    // Identical saturating-shift-then-clamp as the silence window; the policy is
-    // deliberately shared (one escalation curve to reason about).
-    watchdog_silence_window(trips)
-}
-
 /// vc-kcpg: hard cap on the per-dispatcher scorer batch length before an inline
 /// flush is forced, independent of the 200ms flush timer.
 ///
@@ -3200,216 +2949,6 @@ pub fn watchdog_drop_backoff_window(trips: u32) -> std::time::Duration {
 /// ~(SessionId, f32, bool, Instant) ≈ 32 B/entry that bounds the buffer at
 /// ~16 KB regardless of inbound rate.
 pub const SCORER_BATCH_FLUSH_CAP: usize = 512;
-
-/// vc-vyg9: capacity of the per-dispatcher INTERNAL inbound queue that
-/// decouples draining the bounded async-nats subscription from the per-message
-/// fan-out barrier.
-///
-/// ## Why a local queue at all
-///
-/// The dispatcher loop performs the ENTIRE per-message fan-out (per-receiver
-/// `egress_decide_from_parsed` + `try_send`, plus — on the sharded path — an
-/// `await` over a barrier of all shard tasks) INLINE before pulling the next
-/// inbound message off `sub`. Any transient egress/recompute spike (an
-/// AllowSet/layer-selection recompute storm, a late-joiner wave) therefore
-/// stalls the drain of `sub`. While the drain is stalled, the bounded
-/// async-nats subscription buffer (`subscription_capacity(16*1024)`, set in
-/// `nats_connect.rs`) silently overflows — async-nats drops inbound messages
-/// and only fires an opaque process-wide `Event::SlowConsumer(sid)` that is not
-/// routable to a room. That is a SILENT black-hole of media (the lj-2 hazard).
-///
-/// This bounded local queue moves the backpressure boundary OFF async-nats'
-/// invisible 16Ki buffer and ONTO our own queue, where overflow is EXPLICIT,
-/// COUNTED, and shed by priority class (P4 first) rather than indiscriminately.
-///
-/// ## Why this size
-///
-/// 1024 slots ≈ ~20 ms of a single saturated shard's inbound at the worst-case
-/// publisher-storm rate, which is enough to absorb a transient fan-out spike (a
-/// late-joiner re-warm, a keyframe burst) without shedding, while staying small
-/// enough that genuine sustained overload is detected promptly (we shed rather
-/// than letting the queue grow into a latency sink).
-///
-/// ## Per-slot memory
-///
-/// Each slot holds the refcounted `async_nats::Message` (a `Subject` + `Bytes`
-/// payload — both `Arc`/refcount-backed, so the `msg` field is a couple of
-/// pointer clones, NOT a payload copy) PLUS an owned `parsed: Option<ParsedPacket>`.
-/// `ParsedPacket` is NOT free: it owns `wrapper.data: Vec<u8>` and
-/// `media_packet.data: Vec<u8>` — up to TWO payload-sized heap copies per slot.
-/// So worst case (a fully-saturated 1024-slot room of large media packets) the
-/// queue holds ~2 owned payload Vecs × 1024 ≈ ~2–4 MB, dominated by the parsed
-/// copies, not the refcounted `msg`. That is still ~16× smaller than the
-/// async-nats 16Ki subscription buffer this queue replaces as the backpressure
-/// boundary, so even at the worst case it is a net memory win — and unlike that
-/// buffer the overflow here is explicit and class-shed rather than silent.
-pub const DISPATCHER_INBOUND_QUEUE_CAP: usize = 1024;
-
-/// vc-vyg9: pure, unit-testable shed-decision for the per-dispatcher inbound
-/// queue. Factored out of the dispatcher loop exactly like
-/// [`watchdog_should_resubscribe`] so the priority-class shed policy can be
-/// proven in a unit test without provoking real async-nats backpressure.
-///
-/// Called ONLY when the local queue is at capacity ([`DISPATCHER_INBOUND_QUEUE_CAP`])
-/// and a freshly-drained inbound message must be admitted. Given the incoming
-/// message's priority [`Class`] and the lowest-priority (numerically highest)
-/// class currently resident in the queue, it decides what to shed:
-///
-/// * If the incoming message is STRICTLY LOWER priority than the
-///   lowest-priority resident (i.e. the incoming class number is greater),
-///   drop the INCOMING message — never evict a higher-priority queued packet
-///   to make room for a lower-priority new one.
-/// * Otherwise evict the lowest-priority RESIDENT to make room for the
-///   incoming message.
-///
-/// Priority ordering is the existing taxonomy: `Class::all()` is ordered
-/// highest-priority first (P0Control … P4Enhancement), so a larger index =
-/// lower priority = more droppable. This guarantees the bead's "P4 first"
-/// invariant: under sustained overload the queue converges to retaining the
-/// highest-priority classes (audio/keyframe/control) and sheds enhancement /
-/// screenshare (P4), then base video (P3), before ever touching audio (P1) or
-/// control (P0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShedDecision {
-    /// Drop the incoming message (it is the lowest-priority candidate).
-    DropIncoming,
-    /// Evict the lowest-priority resident, then enqueue the incoming message.
-    EvictResident,
-}
-
-/// Rank a [`Class`] by droppability: higher = lower priority = shed first.
-/// P0Control = 0 (least droppable) … P4Enhancement = 4 (most droppable).
-pub fn class_shed_rank(class: crate::sfu::priority_queue::Class) -> u8 {
-    use crate::sfu::priority_queue::Class;
-    match class {
-        Class::P0Control => 0,
-        Class::P1Audio => 1,
-        Class::P2Keyframe => 2,
-        Class::P3VideoBase => 3,
-        Class::P4Enhancement => 4,
-    }
-}
-
-/// vc-vyg9: decide whether to drop the incoming message or evict the
-/// lowest-priority resident, given both classes. See [`ShedDecision`].
-///
-/// `incoming` is the class of the just-drained message; `lowest_resident` is
-/// the lowest-priority class currently in the queue. The full queue is the
-/// precondition for calling this.
-pub fn shed_decision(
-    incoming: crate::sfu::priority_queue::Class,
-    lowest_resident: crate::sfu::priority_queue::Class,
-) -> ShedDecision {
-    // Drop the incoming message ONLY when it is strictly lower priority than
-    // every resident (its rank exceeds the lowest-priority resident's rank).
-    // Otherwise the incoming message deserves a slot more than the worst
-    // resident, so evict that resident. Ties (== rank) evict the resident so
-    // we preserve arrival progress for equal-priority traffic (the incoming
-    // is the newest of its class; head-of-class freshness matters least for
-    // the droppable classes, and for higher classes this keeps forward
-    // progress on the most recent packet).
-    if class_shed_rank(incoming) > class_shed_rank(lowest_resident) {
-        ShedDecision::DropIncoming
-    } else {
-        ShedDecision::EvictResident
-    }
-}
-
-/// vc-vyg9: pure full-queue shed planner, factored out of the dispatcher loop
-/// so the priority-class shed policy is unit-testable over a real sequence of
-/// admissions (not just the binary [`shed_decision`]). The loop calls this when
-/// the local queue is at capacity.
-///
-/// Given the classes currently resident in the queue (`residents`, in arrival
-/// order) and the `incoming` class, it returns:
-///
-/// * `(ShedDecision::DropIncoming, None)` — the incoming message is the
-///   lowest-priority candidate of all; drop IT, keep the queue intact.
-/// * `(ShedDecision::EvictResident, Some(idx))` — evict the resident at `idx`
-///   (the lowest-priority resident, i.e. the first one with maximal shed rank)
-///   to make room, then enqueue the incoming at the tail.
-///
-/// "First one with maximal shed rank": a single forward scan keeps the
-/// FIRST-seen maximum (the `rank <= best` guard only replaces the running best
-/// on a STRICTLY greater rank, so a later equal-rank entry never displaces an
-/// earlier one). Because `residents` is in FIFO/arrival order, the first entry
-/// of the lowest-priority class is its OLDEST member — so we evict the oldest
-/// of the lowest-priority class, preserving freshness within both that class
-/// and the surviving higher-priority classes. Returns `DropIncoming` for an
-/// empty `residents` only as a defensive degenerate (the loop never calls it on
-/// an empty queue).
-pub fn plan_shed(
-    residents: &[crate::sfu::priority_queue::Class],
-    incoming: crate::sfu::priority_queue::Class,
-) -> (ShedDecision, Option<usize>) {
-    // Lowest-priority resident = the head-most entry with the maximal shed
-    // rank. We scan and keep the FIRST max so the oldest of that class is
-    // evicted (FIFO within the shed class).
-    let mut victim: Option<(usize, u8)> = None;
-    for (i, c) in residents.iter().enumerate() {
-        let rank = class_shed_rank(*c);
-        match victim {
-            Some((_, best)) if rank <= best => {}
-            _ => victim = Some((i, rank)),
-        }
-    }
-    let (idx, lowest_class) = match victim {
-        Some((i, _)) => (i, residents[i]),
-        None => return (ShedDecision::DropIncoming, None),
-    };
-    match shed_decision(incoming, lowest_class) {
-        ShedDecision::DropIncoming => (ShedDecision::DropIncoming, None),
-        ShedDecision::EvictResident => (ShedDecision::EvictResident, Some(idx)),
-    }
-}
-
-/// vc-vyg9: account for an EXPLICIT inbound shed. Bumps BOTH:
-///
-/// * [`SFU_DISPATCHER_INBOUND_DROPPED_TOTAL`] — the same process-wide inbound
-///   drop counter that the async-nats `SlowConsumer` handler bumps
-///   (`nats_connect.rs`). Reusing it means a single counter answers "how much
-///   inbound media did the SFU shed?" regardless of WHERE the shed happened
-///   (async-nats' invisible buffer vs. our explicit class-aware queue) — and
-///   this explicit path is the one the bead requires to make the loss visible.
-/// * [`SFU_CLASS_DROPPED_TOTAL`] with the packet's class label — the existing
-///   per-class drop counter (`metrics.rs`), so operators can see WHICH class is
-///   being shed (P4 first under correct policy). This is the same counter the
-///   outbound `PrioritySender` uses, so inbound and outbound class-drop are
-///   reported on one consistent metric.
-///
-/// NEVER SILENT: every explicit drop on the overload path routes through here.
-pub fn shed_inbound(class: crate::sfu::priority_queue::Class) {
-    crate::metrics::SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.inc();
-    crate::metrics::SFU_CLASS_DROPPED_TOTAL
-        .with_label_values(&[class.metric_label()])
-        .inc();
-}
-
-/// vc-vyg9: classify an inbound NATS message into its priority [`Class`] for
-/// the shed policy. Reuses the EXISTING outbound taxonomy
-/// ([`crate::sfu::priority_queue::classify_outbound`]) so the inbound shed and
-/// the outbound priority queue agree on what "P4" means — we do NOT invent a
-/// parallel class scheme.
-///
-/// This is invoked ONLY on the overload path (queue non-empty / shedding), so
-/// the parse cost it incurs never touches the steady-state hot path where the
-/// queue stays empty and messages flow straight to fan-out.
-pub fn classify_inbound(parsed: Option<&ParsedPacket>) -> crate::sfu::priority_queue::Class {
-    use crate::sfu::priority_queue::{classify_outbound, Class};
-    match parsed {
-        Some(p) => {
-            let media_type = p
-                .media_packet
-                .as_ref()
-                .map(|mp| mp.media_type.enum_value_or_default());
-            classify_outbound(&p.wrapper, media_type, p.routing_header())
-        }
-        // Unparseable outer wrapper: treat as base video (the same legacy /
-        // unknown fallback `classify_outbound` itself uses) so a malformed
-        // packet is neither protected as control nor shed first as P4.
-        None => Class::P3VideoBase,
-    }
-}
 
 /// vc-9eh: compute the silence window for the current consecutive-trip count.
 ///
@@ -3471,48 +3010,6 @@ pub fn watchdog_should_resubscribe(
     has_publishers: bool,
 ) -> bool {
     uptime >= WATCHDOG_GRACE && silence >= silence_window && has_receivers && has_publishers
-}
-
-/// vc-nys3: pure drop-slope-watchdog decision — the SECOND recovery trigger,
-/// keyed on a rising per-dispatcher inbound-drop slope WHILE receivers are
-/// present, rather than on total silence. Factored out alongside
-/// [`watchdog_should_resubscribe`] so the gating is unit-testable without
-/// provoking real async-nats backpressure.
-///
-/// Returns `true` IFF the dispatcher should force an in-place resubscribe
-/// BECAUSE it is actively shedding inbound (a starved/wedged subscription that
-/// never goes silent and so is invisible to the silence watchdog). All gates
-/// must hold:
-///
-///   * `uptime >= WATCHDOG_GRACE` — never judge a freshly (re)subscribed
-///     subscription before it has had a grace window to start delivering.
-///   * `since_last_trip >= backoff_window` — the persisted ESCALATING anti-thrash
-///     interval (from [`watchdog_drop_backoff_window`]). This is the load-bearing
-///     gate that prevents resubscribe-thrash when WE (fan-out) are the bottleneck
-///     and a resubscribe cannot help: repeated trips that don't stop the shedding
-///     decay toward the 30s cap, so a fan-out overload is probed at most ~once/30s
-///     while a genuinely-wedged subscription (whose drop slope flattens after the
-///     first successful resubscribe) recovers fast and resets the backoff.
-///   * `drops_rising` — this dispatcher's OWN shed count increased over the last
-///     sample interval (a positive local-drop delta). NOT the process-global drop
-///     counter (that would synchronize a resubscribe-wave across all rooms).
-///   * `has_receivers` — nobody to serve ⇒ nothing to recover.
-///
-/// NOTE: there is intentionally NO `has_publishers` gate here. Active shedding
-/// (`drops_rising`) is itself proof that inbound media is arriving faster than we
-/// drain it, which strictly implies publishers — a stronger, self-evident
-/// liveness signal than the coarse member-count gate the silence path uses.
-///
-/// ZERO per-receiver / per-message cost: evaluated only on the watchdog tick (one
-/// per room per 250ms) and the inline mirror, against task-local counters.
-pub fn watchdog_should_resubscribe_on_drops(
-    uptime: std::time::Duration,
-    since_last_trip: std::time::Duration,
-    backoff_window: std::time::Duration,
-    drops_rising: bool,
-    has_receivers: bool,
-) -> bool {
-    uptime >= WATCHDOG_GRACE && since_last_trip >= backoff_window && drops_rising && has_receivers
 }
 
 /// Spawn the per-room demux subscription task (vc-q0v).
@@ -3770,33 +3267,6 @@ fn spawn_room_dispatcher(
         // single subtraction + divide once per tick per room.
         let mut inbound_msg_count: u64 = 0;
         let mut last_rate_sample: (u64, std::time::Instant) = (0, std::time::Instant::now());
-        // vc-nys3: TASK-LOCAL inbound-drop counter — the "behind" signal that
-        // drives the SECOND (drop-slope) recovery trigger. Bumped O(1) at each of
-        // THIS dispatcher's `shed_inbound` call sites on the (already-cold)
-        // overflow path. Deliberately PER-DISPATCHER, not the process-global
-        // `SFU_DISPATCHER_INBOUND_DROPPED_TOTAL`: keying the per-room trigger on
-        // the global counter would make every room's watchdog trip the instant
-        // ANY room sheds — a synchronized resubscribe-wave against an already-
-        // stressed NATS connection (the thundering-herd hazard the per-room timer
-        // jitter exists to avoid). `(count, instant)` is the previous sample; a
-        // positive delta over the sample interval = this dispatcher is actively
-        // shedding = "behind".
-        let mut local_inbound_dropped: u64 = 0;
-        let mut last_drop_sample: (u64, std::time::Instant) = (0, std::time::Instant::now());
-        // vc-nys3: consecutive drop-slope resubscribes NOT followed by the
-        // shedding stopping. Drives the escalating `watchdog_drop_backoff_window`
-        // so a fan-out bottleneck (where resubscribe cannot help) decays to ~one
-        // probe per WATCHDOG_SILENCE_CAP instead of thrashing every tick. Reset to
-        // 0 the moment the drop delta returns to 0 (shedding stopped — the
-        // resubscribe worked or load eased), exactly like `consecutive_silent_trips`
-        // resets on real traffic.
-        let mut consecutive_drop_trips: u32 = 0;
-        // vc-nys3: instant of the last drop-slope resubscribe (or initial
-        // subscribe). The anti-thrash gate measures `since_last_trip` from here so
-        // repeated trips honour the ESCALATED backoff window. Initialised to the
-        // subscribe instant so the very first trip is governed by GRACE + the base
-        // backoff window, never sooner.
-        let mut last_drop_trip_at = subscribe_at;
         let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
         // The first tick fires immediately; skip it so the very first watchdog
         // evaluation happens one full TICK in (and is anyway gated by GRACE).
@@ -3883,266 +3353,9 @@ fn spawn_room_dispatcher(
             };
         }
 
-        // vc-vyg9: inbound-rate sample, factored out so the watchdog TIMER arm
-        // and the INLINE message-path mitigation compute it identically. Derives
-        // msgs/sec over the interval since `last_rate_sample`, publishes the
-        // process-global `sfu_dispatcher_inbound_rate` gauge, and advances the
-        // sample baseline. O(1): one subtraction + divide, no locks. The
-        // wrapping subtraction matches `inbound_msg_count`'s wrapping increment.
-        macro_rules! sample_inbound_rate {
-            ($now:expr) => {{
-                let now = $now;
-                let (prev_count, prev_at) = last_rate_sample;
-                let elapsed = now.duration_since(prev_at).as_secs_f64();
-                if elapsed > 0.0 {
-                    let delta = inbound_msg_count.wrapping_sub(prev_count) as f64;
-                    crate::metrics::SFU_DISPATCHER_INBOUND_RATE.set(delta / elapsed);
-                }
-                last_rate_sample = (inbound_msg_count, now);
-            }};
-        }
-
-        // vc-nys3: sample THIS dispatcher's inbound-drop SLOPE over the interval
-        // since `last_drop_sample` and return whether it is RISING (a positive
-        // local-drop delta). Also folds in the backoff RESET: when the delta is 0
-        // the shedding has stopped (the resubscribe worked, or the offered load
-        // eased), so `consecutive_drop_trips` resets to base — mirroring the way
-        // the `Some(msg)` arm resets `consecutive_silent_trips` on real traffic.
-        // O(1): one wrapping subtraction, no locks. Computed on the watchdog tick
-        // AND the inline message-path mirror (both pass `$now`), so the slope is
-        // sampled at ~tick cadence on both the timer arm and the starved-timer
-        // overload path. Evaluates to a `bool` (`drops_rising`).
-        macro_rules! sample_drop_slope {
-            ($now:expr) => {{
-                let now = $now;
-                let (prev_count, _prev_at) = last_drop_sample;
-                let delta = local_inbound_dropped.wrapping_sub(prev_count);
-                last_drop_sample = (local_inbound_dropped, now);
-                if delta == 0 {
-                    // Shedding stopped between samples — recovery achieved (or load
-                    // eased). Reset the escalating backoff so the NEXT genuine wedge
-                    // is recovered on the fast base window again.
-                    consecutive_drop_trips = 0;
-                }
-                delta > 0
-            }};
-        }
-
-        // vc-nys3: perform the in-place drop-slope resubscribe. SAME mechanism as
-        // the silence path's resubscribe arm: drop the old (starved) merged
-        // `Subscriber`(s) and re-establish the FULL filter set for this shard on
-        // the SAME task, then restart the grace clock so the fresh subscription
-        // gets a full window to drain before it can be judged behind again. We do
-        // NOT touch `last_msg_at` / `consecutive_silent_trips` (the silence path's
-        // state) — the two triggers are independent. On a resubscribe FAILURE we
-        // fall back to the actor respawn path and EXIT the task (`return`),
-        // identical to the silence path. A macro (not a fn) because the resubscribe
-        // must mutate the loop's `sub` and the per-task clocks in place and may
-        // `return` from the dispatcher future.
-        //
-        // Caller contract: only invoke after `watchdog_should_resubscribe_on_drops`
-        // has returned true and AFTER bumping `consecutive_drop_trips` +
-        // `last_drop_trip_at` (so the escalating backoff persists across trips).
-        macro_rules! drop_slope_resubscribe {
-            () => {
-                match subscribe_all(&nc, &subjects).await {
-                    Ok(fresh) => {
-                        let now = std::time::Instant::now();
-                        sub = fresh;
-                        subscribe_at = now;
-                        // Restart the silence clock too: a freshly-attached
-                        // subscription must not be instantly judged silent by the
-                        // OTHER watchdog the tick after a drop-slope resubscribe.
-                        last_msg_at = now;
-                        // Flush the scorer batch before looping on the fresh sub so
-                        // the resubscribe doesn't drop a tick of observations
-                        // (mirrors the silence path).
-                        flush_scorer_batch!();
-                        last_scorer_flush = now;
-                        info!(
-                            "Per-room demux drop-slope resubscribed in place to \
-                             {:?} (room {}, shard {}/{}, consecutive drop trip #{})",
-                            subjects, room, ingest_shard, n_ingest_shards,
-                            consecutive_drop_trips
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Per-room demux failed to drop-slope resubscribe to \
-                             {:?} (room {}, shard {}/{}): {} — handing off to actor \
-                             respawn",
-                            subjects, room, ingest_shard, n_ingest_shards, e
-                        );
-                        flush_scorer_batch!();
-                        let _ = chat_server.try_send(RoomDispatcherExited { room: room.clone() });
-                        return;
-                    }
-                }
-            };
-        }
-
-        // --- vc-vyg9: decouple inbound DRAIN from per-message FAN-OUT ----------
-        //
-        // PROBLEM (lj-2 defense-in-depth). The loop below performs the entire
-        // per-message fan-out (per-receiver `egress_decide_from_parsed` +
-        // `try_send`, and on the sharded path an `await` over a barrier of all
-        // shard tasks) INLINE before pulling the next message off `sub`. A
-        // transient egress/recompute spike (an AllowSet recompute storm, a
-        // late-joiner wave) therefore stalls the drain of `sub`, and async-nats'
-        // bounded 16Ki subscription buffer silently overflows — dropping inbound
-        // media and firing only an opaque, non-room-routable `SlowConsumer`.
-        //
-        // FIX. A bounded LOCAL queue (`inbound_queue`) sits between the
-        // `sub.next()` drain and the fan-out. After each fan-out completes we
-        // GREEDILY drain `sub` (non-blocking, via `now_or_never`) into this
-        // queue, so async-nats' invisible buffer is emptied promptly even while
-        // fan-out is busy. The backpressure boundary thus moves onto OUR queue,
-        // where overflow is EXPLICIT, COUNTED, and shed by priority class (P4
-        // first) — never a silent black hole.
-        //
-        // WHY THIS SHAPE IS LOWEST-OVERHEAD ON THE HOT PATH. We deliberately
-        // keep the fan-out INLINE on the dispatcher task and do NOT introduce a
-        // dedicated drain task feeding a cross-thread mpsc. In the COMMON
-        // (non-overloaded) case the greedy drain finds `sub` not-ready on its
-        // first `now_or_never` poll, the queue stays EMPTY, and every message
-        // flows `sub.next()` -> fan-out with ZERO extra allocation, ZERO
-        // cross-thread hop, and ZERO priority classification (we classify only
-        // when the queue is full and we must choose what to shed). The queue and
-        // its per-class bookkeeping engage ONLY when fan-out is slower than
-        // ingest — exactly the spike the bead targets. A cross-thread mpsc would
-        // add a hop + a channel send/recv to EVERY packet even at idle; this
-        // does not.
-        //
-        // ORDERING. Per-room ordering WITHIN a priority class is preserved: the
-        // queue is FIFO, drained head-first, and the existing fan-out barrier is
-        // unchanged (message k+1 fan-out still never starts before k's
-        // completes). The ONLY ordering change is the documented, intentional
-        // one: under genuine overload we may drop a lower-priority packet out of
-        // the middle of the stream (shed-by-class) instead of letting async-nats
-        // tail-drop an arbitrary one — strictly better than today's silent loss.
-        //
-        // We store the parsed packet ALONGSIDE the message so the queued item is
-        // parsed exactly ONCE (parse-once preserved): classification at
-        // enqueue-under-pressure and the downstream fan-out share the same
-        // `ParsedPacket`.
-        struct QueuedInbound {
-            msg: async_nats::Message,
-            parsed: Option<ParsedPacket>,
-            class: crate::sfu::priority_queue::Class,
-        }
-        let mut inbound_queue: std::collections::VecDeque<QueuedInbound> =
-            std::collections::VecDeque::new();
-
-        // --- vc-j4kz: task-local remote-publisher dedup (registration off-drain)
-        //
-        // Pre-vc-j4kz the dispatcher took the SHARED `room_state` lock per remote
-        // MEDIA packet to register cross-pod publishers: a `read()` precheck on
-        // EVERY packet (on a spill pod every sender is remote) plus a `write()`
-        // (and two snapshot calls) whenever the registry had to change. That lock
-        // work sat on the drain hot path, contending with the per-receiver
-        // `decide` read fan-out on the same lock and stalling `sub.next()`.
-        //
-        // We now keep a LOCK-FREE task-local view of what this dispatcher has
-        // already registered — `sid -> (has_video, last_sent)` — and evaluate a
-        // LOCAL mirror of the `remote_publisher_write_needed` predicate (new sid
-        // / audio→video upgrade / liveness-throttle-window expiry) against THIS
-        // map. A registration message is fired (fire-and-forget) ONLY when a
-        // change is due; the `ChatServer` actor applies it on its own thread.
-        //
-        // CONSISTENCY (NOT exact — EVENTUALLY-CONSISTENT within one liveness
-        // window). The local view tracks what THIS dispatcher has SENT, not the
-        // shared registry's true state, so the two can diverge briefly:
-        //   * If the shared registry oldest-first-EVICTS a still-live sid at
-        //     `MAX_REMOTE_PUBLISHERS`, the local map still believes it is
-        //     registered and suppresses re-registration for up to one throttle
-        //     window (~1s) until the next liveness send re-asserts it.
-        //   * If membership churn calls `prune_remote_publisher` (a remote
-        //     publisher becoming a local member, or leaving), the local map is
-        //     blind to the prune; a reconnect within the throttle window is
-        //     suppressed for up to ~1s.
-        // Both windows are bounded by `REMOTE_PUBLISHER_LIVENESS_THROTTLE` and
-        // self-heal on the next due send; until they do, `resolve_cached` covers
-        // the gap. The thresholds (`REMOTE_PUBLISHER_LIVENESS_THROTTLE`,
-        // `REMOTE_PUBLISHER_TTL`) match the shared registry so steady-state
-        // cadence is identical.
-        //
-        // SHARDING. Ingest sharding is keyed on the publisher's session id, so a
-        // given remote publisher's packets normally land on this ONE shard — the
-        // local view is complete for the publishers this dispatcher sees. The
-        // ONE exception is a rolling deploy: shard 0 also carries the legacy
-        // 3-token `room.{room}.*` wildcard, which overlaps the 4-token shard a
-        // publisher hashes to, so during migration shard 0 AND that publisher's
-        // own shard may both register it. That double-register is harmless —
-        // `note_remote_publisher` is idempotent and both senders are
-        // throttled — and resolves once the fleet is fully 4-token.
-        //
-        // BOUNDING. TTL-reaped on every send via `REMOTE_PUBLISHER_TTL`, so
-        // distinct sids that go quiet are dropped within the TTL. NOTE: unlike
-        // the shared registry, this map has NO oldest-first eviction cap — a
-        // burst of >MAX_REMOTE_PUBLISHERS distinct STILL-LIVE sids on one shard
-        // could transiently exceed `MAX_REMOTE_PUBLISHERS` entries until the next
-        // reap. The map holds only `(SessionId, bool, Instant)` (~24B) so even a
-        // pathological few-hundred-sid transient is negligible; the entries
-        // self-bound to the live sender set by TTL. Self-skip of LOCAL members is
-        // left to the actor handler (`note_remote_publisher` self-skips) — the
-        // drain path has no lock-free membership view, so it would cost a
-        // per-packet `room_state.read()` to skip them here, the exact cost this
-        // change removes; instead the local throttle caps any redundant
-        // local-member send to once per liveness window and the actor no-ops it.
-        let mut local_remote_pub: std::collections::HashMap<
-            SessionId,
-            (bool, std::time::Instant),
-        > = std::collections::HashMap::new();
-
         loop {
-            // vc-vyg9: `prequeued_parsed` carries an already-parsed
-            // `ParsedPacket` for a message served from the local backlog
-            // (parse-once preserved); `None` means the message came straight off
-            // `sub` and must be parsed below.
-            let mut prequeued_parsed: Option<Option<ParsedPacket>> = None;
-
-            // vc-vyg9: drive everything off ONE `select!`. The `biased` order is:
-            //   1. backlog (guarded by `!is_empty()`) — drain our own queue
-            //      first, in arrival order, before pulling more off `sub`. The
-            //      guard makes the `ready` future ineligible when the queue is
-            //      empty, so in STEADY STATE this arm is a no-op and we fall
-            //      through to `sub.next()` exactly as before.
-            //   2. `sub.next()` — the original inbound drain arm (unchanged).
-            //   3. watchdog tick (the liveness/resubscribe + rate-sample TIMER).
-            //   4. scorer-flush tick.
-            //
-            // CRITICAL: the `biased` order means that under SUSTAINED backlog
-            // (queue always non-empty, or `sub` always ready) arms 1/2 win EVERY
-            // iteration and the watchdog TIMER arm (#3) is STARVED — it is never
-            // polled until the drain catches up. So the two pieces of bookkeeping
-            // that arm normally drives are BOTH mitigated INLINE on the message
-            // path instead, after fan-out, so they stay fresh during overload:
-            //   - the vc-kcpg scorer flush (inline block ~after fan-out), and
-            //   - the vc-m7k6 inbound-rate sample (inline block right after it).
-            // Each inline block is gated on elapsed-since-last so it fires at
-            // ~tick cadence, not per message. Do NOT assume the timer arms keep
-            // ticking under load — they do not; the inline mitigations are what
-            // keep these signals live.
-            //
-            // The silence-watchdog resubscribe path (arm #3's later half) needs
-            // no inline mirror: it depends only on `last_msg_at` /
-            // `consecutive_silent_trips`, which the greedy drain already stamps
-            // every time it pulls a real message — so a still-draining (saturated
-            // but alive) dispatcher never looks silent, exactly as intended.
-            //
-            // Liveness/rate bookkeeping (`last_msg_at`, `consecutive_silent_trips`,
-            // `inbound_msg_count`) is stamped at DRAIN time (the `sub.next()` arm
-            // and the greedy drain at the end of the loop), NOT on backlog
-            // dequeue — a backlog item already came off `sub` and was counted
-            // then, so re-counting here would double-count the rate sample.
             let msg = tokio::select! {
                 biased;
-                // 1. Local backlog. `std::future::ready` resolves immediately;
-                //    the `if` guard disables this arm when the queue is empty.
-                Some(item) = std::future::ready(inbound_queue.pop_front()), if !inbound_queue.is_empty() => {
-                    prequeued_parsed = Some(item.parsed);
-                    item.msg
-                }
                 maybe_msg = sub.next() => match maybe_msg {
                     Some(msg) => {
                         // vc-9eh: subscription is alive — refresh liveness and
@@ -4209,52 +3422,15 @@ fn spawn_room_dispatcher(
                     // saturated-but-still-draining dispatcher, not just a silent
                     // one. Last-writer-wins across rooms (coarse process-level
                     // throughput signal, paired with the process-global drop
-                    // counter). The same computation runs INLINE on the message
-                    // path (after the scorer flush) so the gauge stays fresh even
-                    // when a sustained backlog starves THIS timer arm.
-                    sample_inbound_rate!(now);
-                    // vc-nys3: SECOND recovery trigger — rising inbound-drop slope.
-                    // Evaluated EVERY tick, BEFORE the silence pre-gate below,
-                    // because a STARVED (partially-delivering) subscription is
-                    // never silent — `last_msg_at` stays fresh, so `silence` never
-                    // reaches the window and the silence path would `continue` past
-                    // this case forever (the permanent-dark-room bug). We instead
-                    // key on whether THIS dispatcher is actively shedding. Sample
-                    // the local-drop slope (also resets `consecutive_drop_trips`
-                    // when shedding has stopped) and resubscribe if past grace AND
-                    // past the escalating anti-thrash backoff window.
-                    let drops_rising = sample_drop_slope!(now);
-                    let drop_backoff = watchdog_drop_backoff_window(consecutive_drop_trips);
-                    let since_last_drop_trip = now.duration_since(last_drop_trip_at);
-                    if watchdog_should_resubscribe_on_drops(
-                        uptime,
-                        since_last_drop_trip,
-                        drop_backoff,
-                        drops_rising,
-                        has_receivers,
-                    ) {
-                        // Escalate the drop-slope backoff and stamp the trip
-                        // instant so repeated trips honour the longer window.
-                        // Resets via `sample_drop_slope!` when the delta returns to
-                        // 0 (shedding stopped). NOTE: we do NOT reset `last_msg_at`
-                        // / `consecutive_silent_trips` — the silence trigger's state
-                        // is independent.
-                        consecutive_drop_trips = consecutive_drop_trips.saturating_add(1);
-                        last_drop_trip_at = now;
-                        warn!(
-                            "Per-room demux for room {} is actively shedding inbound \
-                             (local drop slope rising, backoff window {}ms, \
-                             consecutive drop trip #{}) while {} receiver(s) remain — \
-                             the subscription is starved/wedged (slow-consumer \
-                             backpressure that never goes fully silent); \
-                             resubscribing in place",
-                            room,
-                            drop_backoff.as_millis(),
-                            consecutive_drop_trips,
-                            receiver_count,
-                        );
-                        drop_slope_resubscribe!();
-                        continue;
+                    // counter).
+                    {
+                        let (prev_count, prev_at) = last_rate_sample;
+                        let elapsed = now.duration_since(prev_at).as_secs_f64();
+                        if elapsed > 0.0 {
+                            let delta = inbound_msg_count.wrapping_sub(prev_count) as f64;
+                            crate::metrics::SFU_DISPATCHER_INBOUND_RATE.set(delta / elapsed);
+                        }
+                        last_rate_sample = (inbound_msg_count, now);
                     }
                     // Cheap pre-gate for the RESUBSCRIBE path: avoid escalating
                     // / resubscribing until we are actually past grace AND past
@@ -4369,15 +3545,7 @@ fn spawn_room_dispatcher(
             // `msg.payload` is `bytes::Bytes`; deref to `&[u8]` for the
             // parser. The decision call below takes the `&Bytes` so it
             // can `clone()` a refcount bump per forwarded receiver.
-            //
-            // vc-vyg9: a message served from the local backlog was ALREADY
-            // parsed at enqueue time (parse-once preserved); reuse that
-            // `ParsedPacket` instead of re-parsing. A message straight off `sub`
-            // is parsed here as before.
-            let parsed = match prequeued_parsed {
-                Some(p) => p,
-                None => parse_and_inspect(&msg.payload[..]),
-            };
+            let parsed = parse_and_inspect(&msg.payload[..]);
             let subject_str: &str = msg.subject.as_ref();
 
             // p3-11: feed the per-room SpeakerScorer for every inbound
@@ -4417,25 +3585,17 @@ fn spawn_room_dispatcher(
                 }
             }
 
-            // vc-54j2 / vc-j4kz: register cross-pod publishers. A MEDIA packet
-            // whose sender is NOT a local room member arrived here via NATS
-            // federation (it joined a different pod). It must be recorded in the
-            // room's bounded remote-publisher registry so local receivers'
-            // AllowSets are augmented with it — otherwise the forwarder
-            // hard-drops its media as `unsubscribed` (the spill-pod 0-media
-            // defect).
-            //
-            // vc-j4kz: do this WITHOUT touching the shared `room_state` lock on
-            // the drain hot path. We evaluate the EXACT
-            // `remote_publisher_write_needed` predicate against a LOCK-FREE
-            // task-local view (`local_remote_pub`) and only fire a fire-and-
-            // forget `RegisterRemotePublisher` to the `ChatServer` actor — which
-            // takes the `room_state.write()` and (bump-gated) re-warm on its OWN
-            // thread — when a registration change is actually due. On a spill pod
-            // every packet is remote, so the pre-vc-j4kz per-packet READ
-            // precheck on the shared lock was itself a drain-path cost; this
-            // removes it entirely. Runs ONCE per inbound MEDIA message (not per
-            // receiver).
+            // vc-54j2: register cross-pod publishers. A MEDIA packet whose
+            // sender is NOT a local room member arrived here via NATS
+            // federation (it joined a different pod). Record it in the room's
+            // bounded remote-publisher registry so local receivers' AllowSets
+            // are augmented with it — otherwise the forwarder hard-drops its
+            // media as `unsubscribed` (the spill-pod 0-media defect). This runs
+            // ONCE per inbound MEDIA message (not per receiver) and the
+            // registry is bounded by sender count + TTL-reaped, so it adds NO
+            // per-receiver O(members) work to the hot path. `note_remote_publisher`
+            // self-skips local members, so intra-pod (owner-pod) forwarding is
+            // unchanged.
             if sfu_mode == SfuMode::Sfu {
                 if let Some(p) = parsed.as_ref() {
                     if p.wrapper.packet_type == PacketType::MEDIA.into() {
@@ -4450,78 +3610,35 @@ fn spawn_room_dispatcher(
                                 let is_video =
                                     matches!(media_type, MediaType::VIDEO | MediaType::SCREEN);
                                 let now = std::time::Instant::now();
-                                // Lock-free local mirror of
-                                // `remote_publisher_write_needed`: a send is due
-                                // for a brand-new sid, an audio→video upgrade, or
-                                // a liveness refresh past the throttle window.
-                                // Same thresholds as the shared registry, so the
-                                // actor (re-)applies an equivalent decision
-                                // (eventually-consistent within one window — see
-                                // the `local_remote_pub` declaration comment).
-                                use crate::sfu::room_state::{
-                                    REMOTE_PUBLISHER_LIVENESS_THROTTLE, REMOTE_PUBLISHER_TTL,
+                                // Fast pre-check under a READ lock. On a busy
+                                // spill pod every media packet is from a
+                                // non-local member, so an unthrottled write
+                                // would take the room's RwLock in WRITE mode
+                                // once per packet, contending with the
+                                // per-packet per-receiver `decide` READ fan-out
+                                // on the SAME lock. `remote_publisher_write_needed`
+                                // returns false for the common case (a fresh,
+                                // video-consistent liveness refresh of an
+                                // already-tracked publisher, or a local member)
+                                // so we take the write lock only when the
+                                // registry must actually change: a brand-new
+                                // sid, an audio→video upgrade, or a liveness
+                                // refresh past the throttle window (well below
+                                // the TTL, so a still-publishing sender is never
+                                // reaped for lack of a write).
+                                let write_needed = {
+                                    let g = match room_state.read() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    g.remote_publisher_write_needed(sender_sid, is_video, now)
                                 };
-                                let prior = local_remote_pub.get(&sender_sid).copied();
-                                let is_new = prior.is_none();
-                                let send_needed = match prior {
-                                    None => true,
-                                    Some((had_video, last_sent)) => {
-                                        (is_video && !had_video)
-                                            || now.duration_since(last_sent)
-                                                >= REMOTE_PUBLISHER_LIVENESS_THROTTLE
-                                    }
-                                };
-                                if send_needed {
-                                    // Fire-and-forget: the actor applies the write
-                                    // (and bump-gated re-warm) off this barrier.
-                                    // `try_send` never blocks.
-                                    let sent = chat_server
-                                        .try_send(RegisterRemotePublisher {
-                                            room: room.clone(),
-                                            sender: sender_sid,
-                                            is_video,
-                                        })
-                                        .is_ok();
-
-                                    // BRAND-NEW publisher whose send was DROPPED
-                                    // (mailbox full — most likely precisely during
-                                    // a federation wave): do NOT record it. Leaving
-                                    // no entry means the VERY NEXT packet retries
-                                    // immediately rather than waiting a full
-                                    // liveness window, so a new cross-pod
-                                    // publisher's media is not stranded
-                                    // `unsubscribed` for ~1s. Skip the reap too —
-                                    // there is nothing to record.
-                                    //
-                                    // Every OTHER case records the send: a
-                                    // successful new/refresh send, and an EXISTING
-                                    // sid even on a DROPPED liveness refresh (the
-                                    // sid is already registered, so missing one
-                                    // refresh causes no media gap — and stamping
-                                    // keeps the dropped-liveness path from spamming
-                                    // the mailbox on every packet; it retries on the
-                                    // next throttle window).
-                                    if !is_new || sent {
-                                        // Reap stale local entries on the (now
-                                        // committed) record path. O(local map size)
-                                        // and only on the throttled send path, never
-                                        // per packet at steady state. TTL-only
-                                        // bounding (no oldest-first cap — see the
-                                        // declaration comment).
-                                        local_remote_pub.retain(|_, (_, last)| {
-                                            now.duration_since(*last) <= REMOTE_PUBLISHER_TTL
-                                        });
-                                        let entry = local_remote_pub
-                                            .entry(sender_sid)
-                                            .or_insert((false, now));
-                                        // Track the video flag monotonically (an
-                                        // audio→video upgrade sticks) and stamp the
-                                        // send instant so the throttle measures from
-                                        // the last SEND, mirroring the shared
-                                        // registry's `last_seen` on a write.
-                                        entry.0 = entry.0 || is_video;
-                                        entry.1 = now;
-                                    }
+                                if write_needed {
+                                    let mut g = match room_state.write() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    g.note_remote_publisher(sender_sid, is_video, now);
                                 }
                             }
                         }
@@ -4792,212 +3909,6 @@ fn spawn_room_dispatcher(
             {
                 flush_scorer_batch!();
                 last_scorer_flush = std::time::Instant::now();
-            }
-
-            // vc-vyg9: STARVATION-PROOF inline inbound-rate sample. Same hazard
-            // as the scorer flush above: the `biased` `select!` lets the backlog
-            // / `sub.next()` arms win every iteration while there is work, so a
-            // SUSTAINED overload starves the `watchdog.tick()` TIMER arm — the
-            // exact window vc-m7k6's `sfu_dispatcher_inbound_rate` gauge is meant
-            // to expose. Mirror the scorer-flush precedent: re-sample the rate
-            // HERE on the message path once a full `WATCHDOG_TICK` has elapsed
-            // since the last sample, using the identical computation as the timer
-            // arm (`sample_inbound_rate!`). This keeps the gauge fresh during a
-            // saturated drain even though the timer arm never runs. O(1), no
-            // locks. Gated on elapsed so steady state still samples at ~tick
-            // cadence rather than on every message.
-            if last_rate_sample.1.elapsed() >= WATCHDOG_TICK {
-                sample_inbound_rate!(std::time::Instant::now());
-            }
-
-            // --- vc-vyg9: GREEDY non-blocking drain of `sub` -> local queue ----
-            //
-            // This is the decouple. Now that this iteration's fan-out is DONE,
-            // opportunistically pull every message async-nats has ALREADY
-            // buffered for us — WITHOUT awaiting — and stash it on the bounded
-            // local `inbound_queue`. `now_or_never()` polls the `sub.next()`
-            // future exactly once: if a message is immediately ready it is
-            // taken; the moment `sub` would block (the COMMON case — nothing
-            // buffered) the poll returns `None` and we stop. So in steady state
-            // this is a SINGLE non-blocking poll per iteration that finds
-            // nothing, and the queue stays empty.
-            //
-            // Why this defeats the silent black hole: async-nats' 16Ki buffer is
-            // emptied into OUR queue here even though fan-out for the NEXT
-            // message hasn't started. A fan-out spike can no longer let `sub`'s
-            // invisible buffer overflow, because we drain it down promptly right
-            // after each fan-out. The backpressure now lands on `inbound_queue`,
-            // which is bounded by `DISPATCHER_INBOUND_QUEUE_CAP` and shed
-            // EXPLICITLY by priority class below.
-            //
-            // We cap the work per pass at the queue capacity so a relentless
-            // publisher storm can't make this inner loop run unbounded and
-            // starve the watchdog/scorer timer arms of the outer `select!`.
-            {
-                use futures::future::FutureExt;
-                let mut drained_this_pass = 0usize;
-                while drained_this_pass < DISPATCHER_INBOUND_QUEUE_CAP {
-                    // Single non-blocking poll. `None` here means EITHER the
-                    // stream is pending (nothing buffered — stop draining) OR it
-                    // closed. We cannot distinguish without consuming, and a
-                    // genuine close is still surfaced by the blocking `sub.next()`
-                    // arm on the next outer-loop iteration (it returns `None` ->
-                    // `break`), so deferring close-detection to there preserves
-                    // the existing `RoomDispatcherExited` respawn path exactly.
-                    let next = sub.next().now_or_never();
-                    let m = match next {
-                        Some(Some(m)) => m,
-                        // `Some(None)` = stream closed; `None` = pending. Either
-                        // way stop greedy-draining this pass.
-                        _ => break,
-                    };
-                    drained_this_pass += 1;
-                    // Liveness/rate bookkeeping: a greedily-drained message is a
-                    // real inbound message off `sub`, identical to the blocking
-                    // arm — so refresh liveness and count it for the rate sample.
-                    last_msg_at = std::time::Instant::now();
-                    consecutive_silent_trips = 0;
-                    inbound_msg_count = inbound_msg_count.wrapping_add(1);
-
-                    // Parse ONCE here (parse-once preserved end-to-end): the
-                    // dequeue path above reuses this `ParsedPacket` rather than
-                    // re-parsing. Classify into the EXISTING priority taxonomy so
-                    // the shed policy can prefer P4 first.
-                    let parsed = parse_and_inspect(&m.payload[..]);
-                    let class = classify_inbound(parsed.as_ref());
-
-                    if inbound_queue.len() < DISPATCHER_INBOUND_QUEUE_CAP {
-                        // Common (transient-spike) case: room in the queue, just
-                        // enqueue in arrival order.
-                        inbound_queue.push_back(QueuedInbound {
-                            msg: m,
-                            parsed,
-                            class,
-                        });
-                        continue;
-                    }
-
-                    // GENUINE SUSTAINED OVERLOAD: the queue is full. Shed by
-                    // priority class, P4 (lowest) FIRST — never silently. Defer
-                    // to the pure, unit-tested `plan_shed`: it picks the
-                    // lowest-priority resident and decides whether to drop the
-                    // incoming message or evict that resident.
-                    //
-                    // Building the `resident_classes` Vec here is an O(cap)
-                    // allocation, but it occurs ONLY on the genuine-overload
-                    // path (queue at capacity), never in steady state — so it
-                    // does not touch the common hot path.
-                    let resident_classes: Vec<crate::sfu::priority_queue::Class> =
-                        inbound_queue.iter().map(|item| item.class).collect();
-                    // vc-nys3: every branch below sheds exactly ONE inbound
-                    // message, so bump the TASK-LOCAL drop counter once per shed.
-                    // This is the "behind" signal that drives the drop-slope
-                    // recovery trigger; it is per-dispatcher (NOT the process-global
-                    // counter) so a shedding room only trips ITS OWN watchdog, never
-                    // a synchronized resubscribe-wave across all rooms. O(1) on the
-                    // already-cold overflow path; the steady-state (queue-not-full)
-                    // path above never reaches here.
-                    local_inbound_dropped = local_inbound_dropped.wrapping_add(1);
-                    match plan_shed(&resident_classes, class) {
-                        (ShedDecision::DropIncoming, _) => {
-                            // The incoming message is the lowest-priority
-                            // candidate of all; drop IT and keep the queue.
-                            shed_inbound(class);
-                        }
-                        (ShedDecision::EvictResident, Some(lowest_idx)) => {
-                            // Evict the lowest-priority resident (its class is
-                            // <= the incoming's priority), then enqueue the
-                            // incoming at the tail (arrival order within the
-                            // surviving classes is preserved).
-                            if let Some(victim) = inbound_queue.remove(lowest_idx) {
-                                shed_inbound(victim.class);
-                            }
-                            inbound_queue.push_back(QueuedInbound {
-                                msg: m,
-                                parsed,
-                                class,
-                            });
-                        }
-                        (ShedDecision::EvictResident, None) => {
-                            // Unreachable in practice (full queue => non-empty
-                            // residents => `plan_shed` returns Some). Defensive:
-                            // drop the incoming rather than panic on the hot
-                            // path, still counted.
-                            shed_inbound(class);
-                        }
-                    }
-                }
-            }
-
-            // vc-nys3: STARVATION-PROOF inline DROP-SLOPE mirror. The drop-slope
-            // recovery trigger lives in the `watchdog.tick()` arm, but the `biased`
-            // `select!` STARVES that timer arm under sustained backlog — and that is
-            // EXACTLY when shedding is happening and we most need to evaluate
-            // recovery. (Unlike the silence trigger, which the greedy drain keeps
-            // alive implicitly via `last_msg_at`, the drop-slope trigger has no such
-            // implicit refresh.) So we mirror it HERE on the message path, after the
-            // greedy drain (so any shed THIS iteration is already counted), gated on
-            // elapsed-since-last-sample like the scorer-flush and rate-sample inline
-            // mirrors above. The single shared `last_drop_sample.1` clock means the
-            // timer arm and this mirror never double-sample within one tick:
-            // whichever runs first advances the baseline, the other sees < TICK
-            // elapsed and skips. The elapsed-tick path itself is O(1) and lock-free
-            // (only `sample_drop_slope!` runs); the `receivers.read()` lock is taken
-            // only when the drop slope is rising AND the grace/backoff gates have
-            // passed — i.e. on the genuine shedding path, never on a healthy room.
-            if last_drop_sample.1.elapsed() >= WATCHDOG_TICK {
-                let now = std::time::Instant::now();
-                // `sample_drop_slope!` MUST run every elapsed tick regardless of the
-                // gates below: it advances the shared `last_drop_sample` clock and
-                // resets `consecutive_drop_trips` on delta==0 (a healthy tick), so
-                // gating the sample itself would freeze the backoff. O(1), no lock.
-                let drops_rising = sample_drop_slope!(now);
-                let uptime = now.duration_since(subscribe_at);
-                let drop_backoff = watchdog_drop_backoff_window(consecutive_drop_trips);
-                let since_last_drop_trip = now.duration_since(last_drop_trip_at);
-                // Receiver presence requires a read lock, so take it ONLY once the
-                // cheap duration gates have passed AND the slope is actually rising —
-                // i.e. only on the genuine shedding path. On a healthy high-traffic
-                // room that never sheds, `drops_rising` is false and we never lock.
-                // `watchdog_should_resubscribe_on_drops` itself requires all of
-                // `drops_rising`, the grace/backoff gates, and `has_receivers`, so
-                // reading receivers before these gates pass is wasted work.
-                if drops_rising
-                    && uptime >= WATCHDOG_GRACE
-                    && since_last_drop_trip >= drop_backoff
-                {
-                    let has_receivers = {
-                        let g = match receivers.read() {
-                            Ok(g) => g,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        !g.is_empty()
-                    };
-                    if watchdog_should_resubscribe_on_drops(
-                        uptime,
-                        since_last_drop_trip,
-                        drop_backoff,
-                        drops_rising,
-                        has_receivers,
-                    ) {
-                        consecutive_drop_trips = consecutive_drop_trips.saturating_add(1);
-                        last_drop_trip_at = now;
-                        warn!(
-                            "Per-room demux for room {} is actively shedding inbound \
-                             (inline drop-slope mirror; backoff window {}ms, consecutive \
-                             drop trip #{}) — the subscription is starved/wedged under \
-                             sustained overload (timer arm starved by biased select!); \
-                             resubscribing in place",
-                            room,
-                            drop_backoff.as_millis(),
-                            consecutive_drop_trips,
-                        );
-                        // On success the macro restarts the clocks and falls through —
-                        // the outer `loop` re-iterates on the fresh subscription. On
-                        // failure it hands off to the actor respawn and `return`s.
-                        drop_slope_resubscribe!();
-                    }
-                }
             }
         }
         // vc-kcpg: drain any remaining batched observations before the task
