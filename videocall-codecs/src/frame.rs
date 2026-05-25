@@ -69,6 +69,13 @@ pub struct VideoFrame {
     /// The codec used to encode this frame.
     #[serde(default)]
     pub codec: FrameCodec,
+    /// The temporal layer this frame belongs to (0 = base layer / T0,
+    /// 1 = T1, 2 = T2). Used by the jitter buffer to relax the strict
+    /// sequence-continuity check when the SFU strips T1/T2 enhancement
+    /// layers per-receiver. Defaults to 0 for legacy senders without a
+    /// RoutingHeader (which are treated as T0-only / non-SVC).
+    #[serde(default)]
+    pub temporal_layer_id: u8,
     /// The encoded video data.
     pub data: Vec<u8>,
     /// The timestamp of the frame.

@@ -1,0 +1,100 @@
+# Local NATS configuration for the k3d videocall stack.
+#
+# Differences from the production overlays (helm/global/{us-east,singapore}/nats):
+#   - single replica, no cluster mode (one node is plenty for local dev)
+#   - no cross-region gateway
+#   - jetstream off (the SFU pipeline does not currently use JS)
+#   - auth.enabled: true FROM DAY ONE (the local stack mirrors the
+#     production auth posture from sfu-update/audits/nats-acl-audit.md S-P0-4)
+#
+# ----------------------------------------------------------------------------
+# Subchart value-path convention (read this before editing!)
+# ----------------------------------------------------------------------------
+# This is a thin wrapper chart whose only dependency is the upstream `nats`
+# helm chart (https://nats-io.github.io/k8s/helm/charts/, version 0.19.x).
+# Wrapper values are nested under the subchart alias `nats:`, so ANY override
+# meant for the upstream chart lives under that key.
+#
+# Inside the upstream chart's own values.yaml, the TOP-LEVEL keys are:
+#   nats:         (server-level — image, resources, jetstream, client, ...)
+#   cluster:
+#   leafnodes:
+#   gateway:
+#   mqtt:
+#   websocket:
+#   natsbox:
+#   reloader:
+#   exporter:
+#   auth:         <-- auth.enabled + auth.basic.users[] live HERE, not under nats.nats.auth
+#   ...
+#
+# That means the wrapper paths must be:
+#   nats.nats.<x>      for server-level keys (jetstream, resources, image, ...)
+#   nats.cluster.<x>   for cluster-mode keys
+#   nats.auth.<x>      for auth keys  <-- IMPORTANT: auth is a sibling of nats,
+#                                          not a child. Earlier versions of this
+#                                          file had `nats.nats.auth.*`, which
+#                                          silently does nothing — the subchart
+#                                          renders nats.conf with NO
+#                                          `authorization {}` block at all,
+#                                          leaving the server unauthenticated.
+#   nats.natsbox.<x>   for the nats-box helper pod
+#   nats.gateway.<x>   for super-cluster gateway
+#
+# Verified by `helm template` against the rendered ConfigMap (templates/
+# configmap.yaml in the upstream chart) — see bead vco-ciu for the audit trail.
+# ----------------------------------------------------------------------------
+#
+# auth.user and auth.password are intentionally NOT set here. helm/local/up.sh
+# reads helm/local/.env (a developer-local file derived from
+# helm/local/.env.example) and injects the credentials at install time via
+# --set-string flags on `nats.auth.basic.users[0].{user,password}`. The
+# matching `nats-credentials` Secret is created by up.sh from the same .env
+# values so that app pods can mount it as a secretKeyRef the way they do in
+# production.
+nats:
+  # Server-level overrides (subchart's own top-level `nats:` block).
+  nats:
+    jetstream:
+      enabled: false
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+  # Single-node — no clustering in local dev.
+  cluster:
+    enabled: false
+    replicas: 1
+    noAdvertise: true
+
+  # nats-box helper pod — used by helm/local/validate-nats.sh to exercise auth
+  # from inside the cluster.
+  natsbox:
+    enabled: true
+
+  # Basic-auth users are injected by helm/local/up.sh via:
+  #   --set-string nats.auth.basic.users[0].user=$NATS_USER
+  #   --set-string nats.auth.basic.users[0].password=$NATS_PASSWORD
+  auth:
+    enabled: true
+
+  # No cross-region gateway in the local rig.
+  gateway:
+    enabled: false
+
+# Service configuration — match the production naming so app charts can use
+# the same `nats:4222` resolver style without a local-only override.
+service:
+  name: nats
+  type: ClusterIP
+  ports:
+    client:
+      enabled: true
+      port: 4222
+    monitor:
+      enabled: true
+      port: 8222

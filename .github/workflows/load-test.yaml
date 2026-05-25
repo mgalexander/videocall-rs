@@ -1,0 +1,176 @@
+name: SFU Load Test
+
+# P6 close-gate workflow (bead vc-8qc):
+#   - merge-gate: every PR, 50 bots (5 senders + 45 listeners), 1 SFU replica.
+#   - release-gate: nightly + manual dispatch, 200 bots (10 + 190), 2 SFU replicas.
+#
+# Both jobs stand up a k3d cluster on the GitHub Actions runner, run the
+# bot orchestration mode as an in-cluster Job, and evaluate the resulting
+# JSON summary against threshold flags. See helm/local/load-test.sh and
+# scripts/eval-load-test.py for the gory details, and sfu-update/test-matrix.md
+# for the threshold rationale.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - experimental-sfu
+  schedule:
+    # 07:17 UTC nightly — offset off the hour so we're not contending with
+    # other org-wide nightly jobs. Release-gate job only.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      gate:
+        description: "Which gate to run (merge / release / both)"
+        required: false
+        default: "both"
+
+jobs:
+  # vc-1re: byte-fidelity integrity smoke. Tiny, cluster-free job that runs the
+  # bot's `--verify-integrity` trailer codec end-to-end (loopback self-test:
+  # crc_mismatches==0 / unexplained_gaps==0 clean, ==1 on a corrupted byte),
+  # the 100-bot startup-race stress test, and the fixed-shape counter-contract
+  # serialization tests. Runs on every PR so the integrity path never rots dark
+  # between the heavier 50-bot gates.
+  integrity-smoke:
+    if: ${{ github.event_name != 'schedule' }}
+    name: bot integrity-ON smoke (vc-1re)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps (libvpx, opus, pkg-config, clang)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libvpx-dev libopus-dev libclang-dev clang
+      - name: Run integrity-ON smoke
+        run: make ci-bot-integrity
+
+  merge-gate:
+    # Run on every PR + manual dispatch. Skip when invoked via schedule
+    # (cron triggers only fire `release-gate` to keep nightly cheap).
+    if: ${{ github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.gate == 'both' || inputs.gate == 'merge') }}
+    name: 50-bot merge gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3d + helm + kubectl
+        # nolar/setup-k3d-k3s pins a recent k3d release and also installs
+        # kubectl. helm comes pre-installed on ubuntu-latest, but we run
+        # the action's helm setup belt-and-braces.
+        uses: nolar/setup-k3d-k3s@v1
+        with:
+          version: v1.30
+          k3d-name: ci-prep-skip
+          # We don't want this action to spin up a cluster — helm/local/up.sh
+          # creates its own k3d cluster with the videocall-specific port
+          # mappings. Setting k3d-args to --no-* makes the action skip
+          # cluster creation; we just want the binaries on PATH.
+          k3d-args: --no-rollback
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Ensure binaries are on PATH (fallback if action skipped)
+        run: |
+          set -euo pipefail
+          command -v k3d || curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          command -v helm || curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          command -v kubectl || sudo apt-get update && sudo apt-get install -y kubectl || true
+          k3d version
+          helm version
+          kubectl version --client
+
+      - name: Run merge-gate load test
+        # `make ci-load-test` is responsible for up.sh -> load-test.sh ->
+        # down.sh. Exit code mirrors the eval verdict.
+        run: make ci-load-test
+
+      - name: Upload verdict + bot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-merge-gate-${{ github.run_id }}
+          path: |
+            load-test-verdict.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          set +e
+          echo "--- pods (all namespaces) ---"
+          kubectl get pods -A -o wide || true
+          echo "--- events (default ns, last 50) ---"
+          kubectl get events -n default --sort-by=.lastTimestamp | tail -50 || true
+          echo "--- SFU logs (tail=300) ---"
+          kubectl logs -n default -l app.kubernetes.io/name=rustlemania-webtransport --tail=300 --prefix=true || true
+          echo "--- bot Job logs ---"
+          kubectl logs -n default job/load-test --tail=-1 || true
+
+      - name: Tear down (safety net)
+        if: always()
+        run: ./helm/local/down.sh || true
+
+  release-gate:
+    # Run nightly + on manual dispatch (when user picks 'release' or 'both').
+    # NOT triggered on `pull_request` — the merge gate is the per-PR check.
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.gate == 'both' || inputs.gate == 'release')) }}
+    name: 200-bot release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3d + helm + kubectl
+        uses: nolar/setup-k3d-k3s@v1
+        with:
+          version: v1.30
+          k3d-name: ci-prep-skip
+          k3d-args: --no-rollback
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Ensure binaries are on PATH (fallback if action skipped)
+        run: |
+          set -euo pipefail
+          command -v k3d || curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          command -v helm || curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          command -v kubectl || sudo apt-get update && sudo apt-get install -y kubectl || true
+          k3d version
+          helm version
+          kubectl version --client
+
+      - name: Run release-gate load test
+        run: make ci-load-test-release
+
+      - name: Upload verdict + bot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-release-gate-${{ github.run_id }}
+          path: |
+            load-test-verdict.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          set +e
+          echo "--- pods (all namespaces) ---"
+          kubectl get pods -A -o wide || true
+          echo "--- events (default ns, last 50) ---"
+          kubectl get events -n default --sort-by=.lastTimestamp | tail -50 || true
+          echo "--- SFU logs (tail=500) ---"
+          kubectl logs -n default -l app.kubernetes.io/name=rustlemania-webtransport --tail=500 --prefix=true || true
+          echo "--- bot Job logs ---"
+          kubectl logs -n default job/load-test --tail=-1 || true
+
+      - name: Tear down (safety net)
+        if: always()
+        run: ./helm/local/down.sh || true

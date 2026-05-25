@@ -36,6 +36,33 @@ env:
       secretKeyRef:
         name: jwt-secret
         key: secret
+  # NATS basic auth (per sfu-update/audits/nats-acl-audit.md).
+  # When the `nats-credentials` Secret does not exist or is missing keys,
+  # these env vars resolve empty and the actix-api falls back to no-auth
+  # (back-compat with the current cluster). After ops creates the Secret
+  #   kubectl create secret generic nats-credentials \
+  #       --from-literal=user=<user> --from-literal=password=<password>
+  # AND helm/global/{us-east,singapore}/nats/values.yaml has auth.enabled=true,
+  # auth is enforced end-to-end.
+  - name: NATS_USER
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: user
+        optional: true
+  - name: NATS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: password
+        optional: true
+  # Optional NATS TLS. Defaults to off for back-compat. Flip to "true"
+  # AFTER nats-credentials is in place AND the nats Helm chart serves TLS.
+  - name: NATS_TLS
+    value: "false"
+  # Optional NATS_TLS_CA path inside the pod. Empty -> use system trust.
+  - name: NATS_TLS_CA
+    value: ""
 resources:
   limits:
     cpu: "500m"

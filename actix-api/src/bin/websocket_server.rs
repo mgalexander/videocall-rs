@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use actix::Actor;
 use actix_cors::Cors;
 use actix_web::{
     cookie::{
@@ -27,7 +26,6 @@ use actix_web::{
 };
 use reqwest::header::LOCATION;
 use sec_api::{
-    actors::chat_server::ChatServer,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
@@ -37,12 +35,54 @@ use sec_api::{
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
+    sfu::{SfuConfig, SfuMode},
     version,
 };
 use tracing::{debug, error, info};
 use videocall_types::truthy;
 
 const SCOPE: &str = "email profile";
+
+/**
+ * Health check endpoint for k8s liveness/readiness probes.
+ *
+ * Forwarding-liveness + inbound-saturation aware (vc-zf8k + vc-m7k6). Mirrors
+ * the webtransport server's `health_responder` EXACTLY: the WebSocket binary
+ * runs the same per-room dispatchers, so it is subject to the same
+ * forwarding-silence (vc-zf8k) and invisible inbound-saturation (vc-m7k6)
+ * failure modes and must report them identically. Returns 200 when forwarding
+ * in steady state OR idle/empty; returns 503 only when a room with
+ * receivers+publishers was observed within the threshold AND either no forward
+ * has happened (silence) OR inbound is being dropped right now (saturation).
+ * Requires no auth so probes can reach it regardless of OAuth/DB config.
+ */
+async fn health_responder() -> HttpResponse {
+    use sec_api::sfu::forwarding_health::{
+        combined_health_decision, forwarding_silence_threshold, global,
+        inbound_saturation_threshold, now_millis, HealthStatus,
+    };
+    let snap = global().snapshot();
+    let status = combined_health_decision(
+        now_millis(),
+        snap,
+        forwarding_silence_threshold(),
+        inbound_saturation_threshold(),
+    );
+    match status {
+        HealthStatus::Healthy => HttpResponse::Ok().body("Ok"),
+        HealthStatus::ForwardingStalled => {
+            error!(
+                last_forward_ms = snap.last_forward_ms,
+                last_should_forward_ms = snap.last_should_forward_ms,
+                last_inbound_drop_ms = snap.last_inbound_drop_ms,
+                "/healthz: forwarding stalled OR inbound saturated while \
+                 receivers+publishers present — reporting 503 so the liveness \
+                 probe can restart the pod"
+            );
+            HttpResponse::ServiceUnavailable().body("forwarding stalled")
+        }
+    }
+}
 
 /**
  * Query parameters for the login endpoint
@@ -272,15 +312,70 @@ async fn main() -> std::io::Result<()> {
         .init();
     info!("start");
 
+    // vc-8wd: arm targeted SFU tracing from SFU_TRACE_ROOM/SESSION (read
+    // once). No-op when unset, which is the default.
+    sec_api::sfu::trace::init();
+
+    // SFU_TRANSPORT_KIND identifies this binary's transport family for the
+    // wave-3 ADMISSION_DECISION{REDIRECT} DNS template (bead vc-8oa / p6-5).
+    // Set unconditionally at startup so the JoinRoom handler doesn't have to
+    // care which binary it's hosted in; the chart can override this for
+    // non-standard deployments.
+    if std::env::var_os("SFU_TRANSPORT_KIND").is_none() {
+        std::env::set_var("SFU_TRANSPORT_KIND", "websocket");
+    }
+
+    let pod_name = std::env::var("POD_NAME").ok();
+    let self_ordinal = sec_api::sfu::affinity::self_ordinal_from_env();
+    let replicas = sec_api::sfu::affinity::replicas_from_env();
+    info!(
+        pod_name = ?pod_name,
+        replicas,
+        self_ordinal = ?self_ordinal,
+        "affinity init"
+    );
+    // p6-5 follow-up: surface a misconfigured POD_NAME at startup rather
+    // than letting the JoinRoom handler silently skip redirects on every
+    // join. `self_ordinal_from_env()` returns `None` ONLY when POD_NAME
+    // is set but cannot be parsed as `<name>-<u32>`.
+    if pod_name.is_some() && self_ordinal.is_none() {
+        tracing::warn!(
+            pod_name = ?pod_name,
+            "POD_NAME is set but the trailing ordinal could not be parsed; \
+             room→pod affinity redirects will be DISABLED for this pod. \
+             Expected form: <statefulset>-<ordinal>, e.g. \
+             rustlemania-websocket-0"
+        );
+    }
+
+    let sfu_config = SfuConfig::from_env();
+    info!("sfu mode: {}", sfu_config.mode);
+    if sfu_config.mode == SfuMode::Sfu {
+        info!("sfu mode active (no-op shim)");
+    }
+
     let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
-    let nats_client = async_nats::ConnectOptions::new()
-        .require_tls(false)
-        .ping_interval(std::time::Duration::from_secs(10))
-        .connect(&nats_url)
+    let nats_client = sec_api::nats_connect::connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
 
-    let chat = ChatServer::new(nats_client.clone()).await.start();
+    // Start the ChatServer shard pool (bead vc-8txq). SFU_CHATSERVER_SHARDS
+    // actors (default: available_parallelism), each on its own Arbiter thread,
+    // with rooms partitioned by jump-hash. The shared connection-state handle
+    // (vc-ud6o E3) is owned by the pool and cloned into every `SessionLogic`
+    // via AppState so the off-actor media-publish path can read the `Active`
+    // gate lock-free.
+    let chat = sec_api::actors::chat_server::ChatServerPool::new(
+        nats_client.clone(),
+        sfu_config.chatserver_shards,
+        sfu_config.fanout_worker_threads,
+    )
+    .await;
+    let connection_states = chat.connection_states_handle();
+    info!(
+        "ChatServerPool started with {} shard(s)",
+        chat.shard_count()
+    );
 
     // Create SessionManager
     let session_manager = SessionManager::new();
@@ -322,6 +417,7 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
+                    connection_states: connection_states.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)
@@ -329,6 +425,7 @@ async fn main() -> std::io::Result<()> {
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
+                .route("/healthz", web::get().to(health_responder))
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
@@ -339,6 +436,7 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
+                    connection_states: connection_states.clone(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),
@@ -357,6 +455,7 @@ async fn main() -> std::io::Result<()> {
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
+                .route("/healthz", web::get().to(health_responder))
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");
@@ -367,6 +466,7 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
+                    connection_states: connection_states.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)
@@ -374,6 +474,7 @@ async fn main() -> std::io::Result<()> {
                 .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .route("/version", web::get().to(version::websocket_version))
+                .route("/healthz", web::get().to(health_responder))
         }
     })
     .bind((

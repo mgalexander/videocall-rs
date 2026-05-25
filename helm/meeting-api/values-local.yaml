@@ -1,0 +1,153 @@
+# Local k3d overlay for helm/meeting-api.
+#
+# Differences from helm/meeting-api/values.yaml (production):
+#   - image points at the local k3d registry (localhost:5000) with the
+#     :dev tag built by helm/local/up.sh from Dockerfile.meeting-api.
+#   - pullPolicy: IfNotPresent because images are side-loaded into the
+#     cluster via `k3d image import`; pulling would race the import.
+#   - env block is overridden in full (Helm replaces lists, never merges)
+#     to point at the local hostnames + the local-credentials Secrets.
+#   - DATABASE_URL is sourced from the `meeting-api-db` Secret (key: url)
+#     which helm/local/up.sh assembles from helm/local/.env before the
+#     install. Same pattern as jwt-secret / nats-credentials — keeps the
+#     postgres password out of the checked-in overlay and decouples the
+#     env list ordering from the install command.
+#   - ingress targets api.videocall.local with the local-selfsigned
+#     ClusterIssuer (note: cluster-issuer, NOT issuer; the local
+#     cert-manager wiring uses a ClusterIssuer so any namespace can
+#     request certs without a per-namespace Issuer).
+
+image:
+  repository: localhost:5000/videocall-meeting-api
+  pullPolicy: IfNotPresent
+  tag: dev
+
+env:
+  - name: RUST_LOG
+    value: info
+  # Disable tracing-subscriber's ANSI colorization. kubectl logs streams
+  # raw bytes; color escapes only get in the way of grep/log aggregators
+  # (and previously broke helm/local/validate-app.sh's `auth="on"` match
+  # — bead vco-gek). NO_COLOR=1 is the de-facto cross-tooling standard.
+  - name: NO_COLOR
+    value: "1"
+  - name: LISTEN_ADDR
+    value: "0.0.0.0:8081"
+  # DATABASE_URL is sourced from the meeting-api-db Secret. helm/local/up.sh
+  # composes the full postgres URL from helm/local/.env and applies it as
+  # `meeting-api-db` (key: url) before the helm install. Using valueFrom
+  # here mirrors jwt-secret / nats-credentials and removes the brittle
+  # list-index coupling that the previous --set-string env[2] approach
+  # required.
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: meeting-api-db
+        key: url
+  - name: JWT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: jwt-secret
+        key: secret
+  - name: TOKEN_TTL_SECS
+    value: "86400"
+  - name: SESSION_TTL_SECS
+    value: "315360000"
+  # Self-signed certs over local DNS: cookies cannot be Secure-only
+  # (browsers reject Secure cookies served over http or untrusted https
+  # without the CA installed) and the parent domain is .videocall.local.
+  - name: COOKIE_SECURE
+    value: "false"
+  - name: COOKIE_DOMAIN
+    value: ".videocall.local"
+  - name: COOKIE_NAME
+    value: "session"
+  - name: CORS_ALLOWED_ORIGIN
+    value: "https://app.videocall.local"
+  # --- OAuth / OIDC (left blank for local; the secretKeyRefs in the
+  # default values.yaml are optional, so unset env here is fine) ---
+  - name: OAUTH_ISSUER
+    value: ""
+  - name: OAUTH_CLIENT_ID
+    valueFrom:
+      secretKeyRef:
+        name: oauth-credentials
+        key: client-id
+        optional: true
+  - name: OAUTH_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: oauth-credentials
+        key: client-secret
+        optional: true
+  - name: OAUTH_AUTH_URL
+    value: ""
+  - name: OAUTH_TOKEN_URL
+    value: ""
+  - name: OAUTH_JWKS_URL
+    value: ""
+  - name: OAUTH_USERINFO_URL
+    value: ""
+  - name: OAUTH_REDIRECT_URL
+    value: "https://api.videocall.local/login/callback"
+  - name: OAUTH_SCOPES
+    value: "openid email profile"
+  - name: AFTER_LOGIN_URL
+    value: "https://app.videocall.local"
+  - name: ALLOWED_REDIRECT_URLS
+    value: "https://app.videocall.local"
+  - name: SERVICE_VERSION_URLS
+    value: ""
+  # NATS basic auth — same Secret as the SFU charts. The local stack
+  # always runs with `nats.auth.enabled: true` (see
+  # helm/global/local/nats/values.yaml), so secretKeyRef is NOT marked
+  # optional here: missing creds must be a hard pod-start failure, not
+  # silent fall-through to no-auth (which is what bit us in bead vco-757
+  # — pods started before the Secret had user/password keys, env vars
+  # resolved empty, and the pods then ran indefinitely against an
+  # auth-enforcing NATS, logging `authorization violation` every reconnect).
+  # The production values.yaml keeps `optional: true` for back-compat
+  # with the us-east/singapore overlays which still have auth disabled.
+  - name: NATS_URL
+    value: nats:4222
+  - name: NATS_USER
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: user
+  - name: NATS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: password
+  - name: NATS_TLS
+    value: "false"
+  - name: NATS_TLS_CA
+    value: ""
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    # NOTE: cluster-issuer, NOT issuer. The local cert-manager wiring
+    # uses a ClusterIssuer (`local-selfsigned`); a per-namespace Issuer
+    # would require a separate apply in every namespace.
+    cert-manager.io/cluster-issuer: local-selfsigned
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Explicitly drop the production annotations (Helm merges maps, so
+    # values.yaml entries bleed through unless nulled out here).
+    cert-manager.io/issuer: null
+    kubernetes.io/tls-acme: null
+  hosts:
+    - host: api.videocall.local
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: meeting-api
+            port:
+              number: 8081
+  tls:
+    - secretName: meeting-api-local-tls
+      hosts:
+        - api.videocall.local

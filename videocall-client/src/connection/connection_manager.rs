@@ -36,12 +36,37 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
+use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
+
+// -----------------------------------------------------------------------
+// Client capability bitmask (advertised to the SFU on the CONNECTION packet).
+//
+// The SFU uses this to decide what behaviour it can rely on for each receiver
+// (e.g. whether to populate the routing header, whether the client speaks the
+// subscription protocol). New bits MUST be powers of two and MUST NOT be
+// recycled — the wire meaning of each bit is part of the SFU<->client contract.
+// -----------------------------------------------------------------------
+
+/// Client honours the SFU routing header on inbound media (p1-x routing work).
+const CAP_SFU_ROUTING_HEADER: u32 = 1;
+
+/// Client supports SVC (Scalable Video Coding) negotiation. NOT set yet — P4 work.
+#[allow(dead_code)]
+const CAP_SVC: u32 = 2;
+
+/// Client speaks the per-receiver subscription protocol.
+const CAP_SUBSCRIPTION: u32 = 4;
+
+/// Capability bitmask advertised by this client build.
+const CLIENT_CAPABILITIES: u32 = CAP_SFU_ROUTING_HEADER | CAP_SUBSCRIPTION;
 
 /// Maximum plausible RTT in milliseconds. Measurements exceeding this are
 /// discarded as they likely result from clock anomalies or extreme outliers.
@@ -59,6 +84,46 @@ fn monotonic_now_ms() -> f64 {
         .and_then(|w| w.performance())
         .map(|p| p.now())
         .unwrap_or_else(js_sys::Date::now)
+}
+
+/// Replace the host portion of a URL of the form
+/// `scheme://host[:port][/path][?query][#fragment]` with `new_host`,
+/// preserving everything else verbatim.
+///
+/// IPv6 literals (bracketed hosts) are NOT supported. Returns `None` if the
+/// input is missing the `scheme://` prefix or has an empty host segment.
+///
+/// Used by [`ConnectionManager::apply_admission_redirect`] to rewrite an
+/// existing template URL so it points at the redirect target while preserving
+/// scheme, port, and path.
+fn substitute_url_host(url: &str, new_host: &str) -> Option<String> {
+    // Split into scheme and the rest at "://".
+    let scheme_end = url.find("://")?;
+    let scheme = &url[..scheme_end];
+    if scheme.is_empty() {
+        return None;
+    }
+    let rest = &url[scheme_end + 3..];
+
+    // Find where the authority component (host[:port]) ends — at the first
+    // '/', '?', or '#'.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let tail = &rest[auth_end..];
+
+    if authority.is_empty() {
+        return None;
+    }
+
+    // Preserve the port (if any) from the authority.
+    let port = authority.rsplit_once(':').map(|(_, p)| p);
+
+    let new_authority = match port {
+        Some(p) => format!("{new_host}:{p}"),
+        None => new_host.to_string(),
+    };
+
+    Some(format!("{scheme}://{new_authority}{tail}"))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +185,10 @@ pub struct ConnectionManagerOptions {
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
     pub userid: String,
+    /// Meeting the user is joining. Included in the CONNECTION packet emitted
+    /// to the SFU on the elected transport so the server can scope routing and
+    /// subscription state to this meeting.
+    pub meeting_id: String,
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
@@ -175,6 +244,13 @@ pub struct ConnectionManager {
     /// Set to `true` when the user explicitly calls `disconnect()`. Checked by
     /// the reconnection loop to prevent reconnecting after an intentional leave.
     intentionally_disconnected: Rc<RefCell<bool>>,
+
+    /// Number of ADMISSION_DECISION REDIRECT responses chased so far on this
+    /// manager instance. A redirect must be one-shot: if a redirect target
+    /// ALSO redirects, that signals a config / jump-hash inconsistency and we
+    /// fail hard rather than infinite-loop. This counter is only reset by
+    /// constructing a fresh `ConnectionManager` (i.e. a new join attempt).
+    redirect_chase_depth: Rc<RefCell<u32>>,
 }
 
 impl ConnectionManager {
@@ -213,6 +289,7 @@ impl ConnectionManager {
             reelection_in_progress: false,
             old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            redirect_chase_depth: Rc::new(RefCell::new(0)),
         };
 
         Ok(manager)
@@ -222,6 +299,39 @@ impl ConnectionManager {
     /// the real manager instance. Called by `ConnectionController` after construction.
     pub fn set_manager_ref(&mut self, weak: Weak<RefCell<ConnectionManager>>) {
         self.manager_ref = weak;
+    }
+
+    /// Mark the reconnection phase as `Reconnecting` from the inbound REDIRECT
+    /// path WITHOUT clobbering a backoff loop's live counters.
+    ///
+    /// The `ReconnectionPhase::Reconnecting { attempt, next_delay_ms }` variant
+    /// is overloaded by two cooperating mechanisms:
+    ///
+    /// 1. The exponential-backoff reconnection loop (`run_reconnection_loop`)
+    ///    publishes its real attempt counter and next-delay there so UI
+    ///    consumers can render "retrying in Ns (attempt N)".
+    /// 2. The ADMISSION_DECISION REDIRECT inbound path (vc-6rf) uses the same
+    ///    variant with sentinel zeros as a *suppression marker* — its only job
+    ///    is to make the connection-lost callback's phase guard short-circuit
+    ///    so a redundant backoff loop is not spawned on top of the redirect
+    ///    chase.
+    ///
+    /// If a REDIRECT arrives AFTER the connection-lost callback has already
+    /// fired and the backoff loop is mid-flight (vc-339), a naive unconditional
+    /// write would reset the published counters to `attempt=0, next_delay_ms=0`,
+    /// which UI consumers reading `reconnection_phase()` would briefly observe
+    /// as an attempt-counter regression. We therefore preserve the in-flight
+    /// values whenever the phase is already `Reconnecting` — the backoff loop
+    /// owns those fields. Otherwise we install the sentinel-zeros marker.
+    fn mark_reconnecting_preserving_in_flight(phase: &RefCell<ReconnectionPhase>) {
+        let already_reconnecting =
+            matches!(*phase.borrow(), ReconnectionPhase::Reconnecting { .. });
+        if !already_reconnecting {
+            *phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+                attempt: 0,
+                next_delay_ms: 0,
+            };
+        }
     }
 
     /// Kick off the initial server election. Must be called **after**
@@ -277,6 +387,151 @@ impl ConnectionManager {
 
         // Start fresh election — creates new connections and begins RTT probing.
         self.start_election()
+    }
+
+    /// Cleanup invoked when `apply_admission_redirect` returns `Err` from the
+    /// REDIRECT-handler's spawned task: log the error, clear the suppression
+    /// marker (so a stale `Reconnecting` doesn't outlive a terminal failure),
+    /// and notify the UI with a terminal `ConnectionState::Failed`.
+    ///
+    /// Extracted as an associated fn so unit tests can drive the exact same
+    /// body the production failure-branch runs (vc-76h).
+    fn on_redirect_apply_failed(
+        reconnection_phase: &Rc<RefCell<ReconnectionPhase>>,
+        on_state_changed: &Callback<ConnectionState>,
+        redirect_to: &str,
+        err: &anyhow::Error,
+    ) {
+        error!("apply_admission_redirect failed: {err}");
+        *reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
+        on_state_changed.emit(ConnectionState::Failed {
+            error: format!("Redirect apply failed: {err}"),
+            last_known_server: Some(redirect_to.to_string()),
+        });
+    }
+
+    /// Apply an `ADMISSION_DECISION { status=REDIRECT, redirect_to=<dns> }`
+    /// from the server: rewrite the configured URL list so that the matching
+    /// transport now points at a single URL whose host is `redirect_to`,
+    /// clear the other transport's URL list, tear down all current
+    /// connections, and start a fresh election.
+    ///
+    /// The transport (WebSocket vs WebTransport) is inferred from
+    /// `redirect_to` itself — the server's DNS format is
+    /// `rustlemania-{transport}-{ordinal}.{transport}-headless.svc.cluster.local`.
+    /// The redirect is authoritative about which pod owns the room, so the
+    /// other transport list is cleared: probing the wrong-owner pod over
+    /// another transport would just redirect again.
+    ///
+    /// Single-shot: each call increments `redirect_chase_depth`. Once depth
+    /// reaches 2, this method refuses to chase further (treats it as a config
+    /// or jump-hash inconsistency) and returns `Err`. The counter is only
+    /// reset by constructing a fresh `ConnectionManager`.
+    ///
+    /// Returns `Err` if no existing options URL of the matching transport is
+    /// available to serve as a template (we need its scheme, port, and path),
+    /// if the transport hint is missing from `redirect_to`, or if the chase
+    /// depth limit has been hit.
+    pub fn apply_admission_redirect(&mut self, redirect_to: String) -> Result<()> {
+        info!("Applying ADMISSION_DECISION redirect to {redirect_to}");
+
+        // Single-shot bookkeeping. Bump first so a re-entrant redirect (e.g.
+        // arriving while we're still tearing the old connection down) still
+        // trips the guard.
+        let new_depth = {
+            let mut d = self.redirect_chase_depth.borrow_mut();
+            *d += 1;
+            *d
+        };
+        if new_depth >= 2 {
+            let msg = format!(
+                "Redirect chase depth = {new_depth}; refusing to chase further (likely config / jump-hash inconsistency)",
+            );
+            error!("{msg}");
+            // The caller (inbound callback) maps this Err to
+            // ConnectionState::Failed with last_known_server = Some(redirect_to),
+            // so we don't double-emit here.
+            return Err(anyhow!(msg));
+        }
+
+        // Infer transport from the DNS pattern. Strict: an empty / unknown
+        // hint is a config bug — fail hard rather than guess.
+        let is_webtransport = if redirect_to.contains("-webtransport-") {
+            true
+        } else if redirect_to.contains("-websocket-") {
+            false
+        } else {
+            let msg =
+                format!("ADMISSION_DECISION redirect_to has no transport hint: {redirect_to}",);
+            error!("{msg}");
+            return Err(anyhow!(msg));
+        };
+
+        // Pick a template URL from the current options so we can preserve
+        // scheme, port, and path while swapping the host.
+        let template = if is_webtransport {
+            self.options.webtransport_urls.first().cloned()
+        } else {
+            self.options.websocket_urls.first().cloned()
+        };
+
+        let template = match template {
+            Some(t) => t,
+            None => {
+                let msg = format!(
+                    "ADMISSION_DECISION redirect to {redirect_to} but no template {} URL is configured",
+                    if is_webtransport { "WebTransport" } else { "WebSocket" },
+                );
+                error!("{msg}");
+                return Err(anyhow!(msg));
+            }
+        };
+
+        let new_url = match substitute_url_host(&template, &redirect_to) {
+            Some(u) => u,
+            None => {
+                let msg = format!(
+                    "ADMISSION_DECISION redirect: failed to substitute host in template {template} with {redirect_to}",
+                );
+                error!("{msg}");
+                return Err(anyhow!(msg));
+            }
+        };
+
+        // Authoritative swap: matching transport -> single redirect URL; the
+        // other list is cleared so we don't probe the wrong-owner pod via the
+        // alternate transport.
+        if is_webtransport {
+            self.options.webtransport_urls = vec![new_url.clone()];
+            self.options.websocket_urls.clear();
+        } else {
+            self.options.websocket_urls = vec![new_url.clone()];
+            self.options.webtransport_urls.clear();
+        }
+
+        info!(
+            "Redirect target URL = {new_url} (transport = {})",
+            if is_webtransport {
+                "WebTransport"
+            } else {
+                "WebSocket"
+            },
+        );
+
+        // Tear down current connections and start a fresh, immediate election
+        // (no exponential backoff — the redirect is authoritative & instant).
+        //
+        // Skip the live election restart if the manager_ref hasn't been wired
+        // up yet — this matters for unit tests that exercise this method
+        // directly without a full `ConnectionController` around it. In
+        // production `set_manager_ref` is called by `ConnectionController::new`
+        // before any inbound packets can arrive.
+        if self.manager_ref.upgrade().is_some() {
+            self.reset_and_start_election()
+        } else {
+            debug!("apply_admission_redirect: manager_ref not set — skipping election restart (test-only path)");
+            Ok(())
+        }
     }
 
     /// Start the election process by creating all connections upfront
@@ -396,12 +651,108 @@ impl ConnectionManager {
         let userid = self.options.userid.clone();
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
+        let on_state_changed = self.options.on_state_changed.clone();
         let rtt_responses = self.rtt_responses.clone();
         let own_session_id = self.own_session_id.clone();
         let pending_session_ids = self.pending_session_ids.clone();
         let active_connection_id = self.active_connection_id.clone();
+        let reconnection_phase = self.reconnection_phase.clone();
+        let manager_ref = self.manager_ref.clone();
 
         Callback::from(move |packet: PacketWrapper| {
+            // Intercept ADMISSION_DECISION REDIRECT before forwarding to UI.
+            //
+            // p6-6: the server emits an ADMISSION_DECISION{ status=REDIRECT,
+            // redirect_to=<owner-pod DNS> } when this connection landed on the
+            // wrong jump-hash owner pod. We swap the configured URLs to the
+            // target pod and restart the election. Other statuses (ADMITTED /
+            // QUEUED / REJECTED / UNKNOWN) flow through to `on_inbound_media`
+            // unchanged so existing/future handlers can react.
+            if packet.packet_type == PacketType::ADMISSION_DECISION.into() {
+                if let Ok(decision) = AdmissionDecision::parse_from_bytes(&packet.data) {
+                    if decision.status == AdmissionStatus::REDIRECT.into() {
+                        let redirect_to = decision.redirect_to.clone();
+                        info!(
+                            "ADMISSION_DECISION REDIRECT received on {connection_id}: target={redirect_to}",
+                        );
+
+                        if redirect_to.is_empty() {
+                            warn!("ADMISSION_DECISION REDIRECT with empty redirect_to — ignoring",);
+                            return;
+                        }
+
+                        // Mark phase as Reconnecting synchronously so that the
+                        // connection-lost callback (which will fire once the
+                        // server closes the old connection) short-circuits at
+                        // its existing phase-guard instead of launching a
+                        // redundant exponential-backoff reconnection loop.
+                        // `complete_election` resets this back to Idle on a
+                        // successful new election.
+                        //
+                        // The `Reconnecting` variant doubles as both an
+                        // "in-flight backoff loop" indicator (with real
+                        // attempt/next_delay_ms counters owned by
+                        // `run_reconnection_loop`) and a "redirect chase in
+                        // flight" suppression marker (with sentinel zeros).
+                        // vc-339: if a REDIRECT arrives while a backoff loop is
+                        // already mid-flight, preserve its live counters so UI
+                        // consumers don't observe a transient attempt-counter
+                        // regression.
+                        Self::mark_reconnecting_preserving_in_flight(&reconnection_phase);
+
+                        // Notify UI that we're chasing the redirect. Single-
+                        // shot bookkeeping & the actual URL swap / election
+                        // restart happen inside `apply_admission_redirect`.
+                        on_state_changed.emit(ConnectionState::Reconnecting {
+                            server_url: redirect_to.clone(),
+                            attempt: 1,
+                        });
+
+                        // Dispatch to the manager on a fresh task so we don't
+                        // borrow the manager from inside the inbound callback.
+                        // `apply_admission_redirect` owns the chase-depth
+                        // bookkeeping so we don't touch the counter here.
+                        let manager_ref = manager_ref.clone();
+                        let on_state_changed = on_state_changed.clone();
+                        let reconnection_phase = reconnection_phase.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let Some(mgr_rc) = manager_ref.upgrade() else {
+                                warn!(
+                                    "ADMISSION_DECISION REDIRECT: manager dropped before redirect could be applied",
+                                );
+                                return;
+                            };
+
+                            let result = {
+                                let mut mgr = mgr_rc.borrow_mut();
+                                mgr.apply_admission_redirect(redirect_to.clone())
+                            };
+
+                            if let Err(e) = result {
+                                // Clear the suppression marker so it doesn't
+                                // linger past a terminal failure, and notify
+                                // the UI. Extracted into a helper so unit
+                                // tests can exercise the exact same body
+                                // (vc-76h).
+                                Self::on_redirect_apply_failed(
+                                    &reconnection_phase,
+                                    &on_state_changed,
+                                    &redirect_to,
+                                    &e,
+                                );
+                            }
+                        });
+
+                        return;
+                    }
+                } else {
+                    warn!(
+                        "ADMISSION_DECISION packet on {connection_id} failed to parse — forwarding as-is",
+                    );
+                }
+                // Non-REDIRECT statuses fall through to on_inbound_media below.
+            }
+
             // Intercept SESSION_ASSIGNED before anything else
             if packet.packet_type == PacketType::SESSION_ASSIGNED.into() {
                 let sid = packet.session_id;
@@ -597,6 +948,29 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Build the CONNECTION packet sent to the SFU on the elected transport.
+    ///
+    /// The packet carries the meeting id and a bitmask of client capabilities
+    /// so the server can decide what behaviour it can rely on for this
+    /// receiver. Sent reliably (stream, not datagram) and emitted on every
+    /// election — initial connect AND each re-election produces a fresh
+    /// transport with no prior server-side context, so the SFU must be
+    /// re-told. Do not gate this behind a "first time" flag.
+    fn build_connection_packet(userid: &str, meeting_id: &str) -> Result<PacketWrapper> {
+        let connection_packet = ConnectionPacket {
+            meeting_id: meeting_id.to_string(),
+            client_capabilities: Some(CLIENT_CAPABILITIES),
+            ..Default::default()
+        };
+
+        Ok(PacketWrapper {
+            packet_type: PacketType::CONNECTION.into(),
+            user_id: userid.as_bytes().to_vec(),
+            data: connection_packet.write_to_bytes()?,
+            ..Default::default()
+        })
+    }
+
     /// Create an RTT probe packet
     fn create_rtt_packet(&self, timestamp: f64) -> Result<PacketWrapper> {
         let media_packet = MediaPacket {
@@ -677,6 +1051,13 @@ impl ConnectionManager {
                     .borrow_mut()
                     .replace(connection_id.clone());
 
+                // A successful election clears any in-flight reconnection /
+                // redirect suppression marker. The exponential-backoff
+                // reconnection loop also resets this on its own success
+                // path; setting it here covers the redirect path (which
+                // bypasses that loop).
+                *self.reconnection_phase.borrow_mut() = ReconnectionPhase::Idle;
+
                 // Mark as active
                 if let Some(mut_measurement) = self.rtt_measurements.get_mut(&connection_id) {
                     mut_measurement.active = true;
@@ -717,6 +1098,26 @@ impl ConnectionManager {
                 if let Some(connection) = self.connections.get_mut(&connection_id) {
                     connection.start_heartbeat(self.options.userid.clone());
                     info!("Started heartbeat on elected connection {}", connection_id);
+
+                    // Emit a one-shot CONNECTION packet on the elected (reliable)
+                    // transport advertising this client's capabilities. The SFU
+                    // uses this to adapt per-receiver forwarding (routing
+                    // header, subscription protocol, etc.).
+                    match Self::build_connection_packet(
+                        &self.options.userid,
+                        &self.options.meeting_id,
+                    ) {
+                        Ok(packet) => {
+                            info!(
+                                "Emitting CONNECTION packet: meeting_id={}, client_capabilities={:#x}",
+                                self.options.meeting_id, CLIENT_CAPABILITIES
+                            );
+                            connection.send_packet(packet);
+                        }
+                        Err(e) => {
+                            error!("Failed to build CONNECTION packet: {e}");
+                        }
+                    }
                 }
 
                 // Store baseline RTT for re-election quality monitoring.
@@ -1801,6 +2202,7 @@ mod tests {
             websocket_urls: vec![],
             webtransport_urls: vec![],
             userid: "test-user".to_string(),
+            meeting_id: "test-meeting".to_string(),
             on_inbound_media: Callback::from(|_: PacketWrapper| {}),
             on_state_changed: Callback::from(|_: ConnectionState| {}),
             peer_monitor: Callback::from(|_: ()| {}),
@@ -1830,6 +2232,7 @@ mod tests {
             reelection_in_progress: false,
             old_active_connection: None,
             intentionally_disconnected: Rc::new(RefCell::new(false)),
+            redirect_chase_depth: Rc::new(RefCell::new(0)),
         }
     }
 
@@ -2653,6 +3056,501 @@ mod tests {
     }
 
     // ===================================================================
+    // 11. ADMISSION_DECISION redirect handling (p6-6)
+    // ===================================================================
+
+    #[test]
+    fn substitute_url_host_replaces_host_with_port() {
+        let out = substitute_url_host(
+            "wss://old.example.com:443/lobby",
+            "rustlemania-websocket-3.websocket-headless.svc.cluster.local",
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some("wss://rustlemania-websocket-3.websocket-headless.svc.cluster.local:443/lobby")
+        );
+    }
+
+    #[test]
+    fn substitute_url_host_replaces_host_without_port() {
+        let out = substitute_url_host(
+            "https://old.example.com/lobby",
+            "rustlemania-webtransport-0.webtransport-headless.svc.cluster.local",
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                "https://rustlemania-webtransport-0.webtransport-headless.svc.cluster.local/lobby"
+            )
+        );
+    }
+
+    #[test]
+    fn substitute_url_host_preserves_query_string() {
+        let out = substitute_url_host("wss://old.example.com:443/lobby?token=abc", "new.host");
+        assert_eq!(out.as_deref(), Some("wss://new.host:443/lobby?token=abc"));
+    }
+
+    #[test]
+    fn substitute_url_host_preserves_fragment() {
+        let out = substitute_url_host("https://old.example.com/path#frag", "new.host");
+        assert_eq!(out.as_deref(), Some("https://new.host/path#frag"));
+    }
+
+    #[test]
+    fn substitute_url_host_handles_bare_host_no_path() {
+        let out = substitute_url_host("wss://old.example.com", "new.host");
+        assert_eq!(out.as_deref(), Some("wss://new.host"));
+
+        let out = substitute_url_host("wss://old.example.com:9443", "new.host");
+        assert_eq!(out.as_deref(), Some("wss://new.host:9443"));
+    }
+
+    #[test]
+    fn substitute_url_host_returns_none_for_malformed_input() {
+        assert!(substitute_url_host("not-a-url", "new.host").is_none());
+        assert!(substitute_url_host("://no-scheme.example.com", "new.host").is_none());
+        assert!(substitute_url_host("wss://", "new.host").is_none());
+        assert!(substitute_url_host("wss:///just-path", "new.host").is_none());
+    }
+
+    #[test]
+    fn apply_admission_redirect_webtransport_target_swaps_url_lists() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls = vec!["wss://old-ws.example.com:443/lobby".to_string()];
+
+        let redirect_dns =
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string();
+        mgr.apply_admission_redirect(redirect_dns.clone()).unwrap();
+
+        // WebTransport list is replaced with a single substituted URL.
+        assert_eq!(mgr.options.webtransport_urls.len(), 1);
+        assert_eq!(
+            mgr.options.webtransport_urls[0],
+            format!("https://{redirect_dns}:9443/lobby")
+        );
+
+        // The other transport's list is cleared (the redirect is
+        // authoritative; we don't want to probe the wrong-owner pod over WS).
+        assert!(mgr.options.websocket_urls.is_empty());
+
+        // Depth counter incremented.
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 1);
+    }
+
+    #[test]
+    fn apply_admission_redirect_websocket_target_swaps_url_lists() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls = vec!["wss://old-ws.example.com:443/lobby".to_string()];
+
+        let redirect_dns =
+            "rustlemania-websocket-5.websocket-headless.svc.cluster.local".to_string();
+        mgr.apply_admission_redirect(redirect_dns.clone()).unwrap();
+
+        // WebSocket list is replaced with a single substituted URL.
+        assert_eq!(mgr.options.websocket_urls.len(), 1);
+        assert_eq!(
+            mgr.options.websocket_urls[0],
+            format!("wss://{redirect_dns}:443/lobby")
+        );
+
+        // The WebTransport list is cleared.
+        assert!(mgr.options.webtransport_urls.is_empty());
+
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 1);
+    }
+
+    #[test]
+    fn apply_admission_redirect_second_call_fails_hard() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+
+        // First call succeeds.
+        mgr.apply_admission_redirect(
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string(),
+        )
+        .unwrap();
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 1);
+
+        // Second call: depth would become >= 2 → fail hard.
+        let result = mgr.apply_admission_redirect(
+            "rustlemania-webtransport-7.webtransport-headless.svc.cluster.local".to_string(),
+        );
+        assert!(result.is_err(), "second redirect should fail");
+        assert!(*mgr.redirect_chase_depth.borrow() >= 2);
+    }
+
+    #[test]
+    fn apply_admission_redirect_fails_when_no_matching_template_url() {
+        let mut mgr = make_test_manager();
+        // Only WebTransport templates configured; redirect points to WebSocket.
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls.clear();
+
+        let result = mgr.apply_admission_redirect(
+            "rustlemania-websocket-3.websocket-headless.svc.cluster.local".to_string(),
+        );
+        assert!(
+            result.is_err(),
+            "redirect without matching template URL should fail hard"
+        );
+
+        // URL lists must be unchanged on failure.
+        assert_eq!(mgr.options.webtransport_urls.len(), 1);
+        assert!(mgr.options.websocket_urls.is_empty());
+    }
+
+    #[test]
+    fn apply_admission_redirect_fails_when_dns_has_no_transport_hint() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+        mgr.options.websocket_urls = vec!["wss://old-ws.example.com:443/lobby".to_string()];
+
+        // DNS missing the "-webtransport-" / "-websocket-" infix.
+        let result = mgr.apply_admission_redirect("some-random-pod.svc.cluster.local".to_string());
+        assert!(result.is_err());
+
+        // URL lists must be unchanged on failure.
+        assert_eq!(mgr.options.webtransport_urls.len(), 1);
+        assert_eq!(mgr.options.websocket_urls.len(), 1);
+    }
+
+    #[test]
+    fn redirect_chase_depth_initial_value_is_zero() {
+        let mgr = make_test_manager();
+        assert_eq!(*mgr.redirect_chase_depth.borrow(), 0);
+    }
+
+    // ===================================================================
+    // vc-6rf: suppress reconnect loop while an ADMISSION_DECISION redirect
+    // is in flight.
+    // ===================================================================
+
+    /// The inbound REDIRECT callback marks `reconnection_phase = Reconnecting`
+    /// synchronously (before the manager-borrow happens on the spawned task).
+    /// This unit test mimics that path: it sets the phase the way the
+    /// callback does and then invokes `apply_admission_redirect`. The phase
+    /// must remain Reconnecting after the redirect is applied — the
+    /// connection-lost callback's phase guard relies on this marker still
+    /// being set when the server closes the old connection.
+    #[test]
+    fn redirect_inbound_path_sets_reconnection_phase_to_reconnecting() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+
+        // Step 1 — mimic the synchronous set the inbound callback performs.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 0,
+            next_delay_ms: 0,
+        };
+
+        // Step 2 — apply the redirect (the rest of the callback's work).
+        mgr.apply_admission_redirect(
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string(),
+        )
+        .unwrap();
+
+        // The redirect path leaves the suppression marker in place;
+        // complete_election will clear it on the next successful election.
+        assert!(matches!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting { .. }
+        ));
+    }
+
+    /// A successful `complete_election` must reset `reconnection_phase` to
+    /// Idle. This guarantees that the redirect-path suppression marker
+    /// doesn't outlive the redirect chase.
+    #[test]
+    fn complete_election_resets_reconnection_phase_to_idle() {
+        let mut mgr = make_test_manager();
+
+        // Pretend a redirect is in flight: phase is Reconnecting.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 0,
+            next_delay_ms: 0,
+        };
+
+        // Provide a single usable measurement so find_best_connection() can
+        // elect a winner. The connection itself does not need to exist in
+        // mgr.connections — complete_election guards every Connection access
+        // behind `if let Some(...)`.
+        insert_measurement(&mut mgr, "wt_0", true, Some(50.0), vec![50.0, 50.0, 50.0]);
+
+        mgr.complete_election();
+
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Idle);
+    }
+
+    /// On election failure (no usable measurements), the phase is NOT reset
+    /// to Idle — only a successful election clears the suppression marker.
+    #[test]
+    fn complete_election_failure_leaves_reconnection_phase_untouched() {
+        let mut mgr = make_test_manager();
+
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 3,
+            next_delay_ms: 2000,
+        };
+
+        // No measurements → find_best_connection returns Err.
+        mgr.complete_election();
+
+        assert!(matches!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting { attempt: 3, .. }
+        ));
+    }
+
+    // ===================================================================
+    // vc-339: redirect inbound path must not clobber a backoff loop's
+    // live attempt/next_delay_ms counters.
+    // ===================================================================
+
+    /// If a REDIRECT packet arrives AFTER the connection-lost callback has
+    /// already spawned `run_reconnection_loop` and the loop has published its
+    /// real attempt/next_delay_ms values, the inbound REDIRECT path must
+    /// preserve those counters. Otherwise any UI consumer reading
+    /// `reconnection_phase()` between the REDIRECT write and the next loop
+    /// iteration would observe a transient attempt-counter regression.
+    #[test]
+    fn redirect_inbound_path_preserves_in_flight_backoff_attempt() {
+        let mgr = make_test_manager();
+
+        // Mid-flight backoff loop state.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 3,
+            next_delay_ms: 2000,
+        };
+
+        // Apply the same read-modify-write the inbound REDIRECT handler uses.
+        ConnectionManager::mark_reconnecting_preserving_in_flight(&mgr.reconnection_phase);
+
+        // Backoff loop's published counters must be untouched.
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 3,
+                next_delay_ms: 2000,
+            }
+        );
+    }
+
+    /// When no backoff loop is in flight (phase is Idle), the inbound REDIRECT
+    /// path installs the sentinel-zeros suppression marker so the connection-
+    /// lost callback's phase guard short-circuits on the close that follows
+    /// the redirect.
+    #[test]
+    fn redirect_inbound_path_sets_sentinel_when_phase_is_idle() {
+        let mgr = make_test_manager();
+
+        // Phase starts as Idle.
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Idle);
+
+        ConnectionManager::mark_reconnecting_preserving_in_flight(&mgr.reconnection_phase);
+
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 0,
+                next_delay_ms: 0,
+            }
+        );
+    }
+
+    /// `Failed` is not `Reconnecting`, so the inbound REDIRECT path resets it
+    /// to the sentinel-zeros marker rather than leaving the terminal-failure
+    /// state in place. This guards against a stale `Failed` outliving a
+    /// subsequent reconnection opportunity.
+    #[test]
+    fn redirect_inbound_path_overwrites_failed_with_sentinel() {
+        let mgr = make_test_manager();
+
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Failed;
+
+        ConnectionManager::mark_reconnecting_preserving_in_flight(&mgr.reconnection_phase);
+
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 0,
+                next_delay_ms: 0,
+            }
+        );
+    }
+
+    // ===================================================================
+    // vc-76h: directly drive the Callback returned by
+    // `create_connection_lost_callback` and exercise the failure-cleanup
+    // bookkeeping that the inbound REDIRECT handler relies on.
+    // ===================================================================
+
+    /// Test 1 — Phase-guard short-circuit when already Reconnecting.
+    ///
+    /// Invokes the connection-lost callback while `reconnection_phase` is
+    /// already `Reconnecting { .. }` and asserts that:
+    ///
+    ///   1. `on_state_changed` does NOT receive a fresh
+    ///      `ConnectionState::Reconnecting { server_url: <old> }` frame, and
+    ///   2. The async reconnection loop is NOT launched.
+    ///
+    /// Observability for (2): `run_reconnection_loop` is dispatched through
+    /// `wasm_bindgen_futures::spawn_local` immediately AFTER the
+    /// `on_state_changed.emit(Reconnecting { .. })` call, and both sit on
+    /// the far side of the phase guard. We can't directly observe
+    /// spawned-ness without a wasm runtime, but because the emit and the
+    /// spawn are bracketed by the same guard on the same control-flow path,
+    /// the absence of an emission is a sound proxy for the absence of the
+    /// spawn.
+    ///
+    /// Note: the callback clears `active_connection_id` BEFORE reaching the
+    /// phase guard. We pre-set `active_connection_id` to the connection's
+    /// own id so the active-connection check lets control flow through to
+    /// the phase guard.
+    #[test]
+    fn connection_lost_callback_short_circuits_when_already_reconnecting() {
+        let mut mgr = make_test_manager();
+
+        // Capture every ConnectionState the callback emits.
+        let captured: Rc<RefCell<Vec<ConnectionState>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured_clone = captured.clone();
+        mgr.options.on_state_changed = Callback::from(move |state: ConnectionState| {
+            captured_clone.borrow_mut().push(state);
+        });
+
+        // Pre-set the active connection so the callback gets past the
+        // "non-active connection lost" early-return.
+        let conn_id = "wt_0".to_string();
+        let server_url = "https://old-wt.example.com:9443/lobby".to_string();
+        *mgr.active_connection_id.borrow_mut() = Some(conn_id.clone());
+
+        // Pre-set reconnection_phase to Reconnecting with distinct, easily
+        // identifiable counter values. If the phase guard fails to fire, the
+        // callback would overwrite this with { attempt: 0, next_delay_ms:
+        // RECONNECT_INITIAL_DELAY_MS }.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 7,
+            next_delay_ms: 4321,
+        };
+
+        // Build the callback and fire it.
+        let cb = mgr.create_connection_lost_callback(conn_id.clone(), server_url.clone());
+        cb.emit(JsValue::NULL);
+
+        // Assertion (1): no ConnectionState was emitted at all — the guard
+        // returns before the Reconnecting-frame emit on the happy path.
+        let emitted = captured.borrow();
+        assert!(
+            emitted.is_empty(),
+            "expected no ConnectionState emissions while phase-guard short-circuits, got {emitted:?}",
+        );
+
+        // (2) follows from (1): emit and spawn share the same guard.
+
+        // Side-effect check: the active-connection clear runs BEFORE the
+        // phase guard, so it must have executed.
+        assert!(
+            mgr.active_connection_id.borrow().is_none(),
+            "active_connection_id must be cleared on connection-lost before the phase guard fires",
+        );
+
+        // The pre-existing Reconnecting counters must be untouched (the
+        // happy-path overwrite would have replaced attempt:7 with attempt:0).
+        assert_eq!(
+            mgr.reconnection_phase(),
+            ReconnectionPhase::Reconnecting {
+                attempt: 7,
+                next_delay_ms: 4321,
+            },
+            "phase-guard short-circuit must leave the in-flight Reconnecting counters untouched",
+        );
+    }
+
+    /// Test 2 — Redirect-failure cleanup emits the terminal
+    /// `ConnectionState::Failed { last_known_server: Some(target) }` and
+    /// clears the suppression marker.
+    ///
+    /// The real failure branch lives inside a `spawn_local`-driven task
+    /// launched by the inbound REDIRECT handler, which a non-wasm unit test
+    /// can't drive directly. Instead the cleanup body is extracted into
+    /// `ConnectionManager::on_redirect_apply_failed`; production calls it
+    /// with the live `anyhow::Error` returned by `apply_admission_redirect`,
+    /// and this test calls it with the very same Err — produced by really
+    /// invoking `apply_admission_redirect` twice so its depth guard trips.
+    /// That keeps the test honest: failure trigger AND cleanup body are
+    /// shared with production, not mimicked.
+    #[test]
+    fn redirect_failure_cleanup_emits_failed_state() {
+        let mut mgr = make_test_manager();
+        mgr.options.webtransport_urls = vec!["https://old-wt.example.com:9443/lobby".to_string()];
+
+        // Pretend a backoff loop was mid-flight; the cleanup helper must
+        // overwrite this to Failed regardless of prior state.
+        *mgr.reconnection_phase.borrow_mut() = ReconnectionPhase::Reconnecting {
+            attempt: 2,
+            next_delay_ms: 1500,
+        };
+
+        // Capture state emissions.
+        let captured: Rc<RefCell<Vec<ConnectionState>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let on_state_changed: Callback<ConnectionState> =
+            Callback::from(move |state: ConnectionState| {
+                captured_clone.borrow_mut().push(state);
+            });
+
+        // Produce a genuine Err from apply_admission_redirect by applying
+        // two redirects. The second one trips the depth guard and returns
+        // the same anyhow::Error the production spawn_local task inspects.
+        mgr.apply_admission_redirect(
+            "rustlemania-webtransport-2.webtransport-headless.svc.cluster.local".to_string(),
+        )
+        .unwrap();
+
+        let redirect_to =
+            "rustlemania-webtransport-7.webtransport-headless.svc.cluster.local".to_string();
+        let err = mgr
+            .apply_admission_redirect(redirect_to.clone())
+            .expect_err("second redirect must fail hard with depth >= 2");
+
+        // Drive the SAME helper production calls. No mirrored body in the
+        // test — if the cleanup ever changes, both sides change together.
+        ConnectionManager::on_redirect_apply_failed(
+            &mgr.reconnection_phase,
+            &on_state_changed,
+            &redirect_to,
+            &err,
+        );
+
+        // Phase moved to Failed (overwriting the in-flight Reconnecting).
+        assert_eq!(mgr.reconnection_phase(), ReconnectionPhase::Failed);
+
+        // Exactly one Failed frame, with last_known_server matching the
+        // redirect target and the error message derived from the real Err.
+        let emitted = captured.borrow();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "expected exactly one ConnectionState emission, got {emitted:?}",
+        );
+        match &emitted[0] {
+            ConnectionState::Failed {
+                error,
+                last_known_server,
+            } => {
+                assert_eq!(last_known_server.as_deref(), Some(redirect_to.as_str()));
+                assert!(
+                    error.starts_with("Redirect apply failed:"),
+                    "error message should be prefixed by the cleanup-helper format, got {error:?}",
+                );
+            }
+            other => panic!("expected ConnectionState::Failed, got {other:?}"),
+        }
+    }
+
+    // ===================================================================
     // Integration test notes
     // ===================================================================
     //
@@ -2667,7 +3565,11 @@ mod tests {
     //
     // - `complete_election()` with live connections (selects best, starts heartbeat)
     //
-    // - `create_connection_lost_callback` -> spawns reconnection loop
+    // - `create_connection_lost_callback`'s happy path (the path that ends
+    //   in `spawn_local`). The phase-guard short-circuit branch is covered
+    //   by `connection_lost_callback_short_circuits_when_already_reconnecting`
+    //   above; the spawn_local-driven async reconnection loop itself needs
+    //   the wasm-bindgen-test harness.
     //
     // These should be covered by wasm-bindgen-test integration tests or E2E tests.
 }

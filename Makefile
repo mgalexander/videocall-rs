@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci ci-load-test ci-load-test-release
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -115,4 +115,71 @@ e2e-lint:
 # Auto-fix lint and formatting issues
 e2e-fmt:
 	cd e2e && npm run lint:fix && npm run format:fix
+
+# ---------------------------------------------------------------------------
+# Load-test CI gates (P6 close gate — bead vc-8qc)
+# ---------------------------------------------------------------------------
+#
+# These targets stand up the local k3d stack, run an in-cluster bot Job,
+# evaluate the orchestrator JSON summary against threshold flags, and
+# tear the stack down whether the test passed or failed. Mirror of the
+# `e2e-ci` $$E2E_EXIT pattern.
+#
+# Knobs (env-var overrides; mirrored from helm/local/load-test.sh flags):
+#   SENDERS, LISTENERS, DURATION, MAX_LOSS_PCT, REPLICAS
+#
+# Example dev one-liner (60s smoke instead of 5min merge gate):
+#   make ci-load-test SENDERS=2 LISTENERS=8 DURATION=60 MAX_LOSS_PCT=2.0
+#
+# Default thresholds:
+#   ci-load-test          (merge gate, every PR): 5 senders + 45 listeners,
+#                          300s, 0.5% loss budget, 1 SFU replica.
+#   ci-load-test-release  (release gate, nightly): 10 senders + 190
+#                          listeners, 300s, 0.1% loss, 2 SFU replicas.
+SENDERS ?= 5
+LISTENERS ?= 45
+DURATION ?= 300
+MAX_LOSS_PCT ?= 0.5
+REPLICAS ?= 1
+
+ci-load-test:
+	./helm/local/up.sh
+	./helm/local/load-test.sh \
+	    --senders $(SENDERS) --listeners $(LISTENERS) \
+	    --duration $(DURATION) --max-loss-pct $(MAX_LOSS_PCT) \
+	    --replicas $(REPLICAS); \
+	LOAD_EXIT=$$?; \
+	./helm/local/down.sh || true; \
+	exit $$LOAD_EXIT
+
+# Integrity-ON smoke (bead vc-1re). Runs the bot's byte-fidelity integrity
+# path every build so it never rots dark: the loopback self-test drives a
+# sender->in-process->receiver flow with the `[magic][seq][crc32]` trailer
+# enabled and asserts `crc_mismatches == 0` / `unexplained_gaps == 0` on the
+# clean path plus exactly one mismatch on a deliberately corrupted byte. This
+# exercises the same trailer codec the `--verify-integrity` orchestrate flag
+# uses, without standing up a cluster. The 100-bot startup-race stress test
+# and the fixed-shape counter-contract serialization tests run in the same
+# pass. Cheap (cargo test), so it gates every PR alongside the 50-bot gate.
+ci-bot-integrity:
+	cargo test -p bot integrity:: --no-fail-fast -- --nocapture
+	cargo test -p bot vc_1re --no-fail-fast -- --nocapture
+
+# Release gate override defaults. CLI/env overrides still win — `make
+# ci-load-test-release SENDERS=20` swaps the sender count in.
+RELEASE_SENDERS ?= 10
+RELEASE_LISTENERS ?= 190
+RELEASE_DURATION ?= 300
+RELEASE_MAX_LOSS_PCT ?= 0.1
+RELEASE_REPLICAS ?= 2
+
+ci-load-test-release:
+	./helm/local/up.sh
+	./helm/local/load-test.sh \
+	    --senders $(RELEASE_SENDERS) --listeners $(RELEASE_LISTENERS) \
+	    --duration $(RELEASE_DURATION) --max-loss-pct $(RELEASE_MAX_LOSS_PCT) \
+	    --replicas $(RELEASE_REPLICAS); \
+	LOAD_EXIT=$$?; \
+	./helm/local/down.sh || true; \
+	exit $$LOAD_EXIT
 

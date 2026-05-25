@@ -20,6 +20,8 @@
 use protobuf::Message as ProtoMessage;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
+use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
+use videocall_types::protos::admission_decision_packet::AdmissionDecision;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -214,6 +216,79 @@ impl SessionManager {
         wrapper.write_to_bytes().unwrap_or_default()
     }
 
+    /// Build an `ADMISSION_DECISION` packet (bead vc-69e / p3-13).
+    ///
+    /// Wave 1 admission control emits this packet in two situations:
+    /// - `status = QUEUED` when a non-observer joins a room that has reached
+    ///   the soft cap ([`crate::constants::WAITING_ROOM_THRESHOLD`]) but is
+    ///   still below the hard cap. `position` is the 1-based offset into the
+    ///   soft-cap overflow zone (e.g., the joiner of the 196th seat in a 195-
+    ///   threshold room receives `position = 1`). The joiner is still fully
+    ///   admitted; the packet is informational.
+    /// - `status = REJECTED` when the hard cap
+    ///   ([`crate::constants::MAX_PARTICIPANTS_PER_ROOM`]) has been reached.
+    ///   The server emits this packet to the rejected session and then
+    ///   declines the join. `retry_after_secs` is a client-side hint.
+    ///
+    /// `ADMITTED` is reserved for future use; today the common-case admit
+    /// path emits no `ADMISSION_DECISION` packet at all (zero overhead).
+    pub fn build_admission_decision_packet(
+        status: AdmissionStatus,
+        position: u32,
+        reason: &str,
+        retry_after_secs: u32,
+    ) -> Vec<u8> {
+        let decision = AdmissionDecision {
+            status: status.into(),
+            position,
+            reason: reason.to_string(),
+            retry_after_secs,
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: decision.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
+    /// Build an `ADMISSION_DECISION{REDIRECT}` packet (bead vc-8oa / p6-5).
+    ///
+    /// Wave 3 affinity migration: when a client connects to a pod that does
+    /// NOT own the requested room under jump-hash room→pod assignment, the
+    /// server emits this packet and closes the connection. `redirect_to` is
+    /// the StatefulSet headless DNS name of the owner pod (no port — the
+    /// client reuses its current port); `reason` is a short, machine-readable
+    /// label (e.g. `"wrong_owner"`). `position` and `retry_after_secs` are
+    /// always zero for redirects — they are inapplicable.
+    ///
+    /// This is split out from [`Self::build_admission_decision_packet`]
+    /// rather than overloaded, so the common QUEUED/REJECTED path stays
+    /// simple and so each builder owns its own zero-defaults.
+    pub fn build_admission_redirect_packet(redirect_to: &str, reason: &str) -> Vec<u8> {
+        let decision = AdmissionDecision {
+            status: AdmissionStatus::REDIRECT.into(),
+            position: 0,
+            reason: reason.to_string(),
+            retry_after_secs: 0,
+            redirect_to: redirect_to.to_string(),
+            ..Default::default()
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::ADMISSION_DECISION.into(),
+            user_id: to_user_id_bytes(SYSTEM_USER_ID),
+            data: decision.write_to_bytes().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        wrapper.write_to_bytes().unwrap_or_default()
+    }
+
     /// Build MEETING_ENDED packet to send to clients (protobuf)
     pub fn build_meeting_ended_packet(room_id: &str, message: &str) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
@@ -395,5 +470,56 @@ mod tests {
         );
         assert!(joined_inner.message.contains("joined"));
         assert!(left_inner.message.contains("left"));
+    }
+
+    // ==========================================================================
+    // TEST (vc-69e / p3-13): build_admission_decision_packet round-trips cleanly
+    // ==========================================================================
+    #[tokio::test]
+    async fn test_build_admission_decision_packet_queued() {
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let bytes = SessionManager::build_admission_decision_packet(
+            AdmissionStatus::QUEUED,
+            3,
+            "soft_cap_reached",
+            0,
+        );
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(wrapper.packet_type, PacketType::ADMISSION_DECISION.into());
+        assert_eq!(wrapper.user_id, to_user_id_bytes(SYSTEM_USER_ID));
+        assert_eq!(wrapper.session_id, 0);
+
+        let inner = AdmissionDecision::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmissionStatus::QUEUED
+        );
+        assert_eq!(inner.position, 3);
+        assert_eq!(inner.reason, "soft_cap_reached");
+        assert_eq!(inner.retry_after_secs, 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_admission_decision_packet_rejected() {
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let bytes = SessionManager::build_admission_decision_packet(
+            AdmissionStatus::REJECTED,
+            6,
+            "room_full",
+            30,
+        );
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = AdmissionDecision::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmissionStatus::REJECTED
+        );
+        assert_eq!(inner.position, 6);
+        assert_eq!(inner.reason, "room_full");
+        assert_eq!(inner.retry_after_secs, 30);
     }
 }

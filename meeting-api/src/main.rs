@@ -18,6 +18,7 @@
 
 use axum::http;
 use meeting_api::config::Config;
+use meeting_api::nats_connect;
 use meeting_api::routes;
 use meeting_api::state::AppState;
 use sqlx::postgres::PgPoolOptions;
@@ -46,18 +47,36 @@ async fn main() {
 
     tracing::info!("Connected to PostgreSQL");
 
-    // Connect to NATS if configured. The server works without NATS (graceful degradation).
+    // Connect to NATS if configured.
+    //
+    // Failure semantics (see bead vc-frk):
+    //   * `NATS_USER` set → auth was explicitly requested; any connect error
+    //     is fatal so the pod restarts loudly instead of silently degrading
+    //     to no-NATS (which would mask misconfigured credentials in prod).
+    //   * `NATS_USER` unset → legacy anonymous deployments; keep the
+    //     warn-and-continue behavior so the server still boots without NATS.
     let nats = match &config.nats_url {
-        Some(url) => match async_nats::connect(url).await {
-            Ok(client) => {
-                tracing::info!("Connected to NATS at {url}");
-                Some(client)
+        Some(url) => {
+            let auth_required = nats_connect::auth_requested();
+            match nats_connect::connect(url).await {
+                Ok(client) => {
+                    tracing::info!("Connected to NATS at {url}");
+                    Some(client)
+                }
+                Err(e) if auth_required => {
+                    panic!(
+                        "Failed to connect to NATS at {url} with NATS_USER set: {e}. \
+                         Refusing to start with auth requested but unavailable."
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to connect to NATS at {url}: {e}. Continuing without NATS."
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("Failed to connect to NATS at {url}: {e}. Continuing without NATS.");
-                None
-            }
-        },
+        }
         None => {
             tracing::info!("NATS_URL not set — meeting event push notifications disabled");
             None

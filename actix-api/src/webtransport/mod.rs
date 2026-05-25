@@ -16,13 +16,15 @@
  * conditions.
  */
 
-mod bridge;
+pub(crate) mod bridge;
 
-use crate::actors::chat_server::ChatServer;
-use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
+use crate::actors::chat_server::{ChatServer, ChatServerPool};
+use crate::actors::session_logic::SharedConnectionStates;
+use crate::actors::transports::wt_chat_session::WtChatSession;
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
+use crate::sfu::priority_queue::{PriorityReceiver, PrioritySender};
 use crate::token_validator;
 use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
@@ -31,7 +33,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace_span, warn};
 
 lazy_static::lazy_static! {
@@ -149,17 +150,20 @@ fn get_key_and_cert_chain<'a>(
 ///
 /// # Arguments
 /// * `opt` - WebTransport server options (listen address, certs)
-/// * `chat_server` - Address of the ChatServer actor
+/// * `chat_pool` - Per-pod [`ChatServerPool`]; the owning shard for each room
+///   is resolved once per connection by jump-hash (bead vc-8txq)
 /// * `nats_client` - NATS client for health packet processing
 /// * `pool` - Optional database pool
 /// * `tracker_sender` - Server diagnostics tracker
 /// * `session_manager` - Session lifecycle manager
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     opt: WebTransportOpt,
-    chat_server: Addr<ChatServer>,
+    chat_pool: ChatServerPool,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
+    connection_states: SharedConnectionStates,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
@@ -209,17 +213,19 @@ pub async fn start(
     // actor requires the actix LocalSet context for spawn_local.
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
-        let chat_server = chat_server.clone();
+        let chat_pool = chat_pool.clone();
         let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
+        let connection_states = connection_states.clone();
         actix_rt::spawn(async move {
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
-                chat_server,
+                chat_pool,
                 nats_client,
                 tracker_sender,
                 session_manager,
+                connection_states,
             )
             .await
             {
@@ -231,12 +237,14 @@ pub async fn start(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
-    chat_server: Addr<ChatServer>,
+    chat_pool: ChatServerPool,
     nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
+    connection_states: SharedConnectionStates,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
     let uri = request.url();
@@ -311,6 +319,13 @@ async fn run_webtransport_connection_from_request(
     let session = request.ok().await.context("failed to accept session")?;
     debug!("accepted session");
 
+    // vc-8txq: resolve the owning ChatServer shard for this room ONCE, here,
+    // and hand the resulting single `Addr` to the session actor. Every message
+    // this session emits (Connect, JoinRoom, ActivateConnection, ClientMessage,
+    // Disconnect) then routes to the same shard — the one that owns the room's
+    // per-room state — so per-session bookkeeping stays on one actor.
+    let chat_server = chat_pool.addr_for_room(&lobby_id);
+
     // Run the session with actor
     if let Err(err) = handle_webtransport_session(
         session,
@@ -322,6 +337,7 @@ async fn run_webtransport_connection_from_request(
         tracker_sender,
         session_manager,
         observer,
+        connection_states,
     )
     .await
     {
@@ -334,7 +350,14 @@ async fn run_webtransport_connection_from_request(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     level = "trace",
-    skip(session, chat_server, nats_client, tracker_sender, session_manager)
+    skip(
+        session,
+        chat_server,
+        nats_client,
+        tracker_sender,
+        session_manager,
+        connection_states
+    )
 )]
 async fn handle_webtransport_session(
     session: Session,
@@ -346,9 +369,20 @@ async fn handle_webtransport_session(
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
     observer: bool,
+    connection_states: SharedConnectionStates,
 ) -> anyhow::Result<()> {
-    // Create channel for actor → WebTransport I/O
-    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
+    // Build the bandwidth-aware priority queue for actor → WebTransport I/O
+    // (p5-4 swap, replacing the legacy mpsc::channel::<WtOutbound>(256)).
+    // The sender goes to the actor; the receiver is owned by the bridge
+    // writer task and drains with strict-priority + 8-packet fairness.
+    let (outbound_tx, priority_channels) = PrioritySender::new();
+    let outbound_rx = PriorityReceiver::new(priority_channels);
+
+    // vc-n9o: shared "keep accepting inbound" flag. The actor clears it on a
+    // redirect teardown so the bridge readers stop feeding the mailbox and the
+    // queued `StopSession` can run (breaking the mailbox-starvation hang).
+    let accept_inbound: bridge::AcceptInboundFlag =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -361,6 +395,8 @@ async fn handle_webtransport_session(
         tracker_sender,
         session_manager,
         observer,
+        accept_inbound.clone(),
+        connection_states,
     );
     let actor_addr = actor.start();
 
@@ -380,6 +416,7 @@ async fn handle_webtransport_session(
         session,
         actor_addr.clone(),
         outbound_rx,
+        accept_inbound,
         on_packet_sent,
     );
     bridge.wait_for_disconnect().await;
@@ -412,21 +449,21 @@ mod tests {
         if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
             error!("Error installing crypto provider: {e:?}");
         }
-        use crate::actors::chat_server::ChatServer;
+        use crate::actors::chat_server::ChatServerPool;
         use crate::server_diagnostics::ServerDiagnostics;
         use crate::session_manager::SessionManager;
         use crate::webtransport::{self, Certs};
-        use actix::Actor;
         use std::net::ToSocketAddrs;
 
-        // Connect to NATS
+        // Connect to NATS via shared helper (no auth in test env).
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-        let nats_client = async_nats::connect(&nats_url)
+        let nats_client = crate::nats_connect::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        // Start ChatServer actor
-        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        // vc-8txq: drive `start` through a single-shard pool in this smoke test.
+        let chat_pool = ChatServerPool::new(nats_client.clone(), 1, 1).await;
+        let connection_states = chat_pool.connection_states_handle();
 
         // Create SessionManager
         let session_manager = SessionManager::new();
@@ -466,10 +503,11 @@ mod tests {
         actix_rt::spawn(async move {
             if let Err(e) = webtransport::start(
                 opt,
-                chat_server,
+                chat_pool,
                 nats_client,
                 tracker_sender,
                 session_manager,
+                connection_states,
             )
             .await
             {

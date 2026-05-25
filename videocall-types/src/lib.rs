@@ -18,6 +18,7 @@
 
 pub mod callback;
 pub mod feature_flags;
+pub mod frame_marker;
 pub mod protos;
 pub mod user_id;
 pub mod validation;
@@ -83,6 +84,24 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             }
             protos::packet_wrapper::packet_wrapper::PacketType::CONGESTION => {
                 write!(f, "CONGESTION")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::SUBSCRIPTION_UPDATE => {
+                write!(f, "SUBSCRIPTION_UPDATE")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::SPEAKER_UPDATE => {
+                write!(f, "SPEAKER_UPDATE")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::LAYER_HINT => {
+                write!(f, "LAYER_HINT")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::ADMISSION_DECISION => {
+                write!(f, "ADMISSION_DECISION")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::CAPABILITY_ANNOUNCE => {
+                write!(f, "CAPABILITY_ANNOUNCE")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::HEALTH_BEACON => {
+                write!(f, "HEALTH_BEACON")
             }
         }
     }

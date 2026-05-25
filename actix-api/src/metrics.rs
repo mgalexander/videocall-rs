@@ -20,7 +20,9 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_gauge_vec, register_histogram, Counter, GaugeVec, Histogram,
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    register_int_counter, register_int_gauge, Counter, CounterVec, Gauge, GaugeVec, Histogram,
+    IntCounter, IntGauge,
 };
 
 lazy_static! {
@@ -295,4 +297,435 @@ lazy_static! {
         &["protocol", "customer_email", "meeting_id", "server_instance", "region"]
     )
     .expect("Failed to create server_reconnections_total metric");
+
+    // ===== SFU FORWARDER METRICS (p2-7) =====
+    //
+    // These metrics intentionally do NOT carry the `videocall_` prefix used by
+    // the legacy/client metrics above; they are scoped to the SFU forwarder and
+    // are exposed via the same Prometheus default registry (no endpoint
+    // changes required).
+
+    /// Total packets forwarded by `Forwarder::decide`, labeled by packet type.
+    pub static ref SFU_FORWARDED_TOTAL: CounterVec = register_counter_vec!(
+        "sfu_forwarded_total",
+        "Total packets forwarded by the SFU forwarder, labeled by packet type",
+        &["packet_type"]
+    )
+    .expect("Failed to create sfu_forwarded_total metric");
+
+    /// Total packets dropped by `Forwarder::decide`, labeled by reason.
+    ///
+    /// Known label values (registered eagerly so they appear at 0 in
+    /// `/metrics` even before any drop occurs):
+    ///   - `self_skip`        — sender == receiver (wave-3 / current)
+    ///   - `unsubscribed`     — placeholder, wired in P3
+    ///   - `layer_budget`     — placeholder, wired in P4
+    ///   - `kfr_unsubscribed` — KEYFRAME_REQUEST whose target sender is
+    ///                          not in the requester's current
+    ///                          `LayerSelection.forward` (p4-10).
+    pub static ref SFU_DROPPED_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_dropped_total",
+            "Total packets dropped by the SFU forwarder, labeled by reason",
+            &["reason"]
+        )
+        .expect("Failed to create sfu_dropped_total metric");
+        // Touch each known label value at zero so it is visible in /metrics
+        // before the first real increment in later phases.
+        cv.with_label_values(&["self_skip"]).inc_by(0.0);
+        cv.with_label_values(&["unsubscribed"]).inc_by(0.0);
+        cv.with_label_values(&["layer_budget"]).inc_by(0.0);
+        // vc-8wd: touch `reference_miss` at zero too (the forwarder's
+        // reference-aware drop branch uses it). Makes it dashboard-friendly
+        // and keeps the `sfu_drop_reason` doc honest.
+        cv.with_label_values(&["reference_miss"]).inc_by(0.0);
+        cv.with_label_values(&["kfr_unsubscribed"]).inc_by(0.0);
+        // vc-ud6o E3: media frames dropped when the per-session off-actor NATS
+        // publish queue is full (NATS publish stall / backpressure). Dropping
+        // media under congestion is correct SFU behavior.
+        cv.with_label_values(&["publish_backpressure"]).inc_by(0.0);
+        cv
+    };
+
+    /// Current number of members in each SFU room, labeled by room id.
+    /// Refreshed on every `Forwarder::decide` invocation.
+    pub static ref SFU_ROOM_SIZE: GaugeVec = register_gauge_vec!(
+        "sfu_room_size",
+        "Current number of members in the SFU room",
+        &["room_id"]
+    )
+    .expect("Failed to create sfu_room_size metric");
+
+    /// Room member count at the most recent join-milestone crossing, per room
+    /// (bead vc-xow8). This is the authoritative member count
+    /// (`room_members.len()`) — the count the room is "supposed" to fan out
+    /// to. Compare against [`SFU_ROOM_RECEIVER_SET`]: when delivery breaks at
+    /// scale, the receiver-set size diverges from this member count.
+    ///
+    /// Set ONLY at a milestone crossing (10/50/100/... by default), so it is a
+    /// sparse, low-cardinality marker rather than a per-join gauge.
+    pub static ref SFU_ROOM_MEMBERS: GaugeVec = register_gauge_vec!(
+        "sfu_room_members",
+        "SFU room member count sampled at the most recent join-milestone crossing",
+        &["room_id"]
+    )
+    .expect("Failed to create sfu_room_members metric");
+
+    /// Per-room dispatcher receiver-set size at the most recent join-milestone
+    /// crossing, per room (bead vc-xow8). This is
+    /// `room_dispatch[room].receivers.len()` — the size the per-room
+    /// dispatcher actually fans each parsed packet out to.
+    ///
+    /// The delivery-scaling root-cause signal: a healthy room has
+    /// `sfu_room_receiver_set == sfu_room_members`. A persistent gap
+    /// (receiver_set < members) at a milestone means joiners are tracked as
+    /// members but never made delivery-eligible in the dispatcher.
+    pub static ref SFU_ROOM_RECEIVER_SET: GaugeVec = register_gauge_vec!(
+        "sfu_room_receiver_set",
+        "SFU per-room dispatcher receiver-set size sampled at the most recent join-milestone crossing",
+        &["room_id"]
+    )
+    .expect("Failed to create sfu_room_receiver_set metric");
+
+    /// Total JoinRoom intake attempts, process-wide (bead vc-9eve).
+    ///
+    /// Incremented at the ENTRY of `Handler<JoinRoom>` for EVERY join attempt
+    /// — before any validation, redirect, spillover, admission-cap, or
+    /// reconnection logic runs. It therefore climbs even when registration
+    /// never succeeds (e.g. a registration bottleneck where joins are accepted
+    /// at the transport but never make it into `room_members`). This is the
+    /// counterpart to [`SFU_JOIN_DECISION_TOTAL`], which counts only the
+    /// post-decision outcome (`admit_local`/`redirect`/`reject`): a gap
+    /// between this counter and the sum of decisions reveals attempts that
+    /// short-circuit before a decision is reached.
+    pub static ref SFU_JOIN_ATTEMPTS_TOTAL: IntCounter = register_int_counter!(
+        "sfu_join_attempts_total",
+        "Total JoinRoom intake attempts (counted at handler entry, before any admission logic)"
+    )
+    .expect("Failed to create sfu_join_attempts_total metric");
+
+    /// Total transport `Connect` events, process-wide (bead vc-9eve).
+    ///
+    /// Incremented in `Handler<Connect>` for every session that establishes a
+    /// transport connection, regardless of whether it ever registers into a
+    /// room. Together with [`SFU_JOIN_ATTEMPTS_TOTAL`] and
+    /// [`SFU_ROOM_MEMBERS`], this distinguishes the two SFU plateau failure
+    /// modes at a join milestone: a registration plateau shows
+    /// `connected >> members` while a fan-out plateau shows
+    /// `members ~= receiver_set` with `sfu_forward_total` flat.
+    pub static ref SFU_SESSIONS_CONNECTED_TOTAL: IntCounter = register_int_counter!(
+        "sfu_sessions_connected_total",
+        "Total transport Connect events (counted regardless of room registration success)"
+    )
+    .expect("Failed to create sfu_sessions_connected_total metric");
+
+    /// Number of JoinRoom handler invocations currently in flight (bead
+    /// vc-9eve).
+    ///
+    /// Lifecycle: incremented once at the synchronous ENTRY of
+    /// `Handler<JoinRoom>` and decremented exactly once when that synchronous
+    /// handler body returns — on EVERY path (the early `Err` returns for
+    /// reserved-user/redirect/reject, the already-joined `Ok` short-circuit,
+    /// and the final `Ok`). The decrement is driven by an RAII guard so it
+    /// fires even on early returns. The post-join `tokio::spawn`ed task is NOT
+    /// counted as in-flight: by the time it runs the joiner is already
+    /// registered in `room_members`/`room_dispatch` and the synchronous
+    /// handler has returned, so the gauge reflects only the (very short)
+    /// synchronous admission window. A persistently non-zero value indicates
+    /// the actor mailbox is serializing JoinRoom handling under load.
+    pub static ref SFU_JOIN_INFLIGHT: IntGauge = register_int_gauge!(
+        "sfu_join_inflight",
+        "JoinRoom handler invocations currently in flight (synchronous admission window)"
+    )
+    .expect("Failed to create sfu_join_inflight metric");
+
+    /// Speaker changes per minute. Declared in p2-7; wired in P3.
+    pub static ref SFU_SPEAKER_CHANGES_PER_MIN: Gauge = register_gauge!(
+        "sfu_speaker_changes_per_min",
+        "Speaker changes per minute (declared in p2-7; populated in P3)"
+    )
+    .expect("Failed to create sfu_speaker_changes_per_min metric");
+
+    /// Wall-clock duration of `Forwarder::decide` in microseconds.
+    pub static ref SFU_DECIDE_LATENCY_US: Histogram = register_histogram!(
+        "sfu_decide_latency_us",
+        "Wall-clock duration of Forwarder::decide in microseconds",
+        vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0]
+    )
+    .expect("Failed to create sfu_decide_latency_us metric");
+
+    /// Total packets dropped by `PrioritySender::send`, labeled by class.
+    ///
+    /// Companion to [`SFU_DROPPED_TOTAL`] (which labels by drop *reason* on
+    /// the forwarder decide path). This metric labels by outbound priority
+    /// *class* at the queue-admission boundary so operators can answer
+    /// "which class is bleeding under the current load?". Label values are
+    /// the `Debug` form of `priority_queue::Class`:
+    ///   - `P0Control`    — should always remain 0 (NeverDrop policy).
+    ///   - `P1Audio`
+    ///   - `P2Keyframe`
+    ///   - `P3VideoBase`
+    ///   - `P4Enhancement`
+    ///
+    /// All five label values are touched at 0 on init so they appear in
+    /// `/metrics` before the first real drop.
+    pub static ref SFU_CLASS_DROPPED_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_class_dropped_total",
+            "Total packets dropped by the SFU PrioritySender, labeled by priority class",
+            &["class"]
+        )
+        .expect("Failed to create sfu_class_dropped_total metric");
+        for label in ["P0Control", "P1Audio", "P2Keyframe", "P3VideoBase", "P4Enhancement"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
+    /// Total packets successfully enqueued by `PrioritySender::send`,
+    /// labeled by class. Mirrors [`SFU_CLASS_DROPPED_TOTAL`] for sent
+    /// outcomes so ops can compute per-class drop rate as
+    /// `dropped / (sent + dropped)`.
+    pub static ref SFU_CLASS_SENT_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_class_sent_total",
+            "Total packets successfully enqueued by the SFU PrioritySender, labeled by priority class",
+            &["class"]
+        )
+        .expect("Failed to create sfu_class_sent_total metric");
+        for label in ["P0Control", "P1Audio", "P2Keyframe", "P3VideoBase", "P4Enhancement"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
+    /// Total JoinRoom admission decisions, labeled by outcome (bead vc-n9o).
+    ///
+    /// Emitted at the `ChatServer::JoinRoom` handler decision sites:
+    ///   - `admit_local` — the joiner is admitted to the local pod (the
+    ///     synchronous `Ok(())` return, including the spillover-admit path).
+    ///   - `redirect`    — the joiner is told to reconnect to another pod
+    ///     (wrong-owner pod-ordinal redirect or cross-region redirect); an
+    ///     `ADMISSION_DECISION{REDIRECT}` packet is enqueued and the join is
+    ///     declined with `Err`.
+    ///   - `reject`      — the room is at hard cap; an
+    ///     `ADMISSION_DECISION{REJECTED}` packet is enqueued and the join is
+    ///     declined with `Err`.
+    ///
+    /// The gap between `redirect` here and `sfu_session_teardown_total{reason=redirect}`
+    /// is the live regression signal for bead vc-n9o: a redirect that never
+    /// produces a teardown means the redirected sender hung on a non-owner
+    /// pod (the multi-pod 0-decode root cause).
+    pub static ref SFU_JOIN_DECISION_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_join_decision_total",
+            "Total JoinRoom admission decisions, labeled by outcome",
+            &["outcome"]
+        )
+        .expect("Failed to create sfu_join_decision_total metric");
+        for label in ["admit_local", "redirect", "reject"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
+    /// Total per-pod ADMISSION_DECISION{REDIRECT} FQDNs emitted, labeled by
+    /// the resolved Kubernetes `namespace` (bead vc-el0).
+    ///
+    /// vc-el0 fixed a bug where the redirect FQDN omitted the namespace
+    /// label (`...-headless.svc.cluster.local`), which does not resolve, so
+    /// redirected/spillover clients round-robined onto random non-owner pods
+    /// and decoded 0 streams in multi-pod deployments. This counter makes the
+    /// fix verifiable in the wild: a healthy multi-pod deployment shows
+    /// redirects emitted under a REAL namespace label (e.g. `media`), never
+    /// under the local/dev `default` fallback. A spike under `default` in a
+    /// K8s deployment means namespace resolution is failing (POD_NAMESPACE
+    /// unset AND the service-account namespace file unreadable).
+    pub static ref SFU_REDIRECT_FQDN_EMITTED_TOTAL: CounterVec = register_counter_vec!(
+        "sfu_redirect_fqdn_emitted_total",
+        "Total per-pod redirect FQDNs emitted by JoinRoom, labeled by resolved namespace (vc-el0)",
+        &["namespace"]
+    )
+    .expect("Failed to create sfu_redirect_fqdn_emitted_total metric");
+
+    /// Total session teardowns, labeled by reason (bead vc-n9o).
+    ///
+    /// Emitted at the transport-actor `StopSession` / stop sites:
+    ///   - `redirect` — teardown triggered by a JoinRoom-Err redirect
+    ///     decision (the path that vc-n9o makes reliably tear down even
+    ///     while the client keeps sending media).
+    ///   - `normal`   — ordinary client-initiated or lifecycle teardown.
+    ///   - `error`    — teardown forced by an internal error (e.g. P0
+    ///     control queue full, ChatServer connect failure).
+    ///
+    /// Compare `reason=redirect` here against
+    /// `sfu_join_decision_total{outcome=redirect}`: a persistent gap means
+    /// redirected sessions are not tearing down (vc-n9o regression).
+    pub static ref SFU_SESSION_TEARDOWN_TOTAL: CounterVec = {
+        let cv = register_counter_vec!(
+            "sfu_session_teardown_total",
+            "Total transport session teardowns, labeled by reason",
+            &["reason"]
+        )
+        .expect("Failed to create sfu_session_teardown_total metric");
+        for label in ["redirect", "normal", "error"] {
+            cv.with_label_values(&[label]).inc_by(0.0);
+        }
+        cv
+    };
+
+    /// Total base-layer (T0+S0) keyframes forwarded by `Forwarder::decide`.
+    ///
+    /// Per p4-8 invariant 1: a keyframe at `temporal_layer_id=0 AND
+    /// spatial_layer_id=0` is the root of every dependent reference
+    /// chain — dropping one breaks decode for every subsequent frame
+    /// until the next keyframe arrives. The forwarder always passes
+    /// these through regardless of the receiver's layer budget. This
+    /// counter exposes the invariant in metrics so operators can verify
+    /// keyframes are reaching every receiver.
+    pub static ref SFU_KEYFRAME_FORWARDED_TOTAL: Counter = register_counter!(
+        "sfu_keyframe_forwarded_total",
+        "Base-layer (T0+S0) keyframes forwarded by the SFU forwarder (always forwarded, invariant 1)"
+    )
+    .expect("Failed to create sfu_keyframe_forwarded_total metric");
+
+    // ===== SFU JOIN/SUBSCRIBE/FORWARD OBSERVABILITY (bead vc-8wd, Layer 1) =====
+    //
+    // Always-on aggregate counters/gauges. O(1), no per-packet string
+    // formatting: the forward/drop counters below are CounterVec/Counter
+    // whose label values are STATIC `&'static str` constants resolved at
+    // compile time (see `sfu::forwarder` drop branches) — there is never a
+    // `format!` on the hot path. Registered with the prometheus default
+    // registry, so they appear on the existing `/metrics` endpoint with no
+    // wiring changes.
+
+    /// Owner-pod participant count that the spillover decision reads, per
+    /// room. Lets operators see WHY `is_spilled_over` is/isn't true: this is
+    /// the `owner_count` field of the most recent owner-pod health beacon
+    /// the spillover predicate consulted at JoinRoom time.
+    pub static ref SFU_SPILLOVER_OWNER_COUNT: GaugeVec = register_gauge_vec!(
+        "sfu_spillover_owner_count",
+        "Owner-pod participant count consulted by the spillover decision, per room",
+        &["room"]
+    )
+    .expect("Failed to create sfu_spillover_owner_count metric");
+
+    /// Current spilled-over verdict per room (1 = spilled over, 0 = not).
+    /// Set each time the JoinRoom spillover predicate is evaluated.
+    pub static ref SFU_SPILLOVER_STATE: GaugeVec = register_gauge_vec!(
+        "sfu_spillover_state",
+        "Current SpilledOver verdict per room (1=spilled over, 0=not)",
+        &["room"]
+    )
+    .expect("Failed to create sfu_spillover_state metric");
+
+    /// AllowSet size (video membership) observed at resolve time. Catches
+    /// empty-AllowSet regressions: a sustained pile-up at bucket 0 means
+    /// receivers are resolving to "see nobody".
+    pub static ref SFU_ALLOWSET_SIZE: Histogram = register_histogram!(
+        "sfu_allowset_size",
+        "Resolved AllowSet video membership size at resolve time",
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0]
+    )
+    .expect("Failed to create sfu_allowset_size metric");
+
+    /// Increment-only count of packets the forwarder decided to FORWARD.
+    ///
+    /// The bead (vc-8wd) asks for a plain `sfu_forward_total` counter on the
+    /// forward path. The pre-existing [`SFU_FORWARDED_TOTAL`] is a
+    /// `CounterVec` labeled by packet type; this is the un-labeled aggregate
+    /// the bead specifies, incremented once per forwarded packet alongside
+    /// it. Drops are already counted by [`SFU_DROPPED_TOTAL`] (the
+    /// `sfu_dropped_total{reason}` CounterVec just above), whose reason
+    /// labels already cover the bead's required set
+    /// (`unsubscribed`/`layer_budget`/`reference_miss`/`self_skip`); we reuse
+    /// it rather than register a second metric of the same name (which would
+    /// panic the default registry on a duplicate).
+    pub static ref SFU_FORWARD_TOTAL: Counter = register_counter!(
+        "sfu_forward_total",
+        "Total packets the SFU forwarder decided to forward (increment-only)"
+    )
+    .expect("Failed to create sfu_forward_total metric");
+
+    // ===== SFU DISPATCHER INBOUND SATURATION (bead vc-m7k6) =====
+    //
+    // Root cause these expose: the per-room dispatcher's async-nats wildcard
+    // subscription has a BOUNDED pending channel (`subscription_capacity` in
+    // `nats_connect.rs`). Under a publisher storm that channel fills, and
+    // async-nats SILENTLY DROPS the message and fires a connection-global
+    // `Event::SlowConsumer(sid)` — it does NOT close the subscription. The
+    // dispatcher's `sub.next()` keeps yielding the messages that DID get
+    // through, so `last_msg_at` keeps advancing and the vc-9eh silence
+    // watchdog never trips: late-joiner delivery fails with NO signal. These
+    // counters make that saturation observable.
+
+    /// Total inbound NATS messages dropped by async-nats slow-consumer
+    /// backpressure, process-wide (bead vc-m7k6).
+    ///
+    /// Incremented once per `async_nats::Event::SlowConsumer(sid)` in the
+    /// shared `nats_connect` event handler. PROCESS-GLOBAL granularity is
+    /// deliberate and correct: the event carries only the opaque subscription
+    /// `sid` (the `Subscriber.sid` field is private and the event channel is
+    /// per-`Client`), so it is NOT routable back to a specific room/dispatcher
+    /// from the event handler. A non-zero, climbing value means at least one
+    /// subscriber on the shared connection — in practice a per-room dispatcher
+    /// under a publisher storm — is shedding inbound media.
+    pub static ref SFU_DISPATCHER_INBOUND_DROPPED_TOTAL: IntCounter = register_int_counter!(
+        "sfu_dispatcher_inbound_dropped_total",
+        "Total inbound NATS messages dropped by async-nats slow-consumer backpressure (process-wide; SlowConsumer carries only an opaque sid, not routable to a room)"
+    )
+    .expect("Failed to create sfu_dispatcher_inbound_dropped_total metric");
+
+    /// Approximate inbound-queue lag signal for the per-room dispatchers
+    /// (bead vc-m7k6).
+    ///
+    /// LIMITATION (documented, not fabricated): async-nats 0.42 keeps the
+    /// per-subscription pending depth in a PRIVATE `tokio::sync::mpsc::Receiver`
+    /// field on `Subscriber` and exposes NO accessor (`len()`/`capacity()`/
+    /// `pending()`). There is therefore no way to read true per-subscription
+    /// queue depth. Rather than fabricate a number, this gauge is a derived
+    /// PROXY: it is set to the running drop total at the moment a SlowConsumer
+    /// fires (monotone, process-global), so a rising slope of this gauge marks
+    /// the periods the inbound queues were saturating. It is NOT an
+    /// instantaneous queue depth; treat slope, not level, as the signal.
+    pub static ref SFU_DISPATCHER_LAG: IntGauge = register_int_gauge!(
+        "sfu_dispatcher_lag",
+        "Proxy for per-room dispatcher inbound-queue lag (async-nats exposes no per-subscription pending depth; set to the cumulative drop count at each SlowConsumer — read slope, not level)"
+    )
+    .expect("Failed to create sfu_dispatcher_lag metric");
+
+    /// Inbound messages/sec observed by the per-room dispatchers, sampled over
+    /// the watchdog tick interval (bead vc-m7k6).
+    ///
+    /// Derived from a per-dispatcher inbound message counter sampled on the
+    /// existing per-room watchdog tick (one timer per room, no per-receiver
+    /// work). This is the throughput a dispatcher is actually draining off its
+    /// subscription; compared against `sfu_dispatcher_inbound_dropped_total`
+    /// rising, it shows whether a saturated dispatcher is still pulling
+    /// messages (so the silence watchdog cannot see the drops) — exactly the
+    /// invisible-saturation condition vc-m7k6 fixes. Last-writer-wins across
+    /// rooms; it is a coarse process-level throughput sample, not per-room.
+    pub static ref SFU_DISPATCHER_INBOUND_RATE: Gauge = register_gauge!(
+        "sfu_dispatcher_inbound_rate",
+        "Inbound NATS messages/sec drained by the per-room dispatchers, sampled over the watchdog tick interval"
+    )
+    .expect("Failed to create sfu_dispatcher_inbound_rate metric");
+}
+
+/// Static drop-reason label constants for the existing
+/// [`SFU_DROPPED_TOTAL`] `sfu_dropped_total{reason}` CounterVec.
+///
+/// Exposed as `&'static str` so the forwarder hot path passes a compile-time
+/// constant to `with_label_values` and NEVER formats a string per packet.
+/// These match the labels already touched-at-zero on `SFU_DROPPED_TOTAL`
+/// init, so `/metrics` shows them before the first real drop.
+pub mod sfu_drop_reason {
+    /// Sender not in the receiver's resolved AllowSet.
+    pub const UNSUBSCRIBED: &str = "unsubscribed";
+    /// VP9 SVC layer exceeds the receiver's bandwidth budget.
+    pub const LAYER_BUDGET: &str = "layer_budget";
+    /// T1/T2 frame whose referenced T0 was not forwarded to this receiver.
+    pub const REFERENCE_MISS: &str = "reference_miss";
+    /// Sender == receiver (own echo).
+    pub const SELF_SKIP: &str = "self_skip";
 }

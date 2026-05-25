@@ -1,0 +1,2 @@
+# Developer-local credentials for the k3d stack. See .env.example.
+.env

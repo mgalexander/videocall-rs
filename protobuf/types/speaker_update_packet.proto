@@ -1,0 +1,13 @@
+syntax = "proto3";
+package videocall;
+
+message SpeakerUpdate {
+  repeated SpeakerEntry top_speakers = 1;
+  uint64 generation = 2;
+}
+
+message SpeakerEntry {
+  uint64 session_id = 1;
+  float score = 2;
+  bool is_speaking = 3;
+}

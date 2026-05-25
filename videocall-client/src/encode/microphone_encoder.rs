@@ -42,7 +42,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
-    media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
+    media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket, RoutingHeader},
     packet_wrapper::packet_wrapper::PacketType,
 };
 use videocall_types::Callback;
@@ -58,6 +58,34 @@ use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
 use web_time::SystemTime;
+
+/// Speaker-detection threshold applied to the pre-Opus RMS amplitude.
+///
+/// When the per-frame RMS exceeds this value, the outbound AUDIO MediaPacket's
+/// `RoutingHeader.is_speaking` is set to `true`. The constant matches the
+/// active-speaker threshold described in ADR-0002 so the SFU's EWMA scorer
+/// (P3) can trust the bool without recomputing.
+///
+/// This is intentionally distinct from `MicrophoneEncoder::vad_threshold`,
+/// which controls the local UI's speaking indicator and may be tuned per
+/// session.
+const SPEAKING_THRESHOLD: f32 = 0.05;
+
+/// Compute the RMS amplitude of PCM time-domain samples normalized to
+/// `[-1.0, 1.0]`.
+///
+/// Returns `0.0` when `samples` is empty. The result is a non-negative
+/// `f32` suitable for `RoutingHeader.audio_level`.
+pub(crate) fn compute_audio_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    for s in samples {
+        sum += s * s;
+    }
+    (sum / samples.len() as f32).sqrt()
+}
 
 /// Holds the previous audio frame for RED-style redundancy.
 pub(crate) struct PreviousAudioFrame {
@@ -89,6 +117,8 @@ pub fn transform_audio_chunk(
     sequence: u64,
     aes: Rc<Aes128State>,
     previous_frame: Option<&PreviousAudioFrame>,
+    audio_level: f32,
+    is_speaking: bool,
 ) -> PacketWrapper {
     let now_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -118,6 +148,15 @@ pub fn transform_audio_chunk(
             ..Default::default()
         })
         .into(),
+        // Attach pre-Opus speaker hints so the SFU and remote peers can
+        // make routing/UI decisions without having to decode the Opus
+        // frame.  See ADR-0002 and bead p1-8.
+        routing_header: Some(RoutingHeader {
+            audio_level,
+            is_speaking,
+            ..Default::default()
+        })
+        .into(),
         ..Default::default()
     };
     let data = media_packet.write_to_bytes().unwrap();
@@ -137,6 +176,15 @@ pub struct MicrophoneEncoder {
     codec: AudioWorkletCodec,
     on_error: Option<Callback<String>>,
     is_speaking: Rc<AtomicBool>,
+    /// Latest pre-Opus RMS amplitude, stored as `f32::to_bits` for atomic
+    /// access. Written by the VAD interval and read by the audio output
+    /// handler so each outbound MediaPacket can carry the current
+    /// `RoutingHeader.audio_level` / `is_speaking` hints (bead p1-8).
+    audio_level_bits: Rc<AtomicU32>,
+    /// Latest pre-Opus speaking flag computed against
+    /// [`SPEAKING_THRESHOLD`]. Distinct from `is_speaking`, which tracks
+    /// the local-UI VAD threshold (`vad_threshold`).
+    routing_is_speaking: Rc<AtomicBool>,
     vad_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
     /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps).
@@ -179,6 +227,8 @@ impl MicrophoneEncoder {
             codec: AudioWorkletCodec::default(),
             on_error: Some(on_error),
             is_speaking: Rc::new(AtomicBool::new(false)),
+            audio_level_bits: Rc::new(AtomicU32::new(0)),
+            routing_is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
             vad_threshold: vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD),
             tier_audio_bitrate: shared_audio_tier_bitrate
@@ -208,6 +258,8 @@ impl MicrophoneEncoder {
                 }
                 // Reset speaking state and audio level when mic is disabled
                 self.is_speaking.store(false, Ordering::Relaxed);
+                self.audio_level_bits.store(0u32, Ordering::Relaxed);
+                self.routing_is_speaking.store(false, Ordering::Relaxed);
                 self.client.set_speaking(false);
                 self.client.set_audio_level(0.0);
             };
@@ -226,6 +278,8 @@ impl MicrophoneEncoder {
         }
         // Reset speaking state and audio level when encoder stops
         self.is_speaking.store(false, Ordering::Relaxed);
+        self.audio_level_bits.store(0u32, Ordering::Relaxed);
+        self.routing_is_speaking.store(false, Ordering::Relaxed);
         self.client.set_speaking(false);
         self.client.set_audio_level(0.0);
     }
@@ -260,6 +314,10 @@ impl MicrophoneEncoder {
         // Clone atomic values for use in different closures
         let enabled_for_handler = enabled.clone();
         let enable_fec_for_handler = self.tier_enable_fec.clone();
+        // Shared with the VAD interval so each outbound MediaPacket carries
+        // the latest pre-Opus speaker hints (bead p1-8).
+        let audio_level_bits_for_handler = self.audio_level_bits.clone();
+        let routing_is_speaking_for_handler = self.routing_is_speaking.clone();
 
         let audio_output_handler = {
             log::info!("Starting Microphone audio encoder with AnalyserNode VAD");
@@ -306,12 +364,23 @@ impl MicrophoneEncoder {
                         None
                     };
 
+                    // Read the latest pre-Opus speaker hints written by the
+                    // VAD interval. The interval runs every 100ms and the
+                    // audio handler fires every 20ms, so reads may slightly
+                    // lag the underlying signal — that's fine: the value
+                    // is a coarse hint, not a per-frame measurement.
+                    let audio_level =
+                        f32::from_bits(audio_level_bits_for_handler.load(Ordering::Relaxed));
+                    let is_speaking_hint = routing_is_speaking_for_handler.load(Ordering::Relaxed);
+
                     let packet: PacketWrapper = transform_audio_chunk(
                         &data,
                         &user_id,
                         sequence_number,
                         aes.clone(),
                         red_ref,
+                        audio_level,
+                        is_speaking_hint,
                     );
                     client_for_send.send_media_packet(packet);
 
@@ -333,6 +402,9 @@ impl MicrophoneEncoder {
         let client_for_vad = client.clone();
         let vad_interval_holder = self.vad_interval.clone();
         let vad_threshold = self.vad_threshold;
+        // Shared with the audio output handler (bead p1-8).
+        let audio_level_bits_for_vad = self.audio_level_bits.clone();
+        let routing_is_speaking_for_vad = self.routing_is_speaking.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -562,19 +634,27 @@ impl MicrophoneEncoder {
                         prev_level_clone.set(0.0);
                         client_clone.set_audio_level(0.0);
                     }
+                    // Also reset the routing-header hints so packets emitted
+                    // while the mic is disabled don't carry stale values.
+                    audio_level_bits_for_vad.store(0u32, Ordering::Relaxed);
+                    routing_is_speaking_for_vad.store(false, Ordering::Relaxed);
                     return;
                 }
 
                 let mut array = data_array_for_interval.borrow_mut();
                 analyser.get_float_time_domain_data(&mut array);
 
-                let mut sum = 0.0f32;
-                for sample in array.iter() {
-                    sum += sample * sample;
-                }
-                let rms = (sum / array.len() as f32).sqrt();
+                let rms = compute_audio_level(&array);
 
                 let speaking = rms > vad_threshold;
+
+                // Publish the pre-Opus speaker hints for the outbound
+                // MediaPacket RoutingHeader (bead p1-8). The threshold is
+                // intentionally fixed at SPEAKING_THRESHOLD (not
+                // `vad_threshold`) so the SFU's P3 EWMA scorer can rely on
+                // a stable contract — see ADR-0002.
+                audio_level_bits_for_vad.store(rms.to_bits(), Ordering::Relaxed);
+                routing_is_speaking_for_vad.store(rms > SPEAKING_THRESHOLD, Ordering::Relaxed);
 
                 // Compute normalized intensity using the shared perceptual
                 // curve so the host tile shows a smooth, intensity-driven glow.
@@ -648,6 +728,78 @@ impl MicrophoneEncoder {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod audio_level_tests {
+    //! Host-runnable unit tests for [`compute_audio_level`] and the
+    //! [`SPEAKING_THRESHOLD`] contract (bead p1-8).
+    //!
+    //! These tests intentionally avoid `wasm_bindgen_test` and any
+    //! browser-only dependencies so they execute under
+    //! `cargo test -p videocall-client --lib`.
+    use super::{compute_audio_level, SPEAKING_THRESHOLD};
+
+    #[test]
+    fn all_zero_samples_yield_zero_audio_level() {
+        let samples = vec![0.0f32; 1024];
+        let rms = compute_audio_level(&samples);
+        assert_eq!(rms, 0.0);
+        assert!(
+            !(rms > SPEAKING_THRESHOLD),
+            "silence must not be flagged as speaking"
+        );
+    }
+
+    #[test]
+    fn empty_samples_yield_zero_audio_level() {
+        // Guard rail: the function must not panic on empty input.
+        let rms = compute_audio_level(&[]);
+        assert_eq!(rms, 0.0);
+        assert!(!(rms > SPEAKING_THRESHOLD));
+    }
+
+    #[test]
+    fn mid_amplitude_samples_yield_expected_rms() {
+        // Constant signal at 0.5 → RMS == 0.5 exactly.
+        let samples = vec![0.5f32; 2048];
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.5).abs() < 1e-6, "expected RMS ≈ 0.5, got {rms}");
+        assert!(rms > SPEAKING_THRESHOLD, "0.5 must trip the speaking flag");
+    }
+
+    #[test]
+    fn just_under_speaking_threshold_is_not_speaking() {
+        // Constant 0.04 → RMS ≈ 0.04 < 0.05.
+        let samples = vec![0.04f32; 1024];
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.04).abs() < 1e-6, "expected RMS ≈ 0.04, got {rms}");
+        assert!(
+            !(rms > SPEAKING_THRESHOLD),
+            "0.04 must NOT trip the speaking flag"
+        );
+    }
+
+    #[test]
+    fn just_over_speaking_threshold_is_speaking() {
+        // Constant 0.06 → RMS ≈ 0.06 > 0.05.
+        let samples = vec![0.06f32; 1024];
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.06).abs() < 1e-6, "expected RMS ≈ 0.06, got {rms}");
+        assert!(rms > SPEAKING_THRESHOLD, "0.06 must trip the speaking flag");
+    }
+
+    #[test]
+    fn alternating_polarity_signal_matches_amplitude() {
+        // RMS of a square-wave-like signal at +/- 0.1 is 0.1.
+        let mut samples = Vec::with_capacity(1024);
+        for i in 0..1024 {
+            samples.push(if i % 2 == 0 { 0.1f32 } else { -0.1f32 });
+        }
+        let rms = compute_audio_level(&samples);
+        assert!((rms - 0.1).abs() < 1e-6, "expected RMS ≈ 0.1, got {rms}");
+        assert!(rms > SPEAKING_THRESHOLD);
     }
 }
 

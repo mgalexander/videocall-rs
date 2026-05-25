@@ -89,7 +89,7 @@ impl<T> JitterBuffer<T> {
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
-        println!("[JITTER_BUFFER] Inserting frame: {seq}");
+        log::trace!("[JITTER_BUFFER] Inserting frame: {seq}");
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -101,15 +101,15 @@ impl<T> JitterBuffer<T> {
                 if frame.frame_type == FrameType::KeyFrame
                     && last_decoded.saturating_sub(seq) > STREAM_RESTART_BACKTRACK_THRESHOLD
                 {
-                    println!(
+                    log::trace!(
                         "[JITTER_BUFFER] Detected keyframe with older sequence ({seq} <= {last_decoded}). Assuming stream restart – flushing buffer."
                     );
                     self.flush();
                 } else {
-                    println!("[JITTER_BUFFER] Ignoring old frame: {seq}");
+                    log::trace!("[JITTER_BUFFER] Ignoring old frame: {seq}");
                     self.num_consecutive_old_frames += 1;
                     if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
-                        println!(
+                        log::trace!(
                             "[JITTER_BUFFER] Received {} consecutive old frames. Flushing buffer.",
                             self.num_consecutive_old_frames
                         );
@@ -127,15 +127,15 @@ impl<T> JitterBuffer<T> {
         if self.buffered_frames.len() >= MAX_BUFFER_SIZE {
             // Allow a keyframe to clear the buffer if it's full.
             if frame.frame_type == FrameType::KeyFrame {
-                println!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
+                log::trace!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
                 self.drop_all_frames();
             } else {
-                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
+                log::trace!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
                 return; // Reject the frame.
             }
         }
 
-        println!("[JITTER_BUFFER] Received frame: {seq}");
+        log::trace!("[JITTER_BUFFER] Received frame: {seq}");
 
         self.jitter_estimator.update_estimate(seq, arrival_time_ms);
         self.update_target_playout_delay();
@@ -165,7 +165,7 @@ impl<T> JitterBuffer<T> {
     pub fn find_and_move_continuous_frames(&mut self, current_time_ms: u128) {
         let mut frames_were_moved = false;
 
-        println!(
+        log::trace!(
             "[JB_POLL] Checking buffer. Last decoded: {:?}, Buffer size: {}, Target delay: {:.2}ms",
             self.last_decoded_sequence_number,
             self.buffered_frames.len(),
@@ -175,29 +175,66 @@ impl<T> JitterBuffer<T> {
         loop {
             let mut found_frame_to_move = false;
 
+            // SVC layer-strip rationale (bead vc-v82 / vc-27l, ref p4-7/p4-11):
+            // The SFU performs per-receiver temporal-layer stripping for
+            // VP9 SVC: it may drop T2 only (max=1), T1+T2 (max=0), or
+            // forward all layers, producing non-contiguous wire sequence
+            // numbers on a healthy stream. The SFU's contract guarantees
+            // the reference chain of any forwarded frame is intact:
+            // Under this project's VP9 L1T3 pattern:
+            //   - T0 deltas reference only prior T0
+            //   - T1 deltas reference only the prior T0
+            //   - T2 deltas reference prior T0 + prior T1
+            // So if the SFU forwards a delta of any layer, the frames it
+            // references are also being forwarded. When we detect a gap,
+            // we accept ANY non-keyframe across it (layer-agnostic). Real
+            // reference loss (genuine packet loss, not SFU stripping)
+            // would cause the decoder to fail; the layer-aware keyframe-
+            // request logic in peer_decode_manager.rs::track_sequence
+            // handles recovery.
             let next_decodable_key: Option<u64> = if let Some(last_seq) =
                 self.last_decoded_sequence_number
             {
                 // CASE 1: We are in a continuous stream. Look for the next frame.
                 let next_continuous_seq = last_seq + 1;
                 if self.buffered_frames.contains_key(&next_continuous_seq) {
-                    println!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
+                    log::trace!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
                     Some(next_continuous_seq)
                 } else {
-                    // CASE 2: Gap detected. Look for the next keyframe after the gap.
-                    let keyframe = self
+                    // CASE 2: Gap detected. Accept the lowest-sequence
+                    // buffered delta past last_seq across the gap — the
+                    // SFU's layer-stripping contract guarantees its
+                    // references are intact. Keyframes still take the KF
+                    // path below so drop_frames_before runs cleanly.
+                    let forwarded_delta_relax = self
                         .buffered_frames
                         .iter()
-                        .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
+                        .find(|(&s, _)| s > last_seq)
+                        .filter(|(_, f)| !f.is_keyframe())
                         .map(|(&s, _)| s);
-                    if let Some(k) = keyframe {
-                        println!(
-                            "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
+                    if let Some(k) = forwarded_delta_relax {
+                        log::trace!(
+                            "[JB_POLL] Gap after {last_seq}. Delta {k} available across gap (SFU layer-strip relax)."
                         );
+                        Some(k)
                     } else {
-                        println!("[JB_POLL] Gap after {last_seq}. No subsequent keyframe found.");
+                        // Otherwise, fall back to keyframe-search recovery.
+                        let keyframe = self
+                            .buffered_frames
+                            .iter()
+                            .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
+                            .map(|(&s, _)| s);
+                        if let Some(k) = keyframe {
+                            log::trace!(
+                                "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
+                            );
+                        } else {
+                            log::trace!(
+                                "[JB_POLL] Gap after {last_seq}. No subsequent keyframe found."
+                            );
+                        }
+                        keyframe
                     }
-                    keyframe
                 }
             } else {
                 // CASE 3: We have never decoded. We MUST start with a keyframe.
@@ -207,9 +244,9 @@ impl<T> JitterBuffer<T> {
                     .find(|(_, f)| f.is_keyframe())
                     .map(|(&s, _)| s);
                 if let Some(k) = keyframe {
-                    println!("[JB_POLL] Seeking first keyframe. Found: {k}");
+                    log::trace!("[JB_POLL] Seeking first keyframe. Found: {k}");
                 } else {
-                    println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+                    log::trace!("[JB_POLL] Seeking first keyframe. None found in buffer.");
                 }
                 keyframe
             };
@@ -219,27 +256,36 @@ impl<T> JitterBuffer<T> {
                     let time_in_buffer_ms = (current_time_ms - frame.arrival_time_ms) as f64;
 
                     let is_ready = time_in_buffer_ms >= self.target_playout_delay_ms;
-                    println!(
+                    log::trace!(
                         "[JB_POLL] Candidate {key}: Time in buffer: {time_in_buffer_ms:.2}ms, Target: {:.2}ms -> Ready: {is_ready}",
                         self.target_playout_delay_ms
                     );
 
                     if is_ready {
+                        let is_gap_recovery = self
+                            .last_decoded_sequence_number
+                            .is_some_and(|last_seq| key > last_seq + 1);
                         let frame_to_move = self.buffered_frames.remove(&key).unwrap();
 
                         // If we're jumping to a keyframe to recover, drop everything before it.
                         if frame_to_move.is_keyframe() {
                             let is_first_frame = self.last_decoded_sequence_number.is_none();
-                            let is_gap_recovery = self
-                                .last_decoded_sequence_number
-                                .is_some_and(|last_seq| key > last_seq + 1);
 
                             if is_first_frame || is_gap_recovery {
-                                println!(
+                                log::trace!(
                                     "[JITTER_BUFFER] Keyframe {key} recovery. Dropping frames before it."
                                 );
                                 self.drop_frames_before(key);
                             }
+                        } else if is_gap_recovery {
+                            // Layer-relax path: we advanced across a gap to a
+                            // forwarded delta (T0, T1, or T2). Any still-buffered
+                            // frames with seq < key are now stale (decoder has
+                            // moved past them).
+                            log::trace!(
+                                "[JITTER_BUFFER] Delta {key} crossed gap. Dropping stale frames before it."
+                            );
+                            self.drop_frames_before(key);
                         }
 
                         self.push_to_decoder(frame_to_move);
@@ -249,7 +295,7 @@ impl<T> JitterBuffer<T> {
                     }
                 }
             } else {
-                println!("[JB_POLL] No decodable frame found in buffer.");
+                log::trace!("[JB_POLL] No decodable frame found in buffer.");
             }
 
             if !found_frame_to_move {
@@ -265,7 +311,7 @@ impl<T> JitterBuffer<T> {
     /// Pushes a single frame to the shared decodable queue.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
         let seq = frame.sequence_number();
-        println!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
+        log::trace!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
     }
 
@@ -275,18 +321,24 @@ impl<T> JitterBuffer<T> {
     }
 
     /// Removes all frames from the buffer with a sequence number less than the given one.
+    ///
+    /// Allocation-free: uses `BTreeMap::split_off` to partition the map by key without
+    /// building any temporary `Vec`. `split_off(&sequence_number)` returns the entries
+    /// with keys `>= sequence_number` (the ones we keep); we then swap that back into
+    /// `self.buffered_frames` and drain the leftover (entries with keys `< sequence_number`)
+    /// for logging and counting. This matters because under SVC layer-stripping
+    /// (bead vc-v82) this runs on every gap-recovery layer-strip — roughly 30 fps × N
+    /// peers — and a Vec-per-call adds up quickly on constrained devices.
     fn drop_frames_before(&mut self, sequence_number: u64) {
-        let keys_to_drop: Vec<u64> = self
-            .buffered_frames
-            .keys()
-            .cloned()
-            .filter(|&k| k < sequence_number)
-            .collect();
+        // `split_off(&k)` retains keys `< k` in `self.buffered_frames` and returns a
+        // new map with keys `>= k`. We want the opposite (keep `>= k`, drop `< k`),
+        // so swap the two halves.
+        let kept = self.buffered_frames.split_off(&sequence_number);
+        let dropped = std::mem::replace(&mut self.buffered_frames, kept);
 
-        self.dropped_frames_count += keys_to_drop.len() as u64;
-        for key in keys_to_drop {
-            println!("[JITTER_BUFFER] Dropping stale frame: {key}");
-            self.buffered_frames.remove(&key);
+        self.dropped_frames_count += dropped.len() as u64;
+        for key in dropped.keys() {
+            log::trace!("[JITTER_BUFFER] Dropping stale frame: {key}");
         }
     }
 
@@ -295,7 +347,7 @@ impl<T> JitterBuffer<T> {
         let num_dropped = self.buffered_frames.len() as u64;
         self.buffered_frames.clear();
         self.dropped_frames_count += num_dropped;
-        println!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
+        log::trace!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
     }
 
     /// Flushes the jitter buffer, resetting its state completely.
@@ -395,10 +447,19 @@ mod tests {
     }
 
     fn create_test_frame(seq: u64, frame_type: FrameType) -> VideoFrame {
+        create_test_frame_with_layer(seq, frame_type, 0)
+    }
+
+    fn create_test_frame_with_layer(
+        seq: u64,
+        frame_type: FrameType,
+        temporal_layer_id: u8,
+    ) -> VideoFrame {
         VideoFrame {
             sequence_number: seq,
             frame_type,
             codec: crate::frame::FrameCodec::default(),
+            temporal_layer_id,
             data: vec![0; 10],
             timestamp: 0.0,
         }
@@ -777,5 +838,245 @@ mod tests {
         time += 100;
         jb.find_and_move_continuous_frames(time);
         assert!(decoded_frames.lock().unwrap().len() <= 2); // Should not have increased
+    }
+
+    #[test]
+    fn t0_delta_decodes_across_layer_strip_gap() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        // KF at seq 1 (T0).
+        jb.insert_frame(
+            create_test_frame_with_layer(1, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        // T0 delta at seq 4, with seqs 2 and 3 (T1/T2) stripped by SFU.
+        jb.insert_frame(
+            create_test_frame_with_layer(4, FrameType::DeltaFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 2, "Both KF and T0 delta should decode");
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 4);
+        assert_eq!(jb.last_decoded_sequence_number, Some(4));
+    }
+
+    #[test]
+    fn t1_delta_with_gap_is_accepted_across_gap() {
+        // Under the layer-agnostic relax (bead vc-27l), any non-keyframe
+        // delta past last_decoded is accepted across a gap. The SFU's
+        // layer-stripping contract guarantees that anything it forwards
+        // has its references intact (T1 references prior T0 only, which
+        // by construction is also forwarded). Real reference loss would
+        // surface as decoder failure and trigger KFR at a higher layer.
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        // KF at seq 1 (T0).
+        jb.insert_frame(
+            create_test_frame_with_layer(1, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+
+        // T1 delta at seq 4 with seqs 2,3 stripped (T0 at 2 was actually
+        // stripped here for the test — in practice the SFU would forward
+        // the T0; we model the broader relax semantics: trust the SFU).
+        jb.insert_frame(
+            create_test_frame_with_layer(4, FrameType::DeltaFrame, 1),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(
+            queue.len(),
+            2,
+            "T1 delta should now be picked across gap (layer-agnostic relax)"
+        );
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 4);
+        assert_eq!(jb.last_decoded_sequence_number, Some(4));
+    }
+
+    #[test]
+    fn partial_strip_t1_interleaved_with_t0_decodes() {
+        // Bead vc-27l example: partial strip (max=1) forwards T0+T1 and
+        // strips T2. Wire sequence: KF=1 (T0), T1=3, T0=5, T1=7, T0=9
+        // (seqs 2, 4, 6, 8 are T2 frames the SFU stripped). All five
+        // forwarded frames must decode in order.
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        let frames: [(u64, FrameType, u8); 5] = [
+            (1, FrameType::KeyFrame, 0),
+            (3, FrameType::DeltaFrame, 1),
+            (5, FrameType::DeltaFrame, 0),
+            (7, FrameType::DeltaFrame, 1),
+            (9, FrameType::DeltaFrame, 0),
+        ];
+
+        for (seq, ft, tid) in frames {
+            jb.insert_frame(create_test_frame_with_layer(seq, ft, tid), time);
+            time += 100;
+            jb.find_and_move_continuous_frames(time);
+        }
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 5, "all 5 forwarded frames must decode");
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 3);
+        assert_eq!(queue[2].sequence_number, 5);
+        assert_eq!(queue[3].sequence_number, 7);
+        assert_eq!(queue[4].sequence_number, 9);
+        assert_eq!(jb.last_decoded_sequence_number, Some(9));
+    }
+
+    #[test]
+    fn out_of_order_t1_with_t0_decodes_correctly() {
+        // Insert KF=1, then T0=5, T1=7, T1=3 out-of-order (seqs 2, 4, 6
+        // are T2 frames the SFU stripped). BTreeMap-backed buffer sorts
+        // by sequence, so the relax picks lowest-seq past last_decoded
+        // first. After time advances and we poll, expect decode order
+        // 1, 3, 5, 7.
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        // KF first so we have a last_decoded_sequence_number.
+        jb.insert_frame(
+            create_test_frame_with_layer(1, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+
+        // Insert the rest out-of-order WITHOUT polling in between, so the
+        // relax loop sees all of them at once and must pick lowest-first.
+        jb.insert_frame(
+            create_test_frame_with_layer(5, FrameType::DeltaFrame, 0),
+            time,
+        );
+        jb.insert_frame(
+            create_test_frame_with_layer(7, FrameType::DeltaFrame, 1),
+            time,
+        );
+        jb.insert_frame(
+            create_test_frame_with_layer(3, FrameType::DeltaFrame, 1),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 4);
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 3);
+        assert_eq!(queue[2].sequence_number, 5);
+        assert_eq!(queue[3].sequence_number, 7);
+        assert_eq!(jb.last_decoded_sequence_number, Some(7));
+    }
+
+    #[test]
+    fn delta_picked_before_later_keyframe_across_gap() {
+        // Behavioral pin (bead vc-27l): under the layer-agnostic relax,
+        // when the buffer holds BOTH an earlier delta and a later keyframe
+        // past last_decoded, the relax picks the earlier delta first
+        // (BTreeMap lowest-first). The keyframe is then picked on the next
+        // iteration, which invokes drop_frames_before to clean stragglers.
+        // This is a meaningful new behavior vs. the prior T0-only relax,
+        // which would have short-circuited straight to the keyframe.
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        // KF=1 establishes last_decoded.
+        jb.insert_frame(
+            create_test_frame_with_layer(1, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+
+        // Both buffered simultaneously: T1 delta at seq 4 and KF at seq 7.
+        jb.insert_frame(
+            create_test_frame_with_layer(4, FrameType::DeltaFrame, 1),
+            time,
+        );
+        jb.insert_frame(
+            create_test_frame_with_layer(7, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 3, "T1=4 picked first, then KF=7");
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 4);
+        assert_eq!(queue[2].sequence_number, 7);
+        assert_eq!(jb.last_decoded_sequence_number, Some(7));
+    }
+
+    #[test]
+    fn multiple_t0_deltas_with_strip_gaps() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        // L1T3 with T1/T2 stripped: KF=1, T0=4, T0=7, T0=10.
+        jb.insert_frame(
+            create_test_frame_with_layer(1, FrameType::KeyFrame, 0),
+            time,
+        );
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        for seq in [4u64, 7, 10] {
+            jb.insert_frame(
+                create_test_frame_with_layer(seq, FrameType::DeltaFrame, 0),
+                time,
+            );
+            time += 100;
+            jb.find_and_move_continuous_frames(time);
+        }
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 4);
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 4);
+        assert_eq!(queue[2].sequence_number, 7);
+        assert_eq!(queue[3].sequence_number, 10);
+        assert_eq!(jb.last_decoded_sequence_number, Some(10));
+    }
+
+    #[test]
+    fn legacy_zero_temporal_layer_id_still_works() {
+        // Legacy sender (no RoutingHeader) emits temporal_layer_id=0 by default.
+        // A contiguous sequence must still decode in order with no regression.
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), time);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), time);
+
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 3);
+        for (i, f) in queue.iter().enumerate() {
+            assert_eq!(f.sequence_number, (i + 1) as u64);
+        }
     }
 }

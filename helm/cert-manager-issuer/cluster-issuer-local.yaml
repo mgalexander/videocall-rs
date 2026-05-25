@@ -1,0 +1,15 @@
+# Local self-signed ClusterIssuer for *.videocall.local certificates.
+#
+# This is the local-dev counterpart to cert-manager-issuer.yaml (which is the
+# production Let's Encrypt + DigitalOcean DNS Issuer). Do NOT use this in
+# production — it produces certificates that browsers will not trust without
+# manual CA installation.
+#
+# A ClusterIssuer (not Issuer) is used so any namespace in the local cluster
+# can request certs without needing a per-namespace Issuer.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: local-selfsigned
+spec:
+  selfSigned: {}

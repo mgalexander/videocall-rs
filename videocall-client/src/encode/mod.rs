@@ -19,6 +19,7 @@
 mod camera_encoder;
 mod encoder_state;
 mod microphone_encoder;
+mod routing;
 mod screen_encoder;
 mod transform;
 

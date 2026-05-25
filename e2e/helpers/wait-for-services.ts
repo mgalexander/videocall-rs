@@ -1,6 +1,6 @@
 const DIOXUS_UI_URL = process.env.DIOXUS_UI_URL || "http://localhost:3001";
 const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
-const WS_URL = process.env.WS_CHECK_URL || "http://localhost:8080";
+const WS_URL = process.env.WS_CHECK_URL || `http://localhost:${process.env.HOST_WS_PORT || "8080"}`;
 
 const MAX_WAIT_MS = 600_000;
 const POLL_INTERVAL_MS = 2_000;

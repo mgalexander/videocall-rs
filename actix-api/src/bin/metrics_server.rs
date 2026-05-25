@@ -663,8 +663,10 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting metrics server on port {}", port);
     info!("Connecting to NATS at {}", nats_url);
 
-    // Connect to NATS
-    let nats_client = async_nats::connect(&nats_url).await?;
+    // Connect to NATS via the shared helper so auth/TLS env vars apply.
+    let nats_client = sec_api::nats_connect::connect(&nats_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     info!("Connected to NATS successfully");
 
     // Create shared health data store

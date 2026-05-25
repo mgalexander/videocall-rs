@@ -1,0 +1,27 @@
+# Local k3d overlay for helm/postgres.
+#
+# Differences from helm/postgres/values.yaml (production):
+#   - no PVC (storage is ephemeral; tearing down the pod drops the data)
+#   - smaller resource requests/limits suitable for a laptop k3d cluster
+#   - credentials come from the `postgres-credentials` Secret that
+#     helm/local/up.sh creates from helm/local/.env values, not from the
+#     production `rustlemania` Secret which is managed out-of-band
+#
+# This chart reads POSTGRES_PASSWORD from the existingSecret using key
+# `auth.secretKeys.userPasswordKey` (defaults to `postgres-password`).
+# helm/local/up.sh populates BOTH `password` and `postgres-password` from
+# the same dev password value in .env so the local install works against
+# the default key without needing an override here.
+auth:
+  existingSecret: postgres-credentials
+  username: rustlemania
+  database: rustlemania
+persistence:
+  enabled: false
+resources:
+  limits:
+    cpu: 250m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

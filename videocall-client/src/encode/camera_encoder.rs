@@ -26,6 +26,7 @@ use log::error;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,7 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::EncodedVideoChunkMetadata;
 use web_sys::HtmlVideoElement;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
@@ -53,6 +55,7 @@ use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
+use super::routing::extract_temporal_layer_id;
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
@@ -105,6 +108,14 @@ pub struct CameraEncoder {
     /// Shared audio tier FEC flag. Written by the camera encoder's quality
     /// manager alongside `shared_audio_tier_bitrate`.
     shared_audio_tier_fec: Rc<AtomicBool>,
+    /// Monotonic counter used as the `picture_id` / `sequence` for every
+    /// encoded video chunk. Hoisted onto the struct (rather than living as a
+    /// closure-local in `start()`) so it survives encoder restarts triggered
+    /// by camera switches, `set_enabled(false→true)`, and stop/start cycles.
+    /// ADR-0001 and P4 SVC invariants require monotonic `picture_id`
+    /// correlation across restarts; resetting to 0 would create gaps that
+    /// receivers interpret as a fault.
+    picture_id_counter: Rc<AtomicU64>,
 }
 
 impl CameraEncoder {
@@ -146,6 +157,7 @@ impl CameraEncoder {
                 default_audio_tier.bitrate_kbps * 1000,
             )),
             shared_audio_tier_fec: Rc::new(AtomicBool::new(default_audio_tier.enable_fec)),
+            picture_id_counter: Rc::new(AtomicU64::new(0)),
         }
     }
 
@@ -332,13 +344,25 @@ impl CameraEncoder {
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
         let force_keyframe = self.force_keyframe.clone();
+        // Clone the hoisted picture_id counter into the encoder output closure.
+        // The counter lives on `CameraEncoder` so it survives encoder restarts
+        // (camera switch, enable/disable toggle, stop/start) — see ADR-0001
+        // and the P4 SVC invariants for why monotonic `picture_id` matters.
+        let picture_id_counter = self.picture_id_counter.clone();
         let video_output_handler = {
             let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
-            let mut sequence_number = 0;
             let mut last_chunk_time = window().performance().unwrap().now();
             let mut chunks_in_last_second = 0;
 
-            Box::new(move |chunk: JsValue| {
+            // WebCodecs `VideoEncoder.output(chunk, metadata)` — the 2nd
+            // argument carries SVC layer info when the encoder is configured
+            // with `scalability_mode = "L1T3"` (bead p4-1). We type the
+            // closure as `FnMut(JsValue, JsValue)` so JS calls land in Rust
+            // with both args; web-sys' typed `EncodedVideoChunkMetadata`
+            // wrapper handles the field access. A missing/undefined `svc`
+            // field degrades to `temporal_layer_id = 0` (see
+            // `extract_temporal_layer_id`), which is safe for the SFU.
+            Box::new(move |chunk: JsValue, metadata: JsValue| {
                 let now = window().performance().unwrap().now();
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
@@ -358,15 +382,32 @@ impl CameraEncoder {
                     buffer.resize(byte_length, 0);
                 }
 
+                // Extract VP9 SVC temporal layer id from the L1T3 metadata.
+                // `JsValue::is_undefined()` guards against UAs that omit the
+                // 2nd argument; in that case we treat the frame as T0.
+                let temporal_layer_id = if metadata.is_undefined() || metadata.is_null() {
+                    0u8
+                } else {
+                    let meta: EncodedVideoChunkMetadata = metadata.unchecked_into();
+                    extract_temporal_layer_id(&meta)
+                };
+
+                // `fetch_add` returns the value BEFORE the increment, matching
+                // the prior semantics of `transform_video_chunk(... sequence_number ...);
+                // sequence_number += 1;`. Relaxed ordering is sufficient: there
+                // is exactly one writer (this closure) and the counter is a
+                // monotonic ticker with no cross-thread synchronization need.
+                let sequence_number = picture_id_counter.fetch_add(1, Ordering::Relaxed);
+
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,
+                    temporal_layer_id,
                     buffer.as_mut_slice(),
                     &userid,
                     aes.clone(),
                 );
                 client.send_media_packet(packet);
-                sequence_number += 1;
             })
         };
         let device_id = if let Some(vid) = &self.state.selected {
@@ -533,8 +574,11 @@ impl CameraEncoder {
                 error!("error_handler error {e:?}");
             }) as Box<dyn FnMut(JsValue)>);
 
+            // 2-arg closure: WebCodecs `VideoEncoder.output(chunk, metadata)`.
+            // We need both arguments to read `metadata.svc.temporalLayerId`
+            // for the L1T3 RoutingHeader (bead vc-2nh).
             let video_output_handler =
-                Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
+                Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue, JsValue)>);
 
             let video_encoder_init = VideoEncoderInit::new(
                 video_error_handler.as_ref().unchecked_ref(),
@@ -568,6 +612,9 @@ impl CameraEncoder {
             video_encoder_config
                 .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);
+            // VP9 SVC: 1 spatial layer, 3 temporal layers. Allows the SFU to
+            // drop temporal enhancement layers per-receiver without re-encoding.
+            video_encoder_config.set_scalability_mode("L1T3");
 
             if let Err(e) = video_encoder.configure(&video_encoder_config) {
                 error!("Error configuring video encoder: {e:?}");
@@ -644,6 +691,8 @@ impl CameraEncoder {
                     );
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
+                    // VP9 SVC L1T3 (1 spatial, 3 temporal layers) for SFU layer drop.
+                    new_config.set_scalability_mode("L1T3");
                     if let Err(e) = video_encoder.configure(&new_config) {
                         error!("Error reconfiguring camera encoder for tier change: {e:?}");
                     }
@@ -709,6 +758,8 @@ impl CameraEncoder {
                             );
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
+                            // VP9 SVC L1T3 (1 spatial, 3 temporal layers) for SFU layer drop.
+                            new_config.set_scalability_mode("L1T3");
                             if let Err(e) = video_encoder.configure(&new_config) {
                                 error!(
                                     "Error reconfiguring camera encoder with new dimensions: {e:?}"

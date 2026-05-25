@@ -108,6 +108,13 @@ impl<K: Ord + Hash + Clone, V> HashMapWithOrderedKeys<K, V> {
         &self.keys
     }
 
+    /// Iterate over `(&K, &mut V)` pairs (unordered). Mirrors `HashMap::iter_mut`.
+    /// Use when ordering is not required (e.g. broadcasting an update to all
+    /// entries).
+    pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, K, V> {
+        self.map.iter_mut()
+    }
+
     pub fn remove_if<F>(&mut self, predicate: F)
     where
         F: Fn(&mut V) -> bool,

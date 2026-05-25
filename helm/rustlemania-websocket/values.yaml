@@ -28,6 +28,27 @@ env:
       secretKeyRef:
         name: jwt-secret
         key: secret
+  # NATS basic auth (sfu-update/audits/nats-acl-audit.md). Same Secret as
+  # the webtransport chart; safe to leave Secret absent for back-compat
+  # (env vars resolve empty -> actix-api uses no-auth).
+  #   kubectl create secret generic nats-credentials \
+  #       --from-literal=user=<user> --from-literal=password=<password>
+  - name: NATS_USER
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: user
+        optional: true
+  - name: NATS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: password
+        optional: true
+  - name: NATS_TLS
+    value: "false"
+  - name: NATS_TLS_CA
+    value: ""
 resources:
   limits:
     cpu: "500m"

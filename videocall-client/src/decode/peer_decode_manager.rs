@@ -20,7 +20,8 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::adaptive_quality_constants::{
-    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_TIMEOUT_MS,
+    KEYFRAME_REQUEST_MIN_INTERVAL_MS, KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS,
+    KEYFRAME_REQUEST_TIMEOUT_MS,
 };
 use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
@@ -28,6 +29,7 @@ use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
@@ -36,6 +38,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::speaker_update_packet::SpeakerUpdate;
 use videocall_types::Callback;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -83,6 +86,19 @@ impl Display for PeerDecodeError {
     }
 }
 
+/// Rolling 60s window for outbound KEYFRAME_REQUEST emission counts (per remote
+/// peer user_id). Computed lazily on each emission to avoid a background timer.
+/// A peer that stops triggering KFRs simply stops reporting, which is correct
+/// for surfacing high-rate uplink pressure.
+#[derive(Debug, Default)]
+struct KfrEmissionState {
+    window_start_ms: u64,
+    video_count: u64,
+    screen_count: u64,
+}
+
+const KFR_EMISSION_WINDOW_MS: u64 = 60_000;
+
 pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
@@ -101,6 +117,13 @@ pub struct Peer {
     pub screen_enabled: bool,
     pub is_speaking: bool,
     pub audio_level: f32,
+    /// Whether the SFU has taken authority over this peer's `is_speaking`
+    /// state via a `SpeakerUpdate`. Once `true`, the HEARTBEAT path stops
+    /// writing `is_speaking` (and stops zeroing `audio_level` on the
+    /// not-speaking branch) so the SFU's authoritative decision is not
+    /// clobbered by the peer's local VAD. Defaults to `false` so legacy
+    /// path-only / pre-SFU clients keep using the heartbeat-driven path.
+    pub sfu_speaker_authoritative: bool,
     pub display_name: Option<String>,
     /// Whether this peer's video/screen tiles are currently visible in the
     /// viewport (tracked via IntersectionObserver in the UI layer). When
@@ -110,10 +133,25 @@ pub struct Peer {
     context_initialized: bool,
     vad_threshold: Option<f32>,
     has_received_heartbeat: bool,
-    /// Last seen video sequence number for gap detection.
+    /// Last seen video sequence number for gap detection. Used only on the
+    /// legacy (no-RoutingHeader) non-SVC video path and is preserved for
+    /// backward compatibility with senders that don't emit `RoutingHeader`.
+    /// SVC-aware video uses `last_t0_received_ms` instead — see
+    /// `track_sequence`.
     last_video_seq: Option<u64>,
-    /// Last seen screen sequence number for gap detection.
+    /// Last seen screen sequence number for gap detection. Screen sharing
+    /// is not SVC-encoded (L1T1 only) so the simple increment-by-1 detector
+    /// is correct here.
     last_screen_seq: Option<u64>,
+    /// Wall-clock (ms) of the most recent T0 (base-layer) VIDEO arrival.
+    /// Used for time-based T0-stall detection: when enhancement-layer
+    /// (T1/T2) frames keep arriving but no T0 has landed for longer than
+    /// `KEYFRAME_REQUEST_TIMEOUT_MS`, the receiver concludes that T0
+    /// frames are being lost and arms a KEYFRAME_REQUEST. `None` until
+    /// the first T0 frame is seen (the detector cannot arm before any
+    /// T0 has been observed). Only meaningful on the SVC video path
+    /// (when packets carry a `RoutingHeader`).
+    last_t0_received_ms: Option<u64>,
     /// Timestamp (ms) when a video gap was first detected. `None` if no gap.
     video_gap_detected_at_ms: Option<u64>,
     /// Timestamp (ms) when a screen gap was first detected. `None` if no gap.
@@ -169,6 +207,7 @@ impl Peer {
             screen_enabled: false,
             is_speaking: false,
             audio_level: 0.0,
+            sfu_speaker_authoritative: false,
             display_name: None,
             visible: true,
             context_initialized: false,
@@ -176,6 +215,7 @@ impl Peer {
             has_received_heartbeat: false,
             last_video_seq: None,
             last_screen_seq: None,
+            last_t0_received_ms: None,
             video_gap_detected_at_ms: None,
             screen_gap_detected_at_ms: None,
             last_video_keyframe_request_ms: 0,
@@ -449,9 +489,19 @@ impl Peer {
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
-                    self.is_speaking = metadata.is_speaking;
-                    if !metadata.is_speaking {
-                        self.audio_level = 0.0;
+                    // Once the SFU has issued any SpeakerUpdate, it is the
+                    // authoritative writer for `is_speaking`. The peer's
+                    // local VAD (carried in the HEARTBEAT metadata) lags
+                    // the SFU's decision by up to ~1Hz and would otherwise
+                    // clobber the authoritative state and cause UI flicker
+                    // on tile speaker indicators. The other heartbeat
+                    // fields (video/audio/screen enabled) remain peer-
+                    // authoritative regardless.
+                    if !self.sfu_speaker_authoritative {
+                        self.is_speaking = metadata.is_speaking;
+                        if !metadata.is_speaking {
+                            self.audio_level = 0.0;
+                        }
                     }
 
                     // Flush video decoder when video is turned off
@@ -516,20 +566,119 @@ impl Peer {
     /// gaps. Returns `Some(media_type)` if a KEYFRAME_REQUEST should be sent
     /// for this peer, or `None` if no request is needed.
     ///
-    /// Gap detection logic:
-    /// 1. When a gap is detected (seq > last_seq + 1), record the time.
-    /// 2. After `KEYFRAME_REQUEST_TIMEOUT_MS` with the gap still present,
-    ///    return the media type to request a keyframe for.
-    /// 3. Rate-limit to one request per `KEYFRAME_REQUEST_MIN_INTERVAL_MS`.
-    /// 4. When a keyframe arrives (frame_type == "key"), clear the gap state.
+    /// Two detection strategies are used:
+    ///
+    /// 1. **SVC video (packet has a `RoutingHeader`)**: time-based T0-stall
+    ///    detection. T0 (base-layer) arrivals refresh `last_t0_received_ms`
+    ///    and clear any pending gap. T1/T2 (enhancement-layer) arrivals are
+    ///    a liveness signal that the stream is still flowing on the wire,
+    ///    but if more than `KEYFRAME_REQUEST_TIMEOUT_MS` has elapsed since
+    ///    the last T0 while T1/T2 keep arriving, we conclude that T0 frames
+    ///    are being lost (not just dropped by the SFU on a quiet stream)
+    ///    and arm `video_gap_detected_at_ms`. This avoids the bug where the
+    ///    SFU strips T1/T2 per-receiver and the receiver's wire-sequence
+    ///    jumps would otherwise be misread as gaps. We use wall-clock time
+    ///    here rather than picture_id arithmetic because the encoder's
+    ///    current `picture_id` is a global per-frame counter (see
+    ///    `encode/routing.rs::build_routing_header`) — not a per-layer
+    ///    counter — so T0 picture_ids on the wire are not contiguous.
+    ///
+    /// 2. **Legacy video (no `RoutingHeader`) and SCREEN**: original
+    ///    increment-by-1 sequence-gap detection on `video_metadata.sequence`.
+    ///    SCREEN is L1T1 (no SVC, see `encode/transform.rs`) so this is the
+    ///    correct path.
+    ///
+    /// Once `video_gap_detected_at_ms` / `screen_gap_detected_at_ms` is set,
+    /// the `KEYFRAME_REQUEST_TIMEOUT_MS` detection trigger plus a per-path
+    /// rate-limit applies:
+    ///
+    /// - **SVC video path** (RoutingHeader present): uses
+    ///   `KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS` (longer) because the
+    ///   T0-stall detector is heuristic — armed from T1/T2 liveness while T0
+    ///   is silent — and each KFR forces a full I-frame re-encode that bursts
+    ///   ~50–150KB on a low-uplink sender. Throttling protects senders
+    ///   during transient T0 loss.
+    /// - **Legacy/SCREEN path** (sequence-gap): uses
+    ///   `KEYFRAME_REQUEST_MIN_INTERVAL_MS` (shorter) because the detector
+    ///   fires on a real observed sequence gap and should remain responsive.
+    ///
+    /// A keyframe (`frame_type == "key"`) clears the gap state and refreshes
+    /// `last_t0_received_ms` (keyframes are T0 by definition).
     fn track_sequence(&mut self, media_type: MediaType, packet: &MediaPacket) -> Option<MediaType> {
+        let frame_type_str = packet.frame_type.as_str();
+        let now = now_ms();
+
+        // SVC-aware video path: packet carries a RoutingHeader.
+        if media_type == MediaType::VIDEO {
+            if let Some(rh) = packet.routing_header.as_ref() {
+                // Keyframes are always T0 by definition. Treat them as T0
+                // for stall accounting AND clear any armed gap.
+                if frame_type_str == "key" {
+                    self.last_t0_received_ms = Some(now);
+                    self.video_gap_detected_at_ms = None;
+                } else if rh.temporal_layer_id == 0 {
+                    // T0 (base-layer) delta frame arrived. Stream's T0 path
+                    // is healthy: refresh timestamp and clear any pending
+                    // gap. The SFU normally preserves T0 (it only drops
+                    // enhancement layers to fit downlink bandwidth);
+                    // receiving a T0 frame is strong evidence the base
+                    // layer is intact.
+                    self.last_t0_received_ms = Some(now);
+                    self.video_gap_detected_at_ms = None;
+                } else {
+                    // T1/T2 enhancement-layer frame. Use it as a liveness
+                    // signal: if the wire is delivering T1/T2 but T0 has
+                    // been silent for longer than the timeout, that's a
+                    // real T0 loss (not just the SFU stripping enhancement
+                    // layers on a quiet stream).
+                    if let Some(last_t0) = self.last_t0_received_ms {
+                        let since_t0 = now.saturating_sub(last_t0);
+                        if since_t0 >= KEYFRAME_REQUEST_TIMEOUT_MS
+                            && self.video_gap_detected_at_ms.is_none()
+                        {
+                            self.video_gap_detected_at_ms = Some(now);
+                            debug!(
+                                "T0 stall detected for peer {}: {}ms since last T0 while T1/T2 still arriving",
+                                self.session_id, since_t0
+                            );
+                        }
+                    }
+                    // If `last_t0_received_ms` is None we haven't seen a T0
+                    // yet — the detector cannot arm before establishing a
+                    // baseline. Initial-frame recovery is handled by the
+                    // decoder's own keyframe-waiting state machine.
+                }
+
+                // Apply the rate-limited dispatch on
+                // `video_gap_detected_at_ms`. The SVC stall path uses a
+                // longer minimum interval (see
+                // KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS) to avoid
+                // hammering low-uplink senders during transient T0 loss.
+                if let Some(gap_time) = self.video_gap_detected_at_ms {
+                    let elapsed_since_gap = now.saturating_sub(gap_time);
+                    let elapsed_since_last_req =
+                        now.saturating_sub(self.last_video_keyframe_request_ms);
+                    if elapsed_since_gap >= KEYFRAME_REQUEST_TIMEOUT_MS
+                        && elapsed_since_last_req >= KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS
+                    {
+                        self.last_video_keyframe_request_ms = now;
+                        return Some(MediaType::VIDEO);
+                    }
+                }
+                return None;
+            }
+            // Fall through to the legacy seq-based path below for VIDEO
+            // packets without a RoutingHeader.
+        }
+
+        // Legacy sequence-based path: VIDEO without RoutingHeader, and
+        // SCREEN (which is L1T1 and never carries enhancement layers).
         // Both VIDEO and SCREEN packets use `video_metadata` for sequence
         // tracking. This is correct: `transform_screen_chunk` in
         // `encode/transform.rs` populates `VideoMetadata { sequence, .. }`
-        // for SCREEN packets the same way `transform_video_chunk` does for
-        // VIDEO packets.
-        let (seq, frame_type_str) = if let Some(vm) = packet.video_metadata.as_ref() {
-            (vm.sequence, packet.frame_type.as_str())
+        // for SCREEN packets the same way `transform_video_chunk` does.
+        let seq = if let Some(vm) = packet.video_metadata.as_ref() {
+            vm.sequence
         } else {
             return None;
         };
@@ -547,8 +696,6 @@ impl Peer {
             ),
             _ => return None,
         };
-
-        let now = now_ms();
 
         // If this is a keyframe, clear the gap state -- we recovered.
         if frame_type_str == "key" {
@@ -651,6 +798,15 @@ pub struct PeerDecodeManager {
     send_packet: Option<Callback<PacketWrapper>>,
     /// The local user_id, needed to construct outgoing KEYFRAME_REQUEST packets.
     local_user_id: String,
+    /// Highest `SpeakerUpdate.generation` accepted so far. Used to drop
+    /// out-of-order / stale updates from the server (datagram delivery can
+    /// reorder packets). `0` means "no update has been applied yet" and is
+    /// also treated as an invalid generation when found on incoming packets.
+    speaker_generation: u64,
+    /// Per-remote-peer rolling-window counters for outbound KEYFRAME_REQUEST
+    /// emissions. `RefCell` because `send_keyframe_request` takes `&self`
+    /// (called from `set_peer_screen_canvas`, which is also `&self`).
+    kfr_emission_state: RefCell<HashMap<String, KfrEmissionState>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -672,6 +828,8 @@ impl PeerDecodeManager {
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            speaker_generation: 0,
+            kfr_emission_state: RefCell::new(HashMap::new()),
         }
     }
 
@@ -687,6 +845,8 @@ impl PeerDecodeManager {
             vad_threshold: None,
             send_packet: None,
             local_user_id: String::new(),
+            speaker_generation: 0,
+            kfr_emission_state: RefCell::new(HashMap::new()),
         }
     }
 
@@ -723,6 +883,71 @@ impl PeerDecodeManager {
 
     pub fn sorted_keys(&self) -> &Vec<u64> {
         self.connected_peers.ordered_keys()
+    }
+
+    /// Apply a `SpeakerUpdate` from the SFU.
+    ///
+    /// Updates each connected peer's `is_speaking` flag based on the speaker
+    /// list. A generation counter is used to drop stale / out-of-order
+    /// packets (datagrams may reorder). Returns `true` when the update was
+    /// accepted and applied, `false` when it was rejected (older or equal
+    /// generation, or invalid generation `0`).
+    ///
+    /// Note: `audio_level` is zeroed only for peers transitioning to
+    /// not-speaking. When a peer is marked speaking by this update, the
+    /// existing `audio_level` (sourced from the HEARTBEAT path) is left
+    /// untouched. This mirrors the behaviour in the HEARTBEAT handler.
+    pub fn apply_speaker_update(&mut self, update: &SpeakerUpdate) -> bool {
+        // Generation 0 is reserved/unset on the wire. Reject it outright so
+        // server bugs do not silently clobber existing state.
+        if update.generation == 0 {
+            debug!("Dropping SpeakerUpdate with generation == 0 (invalid)");
+            return false;
+        }
+        // Drop strictly older or duplicate generations. The first valid
+        // packet (gen >= 1) passes since `speaker_generation` starts at 0.
+        if update.generation <= self.speaker_generation {
+            debug!(
+                "Dropping out-of-order SpeakerUpdate: incoming gen={} <= current gen={}",
+                update.generation, self.speaker_generation
+            );
+            return false;
+        }
+        self.speaker_generation = update.generation;
+
+        // Build a set of session ids that should be marked speaking.
+        let speakers: std::collections::HashSet<u64> = update
+            .top_speakers
+            .iter()
+            .filter(|e| e.is_speaking)
+            .map(|e| e.session_id)
+            .collect();
+
+        for (sid, peer) in self.connected_peers.iter_mut() {
+            // Flip the authoritative flag for every connected peer,
+            // including peers that are silent for the entire session and
+            // would therefore never appear in `top_speakers`. After the
+            // first accepted SpeakerUpdate, the SFU owns `is_speaking` for
+            // all peers — the HEARTBEAT path must stop writing it.
+            peer.sfu_speaker_authoritative = true;
+
+            let should_speak = speakers.contains(sid);
+            if peer.is_speaking != should_speak {
+                peer.is_speaking = should_speak;
+                if !should_speak {
+                    // Mirror the HEARTBEAT handler: zero audio level on the
+                    // not-speaking transition so the UI bar deflates.
+                    peer.audio_level = 0.0;
+                }
+            }
+        }
+        true
+    }
+
+    /// Test-only accessor for the current speaker generation counter.
+    #[cfg(test)]
+    pub fn current_speaker_generation(&self) -> u64 {
+        self.speaker_generation
     }
 
     pub fn get(&self, key: &u64) -> Option<&Peer> {
@@ -768,8 +993,15 @@ impl PeerDecodeManager {
         let removed = self
             .connected_peers
             .remove_if_and_return(|peer| peer.check_heartbeat());
-        for (_session_id, peer) in removed {
-            self.on_peer_removed.emit(peer.sid_str);
+        if !removed.is_empty() {
+            let mut kfr = self.kfr_emission_state.borrow_mut();
+            for (_session_id, peer) in &removed {
+                kfr.remove(&peer.user_id);
+            }
+            drop(kfr);
+            for (_session_id, peer) in removed {
+                self.on_peer_removed.emit(peer.sid_str);
+            }
         }
     }
 
@@ -878,6 +1110,51 @@ impl PeerDecodeManager {
             requested_media_type
         );
         send_packet.emit(wrapper);
+
+        self.record_kfr_emission(peer_user_id, requested_media_type);
+    }
+
+    /// Record a successful outbound KEYFRAME_REQUEST emission and, if the
+    /// current 60s window has elapsed, broadcast a diagnostics event with the
+    /// per-class counts. Window state is computed lazily on emission — no
+    /// background timer — so quiet peers report nothing (which is correct for
+    /// a high-rate-pressure signal).
+    fn record_kfr_emission(&self, peer_user_id: &str, requested_media_type: MediaType) {
+        let now = now_ms();
+        let mut map = self.kfr_emission_state.borrow_mut();
+        let state = map
+            .entry(peer_user_id.to_string())
+            .or_insert_with(|| KfrEmissionState {
+                window_start_ms: now,
+                ..Default::default()
+            });
+        match requested_media_type {
+            MediaType::VIDEO => state.video_count += 1,
+            MediaType::SCREEN => state.screen_count += 1,
+            _ => {}
+        }
+
+        if now.saturating_sub(state.window_start_ms) >= KFR_EMISSION_WINDOW_MS {
+            let video_count = state.video_count;
+            let screen_count = state.screen_count;
+            let window_ms = now.saturating_sub(state.window_start_ms);
+            state.window_start_ms = now;
+            state.video_count = 0;
+            state.screen_count = 0;
+            drop(map);
+
+            let evt = DiagEvent {
+                subsystem: "keyframe_request",
+                stream_id: Some(peer_user_id.to_string()),
+                ts_ms: now,
+                metrics: vec![
+                    metric!("video_emitted", video_count),
+                    metric!("screen_emitted", screen_count),
+                    metric!("window_ms", window_ms),
+                ],
+            };
+            let _ = global_sender().try_broadcast(evt);
+        }
     }
 
     fn add_peer(
@@ -905,12 +1182,17 @@ impl PeerDecodeManager {
             );
             peer.display_name = Some(cached_name.clone());
         }
+        // If the SFU has already issued at least one SpeakerUpdate, peers
+        // joining mid-call must inherit the authoritative gate so the
+        // heartbeat path does not write `is_speaking` for them either.
+        peer.sfu_speaker_authoritative = self.speaker_generation > 0;
         self.connected_peers.insert(session_id, peer);
         Ok(())
     }
 
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
+            self.kfr_emission_state.borrow_mut().remove(&peer.user_id);
             self.on_peer_removed.emit(peer.sid_str);
         }
     }
@@ -927,6 +1209,7 @@ impl PeerDecodeManager {
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
+        self.kfr_emission_state.borrow_mut().clear();
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
@@ -1172,9 +1455,11 @@ mod tests {
             has_received_heartbeat: false,
             is_speaking: false,
             audio_level: 0.0,
+            sfu_speaker_authoritative: false,
             vad_threshold: None,
             last_video_seq: None,
             last_screen_seq: None,
+            last_t0_received_ms: None,
             video_gap_detected_at_ms: None,
             screen_gap_detected_at_ms: None,
             last_video_keyframe_request_ms: 0,
@@ -1414,6 +1699,312 @@ mod tests {
             (peer.audio_level - 0.0).abs() < f32::EPSILON,
             "audio_level should be reset to 0.0 when heartbeat says not speaking, got {}",
             peer.audio_level
+        );
+    }
+
+    // -- SpeakerUpdate tests ----------------------------------------------
+
+    /// Build a `SpeakerUpdate` with the given generation and speaker list.
+    fn make_speaker_update(generation: u64, speakers: &[(u64, bool)]) -> SpeakerUpdate {
+        use videocall_types::protos::speaker_update_packet::SpeakerEntry;
+        let mut update = SpeakerUpdate::new();
+        update.generation = generation;
+        update.top_speakers = speakers
+            .iter()
+            .map(|(sid, speaking)| {
+                let mut e = SpeakerEntry::new();
+                e.session_id = *sid;
+                e.is_speaking = *speaking;
+                e.score = if *speaking { 1.0 } else { 0.0 };
+                e
+            })
+            .collect();
+        update
+    }
+
+    /// Ascending generations should each be applied and reflected in
+    /// `peer.is_speaking`.
+    #[wasm_bindgen_test]
+    fn speaker_update_ascending_generations_advance_state() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(1);
+        let (peer_b, _) = make_test_peer(2);
+        manager.connected_peers.insert(1, peer_a);
+        manager.connected_peers.insert(2, peer_b);
+
+        // gen 1: peer 1 speaking, peer 2 not.
+        let u1 = make_speaker_update(1, &[(1, true), (2, false)]);
+        assert!(manager.apply_speaker_update(&u1));
+        assert!(manager.get(&1).unwrap().is_speaking);
+        assert!(!manager.get(&2).unwrap().is_speaking);
+
+        // gen 2: flip — peer 2 speaking, peer 1 not.
+        let u2 = make_speaker_update(2, &[(1, false), (2, true)]);
+        assert!(manager.apply_speaker_update(&u2));
+        assert!(!manager.get(&1).unwrap().is_speaking);
+        assert!(manager.get(&2).unwrap().is_speaking);
+
+        assert_eq!(manager.current_speaker_generation(), 2);
+    }
+
+    /// An older generation arriving after a newer one must be dropped.
+    #[wasm_bindgen_test]
+    fn speaker_update_out_of_order_packet_dropped() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(10);
+        manager.connected_peers.insert(10, peer_a);
+
+        // Establish gen 5 first.
+        let u5 = make_speaker_update(5, &[(10, true)]);
+        assert!(manager.apply_speaker_update(&u5));
+        assert!(manager.get(&10).unwrap().is_speaking);
+        assert_eq!(manager.current_speaker_generation(), 5);
+
+        // Late-arriving gen 3 with peer not speaking — must be rejected.
+        let u3 = make_speaker_update(3, &[(10, false)]);
+        assert!(
+            !manager.apply_speaker_update(&u3),
+            "older generation must be dropped"
+        );
+        assert!(
+            manager.get(&10).unwrap().is_speaking,
+            "is_speaking must NOT change when stale update is dropped"
+        );
+        assert_eq!(manager.current_speaker_generation(), 5);
+    }
+
+    /// A duplicate generation (equal to the stored one) must also be dropped.
+    #[wasm_bindgen_test]
+    fn speaker_update_equal_generation_dropped() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(20);
+        let (peer_b, _) = make_test_peer(21);
+        manager.connected_peers.insert(20, peer_a);
+        manager.connected_peers.insert(21, peer_b);
+
+        // First gen 2: peer 20 is speaking.
+        let u2a = make_speaker_update(2, &[(20, true), (21, false)]);
+        assert!(manager.apply_speaker_update(&u2a));
+        assert!(manager.get(&20).unwrap().is_speaking);
+        assert!(!manager.get(&21).unwrap().is_speaking);
+
+        // Second gen 2 with different speakers: must be rejected.
+        let u2b = make_speaker_update(2, &[(20, false), (21, true)]);
+        assert!(
+            !manager.apply_speaker_update(&u2b),
+            "duplicate generation must be dropped"
+        );
+        // State preserved from the first call.
+        assert!(manager.get(&20).unwrap().is_speaking);
+        assert!(!manager.get(&21).unwrap().is_speaking);
+    }
+
+    /// Peers absent from `top_speakers` (or present with is_speaking=false)
+    /// should be marked not speaking, and their `audio_level` zeroed.
+    #[wasm_bindgen_test]
+    fn speaker_update_absent_peers_marked_not_speaking_and_audio_zeroed() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Two peers, both currently speaking with a non-zero audio level.
+        let (mut peer_a, _) = make_test_peer(30);
+        peer_a.is_speaking = true;
+        peer_a.audio_level = 0.42;
+        let (mut peer_b, _) = make_test_peer(31);
+        peer_b.is_speaking = true;
+        peer_b.audio_level = 0.66;
+        manager.connected_peers.insert(30, peer_a);
+        manager.connected_peers.insert(31, peer_b);
+
+        // gen 1 names only peer 30 as speaking; peer 31 is explicitly
+        // listed as not speaking. peer 30 audio_level must stay untouched
+        // (still speaking); peer 31 audio_level must drop to 0.
+        let u = make_speaker_update(1, &[(30, true), (31, false)]);
+        assert!(manager.apply_speaker_update(&u));
+
+        let p30 = manager.get(&30).unwrap();
+        assert!(p30.is_speaking, "peer 30 should remain speaking");
+        assert!(
+            (p30.audio_level - 0.42).abs() < f32::EPSILON,
+            "peer 30 audio_level should NOT be zeroed while speaking"
+        );
+
+        let p31 = manager.get(&31).unwrap();
+        assert!(
+            !p31.is_speaking,
+            "peer 31 should transition to not speaking"
+        );
+        assert!(
+            (p31.audio_level - 0.0).abs() < f32::EPSILON,
+            "peer 31 audio_level must be reset to 0 on transition"
+        );
+    }
+
+    /// Peers omitted entirely from the speaker list should also be marked
+    /// not speaking and have audio_level zeroed.
+    #[wasm_bindgen_test]
+    fn speaker_update_omitted_peer_marked_not_speaking() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer_a, _) = make_test_peer(40);
+        peer_a.is_speaking = true;
+        peer_a.audio_level = 0.9;
+        manager.connected_peers.insert(40, peer_a);
+
+        // No entries for peer 40 at all — it should be cleared.
+        let u = make_speaker_update(1, &[]);
+        assert!(manager.apply_speaker_update(&u));
+
+        let p = manager.get(&40).unwrap();
+        assert!(!p.is_speaking, "omitted peer should be marked not speaking");
+        assert!(
+            (p.audio_level - 0.0).abs() < f32::EPSILON,
+            "audio_level should be zeroed on transition to not speaking"
+        );
+    }
+
+    /// Generation 0 is reserved/unset and must be rejected unconditionally.
+    #[wasm_bindgen_test]
+    fn speaker_update_generation_zero_rejected() {
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer_a, _) = make_test_peer(50);
+        peer_a.is_speaking = false;
+        manager.connected_peers.insert(50, peer_a);
+
+        let u = make_speaker_update(0, &[(50, true)]);
+        assert!(
+            !manager.apply_speaker_update(&u),
+            "generation 0 must be rejected"
+        );
+        assert!(
+            !manager.get(&50).unwrap().is_speaking,
+            "rejected update must not change state"
+        );
+        assert_eq!(
+            manager.current_speaker_generation(),
+            0,
+            "generation counter must remain unchanged"
+        );
+    }
+
+    /// Build a HEARTBEAT packet that carries an explicit `is_speaking` flag
+    /// (the standard `heartbeat_packet` helper leaves it at its protobuf
+    /// default of false).
+    fn heartbeat_packet_with_speaking(
+        session_id: u64,
+        video: bool,
+        audio: bool,
+        screen: bool,
+        is_speaking: bool,
+    ) -> Arc<PacketWrapper> {
+        let media = MediaPacket {
+            media_type: MediaType::HEARTBEAT.into(),
+            user_id: "test@test.com".into(),
+            heartbeat_metadata: Some(HeartbeatMetadata {
+                video_enabled: video,
+                audio_enabled: audio,
+                screen_enabled: screen,
+                is_speaking,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        wrap(&media, session_id)
+    }
+
+    /// Once the SFU has issued a SpeakerUpdate, the HEARTBEAT path must NOT
+    /// override the SFU's authoritative `is_speaking` decision. This guards
+    /// against UI flicker when the peer's local VAD disagrees with the SFU
+    /// for ~1 heartbeat cycle after a generation flip.
+    #[wasm_bindgen_test]
+    fn heartbeat_after_speaker_update_does_not_override_sfu_decision() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer_a, _) = make_test_peer(1001);
+        let (peer_b, _) = make_test_peer(1002);
+        manager.connected_peers.insert(1001, peer_a);
+        manager.connected_peers.insert(1002, peer_b);
+
+        // SFU declares A speaking, B not. This also flips
+        // `sfu_speaker_authoritative = true` on both peers via the real
+        // side effect of `apply_speaker_update`.
+        let u = make_speaker_update(1, &[(1001, true), (1002, false)]);
+        assert!(manager.apply_speaker_update(&u));
+        assert!(manager.get(&1001).unwrap().is_speaking);
+        assert!(!manager.get(&1002).unwrap().is_speaking);
+        assert!(manager.get(&1001).unwrap().sfu_speaker_authoritative);
+        assert!(manager.get(&1002).unwrap().sfu_speaker_authoritative);
+
+        // Heartbeats from each peer disagree with the SFU: A says not
+        // speaking, B says speaking. These must be ignored for is_speaking.
+        let hb_a = heartbeat_packet_with_speaking(1001, true, true, false, false);
+        let hb_b = heartbeat_packet_with_speaking(1002, true, true, false, true);
+
+        // Decode through the manager so we exercise the real Peer::decode
+        // path (which dispatches HEARTBEAT to the gated branch).
+        let _ = manager.decode((*hb_a).clone(), "local@example.com");
+        let _ = manager.decode((*hb_b).clone(), "local@example.com");
+
+        assert!(
+            manager.get(&1001).unwrap().is_speaking,
+            "SFU said A is speaking; heartbeat must not flip it back to false"
+        );
+        assert!(
+            !manager.get(&1002).unwrap().is_speaking,
+            "SFU said B is NOT speaking; heartbeat must not flip it to true"
+        );
+
+        // And video_enabled / audio_enabled writes from the heartbeat
+        // should still propagate (those fields are NOT gated).
+        assert!(manager.get(&1001).unwrap().video_enabled);
+        assert!(manager.get(&1001).unwrap().audio_enabled);
+        assert!(manager.get(&1002).unwrap().video_enabled);
+        assert!(manager.get(&1002).unwrap().audio_enabled);
+    }
+
+    /// Legacy / pre-SFU path: when no SpeakerUpdate has ever been received,
+    /// the HEARTBEAT path must still write `is_speaking`. This guards the
+    /// path-only client (and the moment before the first generation
+    /// arrives) against silent regression.
+    #[wasm_bindgen_test]
+    fn heartbeat_before_any_speaker_update_still_writes_is_speaking() {
+        let (mut peer, _muted) = make_test_peer(1100);
+        assert!(!peer.sfu_speaker_authoritative);
+        assert!(!peer.is_speaking);
+
+        let hb = heartbeat_packet_with_speaking(1100, false, true, false, true);
+        let _ = peer.decode(&hb);
+
+        assert!(
+            peer.is_speaking,
+            "pre-SFU heartbeat with is_speaking=true must flip peer.is_speaking"
+        );
+        // Audio enable should also propagate as before.
+        assert!(peer.audio_enabled);
+    }
+
+    /// Peers joining mid-call (after at least one SpeakerUpdate has been
+    /// applied) must inherit `sfu_speaker_authoritative = true` from
+    /// `add_peer()`, so their first heartbeat does not clobber the SFU's
+    /// state for them either.
+    #[wasm_bindgen_test]
+    fn add_peer_inherits_authoritative_flag_when_generation_nonzero() {
+        let mut manager = PeerDecodeManager::new();
+
+        // First, apply a SpeakerUpdate (with no peers connected — it's
+        // still accepted; manager.speaker_generation advances).
+        let u = make_speaker_update(7, &[]);
+        assert!(manager.apply_speaker_update(&u));
+        assert_eq!(manager.current_speaker_generation(), 7);
+
+        // Now add a brand new peer. NOTE: Peer::new() instantiates real
+        // decoders that require a browser environment, so this test only
+        // succeeds in a wasm-bindgen-test environment.
+        let res = manager.add_peer("late@example.com", 1200, None);
+        assert!(res.is_ok(), "add_peer should succeed: {:?}", res.err());
+
+        let p = manager.get(&1200).expect("peer should exist");
+        assert!(
+            p.sfu_speaker_authoritative,
+            "peer added after a SpeakerUpdate must inherit the authoritative flag"
         );
     }
 
@@ -2039,6 +2630,339 @@ mod tests {
         };
         let result = peer.track_sequence(MediaType::AUDIO, &pkt);
         assert!(result.is_none(), "AUDIO should not be tracked");
+    }
+
+    // -- SVC temporal-layer-aware gap detection tests ----------------------
+
+    /// Build a VIDEO MediaPacket carrying both `video_metadata.sequence` and
+    /// a `RoutingHeader` with the given temporal layer and picture_id.
+    /// `frame_type` is "delta" unless `is_key` is true. Note: with the
+    /// time-based T0-stall detector, `picture_id` no longer participates in
+    /// gap math — it's set here only because it's a real field of
+    /// `RoutingHeader` and helps test packets resemble production traffic.
+    fn svc_video_packet(
+        sequence: u64,
+        temporal_layer_id: u32,
+        picture_id: u64,
+        is_key: bool,
+    ) -> MediaPacket {
+        use videocall_types::protos::media_packet::{RoutingHeader, VideoMetadata};
+        MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence,
+                ..Default::default()
+            })
+            .into(),
+            routing_header: Some(RoutingHeader {
+                is_keyframe: is_key,
+                temporal_layer_id,
+                spatial_layer_id: 0,
+                picture_id,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: if is_key { "key".into() } else { "delta".into() },
+            ..Default::default()
+        }
+    }
+
+    /// A healthy L1T3 stream — alternating T0/T1/T2 deltas arriving at
+    /// realistic wall-clock times — must not trip the gap detector and
+    /// must not fire a KEYFRAME_REQUEST. Verifies the baseline: SVC
+    /// awareness does not introduce false positives.
+    #[wasm_bindgen_test]
+    fn svc_t0_arrivals_keep_stream_healthy() {
+        let (mut peer, _muted) = make_test_peer(220);
+
+        // Two full GOPs of L1T3: T0, T2, T1, T2, T0, T2, T1, T2.
+        // Wire sequence increments per frame; picture_id same as sequence
+        // (matches current encoder).
+        let layers = [0u32, 2, 1, 2, 0, 2, 1, 2];
+        for (i, &tlid) in layers.iter().enumerate() {
+            let pkt = svc_video_packet(100 + i as u64, tlid, 100 + i as u64, false);
+            let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+            assert!(
+                result.is_none(),
+                "Healthy frame i={i} tlid={tlid} must not request a keyframe"
+            );
+        }
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "Healthy stream must not arm the gap detector"
+        );
+        assert!(
+            peer.last_t0_received_ms.is_some(),
+            "T0 arrivals must refresh last_t0_received_ms"
+        );
+    }
+
+    /// When T0 stops arriving but T1/T2 still flow on the wire for longer
+    /// than KEYFRAME_REQUEST_TIMEOUT_MS, the detector arms and (after the
+    /// rate-limit window) a KEYFRAME_REQUEST fires. This is the real T0
+    /// loss case the SFU layer-drop did NOT cause — the SFU never drops
+    /// T0 — so it indicates network loss of base-layer frames.
+    #[wasm_bindgen_test]
+    fn svc_t1_t2_only_no_t0_for_timeout_triggers_kfr() {
+        let (mut peer, _muted) = make_test_peer(221);
+
+        // Establish baseline: one T0 arrival to arm `last_t0_received_ms`.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        assert!(peer.last_t0_received_ms.is_some());
+        assert!(peer.video_gap_detected_at_ms.is_none());
+
+        // Backdate the last-T0 timestamp to simulate a long T0 silence
+        // while enhancement layers keep arriving.
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+
+        // First T1 arrival past the timeout: the detector should arm,
+        // recording `video_gap_detected_at_ms`. The KFR itself can't fire
+        // yet because the gap was JUST armed (elapsed_since_gap is ~0).
+        let result1 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        assert!(
+            peer.video_gap_detected_at_ms.is_some(),
+            "T0 stall past timeout must arm the gap detector"
+        );
+        assert!(
+            result1.is_none(),
+            "Just-armed gap shouldn't fire KFR on the same call"
+        );
+
+        // Backdate the gap timestamp so elapsed >= KEYFRAME_REQUEST_TIMEOUT_MS,
+        // and clear the rate-limit. Now another T1 arrival should fire.
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms = 0;
+
+        let result2 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 2, 12, false));
+        assert_eq!(
+            result2,
+            Some(MediaType::VIDEO),
+            "T0 stall must fire VIDEO KEYFRAME_REQUEST after timeout"
+        );
+    }
+
+    /// A keyframe arrival clears the armed stall and refreshes
+    /// `last_t0_received_ms` (keyframes are T0 by definition).
+    #[wasm_bindgen_test]
+    fn svc_keyframe_clears_t0_stall() {
+        let (mut peer, _muted) = make_test_peer(222);
+
+        // Arm a stall: one T0 baseline, then backdate and feed T1.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        assert!(
+            peer.video_gap_detected_at_ms.is_some(),
+            "Precondition: stall is armed"
+        );
+        let old_last_t0 = peer.last_t0_received_ms;
+
+        // A keyframe arrives. Since keyframes are T0, the stall must clear
+        // and last_t0_received_ms must be refreshed to ~now.
+        let result = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 0, 12, true));
+        assert!(result.is_none(), "Keyframe arrival must not trigger KFR");
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "Keyframe must clear the armed stall"
+        );
+        assert!(
+            peer.last_t0_received_ms != old_last_t0,
+            "Keyframe must refresh last_t0_received_ms"
+        );
+    }
+
+    /// A plain T0 delta arrival (not a keyframe) also clears the armed stall
+    /// and refreshes `last_t0_received_ms`. T0 arrival is itself proof that
+    /// the base-layer path is healthy again.
+    #[wasm_bindgen_test]
+    fn svc_t0_arrival_clears_t0_stall() {
+        let (mut peer, _muted) = make_test_peer(223);
+
+        // Arm a stall: one T0 baseline, then backdate and feed T1.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        assert!(peer.video_gap_detected_at_ms.is_some());
+        let old_last_t0 = peer.last_t0_received_ms;
+
+        // Plain T0 delta arrives.
+        let result = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 0, 12, false));
+        assert!(result.is_none(), "T0 delta arrival must not trigger KFR");
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "T0 delta arrival must clear the armed stall"
+        );
+        assert!(
+            peer.last_t0_received_ms != old_last_t0,
+            "T0 delta arrival must refresh last_t0_received_ms"
+        );
+    }
+
+    /// After a T0-stall KFR fires, an immediate follow-up T1 arrival must
+    /// NOT fire another KFR — `last_video_keyframe_request_ms` was just set
+    /// and `KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS` has not elapsed.
+    /// Pins the rate-limit invariant on the SVC path: the SVC stall path
+    /// uses a longer minimum interval (2000ms) than the legacy/screen
+    /// sequence-gap path (500ms) to avoid hammering low-uplink senders
+    /// during transient T0 loss.
+    #[wasm_bindgen_test]
+    fn svc_t0_stall_kfr_respects_rate_limit() {
+        let (mut peer, _muted) = make_test_peer(224);
+
+        // Mirror the setup in svc_t1_t2_only_no_t0_for_timeout_triggers_kfr
+        // to drive a KFR fire.
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(10, 0, 10, false));
+        peer.last_t0_received_ms = Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let _ = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(11, 1, 11, false));
+        // Backdate the armed gap so the next call fires.
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms = 0;
+        let result1 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(12, 2, 12, false));
+        assert_eq!(
+            result1,
+            Some(MediaType::VIDEO),
+            "Precondition: first KFR fires"
+        );
+        assert!(
+            peer.last_video_keyframe_request_ms > 0,
+            "Precondition: rate-limit timestamp recorded"
+        );
+        let first_kfr_ts = peer.last_video_keyframe_request_ms;
+
+        // Immediately re-arm the gap timestamp (still past timeout) but
+        // do NOT advance `last_video_keyframe_request_ms`. The rate-limit
+        // alone must now suppress a second fire. The SVC stall path uses
+        // KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS (2000ms), which has
+        // not elapsed since `first_kfr_ts` (this whole test runs in ms).
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        let result2 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(13, 1, 13, false));
+        assert!(
+            result2.is_none(),
+            "Second KFR within KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS must be rate-limited"
+        );
+        assert_eq!(
+            peer.last_video_keyframe_request_ms, first_kfr_ts,
+            "Rate-limited call must not update last_video_keyframe_request_ms"
+        );
+
+        // Sanity: backdate `last_video_keyframe_request_ms` to be older
+        // than the SVC stall min-interval and confirm the next call is
+        // permitted to fire. This pins that we're throttling against the
+        // *new* longer interval, not the legacy 500ms one (a second
+        // backdated only by KEYFRAME_REQUEST_MIN_INTERVAL_MS must still be
+        // suppressed).
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms =
+            now_ms().saturating_sub(KEYFRAME_REQUEST_MIN_INTERVAL_MS + 100);
+        let result3 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(14, 2, 14, false));
+        assert!(
+            result3.is_none(),
+            "SVC stall path must throttle past KEYFRAME_REQUEST_MIN_INTERVAL_MS — \
+             only KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS unblocks it"
+        );
+
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms =
+            now_ms().saturating_sub(KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS + 100);
+        let result4 = peer.track_sequence(MediaType::VIDEO, &svc_video_packet(15, 1, 15, false));
+        assert_eq!(
+            result4,
+            Some(MediaType::VIDEO),
+            "SVC stall KFR must fire once KEYFRAME_REQUEST_SVC_STALL_MIN_INTERVAL_MS has elapsed"
+        );
+    }
+
+    /// Without ever observing a T0 frame, T1/T2 arrivals alone must NOT arm
+    /// the gap detector. Pins the "detector cannot arm before baseline"
+    /// invariant: `last_t0_received_ms` is `None`, so the time-based check
+    /// has no reference point and must take no action.
+    #[wasm_bindgen_test]
+    fn svc_no_baseline_t0_t1_t2_only_no_arming() {
+        let (mut peer, _muted) = make_test_peer(225);
+
+        // Fresh peer: no T0 has ever been seen.
+        assert!(peer.last_t0_received_ms.is_none());
+
+        // Feed five enhancement-layer packets (alternating T1 / T2).
+        let layers = [1u32, 2, 1, 2, 1];
+        for (i, &tlid) in layers.iter().enumerate() {
+            let pkt = svc_video_packet(100 + i as u64, tlid, 100 + i as u64, false);
+            let result = peer.track_sequence(MediaType::VIDEO, &pkt);
+            assert!(
+                result.is_none(),
+                "T1/T2 packet i={i} without a T0 baseline must not return a KFR"
+            );
+        }
+        assert!(
+            peer.video_gap_detected_at_ms.is_none(),
+            "Detector must not arm before the first T0 establishes a baseline"
+        );
+        assert!(
+            peer.last_t0_received_ms.is_none(),
+            "T1/T2 packets must not populate last_t0_received_ms"
+        );
+    }
+
+    /// Regression guard: a legacy sender that does not populate a
+    /// `RoutingHeader` must continue to use the original
+    /// `video_metadata.sequence`-based gap detection.
+    #[wasm_bindgen_test]
+    fn legacy_no_routing_header_uses_sequence_based_gap_detection() {
+        use videocall_types::protos::media_packet::VideoMetadata;
+        let (mut peer, _muted) = make_test_peer(224);
+
+        // No RoutingHeader on these packets — purely the legacy path.
+        let pkt1 = MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence: 1,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".into(),
+            ..Default::default()
+        };
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt1);
+
+        let pkt5 = MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence: 5,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".into(),
+            ..Default::default()
+        };
+        let _ = peer.track_sequence(MediaType::VIDEO, &pkt5);
+
+        assert!(
+            peer.video_gap_detected_at_ms.is_some(),
+            "Legacy sender (no RoutingHeader) must still trip seq-based gap detection"
+        );
+
+        // And the KFR still fires after timeout.
+        peer.video_gap_detected_at_ms =
+            Some(now_ms().saturating_sub(KEYFRAME_REQUEST_TIMEOUT_MS + 100));
+        peer.last_video_keyframe_request_ms = 0;
+
+        let pkt6 = MediaPacket {
+            video_metadata: Some(VideoMetadata {
+                sequence: 6,
+                ..Default::default()
+            })
+            .into(),
+            frame_type: "delta".into(),
+            ..Default::default()
+        };
+        let result = peer.track_sequence(MediaType::VIDEO, &pkt6);
+        assert_eq!(
+            result,
+            Some(MediaType::VIDEO),
+            "Legacy seq-gap KFR path must remain unchanged"
+        );
     }
 
     // -- Visibility-based skip tests ----------------------------------------

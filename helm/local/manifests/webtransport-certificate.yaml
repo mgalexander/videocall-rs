@@ -1,0 +1,31 @@
+# cert-manager Certificate for the WebTransport QUIC TLS material.
+#
+# The webtransport_server binary reads cert/key from /certs/tls.crt and
+# /certs/tls.key (see helm/rustlemania-webtransport/values-local.yaml,
+# CERT_PATH/KEY_PATH env). The chart mounts whatever Secret is named by
+# `tlsSecret:` at /certs (deployment.yaml volumeMount). This Certificate
+# resource asks cert-manager (via the `local-selfsigned` ClusterIssuer
+# applied by helm/local/up.sh) to provision that Secret in the default
+# namespace.
+#
+# Production note: in production this Secret is provisioned by the
+# rustlemania-ui chart's Ingress annotation (`tls.acme` flow). Locally
+# the webtransport pod isn't behind an Ingress for the QUIC port, so we
+# request the cert explicitly with a Certificate object instead.
+#
+# Applied (with `kubectl wait --for=condition=Ready cert/...`) by
+# helm/local/up.sh BEFORE the rustlemania-webtransport helm install.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: transport-videocall-local
+  namespace: default
+spec:
+  secretName: transport-videocall-local-tls
+  dnsNames:
+    - transport.videocall.local
+  # Selfsigned ClusterIssuer applied by helm/local/up.sh from
+  # helm/cert-manager-issuer/cluster-issuer-local.yaml.
+  issuerRef:
+    name: local-selfsigned
+    kind: ClusterIssuer

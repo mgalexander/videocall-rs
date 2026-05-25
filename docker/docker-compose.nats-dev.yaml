@@ -1,0 +1,53 @@
+# docker-compose.nats-dev.yaml
+#
+# Local NATS dev sandbox used by the auth integration matrix in
+# actix-api/tests/nats_auth_integration.rs. Two services running the
+# same nats:2.10-alpine image; only the auth posture differs:
+#
+#   sfu-nats-auth   (basic auth: sfu-cluster / testpass123)  host port 24222
+#   sfu-nats-noauth (no auth)                                  host port 24223
+#
+# This replaces the host-bare `docker run nats:2.10 ...` invocations used
+# during the S0 audit pre-flight. The compose form keeps the dev loop
+# inside the project's existing `docker/` convention (sibling of
+# docker-compose.integration.yaml and docker-compose.e2e.yaml).
+#
+# Run with:
+#   docker compose -f docker/docker-compose.nats-dev.yaml up -d
+#   cargo test -p videocall-api --test nats_auth_integration -- \
+#       --ignored --test-threads=1
+#   docker compose -f docker/docker-compose.nats-dev.yaml down
+#
+# Or via the wrapper script (preserves the pre-compose interface):
+#   bash sfu-update/audits/nats-sandbox-up.sh up
+#   bash sfu-update/audits/nats-sandbox-up.sh down
+#
+# Credentials are deliberately weak — this is a dev-only sandbox.
+# Real cluster credentials live in K8s Secrets (see
+# sfu-update/audits/nats-auth-rollout.md).
+#
+# See also: docker/README.nats-dev.md
+services:
+  sfu-nats-auth:
+    image: nats:2.10-alpine
+    container_name: sfu-nats-auth
+    command: ["--user", "sfu-cluster", "--pass", "testpass123", "--http_port", "8222"]
+    ports:
+      - "24222:4222"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4222"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  sfu-nats-noauth:
+    image: nats:2.10-alpine
+    container_name: sfu-nats-noauth
+    command: ["--http_port", "8222"]
+    ports:
+      - "24223:4222"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4222"]
+      interval: 2s
+      timeout: 5s
+      retries: 10

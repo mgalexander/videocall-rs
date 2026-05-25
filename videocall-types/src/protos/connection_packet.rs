@@ -30,6 +30,12 @@ pub struct ConnectionPacket {
     // message fields
     // @@protoc_insertion_point(field:ConnectionPacket.meeting_id)
     pub meeting_id: ::std::string::String,
+    ///  CAPABILITY BITS:
+    ///    SFU_ROUTING_HEADER = 1   // emits MediaPacket.routing_header
+    ///    SVC                = 2   // can encode/decode SVC layered bitstreams
+    ///    SUBSCRIPTION       = 4   // can emit SubscriptionUpdate
+    // @@protoc_insertion_point(field:ConnectionPacket.client_capabilities)
+    pub client_capabilities: ::std::option::Option<u32>,
     // special fields
     // @@protoc_insertion_point(special_field:ConnectionPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -47,12 +53,17 @@ impl ConnectionPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut fields = ::std::vec::Vec::with_capacity(2);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "meeting_id",
             |m: &ConnectionPacket| { &m.meeting_id },
             |m: &mut ConnectionPacket| { &mut m.meeting_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "client_capabilities",
+            |m: &ConnectionPacket| { &m.client_capabilities },
+            |m: &mut ConnectionPacket| { &mut m.client_capabilities },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConnectionPacket>(
             "ConnectionPacket",
@@ -75,6 +86,9 @@ impl ::protobuf::Message for ConnectionPacket {
                 10 => {
                     self.meeting_id = is.read_string()?;
                 },
+                16 => {
+                    self.client_capabilities = ::std::option::Option::Some(is.read_uint32()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -90,6 +104,9 @@ impl ::protobuf::Message for ConnectionPacket {
         if !self.meeting_id.is_empty() {
             my_size += ::protobuf::rt::string_size(1, &self.meeting_id);
         }
+        if let Some(v) = self.client_capabilities {
+            my_size += ::protobuf::rt::uint32_size(2, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -98,6 +115,9 @@ impl ::protobuf::Message for ConnectionPacket {
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
         if !self.meeting_id.is_empty() {
             os.write_string(1, &self.meeting_id)?;
+        }
+        if let Some(v) = self.client_capabilities {
+            os.write_uint32(2, v)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -117,12 +137,14 @@ impl ::protobuf::Message for ConnectionPacket {
 
     fn clear(&mut self) {
         self.meeting_id.clear();
+        self.client_capabilities = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static ConnectionPacket {
         static instance: ConnectionPacket = ConnectionPacket {
             meeting_id: ::std::string::String::new(),
+            client_capabilities: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -147,13 +169,23 @@ impl ::protobuf::reflect::ProtobufValue for ConnectionPacket {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1dtypes/connection_packet.proto\"1\n\x10ConnectionPacket\x12\x1d\n\n\
-    meeting_id\x18\x01\x20\x01(\tR\tmeetingIdJa\n\x06\x12\x04\0\0\x04\x01\n\
-    \x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x04\x01\n\n\
-    \n\x03\x04\0\x01\x12\x03\x02\x08\x18\n\x0b\n\x04\x04\0\x02\0\x12\x03\x03\
-    \x02\x18\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x03\x02\x08\n\x0c\n\x05\x04\
-    \0\x02\0\x01\x12\x03\x03\t\x13\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x03\
-    \x16\x17b\x06proto3\
+    \n\x1dtypes/connection_packet.proto\"\x7f\n\x10ConnectionPacket\x12\x1d\
+    \n\nmeeting_id\x18\x01\x20\x01(\tR\tmeetingId\x124\n\x13client_capabilit\
+    ies\x18\x02\x20\x01(\rH\0R\x12clientCapabilities\x88\x01\x01B\x16\n\x14_\
+    client_capabilitiesJ\xff\x02\n\x06\x12\x04\0\0\n\x01\n\x08\n\x01\x0c\x12\
+    \x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\n\x01\n\n\n\x03\x04\0\x01\x12\
+    \x03\x02\x08\x18\n\x0b\n\x04\x04\0\x02\0\x12\x03\x03\x02\x18\n\x0c\n\x05\
+    \x04\0\x02\0\x05\x12\x03\x03\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\
+    \x03\t\x13\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x03\x16\x17\n\xe3\x01\n\
+    \x04\x04\0\x02\x01\x12\x03\t\x02*\x1a\xd5\x01\x20CAPABILITY\x20BITS:\n\
+    \x20\x20\x20SFU_ROUTING_HEADER\x20=\x201\x20\x20\x20//\x20emits\x20Media\
+    Packet.routing_header\n\x20\x20\x20SVC\x20\x20\x20\x20\x20\x20\x20\x20\
+    \x20\x20\x20\x20\x20\x20\x20\x20=\x202\x20\x20\x20//\x20can\x20encode/de\
+    code\x20SVC\x20layered\x20bitstreams\n\x20\x20\x20SUBSCRIPTION\x20\x20\
+    \x20\x20\x20\x20\x20=\x204\x20\x20\x20//\x20can\x20emit\x20SubscriptionU\
+    pdate\n\n\x0c\n\x05\x04\0\x02\x01\x04\x12\x03\t\x02\n\n\x0c\n\x05\x04\0\
+    \x02\x01\x05\x12\x03\t\x0b\x11\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\t\
+    \x12%\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\t()b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

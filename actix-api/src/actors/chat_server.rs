@@ -17,12 +17,16 @@
  */
 
 use crate::{
-    constants::RECONNECT_GRACE_PERIOD,
+    constants::{
+        MAX_PARTICIPANTS_ENV, MAX_PARTICIPANTS_PER_ROOM, RECONNECT_GRACE_PERIOD,
+        WAITING_ROOM_THRESHOLD, WAITING_ROOM_THRESHOLD_ENV,
+    },
     messages::{
-        server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
+        server::{
+            ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, JoinRoomError, Leave,
+        },
         session::Message,
     },
-    models::build_subject_and_queue,
     session_manager::{SessionEndResult, SessionManager},
 };
 
@@ -32,15 +36,70 @@ use actix::{
 };
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
+use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmissionStatus;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::SYSTEM_USER_ID;
 
-use super::session_logic::{ConnectionState, SessionId};
+use super::packet_handler::{
+    parse_and_inspect, should_drop_kfr_for_layer_selection, PacketKind, ParsedPacket,
+};
+use super::session_logic::{ConnectionState, SessionId, SharedConnectionStates};
+use crate::sfu::forwarder::{ForwardDecision, Forwarder};
+use crate::sfu::health_beacon::{
+    spawn_beacon_hub, BeaconHub, EnvOwnerCheck, LinuxCpuLoad, NatsHealthBeaconPublisher,
+};
+use crate::sfu::layer_selector::LayerSelector;
+use crate::sfu::room_state::RoomState;
+use crate::sfu::speaker::{NatsSpeakerPublisher, SpeakerScorer, SpeakerTick, TickHandle};
+use crate::sfu::spillover::{spawn_spillover_ingest, SpilloverIngestHandle, SpilloverStore};
+use crate::sfu::subscription::SubscriptionStore;
+use crate::sfu::{SfuConfig, SfuMode};
+use tokio::sync::RwLock as TokioRwLock;
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::subscription_packet::SubscriptionUpdate;
+
+/// Cached transport-family identifier for the wave-3 ADMISSION_DECISION
+/// {REDIRECT} DNS template (bead vc-8oa / p6-5).
+///
+/// Resolved exactly once from the `SFU_TRANSPORT_KIND` env var on first
+/// JoinRoom (after the binary's startup sets it; see
+/// `actix-api/src/bin/{webtransport,websocket}_server.rs`). Stored in an
+/// `OnceLock<String>` so subsequent JoinRoom handlers never re-touch the
+/// env. Without caching, every join paid an `env::var` lookup and the
+/// default-on-miss silently masked a misconfigured deployment — the
+/// startup log makes the warning visible at the right time instead.
+static SFU_TRANSPORT_KIND_CACHE: OnceLock<String> = OnceLock::new();
+
+/// Resolve the cached `SFU_TRANSPORT_KIND`, initialising it from the env
+/// on first call. Defaults to `"webtransport"` if the env var is missing —
+/// the binaries unconditionally set this at startup so the default only
+/// fires in tests / misconfigured deployments. The unset-at-runtime branch
+/// emits a one-shot warning so the misconfiguration is observable in logs
+/// without spamming every JoinRoom.
+fn sfu_transport_kind() -> &'static str {
+    SFU_TRANSPORT_KIND_CACHE
+        .get_or_init(|| match std::env::var("SFU_TRANSPORT_KIND") {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    "SFU_TRANSPORT_KIND not set; defaulting to \"webtransport\" for \
+                     ADMISSION_DECISION{{REDIRECT}} DNS. The transport binaries set \
+                     this at startup — if you see this in production, the env wiring \
+                     is broken."
+                );
+                "webtransport".to_string()
+            }
+        })
+        .as_str()
+}
 
 /// Internal message sent via `notify_later` after the reconnection grace period
 /// expires. If the user has not reconnected by the time this message is handled,
@@ -68,12 +127,114 @@ struct PendingDepartureState {
     was_active: bool,
 }
 
+/// Per-room demux state (vc-q0v).
+///
+/// Replaces the pre-vc-q0v *per-session* NATS subscription model. A single
+/// queue-less `subscribe` runs against `room.<room>.*` for the lifetime of the
+/// room. Every inbound message is parsed exactly once via
+/// [`parse_and_inspect`] and fanned out to each receiver in `receivers` via
+/// [`egress_decide_from_parsed`]. Joins update `receivers` under a write lock;
+/// the demux task takes a read lock per inbound message.
+///
+/// When the last receiver leaves, the dispatcher task is aborted and the
+/// `RoomDispatch` entry is removed. This mirrors the lifecycle of
+/// `room_states` / `forwarders` so per-room SFU state and per-room NATS
+/// subscriptions tear down together.
+struct RoomDispatch {
+    /// Live receivers in the room, keyed by `SessionId`. The demux task
+    /// snapshots this map per-message so writes (join/leave) only block
+    /// briefly under a write lock.
+    receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+    /// JoinHandles for the per-room subscription loops. vc-kcpg: there are `K`
+    /// (`SfuConfig::ingest_shards`) dispatcher tasks per room, one per ingest
+    /// shard, all sharing the `receivers` map above (so fan-out reaches every
+    /// receiver regardless of which shard ingested a packet). With the default
+    /// `K == 1` this is a single-element vec — the legacy one-dispatcher case.
+    ///
+    /// Every handle must be `.abort()`-ed before drop: tokio `JoinHandle`
+    /// *detaches* on drop, it does not cancel. Replacing or removing this field
+    /// without first aborting each prior handle leaks the task(s).
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl RoomDispatch {
+    /// Abort every per-shard dispatcher task (vc-kcpg). Called on normal drain
+    /// and on the respawn path. A finished task aborts as a no-op.
+    fn abort_all(&self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Internal message: posted by the per-room demux task when its
+/// subscription loop exits unexpectedly (initial subscribe failed or
+/// `sub.next()` returned `None` because NATS closed the subscription).
+/// Normal teardown via [`ChatServer::drop_room_receiver`] aborts the task
+/// *before* sending — the handler distinguishes the two cases by checking
+/// whether `room_dispatch` still holds the entry.
+///
+/// Without this signal, a dispatcher dying mid-flight would leave a
+/// `RoomDispatch` entry in `room_dispatch` whose receivers map is still
+/// populated; subsequent joiners would register into that orphan map and
+/// silently receive zero media for the lifetime of the room. The handler
+/// recovers by respawning the dispatcher when receivers are still present.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct RoomDispatcherExited {
+    room: String,
+}
+
+/// Internal message: posted by the spawned NATS-KV lookup task once a
+/// room's home region has been resolved (bead vc-hc8 / p6-9). Carries the
+/// information needed for the actor to either:
+///   - populate the synchronous `home_region_cache` and stop (in-region), OR
+///   - emit `ADMISSION_DECISION{REDIRECT}` to the session and force a
+///     `Disconnect`, because the room's home region is elsewhere.
+///
+/// We send this message back to the actor (rather than mutating cache
+/// directly from the spawned task) so all `home_region_cache` writes
+/// happen on a single thread of execution — keeping the cache mutation
+/// path identical to the rest of `ChatServer`'s state and avoiding any
+/// need for interior locking on what is otherwise plain actor state.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct HomeRegionResolved {
+    /// Room the lookup was performed for.
+    room: String,
+    /// Resolved home region (`region` if we won the CAS, else the
+    /// previously-stored value).
+    home_region: String,
+    /// Session that triggered the lookup. If still registered AND the home
+    /// region differs from this pod's region, the handler emits the
+    /// REDIRECT packet and disconnects this session. If the session is
+    /// gone (already disconnected) the handler just populates the cache.
+    session: SessionId,
+    /// User id from the original JoinRoom — used for log breadcrumbs and
+    /// to send a `Disconnect` after the redirect packet so the pending-
+    /// departure / leave path runs identically to a normal disconnect.
+    user_id: String,
+    /// Display name from the original JoinRoom (mirrors user_id semantics).
+    display_name: String,
+}
+
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
-    active_subs: HashMap<SessionId, JoinHandle<()>>,
+    /// Sessions that have completed `JoinRoom`. Used solely for the
+    /// duplicate-join short-circuit in the `JoinRoom` handler; the actual
+    /// receiver-side mailbox lives in [`RoomDispatch::receivers`].
+    joined_sessions: HashSet<SessionId>,
     session_manager: SessionManager,
-    connection_states: HashMap<SessionId, ConnectionState>,
+    /// Per-session connection state (Testing/Active).
+    ///
+    /// vc-ud6o E3: now a shared, lock-free `Arc<DashMap>` (see
+    /// [`SharedConnectionStates`]). The `ChatServer` actor remains the sole
+    /// writer (Connect / ActivateConnection / Disconnect / Leave), so the
+    /// state machine is unchanged; a clone of the handle is given to every
+    /// `SessionLogic` so the off-actor media-publish path can read the
+    /// `Active` gate without round-tripping through this actor's mailbox.
+    connection_states: SharedConnectionStates,
     /// Track which sessions are in which room, with their user_id and display_name.
     /// Used to send PARTICIPANT_JOINED for existing peers to new joiners.
     room_members: HashMap<String, Vec<(SessionId, String, String)>>,
@@ -86,20 +247,458 @@ pub struct ChatServer {
     /// This is used for reconnection sessions: the user never "left" from peers'
     /// perspective, so announcing a "join" would be misleading.
     suppress_join_broadcast: std::collections::HashSet<SessionId>,
+    /// SFU runtime configuration, snapshotted from `SFU_MODE` at actor
+    /// construction. The startup binaries log the mode separately; reading
+    /// the env again here is intentional so the actor owns its own copy.
+    sfu_config: SfuConfig,
+    /// Per-room authoritative SFU state. Lazily inserted in `JoinRoom` and
+    /// removed in the same code paths that clean up `room_members`. Wrapped
+    /// in `Arc<RwLock<_>>` so the per-receiver `Forwarder::decide` calls
+    /// running inside the NATS subscriber task can read it concurrently
+    /// while p2-6 adds member-table mutations from the actor thread.
+    room_states: HashMap<String, Arc<RwLock<RoomState>>>,
+    /// Per-room forwarder, cheaply cloned (via `Arc`) into the per-room
+    /// dispatcher task so the forwarder outlives the actor handler's stack
+    /// frame.
+    forwarders: HashMap<String, Arc<Forwarder>>,
+    /// Per-room declarative subscription state (p3-4). Receivers publish
+    /// `SubscriptionUpdate` packets which the `ClientMessage` handler intercepts
+    /// before NATS publish and applies via `SubscriptionStore::apply_update`.
+    /// The forwarder reads this store on every `decide()` to determine which
+    /// senders' MEDIA may be forwarded to each receiver.
+    subscriptions: HashMap<String, Arc<RwLock<SubscriptionStore>>>,
+    /// Per-room shared scorer (p3-11 wiring).
+    ///
+    /// The per-room dispatcher task observes each inbound AUDIO
+    /// `MediaPacket`'s `RoutingHeader.audio_level` / `is_speaking` hint into
+    /// this scorer; the per-room [`SpeakerTick`] reads it on its 200ms
+    /// cadence to compute the [`ActiveSpeakerSet`] snapshot consumed by the
+    /// forwarder and broadcast to clients on `room.{room}.system`.
+    ///
+    /// Stored alongside `speaker_ticks` (one-to-one), but kept in its own
+    /// map so the dispatcher can clone an `Arc` without touching the tick
+    /// handle's lifecycle.
+    speaker_scorers: HashMap<String, Arc<TokioRwLock<SpeakerScorer>>>,
+    /// Per-room speaker tick. Holds the join handle returned by
+    /// [`SpeakerTick::run`]; dropping the handle aborts the background
+    /// task. Torn down in the same code paths that remove `speaker_scorers`
+    /// and `room_states` when a room drains.
+    ///
+    /// The tick is also responsible for publishing `SpeakerUpdate`
+    /// `PacketWrapper`s on `room.{room}.system` via its embedded
+    /// [`NatsSpeakerPublisher`]. The tick internally owns the
+    /// `watch::Sender<ActiveSpeakerSet>` that the forwarder's
+    /// `watch::Receiver` reads from, so the channel stays open for as long
+    /// as the tick handle is retained here.
+    speaker_ticks: HashMap<String, TickHandle>,
+    /// Single owner-pod health-beacon hub (vc-kol / p6-7, refactored in
+    /// vc-c6l from N per-room tasks to one). Registered with the room id
+    /// alongside the speaker tick, but ONLY when this pod is the room's
+    /// owner per [`crate::sfu::affinity::is_owner`]. Unregistered in the
+    /// same code paths that remove `speaker_ticks`; the `Drop` impl on
+    /// [`BeaconHub`] aborts the background task on shutdown.
+    ///
+    /// Non-owner pods never register any rooms — they silently consume
+    /// the beacons the owner publishes on `room.{room}.system` (p6-8,
+    /// wave 3).
+    beacon_hub: BeaconHub,
+    /// Per-room demux state (one NATS subscription per room, fanned out to
+    /// all local receivers). Lazily created on the first `JoinRoom` for a
+    /// room and torn down when the room drains. See [`RoomDispatch`].
+    room_dispatch: HashMap<String, RoomDispatch>,
+    /// Per-room highest join-milestone already emitted (bead vc-xow8).
+    ///
+    /// Watermark for the "exactly once per room" guarantee on
+    /// `sfu_join_milestone` events. Stores the largest milestone value already
+    /// logged for the room. On each join we emit for every configured
+    /// milestone in `(watermark, member_count]` and advance the watermark to
+    /// the highest milestone crossed. Because the watermark only ever moves
+    /// up, reconnects/replaces (where `member_count` does not increase) and
+    /// non-monotonic edge cases never re-fire a milestone.
+    ///
+    /// Lives in actor state (single-threaded actor → a plain `HashMap` is
+    /// fine, no locking). Cleaned up alongside the room's other per-room state
+    /// when the room drains.
+    sfu_join_milestone_watermark: HashMap<String, u64>,
+    /// Per-room cumulative JoinRoom INTAKE count (bead vc-9eve).
+    ///
+    /// Incremented once per `JoinRoom` handler entry for the room, BEFORE any
+    /// validation/redirect/admission logic — so it climbs on every attempt
+    /// regardless of whether the joiner ever registers into `room_members`.
+    /// This is the value the join-milestone crossing is now driven off (it was
+    /// previously `room_members.len()`), so milestones still fire at
+    /// 1000/2000/... when registration itself is the bottleneck and
+    /// `room_members` plateaus below the first milestone.
+    ///
+    /// Per-room and shard-local: each `ChatServer` shard owns a disjoint set
+    /// of rooms (bead vc-8txq), and every `JoinRoom` for a given room is
+    /// routed to that room's owning shard, so this count is complete and
+    /// authoritative for the room within its shard — no cross-shard
+    /// aggregation is needed (mirrors how `room_members` is per-shard).
+    ///
+    /// Lives in actor state (single-threaded actor → plain `HashMap`, no
+    /// locking). Cleaned up alongside the room's other per-room state when the
+    /// room drains, so a reused room id restarts its milestone progression.
+    sfu_room_join_attempts: HashMap<String, u64>,
+    /// Synchronous in-actor cache of room → home-region (bead vc-hc8 / p6-9).
+    ///
+    /// On JoinRoom: if a cached entry exists, the cross-region redirect
+    /// decision is made synchronously up-front. On miss, a background
+    /// task performs the NATS-KV CAS and posts a [`HomeRegionResolved`]
+    /// message back to the actor which then populates this cache (and,
+    /// if the home region differs, emits a REDIRECT and disconnects the
+    /// session).
+    ///
+    /// Race window (acceptable per v1 / "accept 250ms RTT penalty" in the
+    /// bead): the very first joiner for a room already homed in another
+    /// region pays a brief admission-then-redirect instead of an
+    /// up-front redirect. The client handles the REDIRECT packet the same
+    /// way (see `ConnectionManager` p6-6 / vc-mv3); the visible difference
+    /// is one extra round-trip and a short admit window.
+    home_region_cache: HashMap<String, String>,
+    /// Backing store for [`Self::home_region_cache`] population. Either a
+    /// [`crate::sfu::affinity::NatsRegionKv`] when JetStream is reachable
+    /// at startup, or a [`crate::sfu::affinity::NoopRegionKv`] fallback —
+    /// the noop never returns a foreign region, so a JetStream outage
+    /// silently degrades to single-region behaviour rather than failing
+    /// every JoinRoom.
+    home_region_kv: Arc<dyn crate::sfu::affinity::RegionKv>,
+    /// Process-wide snapshot of every room's owner-pod health beacon
+    /// (bead vc-85p / p6-5 wiring of the p6-8 store). Populated by the
+    /// background ingest task spawned in [`ChatServer::new`], which
+    /// subscribes to `room.*.system` and records the most recent
+    /// `participant_count` + `cpu_load` per room.
+    ///
+    /// Consulted on the non-owner JoinRoom path: when
+    /// [`SpilloverStore::is_spilled_over`] is `true` for the joined room
+    /// (owner over threshold AND a fresh beacon), the non-owner pod admits
+    /// the joiner LOCALLY (spill) instead of redirecting to the owner.
+    /// Otherwise behaviour is unchanged — redirect to the owner.
+    spillover_store: SpilloverStore,
+    /// Retains the [`spawn_spillover_ingest`] task for the actor's
+    /// lifetime. The handle's `Drop` aborts the background subscription on
+    /// shutdown; holding it here (rather than dropping the return value)
+    /// keeps the ingest task alive so the store stays populated. Never read
+    /// directly — its sole purpose is lifetime ownership.
+    _spillover_ingest: SpilloverIngestHandle,
+    /// This shard's ordinal within the per-pod [`ChatServerPool`] (bead
+    /// vc-8txq). `0` for the default single-actor construction. Used only for
+    /// log breadcrumbs — routing is decided by the pool, not the shard.
+    shard_ordinal: usize,
+    /// Total number of shards in this pod's pool (bead vc-8txq). `1` for the
+    /// default single-actor construction. Log breadcrumb only.
+    shard_count: usize,
+    /// Handle to the per-pod fan-out runtime (bead vc-c609 / ADR-0009 Part A).
+    ///
+    /// Every per-room demux/fan-out task is spawned via `fanout_handle.spawn(..)`
+    /// rather than a bare `tokio::spawn`. A bare `tokio::spawn` from inside a
+    /// `ChatServer` handler inherits THIS shard's `Arbiter` current-thread
+    /// runtime, which serializes ALL fan-out for ALL of the shard's rooms onto
+    /// that single arbiter thread — the bottleneck this bead removes. Spawning
+    /// on the shared multi-thread runtime instead lets fan-out CPU spread across
+    /// cores. The handle is a cheap clone of the `Runtime`'s handle owned by
+    /// [`ChatServerPool`]; the runtime itself outlives every shard (held in an
+    /// `Arc` inside the pool), so spawned tasks always have a live runtime.
+    ///
+    /// For the standalone [`ChatServer::new`] path (unit/integration tests) this
+    /// is `Handle::current()` — those constructors run inside the test's tokio
+    /// runtime (current-thread under `#[actix_rt::test]`), so the fan-out tasks
+    /// land there. A `Send` fan-out future runs fine on a current-thread runtime,
+    /// so this keeps the tests' single-actor behaviour identical while still
+    /// exercising the `Handle::spawn` code path.
+    fanout_handle: tokio::runtime::Handle,
 }
 
 impl ChatServer {
+    /// Construct a standalone (single-shard) `ChatServer`.
+    ///
+    /// Used by the in-process unit/integration tests, which talk to one
+    /// `Addr<ChatServer>` directly. Equivalent to one shard owning every room:
+    /// it allocates its own private [`SharedConnectionStates`] and reports
+    /// `shard_ordinal = 0`, `shard_count = 1`. Production wiring uses
+    /// [`ChatServerPool::new`] (which calls [`ChatServer::new_shard`]) instead.
     pub async fn new(nats_connection: async_nats::client::Client) -> Self {
+        // vc-c609: the standalone path always runs inside a tokio runtime (it is
+        // `async`), so the current handle is a valid fan-out spawn target. Tests
+        // run on a multi-thread runtime, so this preserves their behaviour while
+        // exercising the same `Handle::spawn` code path production uses.
+        Self::new_shard(
+            nats_connection,
+            SharedConnectionStates::default(),
+            0,
+            1,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+    }
+
+    /// Construct one shard of a [`ChatServerPool`] (bead vc-8txq).
+    ///
+    /// All shards in a pod share the SAME `connection_states` map: session IDs
+    /// are globally unique and every message for a given session is routed to
+    /// the SAME shard (the one owning the session's room), so the off-actor
+    /// media-publish path can read any session's `Active` gate from the one
+    /// shared handle regardless of which shard owns the room.
+    pub async fn new_shard(
+        nats_connection: async_nats::client::Client,
+        connection_states: SharedConnectionStates,
+        shard_ordinal: usize,
+        shard_count: usize,
+        // vc-c609: handle to the pod-wide multi-thread fan-out runtime. The pool
+        // clones one handle into every shard; the standalone `new` passes
+        // `Handle::current()`.
+        fanout_handle: tokio::runtime::Handle,
+    ) -> Self {
+        // vc-c6l: a single owner-pod hub replaces the previous N per-room
+        // tasks. The hub always runs (1 task, 1 timer) and stays empty on
+        // non-owner pods. Eager-init avoids special-casing `ChatServer::new`
+        // for the rare case of a pod that never owns a room.
+        let beacon_publisher = Arc::new(NatsHealthBeaconPublisher::new(nats_connection.clone()));
+        let beacon_hub = spawn_beacon_hub(
+            Arc::new(EnvOwnerCheck),
+            Arc::new(LinuxCpuLoad),
+            beacon_publisher,
+        );
+        // vc-hc8 (p6-9): try to attach to the JetStream KV bucket that
+        // tracks each room's home region. If JetStream isn't enabled on
+        // this NATS cluster (single-node dev, or a misconfigured prod),
+        // fall back to a no-op KV that effectively disables cross-region
+        // redirects — the SFU still functions in single-region mode.
+        // A failure here MUST NOT block actor startup: ChatServer is the
+        // root of the system, and refusing to start because cross-region
+        // pinning isn't available would be a strict regression vs. p6-8.
+        let home_region_kv: Arc<dyn crate::sfu::affinity::RegionKv> =
+            match crate::sfu::affinity::NatsRegionKv::connect(nats_connection.clone()).await {
+                Ok(kv) => Arc::new(kv),
+                Err(e) => {
+                    warn!(
+                        "p6-9 home-region KV unavailable ({}); cross-region \
+                         redirects DISABLED. Single-region behaviour preserved.",
+                        e
+                    );
+                    Arc::new(crate::sfu::affinity::NoopRegionKv)
+                }
+            };
+        // vc-85p (p6-5): spawn the spillover beacon-ingest task so the
+        // non-owner JoinRoom path can consult fresh owner-pod health. The
+        // task subscribes to `room.*.system`, decodes `HEALTH_BEACON`
+        // packets, and populates `spillover_store`. It runs on its own
+        // tokio task and never blocks the packet-forwarding hot path. We
+        // retain the returned handle so the task is not aborted when the
+        // return value would otherwise be dropped. Reusing the actor's
+        // existing NATS client keeps a single connection per pod.
+        let spillover_store = SpilloverStore::new();
+        let spillover_ingest =
+            spawn_spillover_ingest(nats_connection.clone(), spillover_store.clone());
         ChatServer {
             nats_connection,
-            active_subs: HashMap::new(),
+            joined_sessions: HashSet::new(),
             sessions: HashMap::new(),
             session_manager: SessionManager::new(),
-            connection_states: HashMap::new(),
+            connection_states,
             room_members: HashMap::new(),
             pending_departures: HashMap::new(),
-            suppress_join_broadcast: std::collections::HashSet::new(),
+            suppress_join_broadcast: HashSet::new(),
+            sfu_config: SfuConfig::from_env(),
+            room_states: HashMap::new(),
+            forwarders: HashMap::new(),
+            subscriptions: HashMap::new(),
+            speaker_scorers: HashMap::new(),
+            speaker_ticks: HashMap::new(),
+            beacon_hub,
+            room_dispatch: HashMap::new(),
+            sfu_join_milestone_watermark: HashMap::new(),
+            sfu_room_join_attempts: HashMap::new(),
+            home_region_cache: HashMap::new(),
+            home_region_kv,
+            spillover_store,
+            _spillover_ingest: spillover_ingest,
+            shard_ordinal,
+            shard_count,
+            fanout_handle,
         }
+    }
+
+    /// Clone of the shared connection-state handle (vc-ud6o E3).
+    ///
+    /// Call BEFORE `.start()` consumes the actor; the returned `Arc` is handed
+    /// to every `SessionLogic` so the off-actor media-publish path can read the
+    /// per-session `Active` gate lock-free. There is exactly one `ChatServer`
+    /// per pod, so this single shared map covers all sessions on the pod.
+    pub fn connection_states_handle(&self) -> SharedConnectionStates {
+        self.connection_states.clone()
+    }
+
+    /// vc-xow8 / vc-9eve: emit `sfu_join_milestone` for every configured
+    /// milestone the room just crossed on this join, exactly once per room.
+    ///
+    /// Called from the `JoinRoom` handler immediately after the receiver
+    /// insert, only when `sfu_config.milestones` is non-empty.
+    ///
+    /// vc-9eve CROSSING VALUE: the milestone crossing is driven off
+    /// `join_attempts` — the per-room cumulative INTAKE count — NOT
+    /// `member_count`. Before "Fix E" registration itself is the bottleneck,
+    /// so `room_members` plateaus below the first milestone and the markers
+    /// fired zero times (exactly the failure we needed to see). Driving the
+    /// crossing off intake means milestones fire at 1000/2000/... even when
+    /// joins are not registering. `member_count` and `connected` are still
+    /// emitted in the payload so a single marker distinguishes the two
+    /// plateau modes (registration vs. fan-out).
+    ///
+    /// Uses a per-room high-watermark (`sfu_join_milestone_watermark`): we
+    /// emit for every milestone in `(watermark, join_attempts]` and advance
+    /// the watermark to the highest one crossed. The watermark only moves up
+    /// and `join_attempts` is monotonic (it only ever increments at handler
+    /// entry), so each milestone fires exactly once per room.
+    ///
+    /// O(milestones) per crossing (a handful of values), and the common case
+    /// (no crossing) is a single comparison against the watermark before any
+    /// allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_emit_join_milestone(
+        &mut self,
+        room: &str,
+        session: SessionId,
+        join_attempts: u64,
+        member_count: u64,
+        receivers_for_room: &Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+        room_state: &Arc<RwLock<RoomState>>,
+        subscriptions: &Arc<RwLock<SubscriptionStore>>,
+    ) {
+        let watermark = self
+            .sfu_join_milestone_watermark
+            .get(room)
+            .copied()
+            .unwrap_or(0);
+
+        // Fast path: nothing crossed since the last emit. A single comparison
+        // for the overwhelmingly common case — no allocation, no lock. Driven
+        // off `join_attempts` (intake) so it advances even when registration
+        // never lands the joiner in `room_members`.
+        if join_attempts <= watermark {
+            return;
+        }
+
+        // Collect the milestones in (watermark, join_attempts]. The list is
+        // sorted + deduped (see SfuConfig::parse_milestones), so this is a
+        // cheap linear scan over a handful of values.
+        let crossed: Vec<u64> = self
+            .sfu_config
+            .milestones
+            .iter()
+            .copied()
+            .filter(|&m| m > watermark && m <= join_attempts)
+            .collect();
+        if crossed.is_empty() {
+            // join_attempts grew but didn't pass any configured milestone.
+            // Do NOT advance the watermark past unconfigured ground — only
+            // emitted milestones move it (keeps the invariant simple).
+            return;
+        }
+
+        // The receiver-set size the per-room dispatcher actually fans out to.
+        let receiver_set = match receivers_for_room.read() {
+            Ok(g) => g.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        } as u64;
+
+        // Resolve the new joiner's AllowSet so we can report its audio/video
+        // membership sizes. This is the size the joiner would receive from on
+        // its very first packets. Paid only at a crossing (rare). We resolve
+        // against the current member snapshot with an empty active-speaker set
+        // (the speaker tick has not necessarily produced a set yet at join);
+        // the AllowSet's `receive_all_*` defaults dominate at join time, which
+        // is exactly what we want to confirm for the delivery-scaling probe.
+        let members = match room_state.read() {
+            Ok(g) => g.members_snapshot(),
+            Err(poisoned) => poisoned.into_inner().members_snapshot(),
+        };
+        let (allowset_audio, allowset_video) = match subscriptions.read() {
+            Ok(g) => {
+                let allow = g.resolve(session, &members, &[]);
+                (allow.audio.len(), allow.video.len())
+            }
+            Err(poisoned) => {
+                let g = poisoned.into_inner();
+                let allow = g.resolve(session, &members, &[]);
+                (allow.audio.len(), allow.video.len())
+            }
+        };
+
+        // Current cumulative forward/drop counters (read once at the crossing).
+        let forward_total = crate::metrics::SFU_FORWARD_TOTAL.get();
+        let dropped_total: f64 = crate::metrics::SFU_DROPPED_TOTAL
+            .with_label_values(&[crate::metrics::sfu_drop_reason::UNSUBSCRIBED])
+            .get()
+            + crate::metrics::SFU_DROPPED_TOTAL
+                .with_label_values(&[crate::metrics::sfu_drop_reason::LAYER_BUDGET])
+                .get()
+            + crate::metrics::SFU_DROPPED_TOTAL
+                .with_label_values(&[crate::metrics::sfu_drop_reason::REFERENCE_MISS])
+                .get()
+            + crate::metrics::SFU_DROPPED_TOTAL
+                .with_label_values(&[crate::metrics::sfu_drop_reason::SELF_SKIP])
+                .get();
+
+        // vc-m7k6: process-wide inbound slow-consumer drop count, read once at
+        // the crossing. Surfacing it in the milestone payload means a soak
+        // shows "inbound dropped @ N presenters / M receivers" — the
+        // invisible-saturation signal lands right next to the
+        // member_count/receiver_set/forward_total plateau evidence, so one
+        // marker tells whether a stalled room is a registration plateau, a
+        // fan-out plateau, OR inbound saturation (drops climbing while
+        // forward_total flatlines).
+        let inbound_dropped = crate::metrics::SFU_DISPATCHER_INBOUND_DROPPED_TOTAL.get();
+
+        // vc-9eve: process-wide connected sessions count, read once at the
+        // crossing. Together with join_attempts/member_count/receiver_set in
+        // the payload, ONE marker distinguishes the two plateau modes:
+        //   * registration plateau: connected >> join_attempts is unusual, but
+        //     join_attempts >> member_count ~= receiver_set (joins counted but
+        //     never registered into the room/dispatcher);
+        //   * fan-out plateau: member_count ~= receiver_set climbing while
+        //     forward_total flatlines.
+        let connected = crate::metrics::SFU_SESSIONS_CONNECTED_TOTAL.get();
+
+        // Update the divergence gauges at the crossing point (low-cardinality
+        // sparse markers — set only here, not per join).
+        crate::metrics::SFU_ROOM_MEMBERS
+            .with_label_values(&[room])
+            .set(member_count as f64);
+        crate::metrics::SFU_ROOM_RECEIVER_SET
+            .with_label_values(&[room])
+            .set(receiver_set as f64);
+
+        // Emit ONE structured event per milestone crossed. Reuses the existing
+        // tracing infra (vc-8wd `sfu_trace` target family). vc-9eve: emit
+        // connected + join_attempts ALONGSIDE member_count + receiver_set so a
+        // single marker separates registration plateau from fan-out plateau.
+        for milestone in &crossed {
+            tracing::info!(
+                target: "sfu_trace",
+                event = "sfu_join_milestone",
+                room = %room,
+                milestone = *milestone,
+                connected,
+                join_attempts,
+                member_count,
+                receiver_set,
+                receiver_set_gap = member_count.saturating_sub(receiver_set),
+                allowset_audio,
+                allowset_video,
+                forward_total,
+                dropped_total,
+                inbound_dropped,
+                "SFU room crossed join milestone"
+            );
+        }
+
+        // Advance the watermark to the highest milestone crossed (the last
+        // element, since `milestones` is sorted ascending). Each milestone
+        // therefore fires exactly once as the room grows.
+        let highest = *crossed.last().expect("crossed is non-empty");
+        self.sfu_join_milestone_watermark
+            .insert(room.to_string(), highest);
     }
 
     pub fn leave_rooms(
@@ -109,18 +708,103 @@ impl ChatServer {
         user_id: Option<&str>,
         display_name: Option<&str>,
         observer: bool,
+        was_active: bool,
     ) {
-        // Remove the subscription task if it exists
-        if let Some(task) = self.active_subs.remove(session_id) {
-            task.abort();
-        }
+        // Drop the session marker. The session's receiver entry in the
+        // per-room demux is removed below (we need the room id for that).
+        self.joined_sessions.remove(session_id);
 
         // Remove from room_members tracking
         if let Some(room_id) = room {
-            if let Some(members) = self.room_members.get_mut(room_id) {
+            // p2-6: drop the SFU member entry first. We do this before the
+            // room_members emptiness check below because the room_states
+            // map entry may itself be removed in the same pass.
+            if let Some(state) = self.room_states.get(room_id) {
+                let mut guard = match state.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.remove_member(*session_id);
+            }
+            // vc-q0v: remove this session from the per-room demux receiver
+            // map. When the room's receiver map empties, abort the
+            // dispatcher task so its `Arc<Forwarder>` reference is dropped
+            // and the per-room subscription closes.
+            self.drop_room_receiver(room_id, session_id);
+
+            // Drop the receiver's declarative subscription state (if any) so
+            // a future session reusing this `SessionId` starts from the
+            // legacy default. Best-effort: missing entries are silently
+            // ignored.
+            if let Some(store) = self.subscriptions.get(room_id) {
+                let mut guard = match store.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.forget(*session_id);
+            }
+            let room_torn_down = if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|(sid, _, _)| sid != session_id);
                 if members.is_empty() {
                     self.room_members.remove(room_id);
+                    // Mirror room_members lifecycle for SFU state.
+                    self.forwarders.remove(room_id);
+                    self.room_states.remove(room_id);
+                    self.subscriptions.remove(room_id);
+                    // p3-11: dropping the TickHandle aborts the speaker
+                    // tick task, which in turn drops its `watch::Sender`
+                    // and closes the channel the (already-removed)
+                    // forwarder's receiver was watching. Then drop the
+                    // shared scorer.
+                    self.speaker_ticks.remove(room_id);
+                    self.speaker_scorers.remove(room_id);
+                    // vc-kol / p6-7 (vc-c6l): unregister the room from the
+                    // shared owner-pod beacon hub. Non-owner pods never
+                    // registered; `unregister` is a safe no-op there.
+                    self.beacon_hub.unregister(room_id);
+                    // vc-xow8: drop the join-milestone watermark so a future
+                    // room that reuses this id re-emits milestones as it grows.
+                    self.sfu_join_milestone_watermark.remove(room_id);
+                    // vc-9eve: drop the per-room intake-attempt count alongside
+                    // the watermark so a reused room id restarts its milestone
+                    // progression from zero.
+                    self.sfu_room_join_attempts.remove(room_id);
+                    // vc-xow8: also drop the per-room milestone gauge series so
+                    // they don't leak in the Prometheus registry after the room
+                    // drains (unbounded series growth otherwise).
+                    crate::metrics::SFU_ROOM_MEMBERS
+                        .remove_label_values(&[room_id])
+                        .ok();
+                    crate::metrics::SFU_ROOM_RECEIVER_SET
+                        .remove_label_values(&[room_id])
+                        .ok();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            // p4-7: a member leaving invalidates every cached layer
+            // selection in the room (the departed member was a candidate
+            // sender for other receivers and may have been pinned/admitted
+            // in someone's selection). Skip when the room was torn down
+            // above — the forwarder is already gone, so invalidating its
+            // cache is dead work.
+            //
+            // vc-78q: additionally reap the departing session's per-pair
+            // state from the forwarder — recent_t0 entries keyed by
+            // (sid, *) / (*, sid) and the LayerSelector hysteresis +
+            // cached selection keyed by `sid` as a receiver. Without
+            // this, long-lived rooms accumulate ~2KB per pair indefinitely
+            // as receivers and senders churn.
+            if !room_torn_down {
+                if let Some(fwd) = self.forwarders.get(room_id) {
+                    // vc-wls: no lock to acquire — interior mutability
+                    // is handled inside the selector (DashMap shard
+                    // locks for `last_selections`, mutex for hysteresis).
+                    fwd.layer_selector().invalidate_all();
+                    fwd.prune_session(*session_id);
                 }
             }
         }
@@ -149,14 +833,21 @@ impl ChatServer {
                 return;
             }
 
-            if let Some(state) = self.connection_states.get(session_id) {
-                if *state != ConnectionState::Active {
-                    info!(
-                        "Skipping PARTICIPANT_LEFT for non-active session {}",
-                        session_id
-                    );
-                    return;
-                }
+            // vc-9g7 follow-up: gate on the caller-supplied `was_active`
+            // snapshot. The previous in-band lookup against
+            // `self.connection_states` was racy: every caller in this file
+            // removes the session's `connection_states` entry BEFORE
+            // invoking `leave_rooms` (e.g. `Handler<Disconnect>` at the top
+            // of its body), so the lookup always returned `None` and the
+            // gate became a no-op — letting PARTICIPANT_LEFT fire for
+            // sessions that never reached `Active`. Callers now pass the
+            // value they captured before mutating state.
+            if !was_active {
+                info!(
+                    "Skipping PARTICIPANT_LEFT for non-active session {}",
+                    session_id
+                );
+                return;
             }
 
             tokio::spawn(async move {
@@ -208,10 +899,383 @@ impl ChatServer {
     pub fn session_manager(&self) -> &SessionManager {
         &self.session_manager
     }
+
+    /// Apply a `SubscriptionUpdate` payload from `receiver` in `room` (p3-5).
+    ///
+    /// Decodes `payload` as a [`SubscriptionUpdate`] and applies it to the
+    /// room's [`SubscriptionStore`] against the current member set. Silently
+    /// returns on:
+    ///   * malformed payloads (parse error)
+    ///   * unknown rooms (no `SubscriptionStore` materialised yet)
+    ///   * missing room state (no member snapshot available)
+    ///
+    /// These are best-effort updates: a malformed packet does not break the
+    /// existing subscription state, and a missing store cannot exist in
+    /// practice because both are materialised together in `JoinRoom`.
+    fn apply_subscription_update(&self, room: &str, receiver: SessionId, payload: &[u8]) {
+        let update = match SubscriptionUpdate::parse_from_bytes(payload) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(
+                    "Dropping malformed SubscriptionUpdate from session {} in room {}: {}",
+                    receiver, room, e
+                );
+                return;
+            }
+        };
+
+        let store = match self.subscriptions.get(room) {
+            Some(s) => s,
+            None => return,
+        };
+        // vc-7gc: read the cached `Arc<HashSet>` instead of allocating a
+        // fresh `HashSet` from `members.keys()`. The lock is released the
+        // moment the read scope ends.
+        let members = match self.room_states.get(room) {
+            Some(state) => {
+                let guard = match state.read() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.members_snapshot()
+            }
+            None => return,
+        };
+        let mut guard = match store.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.apply_update(receiver, update, &members);
+        // p4-7 follow-up: a SubscriptionUpdate may change which senders this
+        // receiver wants without bumping the speaker generation or arriving
+        // alongside a bandwidth-estimate refresh. Invalidate the receiver's
+        // cached layer selection so the next `decide()` call recomputes
+        // against the new `AllowSet`.
+        if let Some(fwd) = self.forwarders.get(room) {
+            // vc-wls: lock-free per-key invalidation via DashMap.
+            fwd.layer_selector().invalidate_for_receiver(receiver);
+        }
+    }
+
+    /// Remove a session from the per-room demux receiver map (vc-q0v).
+    ///
+    /// If the room's receiver map becomes empty as a result, the dispatcher
+    /// task is aborted and the `RoomDispatch` entry is dropped. Idempotent:
+    /// safe to call when the room or session is already gone.
+    fn drop_room_receiver(&mut self, room_id: &str, session_id: &SessionId) {
+        let now_empty = {
+            let dispatch = match self.room_dispatch.get(room_id) {
+                Some(d) => d,
+                None => return,
+            };
+            let mut guard = match dispatch.receivers.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.remove(session_id);
+            guard.is_empty()
+        };
+        if now_empty {
+            if let Some(dispatch) = self.room_dispatch.remove(room_id) {
+                // vc-kcpg: abort ALL K per-shard dispatcher tasks.
+                dispatch.abort_all();
+            }
+        }
+    }
+
+    /// Reap a single superseded session's membership rows (`room_members` +
+    /// the SFU `room_states` member table) for a room (orphan-leak fix).
+    ///
+    /// # Why this exists
+    ///
+    /// The reconnect-grace departure reaper keys `pending_departures` on
+    /// `(room, user_id)` and only ever tracks the *latest* `old_session`. When
+    /// a user churns through ≥2 sessions inside the `RECONNECT_GRACE_PERIOD`
+    /// (the norm for RTT-election losers under a co-arrival burst on
+    /// high-latency / jittery links), the second-disconnect replace path and
+    /// the stale-`old_session` arm of [`ExecutePendingDeparture`] would
+    /// overwrite / skip without ever cleaning the superseded session — leaving
+    /// it absent from the dispatcher `receivers` (so it never forwards) yet
+    /// counted in `room_members` / `room_states` forever. This permanently
+    /// inflates `member_count` above `receiver_set` and is the residual
+    /// orphan-leak floor.
+    ///
+    /// The superseded session's dispatcher receiver was already removed by its
+    /// own [`Handler<Disconnect>`] via [`ChatServer::drop_room_receiver`]; this
+    /// method removes the membership rows that were intentionally left behind
+    /// for the (now-cancelled) grace window. It mirrors the exact cleanup idiom
+    /// used by the reconnection path (`room_members.retain` + `remove_member`)
+    /// and, for completeness, the room-teardown sequence used by
+    /// [`ExecutePendingDeparture`] should reaping the stale session empty the
+    /// room. It does NOT touch the dispatcher hot path, the priority queue, or
+    /// transport — it runs only on the cold Disconnect / grace-timer path.
+    fn reap_superseded_session(&mut self, room: &str, session: SessionId) {
+        // Mirror the reconnection-path cleanup on the SFU member table — the
+        // superseded SID's subscription was already aborted in Disconnect.
+        if let Some(state) = self.room_states.get(room) {
+            let mut guard = match state.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.remove_member(session);
+        }
+        // Remove the stale `room_members` row. If this empties the room, run
+        // the same teardown sequence ExecutePendingDeparture uses so per-room
+        // SFU state / metrics / background tasks do not leak.
+        if let Some(members) = self.room_members.get_mut(room) {
+            members.retain(|(sid, _, _)| *sid != session);
+            if members.is_empty() {
+                self.room_members.remove(room);
+                // Mirror room_members lifecycle for SFU state.
+                self.forwarders.remove(room);
+                self.room_states.remove(room);
+                self.subscriptions.remove(room);
+                // p3-11: tear down the speaker tick + scorer for the now-empty
+                // room. Dropping the TickHandle aborts the background task.
+                self.speaker_ticks.remove(room);
+                self.speaker_scorers.remove(room);
+                // vc-kol / p6-7 (vc-c6l): drop this room from the shared
+                // owner-pod beacon hub. Non-owner pods never registered;
+                // `unregister` is a no-op.
+                self.beacon_hub.unregister(room);
+                // vc-xow8: drop the join-milestone watermark on drain.
+                self.sfu_join_milestone_watermark.remove(room);
+                // vc-9eve: drop the per-room intake-attempt count too.
+                self.sfu_room_join_attempts.remove(room);
+                // vc-xow8: drop the per-room milestone gauge series so they
+                // don't leak in the Prometheus registry.
+                crate::metrics::SFU_ROOM_MEMBERS
+                    .remove_label_values(&[room])
+                    .ok();
+                crate::metrics::SFU_ROOM_RECEIVER_SET
+                    .remove_label_values(&[room])
+                    .ok();
+            }
+        }
+    }
+}
+
+/// Per-pod pool of `ChatServer` shards (bead vc-8txq).
+///
+/// # Why this exists
+///
+/// Before sharding, every pod ran exactly one `ChatServer` actor on one
+/// thread. Both per-packet control traffic (`ClientMessage`) and every room
+/// join (`JoinRoom`) funneled through that single mailbox, and the heavy
+/// `Handler<JoinRoom>` body (admission, region pinning, per-room state
+/// materialisation, dispatcher spawn) ran serially. At scale this capped
+/// registration at roughly one join per second.
+///
+/// The pool spawns `n_shards` independent `ChatServer` actors, each pinned to
+/// its **own dedicated [`actix::Arbiter`] thread**, and partitions rooms across
+/// them by Lamping & Veach jump-consistent hash
+/// ([`crate::sfu::affinity::jump_hash`]). Because every message for a given
+/// session is routed to the shard that owns the session's room — and a session
+/// belongs to exactly one room for its whole lifetime — `JoinRoom` handling and
+/// per-room state now parallelise across cores instead of serialising on one
+/// thread.
+///
+/// # Routing invariant
+///
+/// All of a session's messages MUST go to the same shard, because per-session
+/// bookkeeping (`sessions`, `joined_sessions`, `suppress_join_broadcast`,
+/// `pending_departures`) lives in that shard's actor state. The transport actor
+/// holds exactly one `Addr<ChatServer>` (selected once via
+/// [`ChatServerPool::addr_for_room`] at session construction) and sends
+/// `Connect`, `JoinRoom`, `ActivateConnection`, `ClientMessage`, and
+/// `Disconnect` through it, so the invariant holds by construction. Reconnects
+/// re-hash the same `room_id` and therefore land on the same shard, keeping the
+/// grace-period `pending_departures` table consistent.
+///
+/// # Global vs per-room state
+///
+/// Cross-room global state is handled two ways:
+///   - `connection_states` is a single [`SharedConnectionStates`] (`Arc<DashMap>`)
+///     created once by the pool and handed to every shard AND every
+///     `SessionLogic`. Session IDs are globally unique and each session writes
+///     only on its owning shard, so the shared map stays consistent and the
+///     off-actor media-publish path can read any session's `Active` gate.
+///   - The owner-pod beacon HUB (publish side) is per-shard but operates on
+///     disjoint room sets: each room is owned by exactly one shard, and the hub
+///     only `register`s rooms this pod owns per `is_owner`, so exactly one
+///     beacon stream per room is published. `is_owner` (cross-*pod* ownership)
+///     is independent of the local shard partition.
+///   - The spillover INGEST (subscribe side) and home-region KV are per-shard
+///     too, but — unlike the hub — the ingest subscribes to the GLOBAL
+///     `room.*.system` wildcard, so every shard ingests every room's beacons,
+///     not a disjoint subset. This replication is intentional and correct (the
+///     `SpilloverStore` writes are idempotent and the read path consults only
+///     the local shard's store), but it costs O(N_shards) ingest subscriptions
+///     per pod instead of one. Hoisting a single pod-wide ingest is tracked as
+///     follow-up bead vc-wdf5.
+///
+/// This single-pod sharding is INDEPENDENT of the cross-pod
+/// [`crate::sfu::affinity::is_owner`] decision. We reuse the `jump_hash`
+/// function but with `n_shards` = local shard count, not the replica count.
+#[derive(Clone)]
+pub struct ChatServerPool {
+    /// One `Addr` per shard. Indexed by `jump_hash(room, shards.len())`.
+    shards: Arc<Vec<actix::Addr<ChatServer>>>,
+    /// The single shared connection-state map handed to every shard and every
+    /// `SessionLogic` (vc-ud6o E3 handle, now pool-owned for vc-8txq).
+    connection_states: SharedConnectionStates,
+    /// The ONE process-wide multi-thread tokio runtime that runs every room's
+    /// demux/fan-out task (bead vc-c609 / ADR-0009 Part A).
+    ///
+    /// Held in an `Arc` so the runtime outlives every shard and every spawned
+    /// dispatcher: a `ChatServer` shard only retains a `Handle` clone (cheap),
+    /// and the dispatcher tasks are spawned onto this runtime. Keeping the
+    /// `Runtime` here (rather than dropping the return value) is what keeps the
+    /// worker threads alive for the pod's lifetime.
+    ///
+    /// LIFECYCLE NOTE: dropping a `tokio::runtime::Runtime` from WITHIN an async
+    /// context panics. During normal operation this `Arc` lives for the whole
+    /// process, so no live-path drop ever happens. The last `Arc<Runtime>` clone
+    /// actually does live in the per-worker actix `App` factories and IS dropped
+    /// on an async thread — but only at `#[actix_web::main]` runtime teardown on
+    /// process exit, where it is benign because the runtime is already shutting
+    /// down. The pool is `Clone` (the binaries clone the `Addr`s and handles
+    /// around), and cloning the `Arc<Runtime>` does NOT drop the runtime. A
+    /// future graceful-shutdown refactor that dropped this `Arc` during normal
+    /// operation (rather than at process teardown) would need care to avoid
+    /// dropping the `Runtime` from inside an async context.
+    _fanout_runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl ChatServerPool {
+    /// Build and start the pool: `n_shards` `ChatServer` actors, each on its
+    /// own dedicated `Arbiter` thread, all sharing one `connection_states` map.
+    ///
+    /// `n_shards` is clamped to at least 1; the typical source is
+    /// [`crate::sfu::config::SfuConfig::chatserver_shards`].
+    ///
+    /// Each shard is constructed (its background tasks — beacon hub, spillover
+    /// ingest, home-region KV connect — spawned) on the calling runtime, then
+    /// moved onto its own arbiter via `start_in_arbiter`. We construct
+    /// sequentially because `ChatServer::new_shard` is `async` (it awaits the
+    /// home-region KV connect); the per-shard work is small and one-shot at
+    /// startup.
+    pub async fn new(
+        nats_connection: async_nats::client::Client,
+        n_shards: usize,
+        // vc-c609: worker-thread count for the pod-wide fan-out runtime, sourced
+        // from `SfuConfig::fanout_worker_threads` (env `SFU_FANOUT_WORKER_THREADS`).
+        // Clamped to at least 1 here defensively.
+        fanout_worker_threads: usize,
+    ) -> Self {
+        let n_shards = n_shards.max(1);
+        let fanout_worker_threads = fanout_worker_threads.max(1);
+        // vc-c609 / ADR-0009 Part A: build the ONE process-wide multi-thread
+        // fan-out runtime BEFORE the shards, so each shard can be handed a clone
+        // of its `Handle`. This runtime — NOT the per-shard Arbiter — is where
+        // every room's demux/fan-out task runs, so fan-out CPU scales across
+        // cores instead of being pinned to one arbiter thread per shard.
+        //
+        // We are already inside an async context here (`ChatServerPool::new` is
+        // awaited from the binaries' `#[actix_web::main]`), and BUILDING a
+        // runtime from within another runtime is fine — only DROPPING a runtime
+        // on an async thread panics. We never drop it on an async thread: it is
+        // moved into an `Arc` stored on the pool for the process lifetime.
+        let fanout_runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(fanout_worker_threads)
+                .thread_name("sfu-fanout")
+                .enable_all()
+                .build()
+                .expect("failed to build the SFU fan-out runtime"),
+        );
+        let fanout_handle = fanout_runtime.handle().clone();
+        let connection_states = SharedConnectionStates::default();
+        let mut shards = Vec::with_capacity(n_shards);
+        for ordinal in 0..n_shards {
+            let nc = nats_connection.clone();
+            let cs = connection_states.clone();
+            // Build the shard (and spawn its background tasks) on the current
+            // runtime, then hand the constructed actor to a fresh arbiter so
+            // the actor's mailbox is polled on a DEDICATED thread. This is what
+            // gives JoinRoom handling true cross-core parallelism: shard k's
+            // mailbox runs on arbiter k's thread, independent of shard j's.
+            //
+            // vc-c609: each shard also gets a clone of the fan-out runtime
+            // `Handle` so its per-room dispatchers spawn onto the shared
+            // multi-thread runtime instead of the shard's own arbiter thread.
+            let shard =
+                ChatServer::new_shard(nc, cs, ordinal, n_shards, fanout_handle.clone()).await;
+            let arbiter = actix::Arbiter::new();
+            let addr = ChatServer::start_in_arbiter(&arbiter.handle(), move |_ctx| shard);
+            shards.push(addr);
+        }
+        info!(
+            target: "sfu_trace",
+            shard_count = n_shards,
+            fanout_worker_threads = fanout_worker_threads,
+            "ChatServerPool started ({} shard(s), one Arbiter thread each; \
+             {} fan-out worker thread(s) on the shared runtime)",
+            n_shards,
+            fanout_worker_threads
+        );
+        Self {
+            shards: Arc::new(shards),
+            connection_states,
+            _fanout_runtime: fanout_runtime,
+        }
+    }
+
+    /// Number of shards in the pool.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Clone of the shared connection-state handle (vc-ud6o E3 / vc-8txq).
+    ///
+    /// Handed to every `SessionLogic` so the off-actor media-publish path can
+    /// read the per-session `Active` gate lock-free, exactly as before — the
+    /// only difference is the map is now owned by the pool and shared across
+    /// all shards rather than owned by a single actor.
+    pub fn connection_states_handle(&self) -> SharedConnectionStates {
+        self.connection_states.clone()
+    }
+
+    /// The `Addr` of the shard that owns `room`, selected by jump-consistent
+    /// hash over the shard count. Deterministic for a given `(room, n_shards)`,
+    /// so all messages for a room — across its whole lifecycle, including
+    /// reconnects — route to the same shard.
+    pub fn addr_for_room(&self, room: &str) -> actix::Addr<ChatServer> {
+        let idx = crate::sfu::affinity::jump_hash(room, self.shards.len() as u32) as usize;
+        // `jump_hash` returns a value in `0..n_shards`, so the index is always
+        // in bounds; clamp defensively rather than risk a panic on a hot path.
+        self.shards[idx.min(self.shards.len() - 1)].clone()
+    }
 }
 
 impl Actor for ChatServer {
     type Context = Context<Self>;
+
+    /// Raise the actor mailbox above the actix default (16).
+    ///
+    /// There is exactly one `ChatServer` actor per pod and every inbound
+    /// transport packet (`ClientMessage`, `do_send`) plus every room join
+    /// (`JoinRoom`, a bounded awaited `.send()`) funnels through this single
+    /// mailbox on one thread. With the 16-slot default, a high join rate plus a
+    /// packet flood head-of-line stalls the `JoinRoom` `.send()`s, so only a few
+    /// hundred sessions ever register (`room_members` never reaches the join
+    /// count). Sizing the mailbox to
+    /// `sfu_config.chatserver_mailbox_capacity` (default 8192, tunable via
+    /// `SFU_CHATSERVER_MAILBOX_CAPACITY`) lets the flood drain. This hook is
+    /// shared by both the WebTransport and WebSocket binaries, since each starts
+    /// the actor identically via `ChatServer::new(...).start()`.
+    fn started(&mut self, ctx: &mut Self::Context) {
+        let capacity = self.sfu_config.chatserver_mailbox_capacity;
+        ctx.set_mailbox_capacity(capacity);
+        info!(
+            target: "sfu_trace",
+            chatserver_mailbox_capacity = capacity,
+            shard_ordinal = self.shard_ordinal,
+            shard_count = self.shard_count,
+            "ChatServer shard started (mailbox SFU_CHATSERVER_MAILBOX_CAPACITY; \
+             shards SFU_CHATSERVER_SHARDS)"
+        );
+    }
 }
 
 impl Handler<Connect> for ChatServer {
@@ -219,6 +1283,11 @@ impl Handler<Connect> for ChatServer {
 
     fn handle(&mut self, msg: Connect, _ctx: &mut Self::Context) -> Self::Result {
         let Connect { id, addr } = msg;
+        // vc-9eve: count every transport Connect regardless of whether the
+        // session ever registers into a room. Drives the milestone payload's
+        // `connected` reading so a registration plateau (connected >> members)
+        // is distinguishable from a fan-out plateau.
+        crate::metrics::SFU_SESSIONS_CONNECTED_TOTAL.inc();
         self.sessions.insert(id, addr);
         self.connection_states.insert(id, ConnectionState::Testing);
     }
@@ -235,6 +1304,7 @@ impl Handler<Disconnect> for ChatServer {
             user_id,
             display_name,
             observer,
+            redirect,
         }: Disconnect,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -253,23 +1323,69 @@ impl Handler<Disconnect> for ChatServer {
         // Observers and non-active sessions bypass the grace period — they
         // never triggered PARTICIPANT_JOINED, so there is nothing to defer.
         if observer {
+            // Observers short-circuit inside `leave_rooms` before the
+            // `was_active` gate is consulted, so the value is academic
+            // here — pass the real captured value for consistency rather
+            // than a hard-coded literal.
             self.leave_rooms(
                 &session,
                 Some(&room),
                 Some(&user_id),
                 Some(&display_name),
                 true,
+                was_active,
             );
             return;
         }
 
-        // Remove the NATS subscription task immediately so the old session
-        // stops receiving media. Keep room_members intact for now — they
-        // will be cleaned up either on reconnection or when the grace
-        // period expires.
-        if let Some(task) = self.active_subs.remove(&session) {
-            task.abort();
+        // vc-9g7 (p6-9 follow-up): cross-region redirect synthesizes a
+        // Disconnect addressed to ourselves so the normal leave path runs.
+        // The redirected client is being told to reconnect *to a different
+        // pod in a different region* — it will NOT reconnect to this pod,
+        // so the RECONNECT_GRACE_PERIOD deferral is pure dead time that
+        // produces a ~2.25s ghost-participant window for cross-region peers
+        // federated via NATS (PARTICIPANT_JOINED → PARTICIPANT_LEFT pair).
+        //
+        // Mirror what the deferred path does on entry (drop joined_sessions
+        // and the per-room receiver) and then call `leave_rooms` directly
+        // instead of going through ExecutePendingDeparture. The
+        // PARTICIPANT_LEFT broadcast inside `leave_rooms` correctly gates
+        // on whether the session ever reached Active: if it never did
+        // (likely, given the KV-roundtrip window), the broadcast is
+        // suppressed and no JOINED→LEFT pair exists; if it did, the LEFT
+        // fires immediately rather than after the grace period. Either way
+        // the ghost window collapses.
+        //
+        // `observer=false` because the joiner was admitted as a real
+        // participant; the redirect flag is independent of observer-ness.
+        if redirect {
+            self.joined_sessions.remove(&session);
+            self.drop_room_receiver(&room, &session);
+            // Pass the `was_active` snapshot captured at the top of this
+            // handler. In the realistic post-cache-miss timing the KV
+            // roundtrip resolves before the client's CONNECTION packet
+            // triggers `ActivateConnection`, so `was_active` is false and
+            // `leave_rooms` correctly suppresses the spurious
+            // PARTICIPANT_LEFT for a participant nobody saw join.
+            self.leave_rooms(
+                &session,
+                Some(&room),
+                Some(&user_id),
+                Some(&display_name),
+                false,
+                was_active,
+            );
+            return;
         }
+
+        // vc-q0v: drop this session from the per-room demux receiver map
+        // immediately so the old (dead) recipient stops being targeted for
+        // try_send fan-out. Keep room_members intact for now — they will be
+        // cleaned up either on reconnection or when the grace period
+        // expires. The per-room dispatcher task itself stays alive as long
+        // as any receivers remain (and is aborted when the map empties).
+        self.joined_sessions.remove(&session);
+        self.drop_room_receiver(&room, &session);
 
         // If there is already a pending departure for this (room, user_id),
         // cancel the old timer and replace it. This handles the edge case of
@@ -277,8 +1393,16 @@ impl Handler<Disconnect> for ChatServer {
         let key = (room.clone(), user_id.clone());
         if let Some(old) = self.pending_departures.remove(&key) {
             ctx.cancel_future(old.spawn_handle);
+            // Orphan-leak fix: the old timer is now cancelled and the newer
+            // disconnect (staged below) only tracks `session`, so nothing will
+            // ever reap `old.old_session`'s membership rows. Reap them now —
+            // its dispatcher receiver was already dropped on its own Disconnect,
+            // so without this it would remain counted in room_members /
+            // room_states for the room's lifetime while never forwarding.
+            self.reap_superseded_session(&room, old.old_session);
             info!(
-                "Replaced existing pending departure for user {} in room {} (old session {})",
+                "Replaced existing pending departure for user {} in room {} \
+                 (reaped superseded session {})",
                 user_id, room, old.old_session
             );
         }
@@ -322,6 +1446,19 @@ impl Handler<Leave> for ChatServer {
         }: Leave,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
+        // vc-9g7 follow-up: capture `was_active` BEFORE any state mutation
+        // (here it happens to be safe because Leave doesn't touch
+        // `connection_states`, but reading up-front preserves the contract
+        // expected by `leave_rooms`). Clients that issue an explicit Leave
+        // before activating (e.g. very fast Testing-state departures) will
+        // have `was_active == false` and PARTICIPANT_LEFT will be elided,
+        // matching the prior in-band behaviour.
+        let was_active = self
+            .connection_states
+            .get(&session)
+            .map(|s| *s == ConnectionState::Active)
+            .unwrap_or(false);
+
         // Cancel any pending departure for this (room, user_id) to avoid a
         // duplicate PARTICIPANT_LEFT when the grace-period timer fires later.
         // We don't need ctx.cancel_future() because ExecutePendingDeparture::handle
@@ -338,7 +1475,14 @@ impl Handler<Leave> for ChatServer {
         // Leave is always a real participant, never an observer.
         // No display_name available from Leave message; leave_rooms will
         // fall back to user_id.
-        self.leave_rooms(&session, Some(&room), Some(&user_id), None, false);
+        self.leave_rooms(
+            &session,
+            Some(&room),
+            Some(&user_id),
+            None,
+            false,
+            was_active,
+        );
     }
 }
 
@@ -347,7 +1491,7 @@ impl Handler<ActivateConnection> for ChatServer {
 
     fn handle(&mut self, msg: ActivateConnection, ctx: &mut Self::Context) -> Self::Result {
         let ActivateConnection { session } = msg;
-        let was_testing = if let Some(state) = self.connection_states.get_mut(&session) {
+        let was_testing = if let Some(mut state) = self.connection_states.get_mut(&session) {
             if *state == ConnectionState::Testing {
                 *state = ConnectionState::Active;
                 info!("Session {} activated (Testing -> Active)", session);
@@ -444,11 +1588,18 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
         // cancelled by a reconnection or replaced by a newer disconnect.
         if let Some(pending) = self.pending_departures.remove(&key) {
             if pending.old_session != session {
-                // A newer disconnect replaced this one — do nothing, the newer
-                // timer will handle it.
+                // A newer disconnect replaced this one — the newer timer
+                // (tracking `pending.old_session`) will handle that session.
+                // Orphan-leak fix: this timer's own `session` was superseded
+                // and is tracked by NObody — reap its membership rows now. Its
+                // dispatcher receiver was already dropped on its Disconnect, so
+                // without this it would stay counted in room_members /
+                // room_states for the room's lifetime while never forwarding.
+                self.reap_superseded_session(&room, session);
                 info!(
-                    "Stale pending departure for user {} in room {} (session {} != {}), skipping",
-                    user_id, room, session, pending.old_session
+                    "Stale pending departure for user {} in room {} (session {} != {}), \
+                     reaped superseded session {} and re-armed newer departure",
+                    user_id, room, session, pending.old_session, session
                 );
                 // Re-insert the newer pending state.
                 self.pending_departures.insert(key, pending);
@@ -465,11 +1616,45 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                      skipping PARTICIPANT_LEFT (session was never activated)",
                     user_id, session, room
                 );
+                // p2-6: drop the SFU member entry before the room_states
+                // map entry may be evicted below.
+                if let Some(state) = self.room_states.get(&room) {
+                    let mut guard = match state.write() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.remove_member(session);
+                }
                 // Still clean up room_members for the old session.
                 if let Some(members) = self.room_members.get_mut(&room) {
                     members.retain(|(sid, _, _)| *sid != session);
                     if members.is_empty() {
                         self.room_members.remove(&room);
+                        // Mirror room_members lifecycle for SFU state.
+                        self.forwarders.remove(&room);
+                        self.room_states.remove(&room);
+                        self.subscriptions.remove(&room);
+                        // p3-11: tear down the speaker tick + scorer for
+                        // the now-empty room. Dropping the TickHandle
+                        // aborts the background task.
+                        self.speaker_ticks.remove(&room);
+                        self.speaker_scorers.remove(&room);
+                        // vc-kol / p6-7 (vc-c6l): drop this room from the
+                        // shared owner-pod beacon hub. Non-owner pods
+                        // never registered; `unregister` is a no-op.
+                        self.beacon_hub.unregister(&room);
+                        // vc-xow8: drop the join-milestone watermark on drain.
+                        self.sfu_join_milestone_watermark.remove(&room);
+                        // vc-9eve: drop the per-room intake-attempt count too.
+                        self.sfu_room_join_attempts.remove(&room);
+                        // vc-xow8: drop the per-room milestone gauge series too
+                        // so they don't leak in the Prometheus registry.
+                        crate::metrics::SFU_ROOM_MEMBERS
+                            .remove_label_values(&[room.as_str()])
+                            .ok();
+                        crate::metrics::SFU_ROOM_RECEIVER_SET
+                            .remove_label_values(&[room.as_str()])
+                            .ok();
                     }
                 }
                 return;
@@ -482,12 +1667,15 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
             );
             // Observer sessions bypass the grace period entirely (handled
             // directly in Disconnect), so this path is always non-observer.
+            // The `if !pending.was_active { return; }` check above proves
+            // `was_active == true` here, so pass `true` explicitly.
             self.leave_rooms(
                 &session,
                 Some(&room),
                 Some(&user_id),
                 Some(&display_name),
                 false,
+                true,
             );
         } else {
             info!(
@@ -498,9 +1686,296 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
     }
 }
 
+/// Recover from an unexpected per-room dispatcher exit (vc-q0v).
+///
+/// The dispatcher posts [`RoomDispatcherExited`] when its NATS
+/// subscription dies (initial subscribe failed or `sub.next()` returned
+/// `None` mid-flight). Three cases:
+///
+/// 1. **Entry already gone** — normal teardown raced the abort; nothing
+///    to do.
+/// 2. **Entry present, receivers empty** — drain happened concurrently;
+///    drop the entry.
+/// 3. **Entry present, receivers non-empty** — respawn the dispatcher,
+///    *reusing the same receivers map and forwarder*. Sessions stay
+///    connected; they just experience the (NATS-bounded) gap that the
+///    dispatcher was unavailable.
+///
+/// Without this handler, a single dispatcher failure would poison the
+/// whole room: new joiners would insert into the orphaned receivers map
+/// and silently receive zero media for the lifetime of the room. The
+/// pre-vc-q0v per-session model degraded one session per failure; this
+/// recovery preserves the same blast radius at the room level.
+impl Handler<RoomDispatcherExited> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        RoomDispatcherExited { room }: RoomDispatcherExited,
+        ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let Some(existing) = self.room_dispatch.remove(&room) else {
+            // Normal teardown already removed the entry — nothing to do.
+            return;
+        };
+        // vc-kcpg: `existing.tasks` are the K per-shard handles. The shard that
+        // sent this message is already finished (abort is a no-op); the OTHER
+        // K-1 shards may still be live. We respawn the WHOLE set below, so abort
+        // the survivors here to avoid leaking detached tasks that would keep
+        // running against the (reused) receivers map. This preserves the
+        // documented room-level recovery blast radius — one shard failing
+        // re-establishes the whole room's ingest rather than leaving a partial,
+        // hard-to-reason-about mix of old and new dispatchers.
+        existing.abort_all();
+        let receivers = existing.receivers;
+        let has_receivers = {
+            let g = match receivers.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            !g.is_empty()
+        };
+        if !has_receivers {
+            info!(
+                "Per-room dispatcher exited for room {} with no remaining receivers; \
+                 entry removed",
+                room
+            );
+            return;
+        }
+        // Respawn against the same receivers map and forwarder so live
+        // sessions keep their mailbox identity and the room's SFU state
+        // (members + capabilities) is preserved.
+        let Some(forwarder) = self.forwarders.get(&room).cloned() else {
+            warn!(
+                "Per-room dispatcher exited for room {} but forwarder is gone; \
+                 dropping entry (receivers will be cleaned up on next leave_rooms)",
+                room
+            );
+            return;
+        };
+        // p3-11: the scorer should also still be live as long as the
+        // forwarder is, since both share the room lifecycle. Fall back to
+        // a fresh empty scorer if it has somehow been evicted — the
+        // dispatcher must always have one to observe into.
+        let scorer = self
+            .speaker_scorers
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(TokioRwLock::new(SpeakerScorer::new())))
+            .clone();
+        // p4-4: the dispatcher needs the room's RoomState handle to record
+        // per-receiver bandwidth estimates from DiagnosticsPacket ingest.
+        // The forwarder above keeps room_state alive, so this lookup should
+        // always succeed; fall back to materialising a fresh entry to keep
+        // the respawn path infallible (matches the scorer fallback above).
+        let room_state = self
+            .room_states
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(RoomState::new(room.clone()))))
+            .clone();
+        let sfu_mode = self.sfu_config.mode;
+        warn!(
+            "Respawning per-room dispatchers for room {} (a shard subscription \
+             died with {} live receivers still attached)",
+            room,
+            receivers
+                .read()
+                .map(|g| g.len())
+                .unwrap_or_else(|p| p.into_inner().len()),
+        );
+        // vc-kcpg: respawn ALL K ingest dispatchers (the subject filters are
+        // rebuilt per shard inside `spawn_room_dispatcher`).
+        let tasks = spawn_room_dispatchers(
+            &self.nats_connection,
+            &room,
+            self.sfu_config.ingest_shards,
+            sfu_mode,
+            &forwarder,
+            &scorer,
+            &receivers,
+            &room_state,
+            &ctx.address(),
+            &self.fanout_handle,
+            self.sfu_config.fanout_shard_min_receivers,
+        );
+        self.room_dispatch
+            .insert(room, RoomDispatch { receivers, tasks });
+    }
+}
+
+/// Apply the result of an async home-region lookup (bead vc-hc8 / p6-9).
+///
+/// Three cases:
+///
+/// 1. **In-region**: just populate the cache so subsequent joiners take
+///    the synchronous fast path in `JoinRoom`. The session that triggered
+///    the lookup remains admitted — no extra action.
+///
+/// 2. **Out-of-region, session still alive**: emit the REDIRECT packet on
+///    the session's recipient, then synthesize a `Disconnect` to itself
+///    so the normal leave path (PARTICIPANT_LEFT, pending-departure
+///    grace window, SFU cleanup) runs identically to a client-initiated
+///    disconnect. This is the v1 "accept ~250ms RTT penalty" window: the
+///    first joiner for a foreign-homed room in this region pays one
+///    admit-then-redirect round-trip; all subsequent joiners hit the
+///    synchronous cache path.
+///
+/// 3. **Out-of-region, session already gone**: still populate the cache.
+///    The session having disconnected in the meantime doesn't change the
+///    home-region binding for the room; future joiners must still be
+///    redirected. Dropping the cache update here would mean every
+///    cross-region first-joiner re-paid the async lookup.
+impl Handler<HomeRegionResolved> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        HomeRegionResolved {
+            room,
+            home_region,
+            session,
+            user_id,
+            display_name,
+        }: HomeRegionResolved,
+        ctx: &mut Self::Context,
+    ) -> Self::Result {
+        // Idempotency: a second `HomeRegionResolved` for the same room can
+        // arrive if two cache-miss joiners overlap (both spawn lookups
+        // before either finishes). The second writer's value is identical
+        // to the first (KV CAS makes the home region single-valued), so
+        // overwriting is a no-op semantically.
+        self.home_region_cache
+            .insert(room.clone(), home_region.clone());
+
+        let current_region = crate::sfu::affinity::current_region();
+        let Some(target) = crate::sfu::affinity::compute_cross_region_redirect_target(
+            &home_region,
+            current_region,
+            sfu_transport_kind(),
+            crate::sfu::affinity::region_base_domain(),
+        ) else {
+            // Same region — nothing more to do; the originating JoinRoom
+            // has already admitted the session locally.
+            return;
+        };
+
+        // Out-of-region: emit REDIRECT to the originating session if it's
+        // still alive. The session may have already disconnected (rare:
+        // would require the client to drop within the KV-roundtrip window).
+        // In that case we still kept the cache entry above so future
+        // joiners in this region take the synchronous redirect path.
+        let Some(recipient) = self.sessions.get(&session).cloned() else {
+            info!(
+                "p6-9 async redirect: session {} for user {} disappeared \
+                 before lookup completed; cache for room {} now pinned to {}",
+                session, user_id, room, home_region
+            );
+            return;
+        };
+
+        info!(
+            "JoinRoom cross-region redirect (async): room {} homed in {} but \
+             this pod is in {}; redirecting session {} (user {}) to {}",
+            room, home_region, current_region, session, user_id, target,
+        );
+        // vc-n9o: count BOTH the redirect decision AND its teardown at this
+        // site.
+        //
+        // Why count the teardown HERE (not in the transport actor's
+        // `stopping`, as the synchronous JoinRoom-Err path does):
+        //
+        // Unlike the JoinRoom-Err redirect, this async cross-region redirect
+        // fires AFTER the session was already admitted locally (cache-miss
+        // first-joiner). The session's transport actor is fully running and
+        // the client may already be sending media. We deliver the REDIRECT
+        // over the STILL-OPEN session (the `try_send` below), then synthesize
+        // a `Disconnect` that ONLY cleans up ChatServer-side room state
+        // (`sessions` / `connection_states` / `room_members` / `room_states`).
+        // It does NOT stop the transport actor and does NOT clear that actor's
+        // `accept_inbound` flag.
+        //
+        // The transport actor tears itself down later, on its own stop path
+        // (the client reads the REDIRECT over the open session and closes,
+        // or the heartbeat times out) — which records `reason=normal`, NOT
+        // `redirect`. So if we relied on the actor's `stopping` to count this
+        // redirect's teardown, every async cross-region redirect would leave a
+        // permanent `decision{redirect}` without a matching
+        // `teardown{redirect}` — exactly the false-positive gap that looks
+        // like the vc-n9o regression. Counting `teardown{redirect}` here, at
+        // the authoritative teardown trigger for THIS path, closes that gap.
+        // (The actor's later `reason=normal` count is a genuine normal
+        // disconnect and does not affect the redirect-vs-redirect comparison.)
+        //
+        // Note: this path does NOT suffer the WT mailbox-starvation 0-decode
+        // hang. That hang was caused by the QUIC session never closing, so the
+        // client never learned it was redirected. Here the REDIRECT is
+        // delivered over the live session BEFORE any teardown, so the client
+        // learns of it and disconnects cooperatively. Routing it through the
+        // transport actor's flag-clear + StopSession would be redundant and
+        // would disturb the vc-9g7 cross-region ghost-participant handling, so
+        // we deliberately keep the existing synthesized-Disconnect cleanup.
+        crate::metrics::SFU_JOIN_DECISION_TOTAL
+            .with_label_values(&["redirect"])
+            .inc();
+        crate::metrics::SFU_SESSION_TEARDOWN_TOTAL
+            .with_label_values(&["redirect"])
+            .inc();
+        let bytes = SessionManager::build_admission_redirect_packet(&target, "wrong_region");
+        if let Err(e) = recipient.try_send(Message {
+            msg: bytes::Bytes::from(bytes),
+            session,
+        }) {
+            warn!(
+                "Failed to deliver async ADMISSION_DECISION{{REDIRECT}} \
+                 (wrong_region) to session {}: {}",
+                session, e
+            );
+        }
+
+        // Synthesize a Disconnect so the normal leave path runs. We address
+        // it to ourselves rather than calling `leave_rooms` directly so the
+        // Disconnect handler's session-state cleanup (sessions /
+        // connection_states / suppress_join_broadcast removal) runs in one
+        // place. This cleans up ROOM-SIDE state only; the transport actor
+        // stops on its own stop path once the client follows the REDIRECT.
+        //
+        // vc-9g7: set `redirect: true` to BYPASS the pending-departure
+        // grace window. The client will not reconnect to this pod — it's
+        // being told to go to a different region — so the standard 2s
+        // RECONNECT_GRACE_PERIOD deferral would just produce a ghost-
+        // participant flicker for cross-region peers federated via NATS
+        // (PARTICIPANT_JOINED → PARTICIPANT_LEFT pair). The Disconnect
+        // handler's `if redirect` arm calls `leave_rooms` immediately.
+        ctx.address().do_send(crate::messages::server::Disconnect {
+            session,
+            room,
+            user_id,
+            display_name,
+            observer: false,
+            redirect: true,
+        });
+    }
+}
+
 impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
+    /// Handle a packet routed through the actor.
+    ///
+    /// vc-ud6o E3: as of the off-actor publish change, high-volume media
+    /// (`PacketKind::Data`) NO LONGER reaches this handler — the transport
+    /// session task publishes those directly to NATS via
+    /// [`SessionLogic::forward_packet`]. This handler now only sees the rare
+    /// CONTROL packets that genuinely need actor-owned state:
+    ///   * `SUBSCRIPTION_UPDATE` — intercepted and applied to the per-room
+    ///     `SubscriptionStore` (returns without broadcasting).
+    ///   * `KEYFRAME_REQUEST` — subject to the layer-aware drop policy; if it
+    ///     survives, it is published to NATS like before.
+    ///
+    /// The connection-state gate, `session_id == 0` rewrite, and subject
+    /// construction below are preserved unchanged so the KFR publish path is
+    /// byte-for-byte identical to the pre-vc-ud6o behavior. The media-publish
+    /// gate semantics are reproduced off-actor in `publish_media_off_actor`.
     fn handle(&mut self, msg: ClientMessage, ctx: &mut Self::Context) -> Self::Result {
         let ClientMessage {
             session,
@@ -508,13 +1983,14 @@ impl Handler<ClientMessage> for ChatServer {
             msg,
             user: _,
         } = msg;
+        let kind = msg.kind;
         trace!("got message in server room {room} session {session}");
 
         // Check connection state - only publish to NATS if Active
         let connection_state = self
             .connection_states
             .get(&session)
-            .copied()
+            .map(|s| *s)
             .unwrap_or(ConnectionState::Testing);
 
         if connection_state != ConnectionState::Active {
@@ -526,13 +2002,83 @@ impl Handler<ClientMessage> for ChatServer {
         }
 
         let nc = self.nats_connection.clone();
-        let subject = format!("room.{room}.{session}");
-        let subject = subject.replace(' ', "_");
+        // vc-kcpg: this surviving CONTROL publish (KFR, etc.) is emitted on the
+        // publishing session's own subject. With K>1 it must land on that
+        // session's ingest shard so a dispatcher subscribes it; with K==1 this
+        // collapses to the legacy `room.{room}.{session}` 3-token subject.
+        let subject =
+            crate::models::build_publish_subject(&room, session, self.sfu_config.ingest_shards);
 
         let packet_bytes =
             if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
                 if packet_wrapper.session_id == 0 {
                     packet_wrapper.session_id = session;
+                }
+                // p3-5: SUBSCRIPTION_UPDATE is a server-local control packet —
+                // intercept it before NATS publish, apply it to the per-room
+                // SubscriptionStore so the forwarder picks it up on the next
+                // decide(), and return without broadcasting. Peers do not need
+                // to see other peers' subscription state.
+                if packet_wrapper.packet_type == PacketType::SUBSCRIPTION_UPDATE.into() {
+                    self.apply_subscription_update(&room, session, &packet_wrapper.data);
+                    return;
+                }
+                // p4-10: layer-aware KEYFRAME_REQUEST routing.
+                //
+                // A KFR triggers the named sender to blast a fresh ~1.5 MB
+                // keyframe. If the requesting receiver is not currently
+                // subscribed to any layer of that sender (per its cached
+                // `LayerSelection`), the KFR is wasted work — and on a
+                // bandwidth-constrained downlink it can wedge the receiver's
+                // egress queue behind a keyframe burst it will never consume.
+                //
+                // The existing per-session KFR rate limit in
+                // `session_logic.rs` remains in force; this is an additive
+                // policy applied before the NATS publish so the named sender
+                // is never woken at all for KFRs that wouldn't help.
+                //
+                // vc-jgj: branch directly on the `PacketKind` plumbed from
+                // `SessionLogic::handle_inbound`. The inner `MediaPacket`
+                // parse only runs when we already know this is a KFR, so
+                // the AUDIO / VIDEO / SCREEN fan-out path never re-parses.
+                if kind == PacketKind::KeyframeRequest {
+                    if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                        let members: &[(SessionId, String, String)] = self
+                            .room_members
+                            .get(&room)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        // vc-wls: lock-free read of the cached selection.
+                        // `last_selection_for` returns an
+                        // `Arc<CachedSelection>` from a DashMap shard lock
+                        // that contends only with writes to THIS receiver's
+                        // entry. We then clone the inner `LayerSelection`
+                        // (typically tiny) so we don't hand a clone-on-write
+                        // Arc across the helper boundary.
+                        let cached_selection = self.forwarders.get(&room).and_then(|fwd| {
+                            fwd.layer_selector()
+                                .last_selection_for(session)
+                                .map(|cached| cached.selection.clone())
+                        });
+                        if should_drop_kfr_for_layer_selection(
+                            &media_packet.user_id,
+                            session,
+                            members,
+                            cached_selection.as_ref(),
+                        ) {
+                            crate::metrics::SFU_DROPPED_TOTAL
+                                .with_label_values(&["kfr_unsubscribed"])
+                                .inc();
+                            debug!(
+                                "Dropping KEYFRAME_REQUEST from session {} in room {} \
+                                 (target {:?} not in current layer selection)",
+                                session,
+                                room,
+                                std::str::from_utf8(&media_packet.user_id).unwrap_or("<bin>"),
+                            );
+                            return;
+                        }
+                    }
                 }
                 match packet_wrapper.write_to_bytes() {
                     Ok(bytes) => bytes,
@@ -557,6 +2103,28 @@ impl Handler<ClientMessage> for ChatServer {
     }
 }
 
+/// RAII guard for the `sfu_join_inflight` gauge (bead vc-9eve).
+///
+/// Increments the gauge on construction and decrements it on `Drop`, so the
+/// gauge is balanced across EVERY synchronous return path of the `JoinRoom`
+/// handler — including the early `Err`/`Ok` short-circuits — without
+/// hand-threading a decrement through each one. Scoped to the synchronous
+/// handler body only; the post-join spawned task is deliberately out of scope.
+struct JoinInflightGuard;
+
+impl JoinInflightGuard {
+    fn new() -> Self {
+        crate::metrics::SFU_JOIN_INFLIGHT.inc();
+        JoinInflightGuard
+    }
+}
+
+impl Drop for JoinInflightGuard {
+    fn drop(&mut self) {
+        crate::metrics::SFU_JOIN_INFLIGHT.dec();
+    }
+}
+
 impl Handler<JoinRoom> for ChatServer {
     type Result = MessageResult<JoinRoom>;
 
@@ -568,18 +2136,372 @@ impl Handler<JoinRoom> for ChatServer {
             user_id,
             display_name,
             observer,
+            capabilities,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
+        // vc-9eve: count this intake attempt at handler ENTRY, before any
+        // validation/redirect/admission logic. Both the process-wide counter
+        // and the per-room count climb regardless of whether the join
+        // ultimately registers — so milestones still fire when registration
+        // is the bottleneck and `room_members` plateaus below the first
+        // milestone. The per-room count is the value the milestone crossing is
+        // driven off (see `maybe_emit_join_milestone`).
+        crate::metrics::SFU_JOIN_ATTEMPTS_TOTAL.inc();
+        let room_join_attempts = {
+            let n = self.sfu_room_join_attempts.entry(room.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        // vc-9eve: RAII guard — increments `sfu_join_inflight` now and
+        // decrements it on EVERY synchronous return path below (early Err
+        // returns, the already-joined Ok short-circuit, and the final Ok).
+        // The post-join `tokio::spawn`ed task is intentionally NOT covered:
+        // by the time it runs the joiner is already registered and this
+        // synchronous handler has returned, so the gauge tracks only the
+        // short synchronous admission window.
+        let _join_inflight_guard = JoinInflightGuard::new();
+
         // Validate user_id synchronously BEFORE spawning async task.
         // This ensures we return an error to the client if validation fails,
         // rather than returning Ok and silently failing in the spawned task.
         if user_id == SYSTEM_USER_ID {
-            return MessageResult(Err("Cannot use reserved system user ID".into()));
+            return MessageResult(Err(JoinRoomError::error(
+                "Cannot use reserved system user ID",
+            )));
         }
 
-        if self.active_subs.contains_key(&session) {
+        if self.joined_sessions.contains(&session) {
             return MessageResult(Ok(()));
+        }
+
+        // --- Cross-region home-region pinning (bead vc-hc8 / p6-9) ---
+        // Each region runs its own StatefulSet. Rooms have a "home region"
+        // assigned by the first joiner via a NATS JetStream KV bucket
+        // (`rooms-home-region`) under atomic create-if-absent semantics.
+        // Out-of-region clients get redirected to the home region's load
+        // balancer BEFORE the in-region pod-ordinal redirect below — a
+        // wrong-region client must never reach the pod-ordinal check
+        // because the pod ordinal it's about to be told to use lives in
+        // the wrong cluster.
+        //
+        // Observers are EXEMPT for the same reason they're exempt from
+        // the pod-ordinal redirect: they don't participate in SFU state,
+        // and bouncing them across regions just to listen would degrade
+        // the metrics / diagnostic surface without any consistency win.
+        //
+        // ORDER MATTERS — this runs BEFORE the p6-5 pod-ordinal redirect,
+        // BEFORE the reconnection bookkeeping, BEFORE admission control.
+        // Nothing has been mutated by this point, so an Err return (or
+        // an async redirect-then-disconnect) requires no rollback.
+        //
+        // ASYNC HANDLING: the JoinRoom handler returns synchronously, but
+        // the KV lookup is async. We use a synchronous in-actor cache as
+        // the steady-state fast path; on cache miss the very first joiner
+        // is admitted locally and the lookup runs in a spawned task that
+        // posts `HomeRegionResolved` back to the actor. If the resolved
+        // home turns out to be a foreign region, that handler emits the
+        // REDIRECT packet and synthesizes a Disconnect, matching the
+        // single-round-trip "accept ~250ms RTT penalty" v1 compromise
+        // called out in the bead. Steady state (all subsequent joiners
+        // for the room) is a synchronous cache hit with the redirect
+        // decided up front — no admission of cross-region traffic.
+        if !observer {
+            let current_region = crate::sfu::affinity::current_region();
+            if let Some(cached_home) = self.home_region_cache.get(&room).cloned() {
+                if let Some(target) = crate::sfu::affinity::compute_cross_region_redirect_target(
+                    &cached_home,
+                    current_region,
+                    sfu_transport_kind(),
+                    crate::sfu::affinity::region_base_domain(),
+                ) {
+                    info!(
+                        "JoinRoom cross-region redirect (cache hit): room {} \
+                         homed in {} but this pod is in {}; redirecting \
+                         session {} (user {}) to {}",
+                        room, cached_home, current_region, session, user_id, target,
+                    );
+                    if let Some(recipient) = self.sessions.get(&session) {
+                        let bytes = SessionManager::build_admission_redirect_packet(
+                            &target,
+                            "wrong_region",
+                        );
+                        if let Err(e) = recipient.try_send(Message {
+                            msg: bytes::Bytes::from(bytes),
+                            session,
+                        }) {
+                            warn!(
+                                "Failed to deliver ADMISSION_DECISION{{REDIRECT}} \
+                                 (wrong_region) to session {}: {}",
+                                session, e
+                            );
+                        }
+                    }
+                    // vc-n9o: count the redirect decision at the actual
+                    // decision site. The matching teardown is counted in the
+                    // transport actor's StopSession handler; a redirect-vs-
+                    // teardown gap is the live multi-pod 0-decode signal.
+                    crate::metrics::SFU_JOIN_DECISION_TOTAL
+                        .with_label_values(&["redirect"])
+                        .inc();
+                    return MessageResult(Err(JoinRoomError::redirect(format!(
+                        "Room {room} is homed in region {cached_home}; \
+                         redirecting to {target}"
+                    ))));
+                }
+                // Cache hit, same region → fall through to p6-5 below.
+            } else {
+                // Cache miss: spawn the NATS-KV lookup and let the join
+                // proceed locally for v1. The spawned task reports back
+                // via `HomeRegionResolved`, which populates the cache and
+                // (if the room is homed elsewhere) emits the REDIRECT
+                // packet plus a synthesized Disconnect.
+                //
+                // This admits a tiny window where the very first joiner
+                // for a foreign-homed room in this region pays a brief
+                // admit-then-redirect instead of an up-front redirect.
+                // The bead explicitly accepts this for v1. All subsequent
+                // joiners in this region hit the cache path above.
+                debug!(
+                    "p6-9 cache-miss: spawning home-region lookup for room {} \
+                     (session {}, user {}); session admitted locally pending \
+                     lookup result.",
+                    room, session, user_id
+                );
+                let kv = self.home_region_kv.clone();
+                let room_for_task = room.clone();
+                let user_for_task = user_id.clone();
+                let display_for_task = display_name.clone();
+                let region_for_task: &'static str = current_region;
+                let chat_addr = ctx.address();
+                tokio::spawn(async move {
+                    let home = crate::sfu::affinity::home_region(
+                        &room_for_task,
+                        kv.as_ref(),
+                        region_for_task,
+                    )
+                    .await;
+                    // Fire-and-forget: if the actor is gone, dropping the
+                    // future is the right thing.
+                    let _ = chat_addr
+                        .send(HomeRegionResolved {
+                            room: room_for_task,
+                            home_region: home,
+                            session,
+                            user_id: user_for_task,
+                            display_name: display_for_task,
+                        })
+                        .await;
+                });
+            }
+        }
+
+        // --- Ownership redirect (bead vc-8oa / p6-5) ---
+        // Wave 3 affinity migration: each room is jump-hashed to exactly
+        // one pod ordinal in the StatefulSet. If a client connects to a
+        // non-owner pod, we emit an ADMISSION_DECISION{REDIRECT} hint
+        // pointing at the owner pod's headless DNS and decline the join.
+        // The transport actor closes the connection on JoinRoom Err
+        // (see SessionLogic::handle_join_room_result); the redirect packet
+        // delivered through the recipient mpsc just before that close is
+        // what the client uses to reconnect to the correct pod.
+        //
+        // Observers are EXEMPT — they don't participate in room ownership
+        // (no media write path, no SFU room_state membership). Forcing an
+        // observer to redirect just to listen makes the metrics/diagnostic
+        // path more fragile without any consistency benefit.
+        //
+        // ORDER MATTERS — this MUST run BEFORE the reconnection bookkeeping
+        // below. If we ran it after, a reconnecting user landing on the
+        // wrong pod would lose their old `pending_departures` entry, have
+        // their deferred PARTICIPANT_LEFT cancelled, and be removed from
+        // `room_members` / `room_states` — and then be told to redirect.
+        // Peers would never learn the user left, and the redirect would
+        // not heal it because the leave event never fires. Doing the
+        // ownership check synchronously up front means nothing has been
+        // mutated yet, so there's nothing to roll back. The check also
+        // runs BEFORE the soft/hard-cap admission accounting below so a
+        // redirected client never increments the wrong pod's caps and
+        // never receives a QUEUED/REJECTED packet it would discard anyway.
+        //
+        // vc-85p (p6-5) SPILLOVER OVERRIDE: before honouring the ownership
+        // redirect, consult the owner-pod health beacon for this room. If
+        // `is_spilled_over` is true — the owner is over the participant or
+        // CPU threshold AND its beacon is fresh (< 15s) — we ADMIT THE
+        // JOINER LOCALLY (spill) instead of redirecting. Admitting locally
+        // means falling through to the same local-admit machinery below
+        // (reconnection bookkeeping, admission caps, room_members /
+        // room_states materialisation, per-room dispatcher) that any
+        // normally-admitted local participant takes — we do NOT emit the
+        // ADMISSION_DECISION{REDIRECT} packet. Spill-pod media federation
+        // already works: every pod's dispatcher subscribes `room.{room}.*`,
+        // so a locally-admitted listener receives senders' media via NATS.
+        //
+        // For under-threshold, unknown, or stale-beacon rooms,
+        // `is_spilled_over` returns false and behaviour is UNCHANGED:
+        // redirect to the owner exactly as before. Observers were already
+        // exempt from the redirect and remain so.
+        //
+        // Idempotency: this decision lives only in JoinRoom. Once admitted
+        // locally the session is in `room_members` / `room_states` and is
+        // treated as an ordinary local member; no later state message
+        // re-runs this branch, so a spilled joiner never bounces. A
+        // reconnect re-evaluates the predicate, which is correct healing
+        // behaviour (still spilled → stay; no longer spilled → redirect).
+        if !observer {
+            let replicas = crate::sfu::affinity::replicas_from_env();
+            let self_ord = crate::sfu::affinity::self_ordinal_from_env();
+            let spilled_over = self.spillover_store.is_spilled_over(&room);
+            // vc-8wd Layer 1: surface WHY the spillover verdict is what it is.
+            // `owner_count` is the participant count from the owner-pod beacon
+            // the predicate just consulted (0 when no fresh beacon exists);
+            // `state` is the boolean verdict. Both are O(1) gauge sets on the
+            // (low-rate) JoinRoom path — not the per-packet hot path.
+            {
+                let owner_count = self
+                    .spillover_store
+                    .snapshot(&room)
+                    .map(|s| s.owner_count)
+                    .unwrap_or(0);
+                crate::metrics::SFU_SPILLOVER_OWNER_COUNT
+                    .with_label_values(&[room.as_str()])
+                    .set(owner_count as f64);
+                crate::metrics::SFU_SPILLOVER_STATE
+                    .with_label_values(&[room.as_str()])
+                    .set(if spilled_over { 1.0 } else { 0.0 });
+            }
+            // Compute the redirect target once: needed both for the spill
+            // observability log (when this pod is a non-owner) and for the
+            // actual redirect on the non-spill path.
+            // vc-el0: build the FULLY-QUALIFIED per-pod StatefulSet DNS
+            // including the K8s namespace label. A namespace-less name does
+            // not resolve, so redirected/spillover clients would round-robin
+            // back onto random non-owner pods and decode 0 streams. Namespace
+            // is resolved POD_NAMESPACE → service-account file → "default";
+            // the workload (pod-name prefix) comes from SFU_WORKLOAD_NAME
+            // (chart fullname, e.g. webtransport-us-east), defaulting to
+            // rustlemania-{transport_kind} for local/dev.
+            let tk = sfu_transport_kind();
+            let redirect_namespace = crate::sfu::affinity::current_namespace();
+            let redirect_workload = crate::sfu::affinity::workload_from_env(tk);
+            let redirect_target = crate::sfu::affinity::compute_redirect_target(
+                &room,
+                self_ord,
+                replicas,
+                tk,
+                redirect_namespace,
+                &redirect_workload,
+            );
+            if spilled_over {
+                // Log the spill admission UNCONDITIONALLY — the predicate
+                // already passed, so the joiner is being admitted locally
+                // regardless of whether this pod is the owner. Include the
+                // would-be redirect target only when this pod is a non-owner
+                // (target is Some); when this pod IS the owner the spill is a
+                // normal local admission with no redirect to suppress.
+                match &redirect_target {
+                    Some(target) => info!(
+                        "JoinRoom SPILL: admitting joiner locally for room={} \
+                         (session {}, user {}, owner ordinal != self {:?}) \
+                         (would-redirect-to={})",
+                        room, session, user_id, self_ord, target,
+                    ),
+                    None => info!(
+                        "JoinRoom SPILL: admitting joiner locally for room={} \
+                         (session {}, user {}, this pod is the owner)",
+                        room, session, user_id,
+                    ),
+                }
+                // vc-8wd Layer 2: targeted join trace (only for the
+                // configured room/session). Gated on the cheap atomic load
+                // first so unset = zero cost.
+                if crate::sfu::trace::tracing_enabled()
+                    && crate::sfu::trace::traced_room(&room)
+                    && crate::sfu::trace::traced_session(&session.to_string())
+                {
+                    let owner_count = self
+                        .spillover_store
+                        .snapshot(&room)
+                        .map(|s| s.owner_count)
+                        .unwrap_or(0);
+                    tracing::debug!(
+                        target: "sfu_trace",
+                        room = %room,
+                        session,
+                        %user_id,
+                        decision = "admit_local",
+                        reason = "spilled_over",
+                        spilled_over,
+                        self_ordinal = ?self_ord,
+                        owner_count,
+                        "JoinRoom decision"
+                    );
+                }
+                // Fall through to the local-admit path below.
+            } else if let Some(target) = redirect_target {
+                info!(
+                    "JoinRoom redirect: room {} owned by ordinal != self ({:?}); \
+                     redirecting session {} (user {}) to {}",
+                    room, self_ord, session, user_id, target,
+                );
+                if crate::sfu::trace::tracing_enabled()
+                    && crate::sfu::trace::traced_room(&room)
+                    && crate::sfu::trace::traced_session(&session.to_string())
+                {
+                    tracing::debug!(
+                        target: "sfu_trace",
+                        room = %room,
+                        session,
+                        %user_id,
+                        decision = "redirect",
+                        reason = "wrong_owner",
+                        spilled_over,
+                        self_ordinal = ?self_ord,
+                        %target,
+                        // vc-el0: surface the namespace label that this fix
+                        // adds so the FQDN can be validated in the wild.
+                        redirect_namespace = %redirect_namespace,
+                        redirect_workload = %redirect_workload,
+                        "JoinRoom decision"
+                    );
+                }
+                if let Some(recipient) = self.sessions.get(&session) {
+                    let bytes =
+                        SessionManager::build_admission_redirect_packet(&target, "wrong_owner");
+                    if let Err(e) = recipient.try_send(Message {
+                        msg: bytes::Bytes::from(bytes),
+                        session,
+                    }) {
+                        warn!(
+                            "Failed to deliver ADMISSION_DECISION{{REDIRECT}} to \
+                             session {}: {}",
+                            session, e
+                        );
+                    }
+                }
+                // No rollback needed: this block runs before
+                // `pending_departures.remove`, before `room_members` /
+                // `room_states` cleanup, and before the
+                // `suppress_join_broadcast` insert. Returning Err here
+                // leaves all of that state untouched so the original
+                // pod's deferred PARTICIPANT_LEFT still fires after the
+                // grace period if the client doesn't successfully
+                // reconnect on the correct pod.
+                // vc-n9o: count the pod-ordinal redirect decision here so
+                // it can be compared against the teardown counter.
+                crate::metrics::SFU_JOIN_DECISION_TOTAL
+                    .with_label_values(&["redirect"])
+                    .inc();
+                // vc-el0: count the per-pod redirect FQDN emission labeled by
+                // the resolved namespace, so the namespace-label fix is
+                // verifiable in production (real namespace vs. "default").
+                crate::metrics::SFU_REDIRECT_FQDN_EMITTED_TOTAL
+                    .with_label_values(&[redirect_namespace])
+                    .inc();
+                return MessageResult(Err(JoinRoomError::redirect(format!(
+                    "Room {room} is owned by a different pod; redirecting to {target}"
+                ))));
+            }
         }
 
         // --- Reconnection grace period: cancel pending departure ---
@@ -594,6 +2516,16 @@ impl Handler<JoinRoom> for ChatServer {
             // Clean up stale room_members entry from the old session
             if let Some(members) = self.room_members.get_mut(&room) {
                 members.retain(|(sid, _, _)| *sid != pending.old_session);
+            }
+            // Mirror the cleanup on the SFU member table — the old SID is
+            // gone (subscription was already aborted in Disconnect) and a
+            // new SID will be inserted below.
+            if let Some(state) = self.room_states.get(&room) {
+                let mut guard = match state.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.remove_member(pending.old_session);
             }
 
             info!(
@@ -613,18 +2545,135 @@ impl Handler<JoinRoom> for ChatServer {
             self.suppress_join_broadcast.insert(session);
         }
 
+        // --- Admission control (bead vc-69e / p3-13) ---
+        // Two-tier admission policy for non-observer joins:
+        //   - count < WAITING_ROOM_THRESHOLD: admit silently (no packet emitted)
+        //   - WAITING_ROOM_THRESHOLD <= count < hard_cap: admit + emit
+        //     ADMISSION_DECISION{QUEUED} informational packet so the client
+        //     can surface a "near capacity" hint to the user. The joiner IS
+        //     still fully admitted to the room — wave-1 has no actual
+        //     queueing mechanism (that lands in wave-3).
+        //   - count >= hard_cap: reject. Emit ADMISSION_DECISION{REJECTED}
+        //     to the session before declining the join, so the client can
+        //     show a structured error instead of just a disconnect.
+        //
+        // Observers don't count: they bypass room_members tracking entirely.
+        // Reconnections also pass: the stale row was just removed above, so
+        // the count reflects the post-cleanup state.
+        //
+        // Without the hard cap, a scripted attacker with one valid JWT can
+        // spawn thousands of sessions in a single room and OOM the pod (each
+        // session = one bounded mpsc + QUIC connection state + N-1 broadcast
+        // amplifier for PARTICIPANT_JOINED). The cap matches the SFU
+        // refactor's webinar-shape design target (200 participants); see
+        // PLAN.md §J / Open Risk #4.
+        //
+        // `pending_queued_packet` is set to Some(packet_bytes) when the soft
+        // cap has been crossed; it is sent to the new joiner after the
+        // session is fully registered in `room_members` so the client cannot
+        // race the packet against its own JoinRoom Ok response (the packet
+        // travels via the same recipient mpsc used for media fan-out).
+        let mut pending_queued_packet: Option<Vec<u8>> = None;
+        if !observer {
+            let hard_cap = std::env::var(MAX_PARTICIPANTS_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(MAX_PARTICIPANTS_PER_ROOM);
+            // The soft cap is clamped to the hard cap so a misconfigured env
+            // override (soft >= hard) collapses cleanly to a single-tier hard
+            // reject instead of producing a negative overflow zone.
+            let configured_soft = std::env::var(WAITING_ROOM_THRESHOLD_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(WAITING_ROOM_THRESHOLD);
+            let soft_cap = configured_soft.min(hard_cap);
+            let current = self.room_members.get(&room).map(|m| m.len()).unwrap_or(0);
+            if current >= hard_cap {
+                warn!(
+                    "JoinRoom rejected: room {} is at capacity ({}/{}) — \
+                     user {} (session {}) denied",
+                    room, current, hard_cap, user_id, session,
+                );
+                // Emit ADMISSION_DECISION{REJECTED} to the rejected session
+                // before declining the join. Best-effort: a failure here
+                // (e.g., session recipient already gone) does not change
+                // the rejection outcome.
+                if let Some(recipient) = self.sessions.get(&session) {
+                    let bytes = SessionManager::build_admission_decision_packet(
+                        AdmissionStatus::REJECTED,
+                        // 1-based overflow position; for the rejected (N+1)st
+                        // joiner this is (hard_cap - soft_cap + 1).
+                        (current.saturating_sub(soft_cap).saturating_add(1)) as u32,
+                        "room_full",
+                        // Conservative client retry hint. Wave-3 will replace
+                        // this with a server-computed value derived from
+                        // recent churn.
+                        30,
+                    );
+                    if let Err(e) = recipient.try_send(Message {
+                        msg: bytes::Bytes::from(bytes),
+                        session,
+                    }) {
+                        warn!(
+                            "Failed to deliver ADMISSION_DECISION{{REJECTED}} to \
+                             session {}: {}",
+                            session, e
+                        );
+                    }
+                }
+                // Roll back the suppress_join_broadcast insertion we just did
+                // for the reconnection case, so a later retry (after the room
+                // drains) doesn't silently suppress the legitimate broadcast.
+                if is_reconnection {
+                    self.suppress_join_broadcast.remove(&session);
+                }
+                // vc-n9o: count the hard-cap reject decision.
+                crate::metrics::SFU_JOIN_DECISION_TOTAL
+                    .with_label_values(&["reject"])
+                    .inc();
+                return MessageResult(Err(JoinRoomError::reject(format!(
+                    "Room {room} is at capacity ({hard_cap}); please try again later"
+                ))));
+            }
+            if current >= soft_cap {
+                // 1-based offset into the soft-cap overflow zone:
+                //   current == soft_cap     => position = 1
+                //   current == soft_cap + 1 => position = 2
+                //   ...
+                // This matches the bead spec's "count - 194 = position" for
+                // the default thresholds (WAITING_ROOM_THRESHOLD=195) and
+                // generalises cleanly when the soft cap is reconfigured.
+                let position = (current - soft_cap + 1) as u32;
+                info!(
+                    "JoinRoom soft-cap reached: room {} at {}/{} (hard {}) — \
+                     admitting user {} (session {}) with QUEUED hint position={}",
+                    room, current, soft_cap, hard_cap, user_id, session, position,
+                );
+                pending_queued_packet = Some(SessionManager::build_admission_decision_packet(
+                    AdmissionStatus::QUEUED,
+                    position,
+                    "soft_cap_reached",
+                    0,
+                ));
+            }
+        }
+
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
         let display_name_clone = display_name.clone();
         let session_id = session;
         let nc = self.nats_connection.clone();
 
-        let session_str = session.to_string();
-        let (subject, queue) = build_subject_and_queue(&room, &session_str);
+        // vc-kcpg: the per-room demux now builds its own per-shard subscribe
+        // subjects inside `spawn_room_dispatcher` (via
+        // `build_shard_subscribe_subjects`), so the JoinRoom path no longer
+        // pre-computes a subscribe subject here. The legacy
+        // `build_subject_and_queue` helper is retained for the WS/WT handler
+        // paths and the queue group was already a dead per-session artifact.
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
-                return MessageResult(Err("Session not found".into()));
+                return MessageResult(Err(JoinRoomError::error("Session not found")));
             }
         };
 
@@ -651,13 +2700,197 @@ impl Handler<JoinRoom> for ChatServer {
             ));
         }
 
-        // Clone the recipient so we can send existing member info directly to the new joiner
+        // Lazily materialize per-room SFU state and register this session
+        // in the member table (p2-6). `insert_member` overwrites prior
+        // entries with matching `session_id`, mirroring reconnect semantics.
+        let room_state = self
+            .room_states
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(RoomState::new(room.clone()))))
+            .clone();
+        let subscriptions = self
+            .subscriptions
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(SubscriptionStore::new())))
+            .clone();
+        // p3-11: materialise the per-room speaker scorer + tick on first
+        // join. The tick owns the `watch::Sender<ActiveSpeakerSet>` it drives
+        // on its 200ms cadence; we subscribe BEFORE calling `run()` so the
+        // forwarder's receiver is wired up to the same channel the tick task
+        // will publish to. The tick handle is retained in `speaker_ticks`;
+        // dropping it on room drain aborts the background task.
+        let scorer = self
+            .speaker_scorers
+            .entry(room.clone())
+            .or_insert_with(|| Arc::new(TokioRwLock::new(SpeakerScorer::new())))
+            .clone();
+        // Atomically materialise the speaker tick + forwarder on first join.
+        // Using `Entry::Vacant` here (rather than two `or_insert_with` calls
+        // with a precomputed `speakers_rx`) keeps `speaker_ticks` and
+        // `forwarders` impossible to drift: either both exist (occupied
+        // branch reuses the cached forwarder) or both are inserted together.
+        let forwarder = match self.forwarders.entry(room.clone()) {
+            std::collections::hash_map::Entry::Occupied(occ) => occ.get().clone(),
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                let publisher = Arc::new(NatsSpeakerPublisher::new(self.nats_connection.clone()));
+                let tick = SpeakerTick::new(scorer.clone(), room.clone(), publisher);
+                let speakers_rx = tick.subscribe();
+                let handle = tick.run();
+                self.speaker_ticks.insert(room.clone(), handle);
+                // vc-kol / p6-7 (vc-c6l): register the room with the
+                // shared owner-pod beacon hub — only when this pod is the
+                // room's owner per the consistent-hash jump (p6-1).
+                // Non-owner pods stay silent so the topic carries exactly
+                // one beacon stream per room. The hub itself re-checks
+                // ownership on each tick (defensive against runtime
+                // replica scale changes).
+                if crate::sfu::affinity::is_owner(&room) {
+                    self.beacon_hub.register(room.clone(), room_state.clone());
+                }
+                // vc-wls: bare `Arc<LayerSelector>` — the selector now
+                // owns its own interior locking (DashMap shards for the
+                // hot read cache, a small Mutex for hysteresis state).
+                let layer_selector = Arc::new(LayerSelector::new());
+                let f = Arc::new(Forwarder::new(
+                    room_state.clone(),
+                    subscriptions.clone(),
+                    speakers_rx,
+                    layer_selector,
+                ));
+                vac.insert(f).clone()
+            }
+        };
+        {
+            // Poison-safe write: a panicked previous writer leaves the
+            // table mutable. Capabilities default to 0 today; later phases
+            // will refresh the entry from CONNECTION packets out of band.
+            let mut guard = match room_state.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert_member(session, capabilities);
+        }
+        // p4-7: membership change invalidates every cached layer selection
+        // in the room — the new member's `AllowSet` resolution may now
+        // include them as a candidate sender for existing receivers.
+        {
+            // vc-wls: lock-free invalidation — see LayerSelector
+            // concurrency notes for the access pattern.
+            forwarder.layer_selector().invalidate_all();
+        }
+        let sfu_mode = self.sfu_config.mode;
+
+        // --- vc-q0v: per-room parse-once demux ----------------------------
+        // Ensure the per-room dispatcher exists (the first joiner spawns it)
+        // and register this session's recipient in the room's receiver map.
+        // The dispatcher subscribes ONCE to `room.<room>.*`, parses each
+        // inbound NATS message exactly once, and fans the parsed result out
+        // to every entry in `receivers` via `egress_decide_from_parsed`.
+        // This eliminates the N× parse cost of the pre-vc-q0v per-session
+        // subscription model.
+        //
+        // The `subject` built above is the per-room wildcard subject; the
+        // queue group was a per-session artifact that the new dispatcher
+        // does not need (one `subscribe` per pod per room).
+        let receivers_for_room = match self.room_dispatch.entry(room.clone()) {
+            std::collections::hash_map::Entry::Occupied(occ) => occ.get().receivers.clone(),
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                let receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>> =
+                    Arc::new(RwLock::new(HashMap::new()));
+                // vc-kcpg: spawn K ingest dispatchers (one per subject shard), all
+                // sharing this room's receivers/scorer/room_state/forwarder. K==1
+                // (default) is the legacy single-dispatcher path.
+                let tasks = spawn_room_dispatchers(
+                    &self.nats_connection,
+                    &room,
+                    self.sfu_config.ingest_shards,
+                    sfu_mode,
+                    &forwarder,
+                    &scorer,
+                    &receivers,
+                    &room_state,
+                    &ctx.address(),
+                    &self.fanout_handle,
+                    self.sfu_config.fanout_shard_min_receivers,
+                );
+                let recvs = receivers.clone();
+                vac.insert(RoomDispatch { receivers, tasks });
+                recvs
+            }
+        };
+        {
+            let mut w = match receivers_for_room.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Insert (or replace) — reconnects share the same SessionId
+            // semantics as the prior per-session model: the latest
+            // recipient wins.
+            //
+            // vc-9eh ORDERING INVARIANT (Part B — DO NOT MOVE THIS BELOW THE
+            // `tokio::spawn` POST-JOIN TASK): this `receivers.write().insert`
+            // MUST happen synchronously here, BEFORE any `.await`/`spawn`
+            // boundary in this handler. The dispatcher fans out by snapshotting
+            // this exact `receivers` Arc per inbound message (see
+            // `spawn_room_dispatcher`), so a joiner is delivery-eligible the
+            // instant it is in the map — there is no separate "register with the
+            // dispatcher" step. If a future refactor moves this insert after the
+            // post-join `tokio::spawn` (or behind any await), a late joiner
+            // could be admitted into the room AFTER the dispatcher snapshots,
+            // reintroducing the insert-after-subscribe race that the vc-9eh
+            // watchdog above is the recovery net for. Keep it here.
+            w.insert(session, session_recipient.clone());
+        }
+        self.joined_sessions.insert(session);
+
+        // vc-xow8 / vc-9eve: tunable join-milestone markers. Cheap in the
+        // common case: the whole check is guarded behind a non-empty milestone
+        // list AND an actual crossing (a couple of integer comparisons). Only
+        // when a milestone is crossed do we pay for the AllowSet resolve +
+        // tracing event.
+        //
+        // vc-9eve: the crossing is now driven off `room_join_attempts` (the
+        // per-room INTAKE count captured at handler entry), NOT
+        // `member_count`. Intake climbs even when registration is the
+        // bottleneck and `room_members` plateaus, so the markers fire at the
+        // configured milestones regardless of registration success.
+        // `member_count` and `receiver_set` are still read here and emitted in
+        // the payload because, when delivery breaks at scale, the dispatcher's
+        // receiver set diverges from the authoritative member count.
+        if !self.sfu_config.milestones.is_empty() {
+            let member_count = self.room_members.get(&room).map(|m| m.len()).unwrap_or(0) as u64;
+            self.maybe_emit_join_milestone(
+                &room,
+                session,
+                room_join_attempts,
+                member_count,
+                &receivers_for_room,
+                &room_state,
+                &subscriptions,
+            );
+        }
+
+        // Wave-1 soft-cap notification (bead vc-69e / p3-13). The joiner is
+        // already fully tracked in room_members + room_dispatch above; this
+        // packet is purely informational. Best-effort delivery — a full
+        // recipient mpsc here does not roll back the admission.
+        if let Some(bytes) = pending_queued_packet.take() {
+            if let Err(e) = session_recipient.try_send(Message {
+                msg: bytes::Bytes::from(bytes),
+                session,
+            }) {
+                warn!(
+                    "Failed to deliver ADMISSION_DECISION{{QUEUED}} to session {}: {}",
+                    session, e
+                );
+            }
+        }
+
+        // Clone the recipient so we can send existing member info directly
+        // to the new joiner from the one-shot post-join task below.
         let new_joiner_recipient = session_recipient.clone();
 
-        let nc2 = self.nats_connection.clone();
-        let session_clone = session;
-
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
             // wt_chat_session) in their started() method, which blocks with
             // ctx.wait() before this JoinRoom handler runs. We do NOT call it
@@ -729,7 +2962,7 @@ impl Handler<JoinRoom> for ChatServer {
                     existing_uid, existing_display_name, user_id_clone
                 );
                 if let Err(e) = new_joiner_recipient.try_send(Message {
-                    msg: existing_bytes,
+                    msg: bytes::Bytes::from(existing_bytes),
                     session: *existing_sid,
                 }) {
                     warn!(
@@ -738,31 +2971,1053 @@ impl Handler<JoinRoom> for ChatServer {
                     );
                 }
             }
+        });
 
-            match nc2.queue_subscribe(subject, queue).await {
-                Ok(mut sub) => {
-                    while let Some(msg) = sub.next().await {
-                        if let Err(e) = handle_msg(
-                            session_recipient.clone(),
-                            room_clone.clone(),
-                            session_clone,
-                        )(msg)
-                        {
-                            error!("Error handling message: {}", e);
-                            break;
+        // vc-n9o: count the local admission decision (including the
+        // spillover-admit path, which falls through to this Ok return).
+        crate::metrics::SFU_JOIN_DECISION_TOTAL
+            .with_label_values(&["admit_local"])
+            .inc();
+        MessageResult(Ok(()))
+    }
+}
+
+// --- vc-9eh: per-room delivery watchdog tunables + decision ----------------
+//
+// These thresholds are justified against the vc-7wi responsiveness budget
+// (first media <= 1.5s, usable audio <= 2.0s after a late join). See
+// `spawn_room_dispatcher` for the full mechanism write-up.
+//
+//   * SILENCE_BASE = 750ms — the silence window for the FIRST resubscribe
+//     after traffic. A healthy room with active publishers keeps the
+//     dispatcher's `last_msg_at` fresh at ~30fps (audio alone is ~50pps), so
+//     750ms of TOTAL silence is far outside any normal inter-packet gap. For a
+//     genuinely-broken subscription with active publishers, the FIRST trip
+//     fires at 750ms and the in-place resubscribe restores traffic — so first
+//     media is well inside the 1.5s budget.
+//   * TICK = 250ms — worst-case detection latency is the current silence
+//     window + one tick; the in-place resubscribe is sub-millisecond
+//     (single-digit ms to a remote NATS), so for the first trip the total is
+//     ~= 1000ms, comfortably inside the 1.5s first-media budget.
+//   * GRACE = 750ms minimum uptime AFTER each (re)subscribe before the
+//     watchdog may fire again. A fresh subscription must be given at least one
+//     silence-window to receive before we judge it dead.
+//   * BACKOFF (the real anti-thrash, persisted across resubscribes): the
+//     silence window ESCALATES on each *consecutive* trip that fails to
+//     restore traffic — 750ms, 1.5s, 3s, 6s, 12s, 24s, capped at 30s — and
+//     RESETS to SILENCE_BASE the instant any real message advances
+//     `last_msg_at`. This is load-bearing because the `has_publishers` gate is
+//     currently inert in production (`is_observer` is never set true, so
+//     `senders()` == all members) and the only periodic traffic on the
+//     `room.{room}.*` wildcard — the 5s health beacon on `.system` — is far
+//     longer than the 750ms base window. Gating alone therefore cannot tell a
+//     silently-broken subscription from a legitimately-quiet room, so without
+//     the backoff a quiet populated room would resubscribe at a fixed ~1s
+//     cadence forever. With it, a broken room recovers fast (first trip at
+//     750ms) while a quiet room decays to one resubscribe per ~30s.
+pub const WATCHDOG_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+pub const WATCHDOG_SILENCE: std::time::Duration = std::time::Duration::from_millis(750);
+pub const WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+/// vc-9eh: ceiling on the escalating silence window. A persistently-quiet
+/// populated room (everyone muted/camera-off) decays to ~one resubscribe per
+/// 30s — enough to eventually heal a truly-wedged subscription without WARN-log
+/// spam or resubscribe churn.
+pub const WATCHDOG_SILENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// vc-kcpg: hard cap on the per-dispatcher scorer batch length before an inline
+/// flush is forced, independent of the 200ms flush timer.
+///
+/// Picked so a NORMAL 200ms flush window never trips it (a single sender emits
+/// audio at ~50 packets/s, so even a busy small room flushes a few dozen
+/// observations per tick), but a SATURATED shard whose `scorer_flush` timer arm
+/// is starved by the `biased` `select!` cannot grow the buffer without bound:
+/// once 512 observations accumulate we flush inline on the message path. At
+/// ~(SessionId, f32, bool, Instant) ≈ 32 B/entry that bounds the buffer at
+/// ~16 KB regardless of inbound rate.
+pub const SCORER_BATCH_FLUSH_CAP: usize = 512;
+
+/// vc-9eh: compute the silence window for the current consecutive-trip count.
+///
+/// `trips` is the number of consecutive watchdog resubscribes that have NOT
+/// been followed by real traffic (it resets to 0 the moment `last_msg_at`
+/// advances). The window doubles each trip from [`WATCHDOG_SILENCE`], capped at
+/// [`WATCHDOG_SILENCE_CAP`]:
+///
+/// | trips | window |
+/// |-------|--------|
+/// | 0     | 750ms  |
+/// | 1     | 1.5s   |
+/// | 2     | 3s     |
+/// | 3     | 6s     |
+/// | 4     | 12s    |
+/// | 5     | 24s    |
+/// | >=6   | 30s (cap) |
+///
+/// `trips == 0` (the first trip after traffic) yields the base window, so a
+/// genuinely-broken subscription with active publishers still resubscribes at
+/// 750ms — keeping first-media within the 1.5s budget. The escalation only
+/// bites on REPEATED no-traffic trips, which is exactly the legitimately-quiet
+/// room the bead said must not thrash.
+pub fn watchdog_silence_window(trips: u32) -> std::time::Duration {
+    // Saturating shift so a large `trips` cannot overflow; clamp to the cap.
+    let scaled = WATCHDOG_SILENCE
+        .checked_mul(1u32.checked_shl(trips.min(20)).unwrap_or(u32::MAX))
+        .unwrap_or(WATCHDOG_SILENCE_CAP);
+    scaled.min(WATCHDOG_SILENCE_CAP)
+}
+
+/// vc-9eh: pure liveness-watchdog decision, factored out of the dispatcher
+/// `select!` so the gating logic is unit-testable without provoking real
+/// async-nats slow-consumer backpressure (which is impractical to trigger
+/// deterministically in-process).
+///
+/// Returns `true` IFF the per-room dispatcher should force a clean resubscribe.
+/// The gate is strict on purpose:
+///
+///   * `uptime >= WATCHDOG_GRACE` — never judge a freshly (re)subscribed
+///     subscription dead before it has had a silence-window to receive.
+///   * `silence >= silence_window` — only act on genuinely stalled delivery,
+///     where `silence_window` is the (escalating) window from
+///     [`watchdog_silence_window`].
+///   * `has_receivers` — nobody to serve ⇒ nothing to recover (a respawn would
+///     be pointless; the normal drain path aborts the task anyway).
+///   * `has_publishers` — no member at all ⇒ nothing to recover. (NOTE: this is
+///     a coarse gate today — `is_observer` is inert in production so this is
+///     effectively `member_count > 0`; the escalating backoff, not this gate,
+///     is what prevents a quiet-but-populated room from thrashing.)
+///
+/// All four must hold. This adds ZERO per-join work: it reads only the room's
+/// own `receivers` map + `RoomState`, and runs on exactly ONE timer per ROOM.
+pub fn watchdog_should_resubscribe(
+    uptime: std::time::Duration,
+    silence: std::time::Duration,
+    silence_window: std::time::Duration,
+    has_receivers: bool,
+    has_publishers: bool,
+) -> bool {
+    uptime >= WATCHDOG_GRACE && silence >= silence_window && has_receivers && has_publishers
+}
+
+/// Spawn the per-room demux subscription task (vc-q0v).
+///
+/// One task per room. Subscribes once to `room.<room>.*`, parses each
+/// inbound NATS message exactly once via [`parse_and_inspect`], and fans
+/// the parsed result out to every receiver in `receivers` by calling
+/// [`egress_decide_from_parsed`]. The pre-vc-q0v model ran one
+/// `queue_subscribe` per session and re-parsed each wrapper N times for an
+/// N-participant room; this consolidation eliminates the (N-1) redundant
+/// parses per published packet.
+///
+/// The task exits on four conditions:
+///   1. **Normal drain** — [`ChatServer::drop_room_receiver`] aborts the
+///      `JoinHandle` once the receivers map empties.
+///   2. **Initial subscribe failed** — `nc.subscribe` returned `Err`.
+///   3. **Subscription closed mid-flight** — `sub.next()` returned `None`
+///      (NATS server closed the subscription, lame-duck shutdown, etc.).
+///   4. **vc-9eh liveness watchdog** — the subscription went *silent without
+///      closing* (the slow-consumer black hole: async-nats drops the message
+///      and fires a connection-global `Event::SlowConsumer` but keeps the
+///      `Subscriber` stream open, so `sub.next()` never yields `None`). When no
+///      inbound message has arrived for `WATCHDOG_SILENCE` WHILE the room still
+///      has receivers AND active publishers, the watchdog notifies the actor to
+///      force a clean resubscribe.
+///
+/// In cases (2), (3) and (4) the task sends [`RoomDispatcherExited`] back to
+/// the actor so the entry is cleaned up (or the dispatcher respawned if
+/// receivers are still present). Without this signal the room would be
+/// silently dead — receivers in the map but no parser feeding them. In
+/// case (1) the abort drops the message channel before the send can race,
+/// which is fine: the handler checks whether the entry is still present
+/// and exits if not.
+/// Spawn ALL `K` per-room ingest dispatchers (bead vc-kcpg).
+///
+/// One [`spawn_room_dispatcher`] per ingest shard `[0, n_ingest_shards)`, each
+/// subscribing its shard's subject filter(s) but ALL sharing the same
+/// `receivers` / `scorer` / `room_state` / `forwarder` Arcs (cheap clones).
+/// With the default `K == 1` this spawns exactly one dispatcher on the legacy
+/// `room.{room}.*` wildcard — byte-identical to the pre-vc-kcpg single-task
+/// path. Returns the `K` handles for the `RoomDispatch` entry.
+#[allow(clippy::too_many_arguments)]
+fn spawn_room_dispatchers(
+    nc: &async_nats::client::Client,
+    room: &str,
+    n_ingest_shards: usize,
+    sfu_mode: SfuMode,
+    forwarder: &Arc<Forwarder>,
+    scorer: &Arc<TokioRwLock<SpeakerScorer>>,
+    receivers: &Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+    room_state: &Arc<RwLock<RoomState>>,
+    chat_server: &actix::Addr<ChatServer>,
+    fanout_handle: &tokio::runtime::Handle,
+    shard_min_receivers: usize,
+) -> Vec<JoinHandle<()>> {
+    let k = n_ingest_shards.max(1);
+    (0..k)
+        .map(|shard| {
+            spawn_room_dispatcher(
+                nc.clone(),
+                room.to_string(),
+                shard,
+                k,
+                sfu_mode,
+                forwarder.clone(),
+                scorer.clone(),
+                receivers.clone(),
+                room_state.clone(),
+                chat_server.clone(),
+                fanout_handle,
+                shard_min_receivers,
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_room_dispatcher(
+    nc: async_nats::client::Client,
+    room: String,
+    // vc-kcpg: which ingest shard `[0, n_ingest_shards)` this dispatcher serves,
+    // and the total shard count. The dispatcher subscribes the subject filter(s)
+    // for `ingest_shard` via `build_shard_subscribe_subjects` — with K==1 that is
+    // the single legacy `room.{room}.*` wildcard (byte-identical to pre-vc-kcpg);
+    // with K>1, shard 0 also carries the legacy wildcard for rolling-deploy
+    // migration. All K dispatchers share the SAME `receivers` / `scorer` /
+    // `room_state` / `forwarder` Arcs, so fan-out, late-joiner service,
+    // self-skip and active-speaker selection are identical regardless of K.
+    ingest_shard: usize,
+    n_ingest_shards: usize,
+    sfu_mode: SfuMode,
+    forwarder: Arc<Forwarder>,
+    scorer: Arc<TokioRwLock<SpeakerScorer>>,
+    receivers: Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+    // p4-4: per-room SFU state for the bandwidth-estimate ingest path. We
+    // hold an `Arc<RwLock<_>>` so the dispatcher can take a short write
+    // lock when a client sends a DiagnosticsPacket; the JoinRoom handler
+    // owns the same Arc so member inserts/removes remain visible here.
+    room_state: Arc<RwLock<RoomState>>,
+    chat_server: actix::Addr<ChatServer>,
+    // vc-c609: handle to the pod-wide multi-thread fan-out runtime. The task is
+    // spawned here via `fanout_handle.spawn(..)` (NOT a bare `tokio::spawn`,
+    // which would inherit the calling shard's current-thread Arbiter runtime and
+    // serialize every room's fan-out onto one thread).
+    fanout_handle: &tokio::runtime::Handle,
+    // vc-9u8e: minimum receiver count at/above which the per-message fan-out is
+    // sharded across the fan-out workers. Below this the fan-out stays on the
+    // serial path (sharding overhead is a net loss for small rooms). Sourced
+    // from `SfuConfig::fanout_shard_min_receivers` (env
+    // `SFU_FANOUT_SHARD_MIN_RECEIVERS`).
+    shard_min_receivers: usize,
+) -> JoinHandle<()> {
+    // ---- vc-c609 Send/Sync audit (the landing gate) -------------------------
+    //
+    // Moving this task from a current-thread Arbiter runtime onto a MULTI-THREAD
+    // runtime requires the spawned future to be `Send` — the executor may move
+    // it between worker threads at any `.await`. `Handle::spawn` enforces this at
+    // compile time, so a clean build IS the proof. Per captured value:
+    //
+    //   * `nc: async_nats::Client` — `Clone + Send + Sync` (an Arc-backed handle
+    //     to the connection task); safe to move and to hold across awaits.
+    //   * `room` / `subject: String` — owned, `Send`.
+    //   * `sfu_mode: SfuMode` — `Copy + Send`.
+    //   * `forwarder: Arc<Forwarder>` — `Send + Sync` (shared read-mostly state).
+    //   * `scorer: Arc<TokioRwLock<SpeakerScorer>>` — `Send + Sync`; its guard is
+    //     held only across the `tokio::RwLock` `.await` (designed for that), so
+    //     no `std` guard crosses an await.
+    //   * `receivers: Arc<std::sync::RwLock<HashMap<.., Recipient<Message>>>>` —
+    //     `Send + Sync` iff `Recipient<Message>` is. `Recipient` is an
+    //     Arc-backed sendable address handle (delivery already crosses task
+    //     boundaries via `try_send`), so it is `Send + Sync`. CRITICAL: the
+    //     `std::sync::RwLock` guard must NOT be held across any `.await`. Audited:
+    //     every `receivers.read()/.write()` is confined to a scoped block that
+    //     drops the guard before the next await — the hot-path snapshot collects
+    //     into a `Vec` and drops the guard, then the fan-out loop (`try_send`,
+    //     all sync) runs guard-free; the watchdog-tick reads also drop in-block.
+    //   * `room_state: Arc<std::sync::RwLock<RoomState>>` — same reasoning; every
+    //     read/write is in a scoped block (`write_needed`, `note_remote_publisher`,
+    //     `should_invalidate`, the watchdog presence reads) with the guard
+    //     dropped before any await.
+    //   * `chat_server: actix::Addr<ChatServer>` — actix `Addr` is `Send + Sync`
+    //     by design (it is the cross-thread handle to the actor's mailbox; the
+    //     pool already shares `Addr`s across arbiter threads).
+    //
+    // Nothing here required `unsafe`; the gate is satisfied by the types alone.
+    // This is a pure execution-context move — the loop body below is byte-for-byte
+    // unchanged, so the watchdog/resubscribe, scorer feed, remote-publisher
+    // registry, diagnostics ingest, and fan-out decision all behave identically.
+    // vc-9u8e: clone the runtime handle INTO the spawned future so the
+    // per-message fan-out can itself spawn W shard subtasks onto the same
+    // pod-wide multi-thread runtime. `W` (the worker count) is read from the
+    // runtime's own metrics so it tracks `SFU_FANOUT_WORKER_THREADS` exactly;
+    // under the standalone/test current-thread runtime it is 1, which
+    // degenerates to the serial loop (no spawn, no behaviour change).
+    let shard_handle = fanout_handle.clone();
+    fanout_handle.spawn(async move {
+        let fanout_workers = shard_handle.metrics().num_workers().max(1);
+
+        // vc-kcpg: the subject FILTER SET this shard subscribes. For K==1 this is
+        // exactly `["room.{room}.*"]` (the single legacy wildcard — byte-identical
+        // to pre-vc-kcpg). For K>1, shard 0 gets `["room.{room}.0.*",
+        // "room.{room}.*"]` (the new 4-token shard-0 filter plus the legacy
+        // 3-token wildcard for rolling-deploy migration); shards i>0 get
+        // `["room.{room}.{i}.*"]`. The two shard-0 filters are disjoint by token
+        // count, so no message is delivered twice. See
+        // `crate::models::build_shard_subscribe_subjects`.
+        let subjects =
+            crate::models::build_shard_subscribe_subjects(&room, ingest_shard, n_ingest_shards);
+        // Subscribe every filter and MERGE the resulting streams into one. The
+        // merged stream is drained by a single `sub.next()` below, preserving the
+        // existing watchdog / fan-out loop shape exactly; the only difference is
+        // that for shard 0 (K>1) two subscriptions feed the same `next()`.
+        async fn subscribe_all(
+            nc: &async_nats::client::Client,
+            subjects: &[String],
+        ) -> Result<futures::stream::SelectAll<async_nats::Subscriber>, async_nats::SubscribeError>
+        {
+            let mut subs = Vec::with_capacity(subjects.len());
+            for s in subjects {
+                subs.push(nc.subscribe(s.clone()).await?);
+            }
+            Ok(futures::stream::select_all(subs))
+        }
+        let mut sub = match subscribe_all(&nc, &subjects).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    "Per-room demux failed to subscribe to {:?} (room {}, shard \
+                     {}/{}): {} — notifying actor for cleanup/respawn",
+                    subjects, room, ingest_shard, n_ingest_shards, e
+                );
+                // try_send is fine here: if the actor mailbox is full or
+                // the actor is gone, recovery on the next JoinRoom for
+                // this room will spawn a fresh dispatcher (the entry is
+                // keyed on room, not on this task instance).
+                let _ = chat_server.try_send(RoomDispatcherExited { room });
+                return;
+            }
+        };
+        info!(
+            "Per-room demux subscribed to {:?} (room {}, shard {}/{}, mode {:?})",
+            subjects, room, ingest_shard, n_ingest_shards, sfu_mode
+        );
+
+        // --- vc-9eh: per-room delivery watchdog -------------------------------
+        //
+        // ROOT CAUSE (Bug A): under a sustained publisher storm the async-nats
+        // wildcard subscription's bounded channel can fill faster than this
+        // loop drains it. When that happens async-nats does NOT close the
+        // subscription and does NOT block — it *silently drops* the message and
+        // fires a connection-global `Event::SlowConsumer(sid)` (see
+        // async-nats lib.rs ~L732). The `Subscriber` stream stays open, so
+        // `sub.next()` never returns `None`; the existing `None`-exit / respawn
+        // path therefore never fires and the subscription becomes a quiet black
+        // hole. Every receiver in `receivers` — including any cohort that joins
+        // afterward — then stops being served, with no liveness signal at all.
+        //
+        // We detect this with a liveness watchdog instead of trying to route the
+        // connection-global `SlowConsumer` event back to a specific room (the
+        // `Subscriber.sid` is private and the event channel is per-`Client`, so
+        // there is no per-room hook). A subscription that has gone quiet — for
+        // ANY reason (slow-consumer drops, a wedged re-attach across reconnect,
+        // a server-side hiccup) — manifests uniformly as `last_msg_at` going
+        // stale. On prolonged silence WHILE the room still has receivers AND
+        // active publishers, we resubscribe IN PLACE: drop the old `Subscriber`,
+        // re-`subscribe` on the SAME task against the SAME `receivers` Arc +
+        // forwarder, and continue the loop. Live sessions (including the late
+        // cohort) resume the instant the fresh subscription attaches, with no
+        // client reconnect and no actor mailbox round-trip.
+        //
+        // Why IN-PLACE (not posting `RoomDispatcherExited`): the escalating
+        // backoff state (`consecutive_silent_trips`) must PERSIST across
+        // resubscribes, or it is defeated — a respawn via the actor would reset
+        // it to base every time. Keeping the resubscribe local also avoids a
+        // resubscribe herd through the actor mailbox on a cluster-wide
+        // slow-consumer event. The `None`-exit → `RoomDispatcherExited` path is
+        // kept as-is for the genuinely-closed-subscription case.
+        //
+        // Thresholds + the escalating-window + the gating predicate live in
+        // `watchdog_silence_window` / `watchdog_should_resubscribe` above
+        // (factored out so they are unit-testable without provoking real
+        // backpressure).
+        let mut subscribe_at = std::time::Instant::now();
+        let mut last_msg_at = subscribe_at;
+        // vc-9eh: consecutive watchdog resubscribes NOT followed by traffic.
+        // Resets to 0 the moment a real message advances `last_msg_at`. Drives
+        // the escalating silence window so a legitimately-quiet populated room
+        // decays to ~one resubscribe per WATCHDOG_SILENCE_CAP instead of
+        // thrashing at a fixed cadence.
+        let mut consecutive_silent_trips: u32 = 0;
+        // vc-m7k6: per-dispatcher inbound message count and the
+        // (count, instant) sample from the previous watchdog tick. We derive
+        // `sfu_dispatcher_inbound_rate` (msgs/sec) from the delta over the tick
+        // interval. ZERO per-receiver work: one `+= 1` on the inbound arm and a
+        // single subtraction + divide once per tick per room.
+        let mut inbound_msg_count: u64 = 0;
+        let mut last_rate_sample: (u64, std::time::Instant) = (0, std::time::Instant::now());
+        let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
+        // The first tick fires immediately; skip it so the very first watchdog
+        // evaluation happens one full TICK in (and is anyway gated by GRACE).
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // vc-9eh perf: de-align per-room watchdog timers so a cluster-wide
+        // slow-consumer event does not trip every room within the same 250ms
+        // tick (a synchronized resubscribe wave against the already-stressed
+        // connection). Derive a deterministic 0..TICK phase from the room name
+        // so each room's tick lands at a different sub-tick offset; no `rand`
+        // dependency and stable across the room's lifetime.
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            room.hash(&mut h);
+            // vc-kcpg: also fold the ingest shard into the jitter seed so the K
+            // dispatchers WITHIN a room do not all tick together. Without this,
+            // every shard of a room derives the SAME phase from the room name and
+            // a room-wide silent-subscription event would trip all K resubscribes
+            // in the same sub-tick — the synchronized-wave hazard vc-9eh's jitter
+            // exists to avoid, now reintroduced at the per-room-shard granularity.
+            ingest_shard.hash(&mut h);
+            let jitter_ms = h.finish() % (WATCHDOG_TICK.as_millis() as u64);
+            if jitter_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+            }
+        }
+
+        // --- vc-kcpg: per-dispatcher (per-shard) scorer batch buffer ----------
+        //
+        // Pre-vc-kcpg the dispatcher wrote `scorer.write().await.observe(..)` on
+        // the SHARED `Arc<TokioRwLock<SpeakerScorer>>` for EVERY inbound audio
+        // packet. With K parallel dispatchers all contending that one write lock
+        // per audio packet, that is a genuine new serialization point. Instead we
+        // accumulate observations in this task-LOCAL buffer (no lock) and flush
+        // the whole batch into the shared scorer at most once per `SPEAKER_FLUSH`
+        // (== the scorer's own 200ms `TICK_INTERVAL`), so the shared write lock is
+        // taken ~5×/s/dispatcher regardless of audio packet rate.
+        //
+        // SEMANTICS PRESERVED EXACTLY. `SpeakerScorer::observe` is NOT
+        // idempotent-latest — the EWMA is `α*level + (1-α)*prev` and it stamps
+        // `last_update` / `last_speaking_hint_at`, so BOTH order and timestamp
+        // matter. We therefore capture each observation's ARRIVAL `Instant` here
+        // and, at flush, replay every observation IN ARRIVAL ORDER via
+        // `observe_at(.., arrival)`. The result is bit-identical to the
+        // per-packet `observe()` path — the flush coalesces the LOCK acquisition,
+        // not the observations.
+        //
+        // STARVATION-PROOF FLUSH (vc-kcpg review fix). The `select!` is `biased`,
+        // so a SATURATED shard — the exact case this bead targets — has
+        // `sub.next()` ready every iteration and the `scorer_flush.tick()` arm
+        // would NEVER be scheduled. Relying on the timer alone would let the batch
+        // grow unbounded (memory pressure precisely when the pod is already
+        // saturated) AND let the shared scorer go stale (active-speaker set frozen
+        // for the duration of the saturation) — a regression vs the old inline
+        // `observe()`. So we ALSO flush INLINE on the message path whenever the
+        // batch is due: either `>= TICK_INTERVAL` has elapsed since the last flush
+        // OR the batch hit the hard cap. The timer arm is kept for the
+        // idle/low-traffic case (no inbound message to piggyback the inline check
+        // on). Net: steady state still takes the lock ~5×/s, but the batch can
+        // never balloon or go stale under load.
+        let mut scorer_batch: Vec<(SessionId, f32, bool, std::time::Instant)> = Vec::new();
+        let mut last_scorer_flush = std::time::Instant::now();
+        let mut scorer_flush = tokio::time::interval(crate::sfu::speaker::TICK_INTERVAL);
+        scorer_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // vc-kcpg: replay the buffered observations into the shared scorer IN
+        // ARRIVAL ORDER (each with its captured arrival instant). A macro (not a
+        // closure) because every call site must borrow `scorer_batch` mutably AND
+        // hold the `scorer.write().await` guard across the same await — a closure
+        // capturing both would fight the borrow checker; the macro inlines the
+        // few lines at each site with no captures. The macro DRAINS only; callers
+        // that loop again (the timer arm, the inline message-path flush, and the
+        // resubscribe-success path) reset `last_scorer_flush` themselves so the
+        // tick clock advances. The TERMINAL sites (post-loop, resubscribe-failure
+        // handoff) do NOT touch the clock — there is no next tick to measure.
+        macro_rules! flush_scorer_batch {
+            () => {
+                if !scorer_batch.is_empty() {
+                    let mut guard = scorer.write().await;
+                    for (sid, level, hint, at) in scorer_batch.drain(..) {
+                        guard.observe_at(sid, level, hint, at);
+                    }
+                }
+            };
+        }
+
+        loop {
+            let msg = tokio::select! {
+                biased;
+                maybe_msg = sub.next() => match maybe_msg {
+                    Some(msg) => {
+                        // vc-9eh: subscription is alive — refresh liveness and
+                        // reset the backoff so the NEXT stall starts at the base
+                        // 750ms window again.
+                        last_msg_at = std::time::Instant::now();
+                        consecutive_silent_trips = 0;
+                        // vc-m7k6: count every inbound message this dispatcher
+                        // DRAINS off its subscription, for the inbound-rate
+                        // sample on the watchdog tick. A saturated dispatcher
+                        // keeps draining (so the silence watchdog stays blind)
+                        // even while async-nats drops the overflow — comparing
+                        // this rate against the rising drop counter exposes
+                        // exactly that invisible-saturation condition. Single
+                        // wrapping increment; no per-receiver cost.
+                        inbound_msg_count = inbound_msg_count.wrapping_add(1);
+                        msg
+                    }
+                    // `None` => subscription closed (existing behavior). Break
+                    // out of the loop to the abnormal-exit / respawn notify.
+                    None => break,
+                },
+                _ = watchdog.tick() => {
+                    // vc-9eh: liveness check. ZERO per-join work — exactly ONE
+                    // timer per ROOM, O(1) resubscribe per room. We read only
+                    // data already in scope (the `receivers` map + `room_state`)
+                    // and defer the decision to the unit-tested predicate.
+                    let now = std::time::Instant::now();
+                    let uptime = now.duration_since(subscribe_at);
+                    let silence = now.duration_since(last_msg_at);
+                    let window = watchdog_silence_window(consecutive_silent_trips);
+                    // vc-zf8k: read receiver/publisher presence EVERY tick (one
+                    // read lock each, per room, per 250ms — negligible) so the
+                    // process-global forwarding-health signal knows whether this
+                    // room SHOULD be forwarding right now. This reuses the exact
+                    // vc-9eh `has_receivers && has_publishers` gate, so the
+                    // `/healthz` liveness decision shares the watchdog's
+                    // semantics rather than inventing a parallel heuristic. A
+                    // room that should be forwarding stamps `note_should_forward`
+                    // here; the dispatcher fan-out stamps `note_forward` on the
+                    // hot path, and `forwarding_health_decision` compares the two.
+                    let (has_receivers, receiver_count) = {
+                        let g = match receivers.read() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        (!g.is_empty(), g.len())
+                    };
+                    let has_publishers = {
+                        let g = match room_state.read() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        g.has_senders()
+                    };
+                    if has_receivers && has_publishers {
+                        crate::sfu::forwarding_health::global().note_should_forward();
+                    }
+                    // vc-m7k6: sample inbound throughput over the elapsed tick
+                    // interval and publish `sfu_dispatcher_inbound_rate`
+                    // (msgs/sec). One subtraction + divide per room per tick —
+                    // O(1), off the per-receiver fan-out path. Done EVERY tick
+                    // (before the pre-gate below) so the rate reflects a
+                    // saturated-but-still-draining dispatcher, not just a silent
+                    // one. Last-writer-wins across rooms (coarse process-level
+                    // throughput signal, paired with the process-global drop
+                    // counter).
+                    {
+                        let (prev_count, prev_at) = last_rate_sample;
+                        let elapsed = now.duration_since(prev_at).as_secs_f64();
+                        if elapsed > 0.0 {
+                            let delta = inbound_msg_count.wrapping_sub(prev_count) as f64;
+                            crate::metrics::SFU_DISPATCHER_INBOUND_RATE.set(delta / elapsed);
+                        }
+                        last_rate_sample = (inbound_msg_count, now);
+                    }
+                    // Cheap pre-gate for the RESUBSCRIBE path: avoid escalating
+                    // / resubscribing until we are actually past grace AND past
+                    // the (escalating) silence window. The common steady-state
+                    // path (recent delivery) bails here. NOTE: the presence read
+                    // above intentionally runs BEFORE this gate so a healthy,
+                    // actively-forwarding room still stamps `note_should_forward`
+                    // every tick (otherwise the health signal would only ever be
+                    // refreshed while the subscription is silent).
+                    if uptime < WATCHDOG_GRACE || silence < window {
+                        continue;
+                    }
+                    if !watchdog_should_resubscribe(
+                        uptime,
+                        silence,
+                        window,
+                        has_receivers,
+                        has_publishers,
+                    ) {
+                        continue;
+                    }
+                    // Escalate the backoff: this trip counts toward the next
+                    // window. It resets to 0 on the `Some(msg)` arm above the
+                    // moment real traffic resumes.
+                    consecutive_silent_trips = consecutive_silent_trips.saturating_add(1);
+                    warn!(
+                        "Per-room demux for room {} saw no inbound message for \
+                         {}ms (window {}ms, consecutive silent trip #{}) while {} \
+                         receiver(s) and active publishers remain — the \
+                         subscription has gone silent (likely slow-consumer \
+                         backpressure); resubscribing in place",
+                        room,
+                        silence.as_millis(),
+                        window.as_millis(),
+                        consecutive_silent_trips,
+                        receiver_count,
+                    );
+                    // Resubscribe IN PLACE. Drop the old (silent) merged
+                    // `Subscriber`(s) and re-establish the FULL filter set for
+                    // this shard on the SAME task (vc-kcpg: shard 0 re-attaches
+                    // both its 4-token and legacy filters). On success the grace
+                    // clock restarts so the new subscription gets a full window to
+                    // receive before it can be judged dead again.
+                    match subscribe_all(&nc, &subjects).await {
+                        Ok(fresh) => {
+                            let now = std::time::Instant::now();
+                            sub = fresh;
+                            subscribe_at = now;
+                            // CRITICAL (anti-thrash): restart the SILENCE clock at
+                            // the resubscribe too, not just the grace clock. The
+                            // next trip is then measured FROM this resubscribe, so
+                            // a persistently-quiet room re-trips only after the
+                            // ESCALATED `watchdog_silence_window(trips)` elapses —
+                            // decaying the cadence toward the 30s cap. If we left
+                            // `last_msg_at` as-is, `silence` would grow
+                            // monotonically from the last REAL message and, once it
+                            // permanently exceeds the cap, the `silence >= window`
+                            // gate would always pass — flooring the cadence at
+                            // ~GRACE (≈1s) and spamming WARN forever. The escalation
+                            // is keyed on `consecutive_silent_trips` (NOT reset
+                            // here), and the `Some(msg)` arm resets BOTH the moment
+                            // any real traffic resumes — so genuine-broken recovery
+                            // stays fast.
+                            last_msg_at = now;
+                            // vc-kcpg: flush the batch before looping on the fresh
+                            // subscription so a stall+resubscribe doesn't drop up
+                            // to a tick of buffered observations.
+                            flush_scorer_batch!();
+                            last_scorer_flush = now;
+                            info!(
+                                "Per-room demux resubscribed in place to {:?} \
+                                 (room {}, shard {}/{})",
+                                subjects, room, ingest_shard, n_ingest_shards
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            // Could not re-establish locally — fall back to the
+                            // actor respawn path (it reuses the same receivers
+                            // Arc + forwarder) and exit this task.
+                            warn!(
+                                "Per-room demux failed to resubscribe to {:?} \
+                                 (room {}, shard {}/{}): {} — handing off to actor \
+                                 respawn",
+                                subjects, room, ingest_shard, n_ingest_shards, e
+                            );
+                            // vc-kcpg: flush before handing off so teardown does
+                            // not lose the buffered tail of observations.
+                            flush_scorer_batch!();
+                            let _ = chat_server
+                                .try_send(RoomDispatcherExited { room: room.clone() });
+                            return;
                         }
                     }
                 }
-                Err(e) => {
-                    error!("{}", e)
+                _ = scorer_flush.tick() => {
+                    // vc-kcpg: flush the task-local scorer batch into the shared
+                    // scorer. This arm handles the IDLE / low-traffic case (no
+                    // inbound message to piggyback the inline flush on); the
+                    // message-path inline flush below handles the saturated case
+                    // where this arm is starved by the `biased` `select!`. Replays
+                    // IN ARRIVAL ORDER via `observe_at` with each observation's
+                    // captured arrival instant, so the shared scorer state is
+                    // bit-identical to the pre-batching per-packet path.
+                    flush_scorer_batch!();
+                    last_scorer_flush = std::time::Instant::now();
+                    continue;
+                }
+            };
+
+            // Parse ONCE per inbound message — the whole point of vc-q0v.
+            // `msg.payload` is `bytes::Bytes`; deref to `&[u8]` for the
+            // parser. The decision call below takes the `&Bytes` so it
+            // can `clone()` a refcount bump per forwarded receiver.
+            let parsed = parse_and_inspect(&msg.payload[..]);
+            let subject_str: &str = msg.subject.as_ref();
+
+            // p3-11: feed the per-room SpeakerScorer for every inbound
+            // AUDIO MediaPacket whose RoutingHeader carries an
+            // `audio_level`. The SpeakerTick reads the scorer on its
+            // 200ms cadence to maintain the ActiveSpeakerSet snapshot
+            // that the forwarder consumes (via watch::Receiver) and that
+            // is broadcast to clients on `room.{room}.system`.
+            //
+            // Gated on SFU mode: in legacy mode the scorer is never
+            // consulted (the forwarder is bypassed), so the write is pure
+            // waste — skip it entirely on the legacy hot path.
+            if sfu_mode == SfuMode::Sfu {
+                if let Some(p) = parsed.as_ref() {
+                    if let Some(rh) = p.routing_header() {
+                        let is_audio = p
+                            .media_packet
+                            .as_ref()
+                            .map(|mp| mp.media_type == MediaType::AUDIO.into())
+                            .unwrap_or(false);
+                        if is_audio {
+                            let sender_sid = p.wrapper.session_id;
+                            let level = rh.audio_level;
+                            let hint = rh.is_speaking;
+                            // vc-kcpg: do NOT take the shared scorer write lock
+                            // per audio packet (the K-dispatcher serialization
+                            // point). Instead buffer the observation with its
+                            // ARRIVAL instant in the task-local batch; the
+                            // `scorer_flush` timer arm above replays the batch
+                            // in order via `observe_at` ~once per 200ms tick,
+                            // preserving today's EWMA/timestamp semantics exactly
+                            // while taking the shared lock ~5×/s instead of per
+                            // packet.
+                            scorer_batch.push((sender_sid, level, hint, std::time::Instant::now()));
+                        }
+                    }
                 }
             }
-        });
 
-        self.active_subs.insert(session, handle);
+            // vc-54j2: register cross-pod publishers. A MEDIA packet whose
+            // sender is NOT a local room member arrived here via NATS
+            // federation (it joined a different pod). Record it in the room's
+            // bounded remote-publisher registry so local receivers' AllowSets
+            // are augmented with it — otherwise the forwarder hard-drops its
+            // media as `unsubscribed` (the spill-pod 0-media defect). This runs
+            // ONCE per inbound MEDIA message (not per receiver) and the
+            // registry is bounded by sender count + TTL-reaped, so it adds NO
+            // per-receiver O(members) work to the hot path. `note_remote_publisher`
+            // self-skips local members, so intra-pod (owner-pod) forwarding is
+            // unchanged.
+            if sfu_mode == SfuMode::Sfu {
+                if let Some(p) = parsed.as_ref() {
+                    if p.wrapper.packet_type == PacketType::MEDIA.into() {
+                        if let Some(mp) = p.media_packet.as_ref() {
+                            let media_type = mp.media_type.enum_value_or_default();
+                            let is_av = matches!(
+                                media_type,
+                                MediaType::AUDIO | MediaType::VIDEO | MediaType::SCREEN
+                            );
+                            if is_av {
+                                let sender_sid = p.wrapper.session_id;
+                                let is_video =
+                                    matches!(media_type, MediaType::VIDEO | MediaType::SCREEN);
+                                let now = std::time::Instant::now();
+                                // Fast pre-check under a READ lock. On a busy
+                                // spill pod every media packet is from a
+                                // non-local member, so an unthrottled write
+                                // would take the room's RwLock in WRITE mode
+                                // once per packet, contending with the
+                                // per-packet per-receiver `decide` READ fan-out
+                                // on the SAME lock. `remote_publisher_write_needed`
+                                // returns false for the common case (a fresh,
+                                // video-consistent liveness refresh of an
+                                // already-tracked publisher, or a local member)
+                                // so we take the write lock only when the
+                                // registry must actually change: a brand-new
+                                // sid, an audio→video upgrade, or a liveness
+                                // refresh past the throttle window (well below
+                                // the TTL, so a still-publishing sender is never
+                                // reaped for lack of a write).
+                                let write_needed = {
+                                    let g = match room_state.read() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    g.remote_publisher_write_needed(sender_sid, is_video, now)
+                                };
+                                if write_needed {
+                                    let mut g = match room_state.write() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    g.note_remote_publisher(sender_sid, is_video, now);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
-        MessageResult(Ok(()))
-    }
+            // p4-4: DiagnosticsPacket ingest — record the sender's most
+            // recent receiver-downlink bandwidth estimate on its
+            // MemberEntry so the LayerSelector (p4-5) can budget per-
+            // receiver layer selection. We do NOT consume the packet:
+            // diagnostics continue through the existing fan-out so peers
+            // who today forward/inspect diagnostics keep seeing them.
+            //
+            // Gated on SfuMode::Sfu (mirrors the scorer gate above):
+            // legacy mode bypasses the forwarder, so storing the estimate
+            // would be pure waste.
+            //
+            // Cost: one extra `DiagnosticsPacket::parse_from_bytes` per
+            // inbound DIAGNOSTICS message (the client emits per peer × per
+            // media-type on its `report_interval_ms` cadence, ~2Hz by
+            // default). Negligible relative to the MEDIA hot path.
+            if sfu_mode == SfuMode::Sfu {
+                if let Some(p) = parsed.as_ref() {
+                    if p.wrapper.packet_type == PacketType::DIAGNOSTICS.into() {
+                        match DiagnosticsPacket::parse_from_bytes(&p.wrapper.data) {
+                            Ok(diag) => {
+                                if let Some(est) = diag.bandwidth_estimate.as_ref() {
+                                    let sender_sid = p.wrapper.session_id;
+                                    debug!(
+                                        "received bandwidth estimate from {}: \
+                                         {}kbps rtt={}ms loss={}",
+                                        sender_sid,
+                                        est.estimated_downlink_kbps,
+                                        est.rtt_ms,
+                                        est.estimated_loss_rate,
+                                    );
+                                    // Tight critical section: only the
+                                    // `update_bandwidth_estimate` call holds the
+                                    // write lock; no awaits within. Poison-safe
+                                    // pattern matches the rest of this file.
+                                    let should_invalidate = {
+                                        let mut guard = match room_state.write() {
+                                            Ok(g) => g,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        guard.update_bandwidth_estimate(sender_sid, est)
+                                    };
+                                    // p4-7: invalidate the cached layer
+                                    // selection for this receiver so the
+                                    // next `decide()` call recomputes
+                                    // against the fresh bandwidth budget.
+                                    // The DiagnosticsPacket's sender is
+                                    // the receiver whose downlink changed
+                                    // — they're reporting their OWN
+                                    // bandwidth back to the SFU.
+                                    // vc-wls: lock-free per-key invalidate.
+                                    //
+                                    // vc-17e: skip both the invalidate AND
+                                    // the underlying `bandwidth_estimate`
+                                    // overwrite when the new value is
+                                    // within noise. The forwarder's cache-
+                                    // validity check is exact equality on
+                                    // `bandwidth_kbps` (forwarder.rs), so
+                                    // a chatty client that we let through
+                                    // here would still miss the cache and
+                                    // force a recompute every tick — the
+                                    // suppression has to be paired in
+                                    // `update_bandwidth_estimate` to be
+                                    // load-bearing.
+                                    if should_invalidate {
+                                        forwarder
+                                            .layer_selector()
+                                            .invalidate_for_receiver(sender_sid);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                trace!(
+                                    "DiagnosticsPacket parse failed for session {} in room {}: {}",
+                                    p.wrapper.session_id,
+                                    room,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Snapshot the recipients under the read lock, then drop it
+            // before fan-out. Recipient<_> is Clone (Arc-backed inside
+            // actix), so per-message cloning is cheap; this keeps the
+            // join/leave write path from being blocked for the full
+            // fan-out (which calls try_send N times).
+            let snapshot: Vec<(SessionId, Recipient<Message>)> = {
+                let guard = match receivers.read() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.iter().map(|(sid, r)| (*sid, r.clone())).collect()
+            };
+
+            // vc-zf8k: track whether THIS inbound message produced at least one
+            // forward. We stamp the process-global forwarding heartbeat once per
+            // message (a single relaxed atomic store), NOT once per receiver, so
+            // the hot-path cost is negligible regardless of room size.
+            //
+            // vc-9u8e: SHARD the per-receiver decide+send fan-out across the W
+            // pod-wide fan-out workers. Each receiver is assigned to shard
+            // `hash(SessionId) % W`; shard `s` runs `egress_decide_from_parsed`
+            // (per-receiver `decide` + alloc-free self-skip) and `try_send` for
+            // its slice in parallel with the other shards, so the previously
+            // serial O(members) loop now spreads across cores.
+            //
+            // PARSE-ONCE is preserved: `parse_and_inspect` ran ONCE above; the
+            // resulting `ParsedPacket` is shared into every shard via an `Arc`
+            // (a refcount bump, not a re-parse). `msg.payload` (`bytes::Bytes`)
+            // and the room string are likewise shared by cheap clone.
+            //
+            // BARRIER model (pipelining explicitly DEFERRED): we `await` ALL
+            // shard tasks for THIS message before pulling the next inbound
+            // message off `sub`. Per-room ordering is therefore unchanged —
+            // message k+1 fan-out never starts before message k's completes.
+            //
+            // SMALL-ROOM GUARD (vc-9u8e perf fix). Sharding replaces sub-µs
+            // serial per-receiver work with a cross-thread spawn + barrier-join
+            // round-trip per packet, which is a NET LOSS for the small rooms
+            // (2-5 receivers) that dominate real traffic. We therefore take the
+            // serial path unless BOTH the runtime is multi-worker AND the room
+            // has at least `shard_min_receivers` receivers — only then is there
+            // enough per-receiver work to amortize the spawn+join. The guard is
+            // on receiver COUNT alone (not media type): a large audio-only room
+            // still benefits from parallel `decide`.
+            //
+            // W==1 (the standalone/test current-thread runtime, or a 1-worker
+            // production config) ALSO degenerates here to the original serial
+            // loop with NO task spawn — byte-for-byte the legacy behaviour.
+            let forwarded_any = if fanout_workers <= 1 || snapshot.len() < shard_min_receivers {
+                let mut any = false;
+                for (rsid, recipient) in snapshot {
+                    if let Some(bytes) = egress_decide_from_parsed(
+                        sfu_mode,
+                        &forwarder,
+                        rsid,
+                        &room,
+                        subject_str,
+                        &msg.payload,
+                        parsed.as_ref(),
+                        n_ingest_shards,
+                    ) {
+                        any = true;
+                        if let Err(e) = recipient.try_send(Message {
+                            msg: bytes,
+                            session: rsid,
+                        }) {
+                            warn!(
+                                "Dropping inbound message for session {}: {} \
+                                 (mailbox full — subscription continues)",
+                                rsid, e
+                            );
+                        }
+                    }
+                }
+                any
+            } else {
+                // Partition the snapshot into W buckets by `hash(SessionId) % W`.
+                // A receiver's egress decision depends only on its own
+                // `SessionId`, so any partition is correct; hashing keeps the
+                // buckets balanced regardless of `SessionId` distribution.
+                let w = fanout_workers;
+                let mut buckets: Vec<Vec<(SessionId, Recipient<Message>)>> =
+                    (0..w).map(|_| Vec::new()).collect();
+                for (rsid, recipient) in snapshot {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(&rsid, &mut hasher);
+                    let idx = (std::hash::Hasher::finish(&hasher) % (w as u64)) as usize;
+                    buckets[idx].push((rsid, recipient));
+                }
+
+                // Share the parse-once payload + parsed packet + room across
+                // shards via Arc (refcount bumps — NOT re-parsed/re-copied).
+                // `parsed` is MOVED into the Arc here (this `else` branch is
+                // exclusive with the serial branch that borrows it, and `parsed`
+                // is not used after this fan-out), so there is no extra clone of
+                // the `ParsedPacket` — parse-once is preserved end-to-end.
+                let parsed_shared: Option<Arc<ParsedPacket>> = parsed.map(Arc::new);
+                let payload_shared = msg.payload.clone();
+                let room_shared: Arc<str> = Arc::from(room.as_str());
+                let subject_shared: Arc<str> = Arc::from(subject_str);
+
+                let mut handles = Vec::with_capacity(w);
+                for bucket in buckets {
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    let forwarder = forwarder.clone();
+                    let parsed_shared = parsed_shared.clone();
+                    let payload_shared = payload_shared.clone();
+                    let room_shared = room_shared.clone();
+                    let subject_shared = subject_shared.clone();
+                    handles.push(shard_handle.spawn(async move {
+                        let mut any = false;
+                        for (rsid, recipient) in bucket {
+                            if let Some(bytes) = egress_decide_from_parsed(
+                                sfu_mode,
+                                &forwarder,
+                                rsid,
+                                &room_shared,
+                                &subject_shared,
+                                &payload_shared,
+                                parsed_shared.as_deref(),
+                                n_ingest_shards,
+                            ) {
+                                any = true;
+                                if let Err(e) = recipient.try_send(Message {
+                                    msg: bytes,
+                                    session: rsid,
+                                }) {
+                                    warn!(
+                                        "Dropping inbound message for session {}: {} \
+                                         (mailbox full — subscription continues)",
+                                        rsid, e
+                                    );
+                                }
+                            }
+                        }
+                        any
+                    }));
+                }
+
+                // BARRIER: wait for every shard before the next inbound message.
+                // Aggregate `forwarded_any` across shards so the HEALTH_BEACON
+                // heartbeat is stamped exactly once per message iff ANY shard
+                // forwarded at least one packet. A panicked shard task
+                // (JoinError) contributes `false` and is logged; it must not
+                // wedge the dispatcher loop.
+                let mut any = false;
+                for h in handles {
+                    match h.await {
+                        Ok(shard_forwarded) => any |= shard_forwarded,
+                        Err(e) => {
+                            warn!(
+                                "Fan-out shard task failed for room {}: {} \
+                                 (continuing — other shards unaffected)",
+                                room, e
+                            );
+                        }
+                    }
+                }
+                any
+            };
+            if forwarded_any {
+                crate::sfu::forwarding_health::global().note_forward();
+            }
+
+            // vc-kcpg: STARVATION-PROOF inline scorer flush. We reach here only
+            // after handling a real inbound `msg` (the watchdog/flush `select!`
+            // arms `continue`, the `None` arm `break`s). On a saturated shard the
+            // `biased` `select!` keeps `sub.next()` ready and never schedules the
+            // `scorer_flush.tick()` arm, so the batch MUST be drained here too —
+            // when either a full tick has elapsed since the last flush OR the
+            // batch hit the hard cap. Replays in arrival order via `observe_at`,
+            // identical to the timer arm. This bounds the buffer (≤ cap) and keeps
+            // the shared scorer fresh even while the timer arm is starved.
+            if scorer_batch.len() >= SCORER_BATCH_FLUSH_CAP
+                || last_scorer_flush.elapsed() >= crate::sfu::speaker::TICK_INTERVAL
+            {
+                flush_scorer_batch!();
+                last_scorer_flush = std::time::Instant::now();
+            }
+        }
+        // vc-kcpg: drain any remaining batched observations before the task
+        // exits via the `None`-closed-subscription `break`, so we don't silently
+        // lose up to one tick of speaker observations on teardown/handoff.
+        flush_scorer_batch!();
+        // `sub.next()` returned None (the `None` arm `break`s the loop) — the
+        // subscription is closed. This is
+        // unexpected during normal operation (async-nats is supposed to
+        // transparently re-attach subscriptions across reconnects). Surface
+        // loudly and ask the actor to either respawn (receivers still
+        // present) or drop the entry (room already drained). A normal
+        // drain reaches this point via `.abort()` before the next `.await`,
+        // so this log specifically marks abnormal exits — though `.abort()`
+        // can race past the await, in which case the actor sees a stale
+        // RoomDispatcherExited and a no-op cleanup, which is harmless.
+        warn!(
+            "Per-room demux subscription closed unexpectedly for room {} — \
+             notifying actor for cleanup/respawn",
+            room
+        );
+        let _ = chat_server.try_send(RoomDispatcherExited { room });
+    })
 }
 
 async fn send_meeting_info(
@@ -781,35 +4036,378 @@ async fn send_meeting_info(
     }
 }
 
+/// Parse-and-decide helper for tests.
+///
+/// Production fan-out runs through [`spawn_room_dispatcher`] +
+/// [`egress_decide_from_parsed`], which parses each inbound NATS message
+/// exactly once per room (vc-q0v). This wrapper parses on every call and
+/// is retained for test consumers — `sfu::tests::forwarder_parity_tests`
+/// (legacy-vs-SFU golden-trace parity), `sfu::tests::parse_once_tests`
+/// (the parse-per-receiver reference oracle), and the `#[cfg(test)]`
+/// `handle_msg` helper. None of these need to amortize parsing across N
+/// receivers, so they exercise the per-receiver decision path directly.
+///
+/// Semantics preserved bit-for-bit from the pre-extraction closure:
+///
+/// 1. **Self-skip with CONGESTION carve-out.** If `subject` is the receiver's
+///    own publish subject, the message is dropped *unless* the parsed wrapper
+///    is a `CONGESTION` packet (server-published back-off signal that all
+///    peers must still receive).
+/// 2. **Legacy mode** delivers every non-self-skipped payload byte-for-byte.
+/// 3. **SFU mode** runs the forwarder's per-receiver `decide`. The
+///    server-published CONGESTION class is carve-out-broadcast (see the
+///    CRITICAL comment inline) and parse failures fall through to a tolerant
+///    "forward as-is" — matching legacy so we never black-hole unparseable
+///    payloads.
+#[cfg(test)]
+pub(crate) fn egress_decide_bytes(
+    sfu_mode: SfuMode,
+    forwarder: &Forwarder,
+    receiver_session: SessionId,
+    room: &str,
+    subject: &str,
+    payload: &bytes::Bytes,
+) -> Option<bytes::Bytes> {
+    let parsed = parse_and_inspect(&payload[..]);
+    egress_decide_from_parsed(
+        sfu_mode,
+        forwarder,
+        receiver_session,
+        room,
+        subject,
+        payload,
+        parsed.as_ref(),
+        // vc-kcpg: this test helper is exercised with the legacy 3-token subject,
+        // so K==1 matches the on-wire form the tests build.
+        1,
+    )
+}
+
+/// Per-receiver egress decision, given a *pre-parsed* wrapper.
+///
+/// The per-room demux task (see [`spawn_room_dispatcher`]) calls
+/// [`parse_and_inspect`] once per inbound NATS message and then invokes this
+/// function once per receiver. This avoids the O(N) parse fan-out that the
+/// pre-vc-q0v per-session subscription model incurred (~6k extra parses/s
+/// per active 30 fps sender per pod with a 200-participant room).
+///
+/// Semantics are identical to [`egress_decide_bytes`]; the only difference
+/// is who owns the parse. `parsed` is `None` when the wrapper failed to
+/// parse — preserving the pre-existing tolerant "forward as-is" behavior on
+/// the SFU path so we never black-hole encrypted-or-unparseable payloads.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn egress_decide_from_parsed(
+    sfu_mode: SfuMode,
+    forwarder: &Forwarder,
+    receiver_session: SessionId,
+    room: &str,
+    subject: &str,
+    payload: &bytes::Bytes,
+    parsed: Option<&ParsedPacket>,
+    // vc-kcpg: the ingest shard count `K`, needed ONLY for the parse-failure
+    // self-skip fallback (the parseable hot path uses `session_id` equality and
+    // ignores this). Under K>1 the on-wire subject is the 4-token
+    // `room.{room}.{shard}.{session}`, so the fallback comparison subject must be
+    // built with the SAME `build_publish_subject(.., k)` the publisher used or it
+    // would never match and an unparseable self-published packet would be echoed
+    // back to its own publisher.
+    ingest_shards: usize,
+) -> Option<bytes::Bytes> {
+    // p6-7 / vc-kol follow-up: HEALTH_BEACON is server-internal. It is
+    // published on `room.{room}.system` by the owner pod for the spill
+    // controller (p6-8) to consume, and is never relevant to any client.
+    // Without this drop, the dispatcher's wildcard subscription
+    // (`room.{room}.*`) would fan the ~70 B beacon out to every connected
+    // receiver every 5 s — ~8 KB/min/client of pure overhead on mobile.
+    //
+    // Mode-independent and earliest-possible: applied before self-skip
+    // so we never echo a beacon, applied in both SFU and Legacy modes
+    // because the beacon has no place on either client path. The client-
+    // side handler (`videocall-client/src/client/video_call_client.rs`)
+    // also ignores it as defense-in-depth, but the drop MUST happen here
+    // on the server so we don't burn the bytes on the wire.
+    if let Some(p) = parsed {
+        if p.wrapper.packet_type == PacketType::HEALTH_BEACON.into() {
+            return None;
+        }
+    }
+
+    // vc-9u8e: allocation-free self-skip.
+    //
+    // The legacy self-skip built `format!("room.{room}.{receiver_session}")
+    // .replace(' ', "_")` once PER RECEIVER PER PACKET (~2 heap allocs each)
+    // and compared it to the inbound NATS `subject`. At target fan-out rates
+    // that is ~800k allocs/s of pure overhead. Replace it with a
+    // `SessionId`-equality test against the parsed `wrapper.session_id`,
+    // mirroring the forwarder's own self-skip (forwarder.rs:368).
+    //
+    // EQUIVALENCE PROOF. A client publishes on the subject
+    // `build_publish_subject(room, session, K)` (vc-kcpg) — `room.{room}.{session}`
+    // when K==1 and `room.{room}.{shard}.{session}` when K>1 — where `session` is
+    // the publisher's own SessionId. In the same path the server stamps
+    // `packet_wrapper.session_id = session` only when it was 0 (session_logic.rs
+    // ~115); a well-behaved client otherwise already sets `session_id` to its own
+    // session, so after this point a benign packet's `wrapper.session_id` equals
+    // the publishing `session` either way. Therefore for any PARSEABLE benign
+    // packet `subject == self_subject` ⟺ `wrapper.session_id == receiver_session`
+    // for every class (MEDIA, CONGESTION, …): both detect "this is a packet the
+    // receiver itself published". The session_id form is a faithful,
+    // allocation-free replacement (verified consistent for MEDIA and the
+    // CONGESTION carve-out below), and crucially it is INDEPENDENT of the subject
+    // token-count, so the parseable hot path is unaffected by K.
+    //
+    // The only way the two forms could diverge is a malformed/adversarial
+    // packet that carries a NON-ZERO `session_id != session` (so the server's
+    // zero-fill does not normalize it). That case is already neutralized
+    // upstream: the ingress filter drops server-only packet types
+    // (SERVER_ONLY_PACKET_TYPES) before they ever reach egress, and this
+    // session_id-equality test matches the forwarder's own self-skip
+    // (forwarder.rs:368), so egress and the forwarder agree.
+    //
+    // A parse FAILURE leaves `wrapper.session_id` unavailable. The legacy
+    // code still self-skipped such a payload by subject match, so we preserve
+    // that exact outcome by falling back to the subject comparison only on the
+    // `parsed.is_none()` path — which does not allocate on the common
+    // (parseable) hot path. vc-kcpg: the fallback comparison subject is built via
+    // `build_publish_subject(.., ingest_shards)` so it matches the REAL on-wire
+    // form under K>1 (the 4-token `room.{room}.{shard}.{session}`); using the bare
+    // 3-token form here would never match and the unparseable self-packet would
+    // be echoed back to its own publisher.
+    let is_self = match parsed {
+        Some(p) => p.wrapper.session_id == receiver_session,
+        None => {
+            subject == crate::models::build_publish_subject(room, receiver_session, ingest_shards)
+        }
+    };
+    if is_self {
+        // Self-skip prevents echo of our own broadcasts. However,
+        // CONGESTION signals published on our subject by a congested
+        // receiver must still be delivered — they are not echo.
+        let is_congestion = parsed
+            .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
+            .unwrap_or(false);
+        if !is_congestion {
+            return None;
+        }
+    }
+
+    match sfu_mode {
+        SfuMode::Sfu => {
+            // CRITICAL carve-out — preserve legacy broadcast semantics
+            // for CONGESTION. Without this, the forwarder's per-receiver
+            // filter could drop CONGESTION packets that all peers MUST
+            // receive so they can back off. The full priority-class
+            // carve-out (HEARTBEAT, RTT, SESSION_ASSIGNED, MEETING_*,
+            // etc.) lands in P5 — see PLAN.md Phase 5 priority-queue
+            // table.
+            let is_congestion = parsed
+                .map(|p| p.wrapper.packet_type == PacketType::CONGESTION.into())
+                .unwrap_or(false);
+
+            if is_congestion {
+                Some(payload.clone())
+            } else if let Some(p) = parsed {
+                match forwarder.decide(receiver_session, &p.wrapper, p.media_packet.as_ref()) {
+                    // Reuse the original on-wire NATS payload — no per-receiver
+                    // re-serialization of an identical PacketWrapper. `Bytes::clone`
+                    // is a refcount bump, so every receiver shares one allocation.
+                    ForwardDecision::Forward => Some(payload.clone()),
+                    ForwardDecision::Drop => {
+                        // p2-7 will increment a dropped-packet counter here.
+                        None
+                    }
+                }
+            } else {
+                // Parse failure — match the pre-existing tolerant
+                // behavior: forward bytes as-is so we don't black-hole
+                // encrypted-or-unparseable payloads on the SFU path.
+                // Note: the mode-independent self-echo skip above
+                // already dropped any self-addressed unparseable
+                // payloads before we got here, so SFU and legacy
+                // diverge only on *non-self-addressed* unparseable
+                // payloads — which don't occur in practice (only
+                // senders mint these, and they hit the self-skip).
+                Some(payload.clone())
+            }
+        }
+        SfuMode::Legacy => Some(payload.clone()),
+    }
+}
+
+/// Per-receiver subscription handler used by the unit test that exercises
+/// the SFU CONGESTION bypass branch (see
+/// `test_sfu_mode_congestion_bypasses_forwarder`). Production fan-out runs
+/// through [`spawn_room_dispatcher`] and [`egress_decide_from_parsed`]
+/// instead, which parses each inbound NATS message exactly once per room
+/// rather than once per receiver (vc-q0v).
+#[cfg(test)]
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
     session: SessionId,
+    sfu_mode: SfuMode,
+    forwarder: Arc<Forwarder>,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
-            // Self-skip prevents echo of our own broadcasts. However,
-            // CONGESTION signals published on our subject by a congested
-            // receiver must still be delivered — they are not echo.
-            let is_congestion = PacketWrapper::parse_from_bytes(&msg.payload)
-                .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
-                .unwrap_or(false);
-            if !is_congestion {
-                return Ok(());
+        let subject_str: &str = msg.subject.as_ref();
+        if let Some(bytes) = egress_decide_bytes(
+            sfu_mode,
+            &forwarder,
+            session,
+            &room,
+            subject_str,
+            &msg.payload,
+        ) {
+            if let Err(e) = session_recipient.try_send(Message {
+                msg: bytes,
+                session,
+            }) {
+                warn!(
+                    "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
+                    session, e
+                );
             }
         }
-        let message = Message {
-            msg: msg.payload.to_vec(),
-            session,
-        };
 
-        if let Err(e) = session_recipient.try_send(message) {
-            warn!(
-                "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
-                session, e
-            );
-        }
         Ok(())
+    }
+}
+
+// ==========================================================================
+// Test-only query: snapshot a room's SFU member table.
+// ==========================================================================
+// Returns `None` if the room has no SFU state. Otherwise returns a vector of
+// `(session_id, capabilities)` pairs sorted by session_id for determinism.
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "Option<Vec<(SessionId, u32)>>")]
+struct SnapshotRoomMembers {
+    room: String,
+}
+
+#[cfg(test)]
+impl Handler<SnapshotRoomMembers> for ChatServer {
+    type Result = Option<Vec<(SessionId, u32)>>;
+
+    fn handle(
+        &mut self,
+        SnapshotRoomMembers { room }: SnapshotRoomMembers,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let state = self.room_states.get(&room)?;
+        let guard = match state.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut entries: Vec<(SessionId, u32)> = guard
+            .members
+            .values()
+            .map(|m| (m.session_id, m.capabilities))
+            .collect();
+        entries.sort_by_key(|(sid, _)| *sid);
+        Some(entries)
+    }
+}
+
+// ==========================================================================
+// Test-only command: seed the spillover store for a room (vc-85p / p6-5).
+// ==========================================================================
+// Records a synthetic owner-pod health snapshot so the JoinRoom spill
+// decision branch can be exercised deterministically without standing up a
+// real owner pod publishing beacons. `last_seen` is set to `Instant::now()`
+// inside the handler, so a seeded over-threshold snapshot is always fresh
+// for the duration of a test.
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "()")]
+struct SeedSpilloverState {
+    room: String,
+    owner_count: u32,
+    owner_cpu: f32,
+}
+
+#[cfg(test)]
+impl Handler<SeedSpilloverState> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        SeedSpilloverState {
+            room,
+            owner_count,
+            owner_cpu,
+        }: SeedSpilloverState,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        // The ingest task stores subject-derived (underscore-normalized)
+        // keys; mirror that here so the JoinRoom lookup (which normalizes
+        // its raw room id the same way) hits the seeded entry.
+        let key = room.replace(' ', "_");
+        self.spillover_store.record(
+            &key,
+            crate::sfu::spillover::RoomSpilloverState {
+                owner_count,
+                owner_cpu,
+                last_seen: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+// ==========================================================================
+// Test-only query: snapshot a (room, user) pending-departure entry.
+// ==========================================================================
+// Returns `Some(old_session)` if a deferred PARTICIPANT_LEFT is pending for
+// the (room, user) key, `None` otherwise. Used by the p6-5 follow-up
+// reconnection-into-redirect test to assert the redirect path runs BEFORE
+// the reconnection bookkeeping (i.e. doesn't drain the pending_departures
+// entry on its way to declining the join).
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "Option<SessionId>")]
+struct SnapshotPendingDeparture {
+    room: String,
+    user_id: String,
+}
+
+#[cfg(test)]
+impl Handler<SnapshotPendingDeparture> for ChatServer {
+    type Result = Option<SessionId>;
+
+    fn handle(
+        &mut self,
+        SnapshotPendingDeparture { room, user_id }: SnapshotPendingDeparture,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.pending_departures
+            .get(&(room, user_id))
+            .map(|p| p.old_session)
+    }
+}
+
+// ==========================================================================
+// Test-only query: snapshot the legacy room_members table for a room.
+// ==========================================================================
+// Mirrors SnapshotRoomMembers but returns the (room_members) tuple rather
+// than the SFU member table — used to assert that the early redirect path
+// does NOT touch the user-visible membership list before declining a join.
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "Option<Vec<(SessionId, String, String)>>")]
+struct SnapshotRoomMembersList {
+    room: String,
+}
+
+#[cfg(test)]
+impl Handler<SnapshotRoomMembersList> for ChatServer {
+    type Result = Option<Vec<(SessionId, String, String)>>;
+
+    fn handle(
+        &mut self,
+        SnapshotRoomMembersList { room }: SnapshotRoomMembersList,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.room_members.get(&room).cloned()
     }
 }
 
@@ -882,6 +4480,7 @@ mod tests {
                 user_id: SYSTEM_USER_ID.to_string(),
                 display_name: SYSTEM_USER_ID.to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -892,10 +4491,12 @@ mod tests {
             "JoinRoom with system user ID should return Err, not Ok"
         );
 
-        let error_msg = result.unwrap_err();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, crate::messages::server::JoinDeclineKind::Error);
         assert!(
-            error_msg.contains("reserved system user ID"),
-            "Error should mention reserved system user ID, got: {error_msg}"
+            error.message.contains("reserved system user ID"),
+            "Error should mention reserved system user ID, got: {}",
+            error.message
         );
     }
 
@@ -941,6 +4542,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -972,6 +4574,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -981,7 +4584,7 @@ mod tests {
             "JoinRoom without registered session should return Err"
         );
         assert!(
-            result.unwrap_err().contains("Session not found"),
+            result.unwrap_err().message.contains("Session not found"),
             "Error should mention session not found"
         );
     }
@@ -990,7 +4593,7 @@ mod tests {
     // TEST: Duplicate join with same session returns Ok
     // ==========================================================================
     // Verifies that a second JoinRoom for the same session_id returns Ok
-    // immediately because the session is already tracked in active_subs.
+    // immediately because the session is already tracked in joined_sessions.
     #[actix_rt::test]
     #[serial]
     async fn test_duplicate_join_same_session_returns_ok() {
@@ -1031,6 +4634,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1038,7 +4642,7 @@ mod tests {
         assert!(result1.is_ok(), "First join should succeed");
 
         // Second join attempt with same session - should return Ok
-        // immediately because session is already in active_subs
+        // immediately because session is already in joined_sessions
         let result2 = chat_server
             .send(JoinRoom {
                 session: session_id,
@@ -1046,6 +4650,7 @@ mod tests {
                 user_id: "valid-user@example.com".to_string(),
                 display_name: "valid-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1073,7 +4678,9 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let chat_actor = ChatServer::new(nats_client.clone()).await;
+        let connection_states = chat_actor.connection_states_handle();
+        let chat_server = chat_actor.start();
 
         let (tx, _rx) = mpsc::unbounded_channel::<TrackerMessage>();
         let tracker_sender: TrackerSender = tx;
@@ -1092,6 +4699,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            connection_states.clone(),
         );
 
         let session2 = SessionLogic::new(
@@ -1103,6 +4711,7 @@ mod tests {
             tracker_sender.clone(),
             session_manager.clone(),
             false,
+            connection_states.clone(),
         );
 
         // Verify they have different session IDs
@@ -1178,6 +4787,7 @@ mod tests {
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
+                    kind: PacketKind::Data,
                 },
                 user: "test@example.com".to_string(),
             })
@@ -1265,6 +4875,7 @@ mod tests {
                 room: room.clone(),
                 msg: Packet {
                     data: Arc::new(b"test data".to_vec()),
+                    kind: PacketKind::Data,
                 },
                 user: "test@example.com".to_string(),
             })
@@ -1377,10 +4988,10 @@ mod tests {
 
         let chat_server = ChatServer::new(nats_client).await.start();
 
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
 
         struct CapturingSession {
-            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
         }
         impl Actor for CapturingSession {
             type Context = actix::Context<Self>;
@@ -1413,6 +5024,7 @@ mod tests {
                 user_id: "alice@example.com".to_string(),
                 display_name: "alice@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1521,6 +5133,7 @@ mod tests {
                 user_id: "observer-user@example.com".to_string(),
                 display_name: "observer-user@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1615,6 +5228,7 @@ mod tests {
                 user_id: "real-user@example.com".to_string(),
                 display_name: "real-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1715,6 +5329,7 @@ mod tests {
                 user_id: "testing-user@example.com".to_string(),
                 display_name: "testing-user@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1779,6 +5394,7 @@ mod tests {
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1822,6 +5438,7 @@ mod tests {
                 user_id: "testing-dc@example.com".to_string(),
                 display_name: "testing-dc@example.com".to_string(),
                 observer: false,
+                redirect: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -1885,6 +5502,7 @@ mod tests {
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -1929,6 +5547,7 @@ mod tests {
                 user_id: "observer-dc@example.com".to_string(),
                 display_name: "observer-dc@example.com".to_string(),
                 observer: true,
+                redirect: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -1992,6 +5611,7 @@ mod tests {
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2051,6 +5671,7 @@ mod tests {
                 user_id: "real-dc@example.com".to_string(),
                 display_name: "real-dc@example.com".to_string(),
                 observer: false,
+                redirect: false,
             })
             .await
             .expect("Disconnect should succeed");
@@ -2112,6 +5733,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2121,7 +5743,7 @@ mod tests {
             "Observer JoinRoom should succeed, got: {result:?}"
         );
 
-        // Joining again with same session should return Ok (already in active_subs)
+        // Joining again with same session should return Ok (already in joined_sessions)
         let result2 = chat_server
             .send(JoinRoom {
                 session: session_id,
@@ -2129,6 +5751,7 @@ mod tests {
                 user_id: "observer@example.com".to_string(),
                 display_name: "observer@example.com".to_string(),
                 observer: true,
+                capabilities: 0,
             })
             .await
             .expect("Message delivery should succeed");
@@ -2153,8 +5776,2214 @@ mod tests {
             Ok(self
                 .connection_states
                 .get(&msg.session)
-                .copied()
+                .map(|s| *s)
                 .unwrap_or(ConnectionState::Testing))
         }
+    }
+
+    // ==========================================================================
+    // TEST: Hard admission cap rejects joins past the limit (S-P0-3)
+    // ==========================================================================
+    // Locks in the room-capacity check added per sfu-update/GAP-ANALYSIS.md
+    // S-P0-3. Without this cap, a scripted attacker with one valid JWT can
+    // OOM a pod by spawning thousands of sessions in a single room.
+    //
+    // Uses MAX_PARTICIPANTS_ENV to shrink the cap so the test runs quickly.
+    // The env var is set/unset via the `serial` attribute on each test to
+    // avoid races with other tests reading it.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_rejects_past_capacity() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        // Shrink the cap to 3 so the test joins 4 sessions instead of 201.
+        // The handler reads MAX_PARTICIPANTS_ENV at request-time, so setting
+        // it before any JoinRoom is sent is sufficient.
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "3");
+
+        let room = "cap-test-room";
+
+        // Helper: register a dummy session under the given id.
+        async fn register(chat_server: &actix::Addr<ChatServer>, id: u64) {
+            let dummy = DummySession.start();
+            chat_server
+                .send(Connect {
+                    id,
+                    addr: dummy.recipient(),
+                })
+                .await
+                .expect("Connect should succeed");
+        }
+
+        // The first three joins succeed; the fourth is rejected at capacity.
+        for (i, id) in [4001u64, 4002, 4003].iter().enumerate() {
+            register(&chat_server, *id).await;
+            let result = chat_server
+                .send(JoinRoom {
+                    session: *id,
+                    room: room.to_string(),
+                    user_id: format!("user{i}@example.com"),
+                    display_name: format!("user{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .expect("Message delivery should succeed");
+            assert!(
+                result.is_ok(),
+                "Join #{} (session {id}) should succeed, got: {result:?}",
+                i + 1,
+            );
+        }
+
+        register(&chat_server, 4004u64).await;
+        let result = chat_server
+            .send(JoinRoom {
+                session: 4004u64,
+                room: room.to_string(),
+                user_id: "user4@example.com".to_string(),
+                display_name: "user4".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_err(),
+            "Join past cap should return Err, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::messages::server::JoinDeclineKind::Reject,
+            "hard-cap decline must be classified Reject (vc-n9o: must NOT be \
+             labeled redirect)"
+        );
+        assert!(
+            err.message.contains("capacity"),
+            "Error should mention capacity, got: {}",
+            err.message
+        );
+
+        // Observers are not subject to the cap. Register and join a 5th
+        // session as observer — should succeed even though room_members
+        // is already at the (non-observer) cap.
+        register(&chat_server, 4005u64).await;
+        let observer_result = chat_server
+            .send(JoinRoom {
+                session: 4005u64,
+                room: room.to_string(),
+                user_id: "observer@example.com".to_string(),
+                display_name: "observer".to_string(),
+                observer: true,
+                capabilities: 0,
+            })
+            .await
+            .expect("Message delivery should succeed");
+        assert!(
+            observer_result.is_ok(),
+            "Observer join should bypass the cap, got: {observer_result:?}"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+    }
+
+    // ==========================================================================
+    // TEST (p2-5): CONGESTION packets bypass Forwarder::decide in SFU mode
+    // ==========================================================================
+    // Verifies the CRITICAL carve-out in `handle_msg`: in SfuMode::Sfu, a
+    // CONGESTION packet must always be forwarded as-is regardless of what the
+    // forwarder would decide. The forwarder is built on top of an empty
+    // RoomState (p2-5 does not call insert_member — that's p2-6).
+    //
+    // To prove the bypass actually runs, we set `pw.session_id ==
+    // receiver_sid`. If the CONGESTION bypass branch were removed, the code
+    // would fall through to `Forwarder::decide`, whose self-skip filter
+    // (keyed on `packet_wrapper.session_id == receiver_sid`) would return
+    // `Drop` and no message would be captured — failing the assertion.
+    // Equal SIDs therefore make the test sensitive to the very branch it is
+    // intended to lock in.
+    //
+    // Exercised by constructing a synthetic async_nats::Message and invoking
+    // the `handle_msg` closure directly — no NATS round-trip required.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_sfu_mode_congestion_bypasses_forwarder() {
+        use crate::sfu::forwarder::Forwarder;
+        use crate::sfu::room_state::RoomState;
+        use crate::sfu::SfuMode;
+        use std::sync::{Arc, Mutex, RwLock};
+        use tokio::time::{sleep, Duration};
+
+        // Capturing receiver — records every Message it gets.
+        struct CapturingSession {
+            captured: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.captured.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let receiver = CapturingSession {
+            captured: captured.clone(),
+        }
+        .start();
+        let recipient = receiver.recipient();
+
+        let room = "p2-5-test-room".to_string();
+        // sender_sid == receiver_sid is deliberate: if the CONGESTION bypass
+        // were removed, Forwarder::decide would self-skip-drop this packet
+        // (its only filter today keys on packet_wrapper.session_id ==
+        // receiver_sid), so the assertion below would fail. Equal SIDs make
+        // this test sensitive to the bypass branch actually running.
+        let receiver_sid: SessionId = 7001;
+        let sender_sid: SessionId = 7001;
+
+        // Build the SFU side: empty RoomState + Forwarder over it.
+        let room_state = Arc::new(RwLock::new(RoomState::new(room.clone())));
+        let forwarder = Arc::new(Forwarder::with_room_only(room_state));
+
+        let handler = handle_msg(
+            recipient,
+            room.clone(),
+            receiver_sid,
+            SfuMode::Sfu,
+            forwarder,
+        );
+
+        // Build a CONGESTION PacketWrapper from the SAME session as the
+        // receiver (see SID comment above). The top-of-handle_msg self-echo
+        // skip carves out CONGESTION explicitly, so it reaches the SFU
+        // branch; the SFU branch's bypass is then the only thing standing
+        // between this packet and the assertion.
+        let mut pw = PacketWrapper::new();
+        pw.packet_type = PacketType::CONGESTION.into();
+        pw.session_id = sender_sid;
+        pw.user_id = b"test-user@example.com".to_vec();
+        pw.data = b"congestion-payload".to_vec();
+        let payload_bytes = pw.write_to_bytes().expect("serialize CONGESTION wrapper");
+        let payload_len = payload_bytes.len();
+
+        // Publish on the receiver's OWN subject. With sender_sid ==
+        // receiver_sid, the top-level self-echo skip would drop this if
+        // CONGESTION weren't carved out, and the SFU branch's bypass is the
+        // only path that delivers it without consulting the forwarder.
+        let subject_str = format!("room.{room}.{receiver_sid}").replace(' ', "_");
+        let msg = async_nats::Message {
+            subject: subject_str.into(),
+            reply: None,
+            payload: bytes::Bytes::from(payload_bytes),
+            headers: None,
+            status: None,
+            description: None,
+            length: payload_len,
+        };
+
+        handler(msg).expect("handle_msg should succeed");
+
+        // The CapturingSession runs on the same actix runtime; give it one
+        // scheduler tick to drain its mailbox.
+        sleep(Duration::from_millis(50)).await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            1,
+            "CONGESTION packet must be forwarded (bypass), got {} messages",
+            got.len()
+        );
+        // The CONGESTION bypass forwards the original payload verbatim.
+        let received = PacketWrapper::parse_from_bytes(&got[0])
+            .expect("captured payload must be a valid PacketWrapper");
+        assert_eq!(
+            received.packet_type,
+            PacketType::CONGESTION.into(),
+            "forwarded packet must remain CONGESTION"
+        );
+        assert_eq!(
+            received.session_id, sender_sid,
+            "forwarded packet must preserve the sender SID"
+        );
+    }
+
+    // ==========================================================================
+    // TEST (p2-6): JoinRoom/Leave drive RoomState.members + capabilities
+    // ==========================================================================
+    // Two sessions join the same room with distinct capabilities; the SFU
+    // member table must reflect both entries. One session leaves; the table
+    // must shrink to one entry while preserving the other's capabilities.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_leave_drives_room_state_members() {
+        use crate::sfu::room_state::{CAP_SFU_ROUTING_HEADER, CAP_SUBSCRIPTION, CAP_SVC};
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy_a = DummySession.start();
+        let dummy_b = DummySession.start();
+        let sid_a: SessionId = 30001;
+        let sid_b: SessionId = 30002;
+        let caps_a = CAP_SFU_ROUTING_HEADER | CAP_SVC;
+        let caps_b = CAP_SUBSCRIPTION;
+        let room = "test-room-p2-6".to_string();
+
+        for (sid, addr) in [(sid_a, dummy_a.recipient()), (sid_b, dummy_b.recipient())] {
+            chat_server
+                .send(Connect { id: sid, addr })
+                .await
+                .expect("Connect should succeed");
+        }
+
+        for (sid, caps, user) in [
+            (sid_a, caps_a, "alice@example.com"),
+            (sid_b, caps_b, "bob@example.com"),
+        ] {
+            let res = chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.clone(),
+                    user_id: user.to_string(),
+                    display_name: user.to_string(),
+                    observer: false,
+                    capabilities: caps,
+                })
+                .await
+                .expect("Message delivery should succeed");
+            assert!(res.is_ok(), "JoinRoom should succeed for {user}: {res:?}");
+        }
+
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .expect("Snapshot delivery should succeed")
+            .expect("Room should exist after JoinRoom");
+        assert_eq!(
+            snapshot,
+            vec![(sid_a, caps_a), (sid_b, caps_b)],
+            "Both sessions must appear with their declared capabilities"
+        );
+
+        chat_server
+            .send(Leave {
+                session: sid_a,
+                room: room.clone(),
+                user_id: "alice@example.com".to_string(),
+            })
+            .await
+            .expect("Leave delivery should succeed");
+
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .expect("Snapshot delivery should succeed")
+            .expect("Room should still exist after one leave");
+        assert_eq!(
+            snapshot,
+            vec![(sid_b, caps_b)],
+            "After Leave(sid_a), only sid_b remains with its capabilities"
+        );
+    }
+
+    // ==========================================================================
+    // TEST (vc-69e / p3-13): admission control — below soft cap admits silently
+    // ==========================================================================
+    // count < WAITING_ROOM_THRESHOLD: the join is admitted and the new joiner
+    // receives NO ADMISSION_DECISION packet (the common path is zero-overhead).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_admission_below_soft_cap_admits_silently() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        // Default thresholds: 195 soft / 200 hard. Make sure nothing in this
+        // process has overridden them via env.
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        // Pre-populate the room with 100 placeholder members via repeated
+        // JoinRoom calls. Below the 195 soft cap, the new (101st) joiner
+        // should not receive any ADMISSION_DECISION packet.
+        let room = "test-admission-below-soft-cap";
+        let dummy = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+        for i in 0..100u64 {
+            let sid = 50_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: dummy.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("filler-{i}@example.com"),
+                    display_name: format!("filler-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap()
+                .expect("filler join should succeed");
+        }
+
+        // Now have the capturing session attempt to join — count=100 before
+        // join, well below the 195 soft cap.
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let observer_sid = 51_000u64;
+        chat_server
+            .send(Connect {
+                id: observer_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: observer_sid,
+                room: room.to_string(),
+                user_id: "alice@example.com".to_string(),
+                display_name: "alice".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "join below soft cap must succeed");
+
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                assert_ne!(
+                    wrapper.packet_type,
+                    PacketType::ADMISSION_DECISION.into(),
+                    "no ADMISSION_DECISION packet must be sent below the soft cap"
+                );
+                // Defensive parse — confirms the payload is also empty / no decision.
+                let _ = AdmissionDecision::parse_from_bytes(&wrapper.data);
+            }
+        }
+    }
+
+    // ==========================================================================
+    // TEST (vc-69e / p3-13): admission control — soft cap emits QUEUED hint
+    // ==========================================================================
+    // count >= WAITING_ROOM_THRESHOLD && count < hard cap: the join is still
+    // admitted (no behavioural change) but the new joiner receives an
+    // ADMISSION_DECISION{QUEUED} packet with a 1-based overflow position.
+    //
+    // Uses env overrides to shrink the thresholds for fast testing
+    // (soft_cap=3, hard_cap=5) — equivalent to the production thresholds:
+    //   count=3 -> position=1
+    //   count=4 -> position=2
+    //
+    // Documents the position convention chosen: position = current - soft + 1.
+    // For the production defaults (soft=195) this matches the bead spec's
+    // "count - 194 = position" formula exactly: at count=195, position=1.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_admission_at_soft_cap_emits_queued_packet() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "5");
+        std::env::set_var(WAITING_ROOM_THRESHOLD_ENV, "3");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let room = "test-admission-soft-cap";
+
+        // Fill 3 filler sessions (count=3, exactly at soft cap).
+        let filler = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+        for i in 0..3u64 {
+            let sid = 52_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: filler.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("filler-{i}@example.com"),
+                    display_name: format!("filler-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap()
+                .expect("filler join should succeed");
+        }
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let soft_sid = 52_100u64;
+        chat_server
+            .send(Connect {
+                id: soft_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        // count=3 before this join, in [soft_cap=3, hard_cap=5) — must be
+        // admitted and QUEUED notification must be delivered.
+        let result = chat_server
+            .send(JoinRoom {
+                session: soft_sid,
+                room: room.to_string(),
+                user_id: "queued-user@example.com".to_string(),
+                display_name: "queued-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "join at soft cap must succeed (admitted)");
+
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+
+        let inner = found.expect("ADMISSION_DECISION{QUEUED} must be delivered to soft-cap joiner");
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmStatus::QUEUED,
+            "status must be QUEUED for soft-cap admit"
+        );
+        assert_eq!(
+            inner.position, 1,
+            "position convention: current=soft_cap (3) -> position=1"
+        );
+        assert_eq!(inner.reason, "soft_cap_reached");
+        assert_eq!(
+            inner.retry_after_secs, 0,
+            "QUEUED packets do not set retry hints"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+    }
+
+    // ==========================================================================
+    // TEST (vc-69e / p3-13): admission control — hard cap rejects with packet
+    // ==========================================================================
+    // count >= hard cap: join is rejected. Server emits ADMISSION_DECISION
+    // {REJECTED, reason="room_full"} to the would-be joiner BEFORE returning
+    // an Err, and does NOT add the session to room_members.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_admission_at_hard_cap_rejects_with_packet() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "5");
+        std::env::set_var(WAITING_ROOM_THRESHOLD_ENV, "3");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let room = "test-admission-hard-cap";
+
+        // Fill 5 filler sessions (count = hard_cap).
+        let filler = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+        for i in 0..5u64 {
+            let sid = 53_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: filler.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("filler-{i}@example.com"),
+                    display_name: format!("filler-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap()
+                .expect("filler join should succeed");
+        }
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let rejected_sid = 53_100u64;
+        chat_server
+            .send(Connect {
+                id: rejected_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        // count=5 before this join, == hard_cap=5 — must be rejected.
+        let result = chat_server
+            .send(JoinRoom {
+                session: rejected_sid,
+                room: room.to_string(),
+                user_id: "rejected-user@example.com".to_string(),
+                display_name: "rejected-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "join at hard cap must be rejected");
+        assert!(
+            result.unwrap_err().message.contains("at capacity"),
+            "error message should mention capacity"
+        );
+
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+
+        let inner =
+            found.expect("ADMISSION_DECISION{REJECTED} must be delivered to rejected joiner");
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmStatus::REJECTED,
+            "status must be REJECTED for hard-cap reject"
+        );
+        assert_eq!(inner.reason, "room_full");
+        assert!(
+            inner.retry_after_secs > 0,
+            "REJECTED packets must include a retry_after_secs hint"
+        );
+
+        // Verify the rejected session is NOT in room_members.
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap()
+            .expect("room must still exist");
+        assert_eq!(snapshot.len(), 5, "room_members must still hold exactly 5");
+        assert!(
+            !snapshot.iter().any(|(sid, _)| *sid == rejected_sid),
+            "rejected session must NOT appear in room_members"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+    }
+
+    // ==========================================================================
+    // INTEGRATION (vc-69e / p3-13): 200 sequential joins succeed; 201st rejected
+    // ==========================================================================
+    // Uses the production hard cap (200) via env, with the soft cap shrunk to
+    // 199 so that we don't have to deliver/capture 5 QUEUED packets per join
+    // for participants 195..199. The acceptance criterion is the boundary:
+    // the 200th join succeeds; the 201st is rejected and is not added.
+    //
+    // Marked #[ignore] by default because spinning up 201 sessions in-process
+    // is slow (multi-second) and stresses NATS subscribers. Run explicitly via
+    //   cargo test -p videocall-api -- --ignored test_admission_200_sequential
+    // or in nightly CI.
+    #[actix_rt::test]
+    #[serial]
+    #[ignore]
+    async fn test_admission_200_sequential_joins_201st_rejected() {
+        std::env::set_var(MAX_PARTICIPANTS_ENV, "200");
+        std::env::set_var(WAITING_ROOM_THRESHOLD_ENV, "199");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        let room = "test-admission-200-seq";
+
+        let filler = {
+            struct DummySession;
+            impl Actor for DummySession {
+                type Context = actix::Context<Self>;
+            }
+            impl Handler<Message> for DummySession {
+                type Result = ();
+                fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+            }
+            DummySession.start()
+        };
+
+        for i in 0..200u64 {
+            let sid = 60_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: filler.clone().recipient(),
+                })
+                .await
+                .unwrap();
+            let res = chat_server
+                .send(JoinRoom {
+                    session: sid,
+                    room: room.to_string(),
+                    user_id: format!("user-{i}@example.com"),
+                    display_name: format!("user-{i}"),
+                    observer: false,
+                    capabilities: 0,
+                })
+                .await
+                .unwrap();
+            assert!(
+                res.is_ok(),
+                "join #{i} must succeed (still within hard cap)"
+            );
+        }
+
+        // 201st join: count=200 == hard cap -> reject.
+        let extra_sid = 60_999u64;
+        chat_server
+            .send(Connect {
+                id: extra_sid,
+                addr: filler.clone().recipient(),
+            })
+            .await
+            .unwrap();
+        let result = chat_server
+            .send(JoinRoom {
+                session: extra_sid,
+                room: room.to_string(),
+                user_id: "overflow@example.com".to_string(),
+                display_name: "overflow".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "201st join must be rejected");
+
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap()
+            .expect("room must exist");
+        assert_eq!(
+            snapshot.len(),
+            200,
+            "room_members must still hold exactly 200"
+        );
+        assert!(
+            !snapshot.iter().any(|(sid, _)| *sid == extra_sid),
+            "the 201st session must NOT appear in room_members"
+        );
+
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+    }
+
+    // ==========================================================================
+    // TEST (vc-8oa / p6-5): pod ownership redirect on JoinRoom
+    // ==========================================================================
+    // When a client joins a room whose jump-hash owner is a different pod
+    // ordinal than this pod's own ordinal, the server MUST:
+    //   1. emit ADMISSION_DECISION{REDIRECT, redirect_to=<owner DNS>}
+    //   2. return MessageResult(Err(_)) so the transport closes the conn
+    //   3. NOT add the session to room_members (no admission accounting)
+    //
+    // Env vars POD_NAME, STATEFULSET_REPLICAS, SFU_TRANSPORT_KIND are
+    // process-global; the existing admission tests in this module already
+    // gate on `#[serial]` for the same reason. We follow that pattern.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_redirects_on_pod_ownership_mismatch() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        // Configure ourselves as pod 0 in a 3-replica StatefulSet.
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        // Clear any admission-cap leakage from prior tests.
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Pick a room whose jump_hash lands on a NON-zero ordinal so the
+        // redirect path actually fires. Loop a few candidates; with 3
+        // replicas the expected miss rate is ~2/3 so we find one quickly.
+        let replicas = 3u32;
+        let (room, owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("redirect-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // Capturing recipient so we can decode the REDIRECT packet.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let sid: SessionId = 71_000;
+        chat_server
+            .send(Connect {
+                id: sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: sid,
+                room: room.clone(),
+                user_id: "wrong-pod-user@example.com".to_string(),
+                display_name: "wrong-pod-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(result.is_err(), "join on non-owner pod must be declined");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::messages::server::JoinDeclineKind::Redirect,
+            "non-owner-pod decline must be classified Redirect so the teardown \
+             counter lines up with the redirect decision (vc-n9o)"
+        );
+        assert!(
+            err.message.contains("different pod"),
+            "error message should mention pod ownership"
+        );
+
+        // Let the recipient mpsc drain.
+        sleep(Duration::from_millis(150)).await;
+
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner =
+            found.expect("ADMISSION_DECISION{REDIRECT} must be delivered to redirected joiner");
+        assert_eq!(
+            inner.status.enum_value_or_default(),
+            AdmStatus::REDIRECT,
+            "status must be REDIRECT for ownership mismatch"
+        );
+        assert_eq!(inner.reason, "wrong_owner");
+        // vc-el0: the redirect FQDN MUST carry the namespace label. The
+        // namespace resolver falls back to "default" when POD_NAMESPACE is
+        // unset AND the in-pod service-account namespace file is absent
+        // (the case in CI). We assert on whatever namespace was actually
+        // resolved by reading it back from the affinity module, and pin
+        // that the FQDN is NOT the namespace-less old form.
+        let ns = crate::sfu::affinity::current_namespace();
+        let expected_dns = format!(
+            "rustlemania-webtransport-{owner_ord}.webtransport-headless.{ns}.svc.cluster.local"
+        );
+        assert_eq!(
+            inner.redirect_to, expected_dns,
+            "redirect_to must point at the owner pod's fully-qualified headless DNS"
+        );
+        assert!(
+            inner
+                .redirect_to
+                .contains(&format!(".{ns}.svc.cluster.local")),
+            "redirect_to must contain the namespace label (vc-el0): {}",
+            inner.redirect_to
+        );
+        assert!(
+            !inner.redirect_to.contains("-headless.svc.cluster.local"),
+            "redirect_to must NOT be namespace-less (vc-el0 regression): {}",
+            inner.redirect_to
+        );
+
+        // The redirected session must NOT have been admitted: the room
+        // either doesn't exist (no prior joiners) or doesn't contain `sid`.
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .unwrap();
+        if let Some(members) = snapshot {
+            assert!(
+                !members.iter().any(|(s, _)| *s == sid),
+                "redirected session must NOT appear in room_members"
+            );
+        }
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST (vc-85p / p6-5): spillover ADMITS LOCALLY instead of redirecting
+    // ==========================================================================
+    // Same setup as test_join_room_redirects_on_pod_ownership_mismatch — a
+    // room jump-hashed to a non-owner ordinal, so the redirect path would
+    // normally fire — but with a FRESH, OVER-THRESHOLD owner-pod beacon
+    // seeded into the spillover store. The non-owner pod MUST then:
+    //   1. NOT emit ADMISSION_DECISION{REDIRECT}
+    //   2. return MessageResult(Ok(_)) (the join succeeds locally)
+    //   3. add the session to room_members (normal local admission)
+    //
+    // This is the inverse assertion of the redirect test and locks in the
+    // admit-vs-redirect branch added in vc-85p.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_spills_locally_when_owner_over_threshold() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Room owned by a NON-zero ordinal (this pod is 0) so the redirect
+        // path WOULD fire absent the spill override.
+        let replicas = 3u32;
+        let (room, _owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("spill-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // Seed a fresh, over-threshold owner beacon so is_spilled_over()
+        // returns true for this room.
+        chat_server
+            .send(SeedSpilloverState {
+                room: room.clone(),
+                owner_count: 200, // > SPILLOVER_PARTICIPANT_THRESHOLD (180)
+                owner_cpu: 0.10,
+            })
+            .await
+            .unwrap();
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let sid: SessionId = 72_000;
+        chat_server
+            .send(Connect {
+                id: sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: sid,
+                room: room.clone(),
+                user_id: "spill-user@example.com".to_string(),
+                display_name: "spill-user".to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "join on non-owner pod with over-threshold owner beacon must be \
+             admitted LOCALLY (spill), not declined: {result:?}"
+        );
+
+        // Drain the recipient mpsc and assert NO REDIRECT was delivered.
+        sleep(Duration::from_millis(150)).await;
+        let msgs = received.lock().unwrap().clone();
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                assert_ne!(
+                    wrapper.packet_type,
+                    PacketType::ADMISSION_DECISION.into(),
+                    "a spilled (locally-admitted) joiner must NOT receive an \
+                     ADMISSION_DECISION{{REDIRECT}} packet"
+                );
+            }
+        }
+
+        // The spilled session MUST be admitted to the local room_members.
+        let snapshot = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .unwrap()
+            .expect("room must exist after local admission");
+        assert!(
+            snapshot.iter().any(|(s, _)| *s == sid),
+            "spilled session must appear in local room_members"
+        );
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST (vc-8oa / p6-5 follow-up): redirect runs BEFORE reconnection bookkeeping
+    // ==========================================================================
+    // Locks in the must-fix from the p6-5 review: the ownership redirect
+    // path MUST run synchronously up front, before `pending_departures`,
+    // `room_members`, or `room_states` are touched. If it ran after, a
+    // reconnecting user landing on the wrong pod would:
+    //   1. have their old `pending_departures` entry drained,
+    //   2. have their deferred PARTICIPANT_LEFT timer cancelled,
+    //   3. be removed from `room_members` and `room_states` (old session),
+    //   4. be redirected.
+    // Peers would never see the leave event, and the user would silently
+    // disappear from the room until they reconnected to the correct pod.
+    //
+    // This test simulates the reconnection-into-redirect scenario by
+    // staging a `pending_departures` entry via the Disconnect handler on
+    // pod-0, then issuing a fresh JoinRoom for the same (room, user) where
+    // the room is jump-hash-owned by pod 1 in a 3-replica StatefulSet.
+    // The Err-with-redirect must NOT mutate any reconnection state.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_redirect_does_not_leak_reconnection_state() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+
+        // Pod-0 in a 3-replica cluster.
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Find a room whose jump-hash owner is NOT pod 0 (so the redirect
+        // path actually fires for this pod).
+        let replicas = 3u32;
+        let (room, owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("reconnect-redirect-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // Stage a pending_departures entry for (room, user) the same way
+        // a real disconnect would: we cannot use the JoinRoom→Disconnect
+        // sequence because JoinRoom itself would redirect on this pod for
+        // this room (the whole point of the test). Instead, we drive the
+        // Disconnect handler directly with a dummy session that we DO
+        // pre-register (so Disconnect's cleanup paths are well-defined).
+        //
+        // The Disconnect handler requires the session to have been
+        // ConnectionState::Active to defer (otherwise it bypasses the
+        // grace period). We achieve that by joining with replicas=1 first
+        // (no redirect), activating, then flipping the env to the 3-pod
+        // configuration for the JoinRoom-under-test.
+        std::env::set_var("STATEFULSET_REPLICAS", "1");
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let old_sid: SessionId = 72_000;
+        let user_id = "reconnect-user@example.com";
+
+        chat_server
+            .send(Connect {
+                id: old_sid,
+                addr: dummy.recipient(),
+            })
+            .await
+            .unwrap();
+        chat_server
+            .send(JoinRoom {
+                session: old_sid,
+                room: room.clone(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap()
+            .expect("initial join with replicas=1 must succeed (pod 0 owns everything)");
+        chat_server
+            .send(ActivateConnection { session: old_sid })
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        // Disconnect — defers PARTICIPANT_LEFT by RECONNECT_GRACE_PERIOD.
+        // vc-9g7: `redirect: false` here is correct — this test simulates a
+        // real client-initiated disconnect (not a cross-region async
+        // redirect). The point of the test is that a *subsequent* client
+        // reconnect onto a non-owner pod (a separate redirect path, p6-5)
+        // must not drain the pending_departures entry staged below; the
+        // deferred-leave behavior must be exercised exactly as in
+        // production for that scenario.
+        chat_server
+            .send(Disconnect {
+                session: old_sid,
+                room: room.clone(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                redirect: false,
+            })
+            .await
+            .unwrap();
+
+        // Verify the pending_departures entry was staged.
+        let staged = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.clone(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            staged,
+            Some(old_sid),
+            "pre-condition: Disconnect must stage a pending_departures entry"
+        );
+        // And room_members still contains the old session (cleanup is
+        // deferred to either reconnection or grace-period expiry).
+        let members_before = chat_server
+            .send(SnapshotRoomMembersList { room: room.clone() })
+            .await
+            .unwrap()
+            .expect("room_members entry should exist after Disconnect (deferred cleanup)");
+        assert!(
+            members_before.iter().any(|(s, _, _)| *s == old_sid),
+            "pre-condition: room_members must still contain old session before reconnect"
+        );
+
+        // NOW switch to the 3-replica configuration so the room is owned
+        // by a different pod, and attempt to "reconnect" with a new SID.
+        // The redirect path must fire WITHOUT draining pending_departures
+        // / room_members / room_states.
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+        let new_sid: SessionId = 72_001;
+        chat_server
+            .send(Connect {
+                id: new_sid,
+                addr: capturing.recipient(),
+            })
+            .await
+            .unwrap();
+
+        let result = chat_server
+            .send(JoinRoom {
+                session: new_sid,
+                room: room.clone(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "reconnect onto non-owner pod must be redirected (Err)"
+        );
+
+        // CORE ASSERTION 1: pending_departures entry was NOT drained.
+        // If the redirect block ran after the reconnection bookkeeping,
+        // `pending_departures.remove(&key)` would have fired and this
+        // would be `None`, leaking the deferred PARTICIPANT_LEFT.
+        let after = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.clone(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            after,
+            Some(old_sid),
+            "pending_departures entry MUST survive a redirect — the deferred \
+             PARTICIPANT_LEFT will still fire after the grace period if the \
+             client doesn't successfully reconnect on the correct pod"
+        );
+
+        // CORE ASSERTION 2: room_members entry for the old session is
+        // intact. If the reconnection bookkeeping had run, the old SID
+        // would have been retained out of `room_members`.
+        let members_after = chat_server
+            .send(SnapshotRoomMembersList { room: room.clone() })
+            .await
+            .unwrap()
+            .expect("room_members entry must still exist after redirect");
+        assert!(
+            members_after.iter().any(|(s, _, _)| *s == old_sid),
+            "room_members MUST still contain old session — redirect must not \
+             prematurely evict the disconnected session's row"
+        );
+
+        // CORE ASSERTION 3: the new session was NOT added to room_members.
+        assert!(
+            !members_after.iter().any(|(s, _, _)| *s == new_sid),
+            "redirected session MUST NOT appear in room_members"
+        );
+
+        // SANITY: the REDIRECT packet was delivered.
+        sleep(Duration::from_millis(150)).await;
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner =
+            found.expect("ADMISSION_DECISION{REDIRECT} must be delivered to redirected session");
+        assert_eq!(inner.status.enum_value_or_default(), AdmStatus::REDIRECT);
+        // vc-el0: FQDN must carry the resolved namespace label.
+        let ns = crate::sfu::affinity::current_namespace();
+        let expected_dns = format!(
+            "rustlemania-webtransport-{owner_ord}.webtransport-headless.{ns}.svc.cluster.local"
+        );
+        assert_eq!(inner.redirect_to, expected_dns);
+        assert!(
+            !inner.redirect_to.contains("-headless.svc.cluster.local"),
+            "redirect_to must NOT be namespace-less (vc-el0 regression): {}",
+            inner.redirect_to
+        );
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST: vc-9g7 — cross-region async redirect bypasses RECONNECT_GRACE_PERIOD
+    // ==========================================================================
+    // When the JoinRoom async cache-miss path admits a non-observer joiner and
+    // the spawned KV lookup resolves to a foreign home region,
+    // `Handler<HomeRegionResolved>` sends a synthetic Disconnect to itself with
+    // `redirect: true`. The new `if redirect` arm in `Handler<Disconnect>` must
+    // call `leave_rooms` IMMEDIATELY (no 2s deferral) so cross-region peers
+    // federated via NATS do not observe a JOINED → LEFT ghost-participant pair.
+    //
+    // We drive `HomeRegionResolved` directly with `home_region != current_region`
+    // to exercise the redirect branch without needing a multi-region NATS-KV
+    // setup. After the synthetic Disconnect flows through:
+    //
+    //   1. `pending_departures` MUST NOT contain an entry for the session
+    //      (the redirect arm must NOT take the deferred path).
+    //   2. `room_members` MUST NOT contain the session (immediate leave_rooms
+    //      cleanup ran).
+    //   3. PARTICIPANT_LEFT must either fire immediately (within ~200ms) or be
+    //      suppressed entirely (if leave_rooms gates on the session having
+    //      reached Active). It MUST NOT fire 2s later.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cross_region_redirect_bypasses_grace_period() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration, Instant};
+
+        // Single-pod, default region ("local"). The HomeRegionResolved we
+        // synthesize will name "us-east" so the cross-region branch fires.
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        // Capturing session — records all Message bytes for later inspection.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let session_id: SessionId = 91_000;
+        let user_id = "redirect-bypass@example.com";
+        let room = "vc-9g7-redirect-bypass-room";
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: capturing.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom must succeed in single-region default config");
+
+        // Activate so the session reaches the state where PARTICIPANT_LEFT
+        // *would* fire on a normal disconnect — this is the worst case for
+        // the bug we are fixing (where the deferred path would produce a
+        // 2s ghost window).
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Watch the system subject for PARTICIPANT_LEFT and record the time
+        // it arrived (if at all).
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let left_arrived_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let left_clone = left_arrived_at.clone();
+        let observed_any_left = Arc::new(AtomicBool::new(false));
+        let observed_clone = observed_any_left.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        tokio::spawn(async move {
+            // Watch for ~3s — long enough to detect a deferred (2s) leave
+            // if the bug were still present, plus margin.
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(3000), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                            observed_clone.store(true, Ordering::Relaxed);
+                            *left_clone.lock().unwrap() = Some(Instant::now());
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Let the JOINED publish settle.
+        sleep(Duration::from_millis(200)).await;
+
+        // Drive the redirect path directly. The HomeRegionResolved handler
+        // will (a) emit the ADMISSION_DECISION{REDIRECT} packet to the
+        // capturing session, and (b) synthesize a Disconnect with
+        // redirect=true to itself.
+        let synth_start = Instant::now();
+        chat_server
+            .send(HomeRegionResolved {
+                room: room.to_string(),
+                home_region: "us-east".to_string(),
+                session: session_id,
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+            })
+            .await
+            .expect("HomeRegionResolved delivery should succeed");
+
+        // Give actix a moment to run the synthesized Disconnect.
+        sleep(Duration::from_millis(150)).await;
+
+        // CORE ASSERTION 1: pending_departures must be empty for this room+user.
+        // If the redirect arm fell through to the deferred path, this would be
+        // Some(session_id).
+        let staged = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            staged, None,
+            "vc-9g7: redirect Disconnect MUST NOT stage a pending_departures \
+             entry — the deferred-leave grace window must be bypassed"
+        );
+
+        // CORE ASSERTION 2: room_members must not contain this session anymore.
+        // leave_rooms ran synchronously, so the row should be gone (or the
+        // entire room_members entry for this room may be gone if it was the
+        // last member).
+        let members_after = chat_server
+            .send(SnapshotRoomMembersList {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap();
+        if let Some(members) = members_after {
+            assert!(
+                !members.iter().any(|(s, _, _)| *s == session_id),
+                "vc-9g7: redirect Disconnect MUST evict the session from \
+                 room_members immediately, not after the grace period"
+            );
+        }
+
+        // CORE ASSERTION 3: if PARTICIPANT_LEFT fired at all, it fired
+        // immediately — NOT after RECONNECT_GRACE_PERIOD (2s).
+        // Wait for the watcher window to elapse so a deferred event would
+        // have a chance to be observed if the bug were present.
+        sleep(Duration::from_millis(2500)).await;
+        if observed_any_left.load(Ordering::Relaxed) {
+            let when = left_arrived_at
+                .lock()
+                .unwrap()
+                .expect("flag set implies timestamp set");
+            let delay = when.duration_since(synth_start);
+            assert!(
+                delay < Duration::from_millis(300),
+                "vc-9g7: PARTICIPANT_LEFT after redirect must fire promptly \
+                 (got {:?} after HomeRegionResolved); the synchronous \
+                 leave_rooms path should complete well under 300ms — a longer \
+                 delay indicates a regression toward the deferred-leave \
+                 timing the redirect path is supposed to bypass",
+                delay
+            );
+        }
+        // If observed_any_left == false, that's also a passing outcome: the
+        // session's PARTICIPANT_JOINED was suppressed because no peer had
+        // subscribed yet, and `leave_rooms` correctly elided the LEFT
+        // broadcast. Either way no JOINED→LEFT ghost pair was emitted with
+        // a 2s gap.
+
+        // SANITY: the ADMISSION_DECISION{REDIRECT} packet was delivered to
+        // the originating session.
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner = found.expect(
+            "ADMISSION_DECISION{REDIRECT} (wrong_region) must be delivered to redirected session",
+        );
+        assert_eq!(inner.status.enum_value_or_default(), AdmStatus::REDIRECT);
+
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST: vc-9g7 follow-up — cross-region redirect with never-activated session
+    // ==========================================================================
+    // Sibling of `test_cross_region_redirect_bypasses_grace_period`, exercising
+    // the REALISTIC post-cache-miss timing: the KV roundtrip resolves BEFORE
+    // the client's CONNECTION packet reaches `ActivateConnection`, so the
+    // joiner never reaches the `Active` state and no PARTICIPANT_JOINED was
+    // ever published.
+    //
+    // Before the leave_rooms refactor, the in-band `connection_states` lookup
+    // inside `leave_rooms` saw `None` (the Disconnect handler already removed
+    // the entry), the gate became a no-op, and PARTICIPANT_LEFT fired for a
+    // participant nobody ever saw join. After the refactor, the caller passes
+    // its captured `was_active=false` and the broadcast is suppressed.
+    //
+    // Assertions:
+    //   1. `pending_departures` is empty (grace bypassed — same as the sibling).
+    //   2. `room_members` no longer contains the session (immediate eviction).
+    //   3. NO PARTICIPANT_LEFT is published at all — wait at least 300ms after
+    //      the synthesized Disconnect, then assert nothing was observed. This
+    //      is the assertion the previous bug would have failed.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cross_region_redirect_when_session_never_activated() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        let session_id: SessionId = 91_001;
+        let user_id = "redirect-never-active@example.com";
+        let room = "vc-9g7-redirect-never-active-room";
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: capturing.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        chat_server
+            .send(JoinRoom {
+                session: session_id,
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+                observer: false,
+                capabilities: 0,
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom must succeed in single-region default config");
+
+        // INTENTIONALLY DO NOT call ActivateConnection — this is the
+        // realistic timing where the KV-roundtrip resolves first.
+
+        // Watch the system subject for ANY PARTICIPANT_LEFT — we expect none.
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let observed_any_left = Arc::new(AtomicBool::new(false));
+        let observed_clone = observed_any_left.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(3000), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_LEFT.into() {
+                            observed_clone.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Let the subscription settle.
+        sleep(Duration::from_millis(200)).await;
+
+        // Drive the redirect path directly while the session is still in
+        // Testing state (never activated).
+        chat_server
+            .send(HomeRegionResolved {
+                room: room.to_string(),
+                home_region: "us-east".to_string(),
+                session: session_id,
+                user_id: user_id.to_string(),
+                display_name: user_id.to_string(),
+            })
+            .await
+            .expect("HomeRegionResolved delivery should succeed");
+
+        // Give actix a moment to run the synthesized Disconnect.
+        sleep(Duration::from_millis(150)).await;
+
+        // ASSERTION 1: pending_departures must be empty (grace bypassed).
+        let staged = chat_server
+            .send(SnapshotPendingDeparture {
+                room: room.to_string(),
+                user_id: user_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            staged, None,
+            "vc-9g7: redirect Disconnect MUST NOT stage a pending_departures \
+             entry even for never-activated sessions"
+        );
+
+        // ASSERTION 2: room_members must not contain this session anymore.
+        let members_after = chat_server
+            .send(SnapshotRoomMembersList {
+                room: room.to_string(),
+            })
+            .await
+            .unwrap();
+        if let Some(members) = members_after {
+            assert!(
+                !members.iter().any(|(s, _, _)| *s == session_id),
+                "vc-9g7: redirect Disconnect MUST evict the session from \
+                 room_members immediately, even when never activated"
+            );
+        }
+
+        // ASSERTION 3: NO PARTICIPANT_LEFT must be published. Wait long
+        // enough that a synchronous publish would have shown up; also longer
+        // than the (bypassed) 2s grace window so a regression to the
+        // deferred path would also be caught.
+        sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !observed_any_left.load(Ordering::Relaxed),
+            "vc-9g7: no PARTICIPANT_LEFT must be published when redirecting \
+             a session that never reached Active — the joiner was never \
+             visible to peers, so emitting LEFT creates a ghost-departed \
+             participant peers never saw join"
+        );
+
+        // SANITY: ADMISSION_DECISION{REDIRECT} was still delivered to the
+        // originating session.
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+        let msgs = received.lock().unwrap().clone();
+        let mut found = None;
+        for msg_bytes in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(msg_bytes) {
+                if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                    let inner = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                        .expect("AdmissionDecision must decode");
+                    found = Some(inner);
+                    break;
+                }
+            }
+        }
+        let inner = found.expect(
+            "ADMISSION_DECISION{REDIRECT} must be delivered to redirected \
+             session even when it never activated",
+        );
+        assert_eq!(inner.status.enum_value_or_default(), AdmStatus::REDIRECT);
+
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // TEST (vc-9z6): concurrent T=0 joiners on a non-owner pod must NOT loop
+    // ==========================================================================
+    // Reproduction for vc-9z6: at T=0 on shard A (the room's non-owner pod),
+    // many concurrent JoinRoom messages arrive at once (e.g. the 200-bot
+    // harness sending 100 listener bots + senders against the same room).
+    //
+    // The bead's failure signature is bots exhausting MAX_REDIRECT_HOPS=5
+    // without converging. For that to happen, each bot's reconnect attempt
+    // must keep being told to redirect — i.e. the server is emitting a
+    // REDIRECT packet for sessions it should NOT be redirecting, OR the
+    // REDIRECT target it emits is wrong for some sessions.
+    //
+    // This test exercises the chat_server side in isolation: spawn N
+    // concurrent JoinRoom messages from N distinct sessions, all targeting
+    // a room whose jump-hash owner is a DIFFERENT pod ordinal than `self`.
+    // Required behaviour:
+    //
+    //   1. Every JoinRoom must return Err(... "different pod" ...).
+    //   2. Every session must receive exactly ONE ADMISSION_DECISION{REDIRECT}
+    //      packet on its recipient.
+    //   3. Every redirect target must point at the same owner pod's headless
+    //      DNS — N concurrent joiners must NOT split between conflicting
+    //      targets (which would happen if jump_hash or the env reads were
+    //      non-deterministic under contention).
+    //   4. No session must end up in `joined_sessions` or in the SFU member
+    //      table for the room. The redirect path is non-admitting.
+    //
+    // A passing assertion set here is necessary-but-not-sufficient to fix
+    // vc-9z6 — but a failure here at concurrent T=0 join time would be a
+    // proximate explanation for the redirect-loop signature, since a bot
+    // that arrives at a pod and is told to redirect a second time would
+    // increment its hop counter against the MAX_REDIRECT_HOPS=5 cap.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_concurrent_t0_joiners_redirect_consistently_vc_9z6() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::admission_decision_packet::admission_decision::Status as AdmStatus;
+        use videocall_types::protos::admission_decision_packet::AdmissionDecision;
+
+        // Pod 0 in a 3-replica StatefulSet, identical to
+        // test_join_room_redirects_on_pod_ownership_mismatch so the redirect
+        // target shape is comparable.
+        std::env::set_var("POD_NAME", "rustlemania-webtransport-0");
+        std::env::set_var("STATEFULSET_REPLICAS", "3");
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+        std::env::remove_var(MAX_PARTICIPANTS_ENV);
+        std::env::remove_var(WAITING_ROOM_THRESHOLD_ENV);
+
+        // Pick a room whose jump-hash owner is NOT pod 0.
+        let replicas = 3u32;
+        let (room, owner_ord) = (0..200)
+            .find_map(|i| {
+                let r = format!("concurrent-t0-room-{i}");
+                let o = crate::sfu::affinity::jump_hash(&r, replicas);
+                (o != 0).then_some((r, o))
+            })
+            .expect("must find a room hashing to a non-zero ordinal among 200 candidates");
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let chat_server = ChatServer::new(nats_client).await.start();
+
+        // One capturing recipient per session so we can assert that EVERY
+        // session received the REDIRECT (rather than asserting on a shared
+        // counter that masks per-session delivery failures).
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        const N: u64 = 100;
+        let mut per_session_received: Vec<Arc<Mutex<Vec<bytes::Bytes>>>> =
+            Vec::with_capacity(N as usize);
+        let mut sids: Vec<SessionId> = Vec::with_capacity(N as usize);
+
+        // Phase 1: register all N sessions synchronously so Connect lands
+        // BEFORE any JoinRoom is processed. This matches the real flow
+        // (WtChatSession.started does Connect.send.await before JoinRoom.send).
+        for i in 0..N {
+            let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+            let capturing = CapturingSession {
+                received: received.clone(),
+            }
+            .start();
+            let sid: SessionId = 80_000 + i;
+            chat_server
+                .send(Connect {
+                    id: sid,
+                    addr: capturing.recipient(),
+                })
+                .await
+                .unwrap();
+            per_session_received.push(received);
+            sids.push(sid);
+        }
+
+        // Phase 2: fan out N JoinRoom messages CONCURRENTLY. Use a tokio
+        // join_all so the actor's mailbox sees them all at once — the
+        // single-threaded actor will still serialise execution, but the
+        // queueing models the T=0 burst scenario from the bead.
+        let join_futs: Vec<_> = sids
+            .iter()
+            .enumerate()
+            .map(|(i, sid)| {
+                let cs = chat_server.clone();
+                let room = room.clone();
+                let user = format!("listener-{i}@example.com");
+                async move {
+                    cs.send(JoinRoom {
+                        session: *sid,
+                        room,
+                        user_id: user.clone(),
+                        display_name: user,
+                        observer: false,
+                        capabilities: 0,
+                    })
+                    .await
+                    .unwrap()
+                }
+            })
+            .collect();
+        let results = futures::future::join_all(join_futs).await;
+
+        // ASSERTION 1: every JoinRoom returned Err with the pod-ownership
+        // redirect message. Any Ok here would mean the joiner was admitted
+        // onto the wrong pod, which is the proximate cause of bots running
+        // out of the bot harness's per-pod accounting.
+        for (i, r) in results.iter().enumerate() {
+            assert!(
+                r.is_err(),
+                "session #{i} ({}) must be redirected (Err), got Ok",
+                sids[i]
+            );
+            let err = r.as_ref().unwrap_err();
+            assert_eq!(
+                err.kind,
+                crate::messages::server::JoinDeclineKind::Redirect,
+                "session #{i}: decline must be classified Redirect (vc-n9o)"
+            );
+            assert!(
+                err.message.contains("different pod"),
+                "session #{i}: error must be a pod-ownership redirect, got: {}",
+                err.message
+            );
+        }
+
+        // Let the actor mailbox flush all REDIRECT Message deliveries.
+        sleep(Duration::from_millis(300)).await;
+
+        // ASSERTION 2 + 3: every session got exactly ONE ADMISSION_DECISION
+        // {REDIRECT} packet, and every redirect target points at the same
+        // owner pod DNS. If concurrent joiners produced inconsistent
+        // redirect targets, the bot's reconnect logic would split between
+        // pods and increment hop counters non-monotonically — the bead's
+        // "loop redirect" signature.
+        // vc-el0: FQDN must carry the resolved namespace label.
+        let ns = crate::sfu::affinity::current_namespace();
+        let expected_dns = format!(
+            "rustlemania-webtransport-{owner_ord}.webtransport-headless.{ns}.svc.cluster.local"
+        );
+        for (i, recv) in per_session_received.iter().enumerate() {
+            let msgs = recv.lock().unwrap().clone();
+            let mut redirects: Vec<AdmissionDecision> = Vec::new();
+            for bytes in msgs.iter() {
+                if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(bytes) {
+                    if wrapper.packet_type == PacketType::ADMISSION_DECISION.into() {
+                        let dec = AdmissionDecision::parse_from_bytes(&wrapper.data)
+                            .expect("AdmissionDecision must decode");
+                        if dec.status.enum_value_or_default() == AdmStatus::REDIRECT {
+                            redirects.push(dec);
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                redirects.len(),
+                1,
+                "session #{i} ({}) must receive exactly ONE REDIRECT \
+                 packet at T=0; got {} (a duplicate would push the bot \
+                 closer to MAX_REDIRECT_HOPS without it actually following \
+                 conflicting targets)",
+                sids[i],
+                redirects.len()
+            );
+            let dec = &redirects[0];
+            assert_eq!(
+                dec.redirect_to, expected_dns,
+                "session #{i} ({}) redirect_to MUST point at the same owner \
+                 pod under concurrent joiners — any divergence here would \
+                 split the bot fleet across pods on reconnect",
+                sids[i]
+            );
+            assert_eq!(dec.reason, "wrong_owner");
+            assert!(
+                !dec.redirect_to.contains("-headless.svc.cluster.local"),
+                "session #{i} redirect_to must NOT be namespace-less (vc-el0): {}",
+                dec.redirect_to
+            );
+        }
+
+        // ASSERTION 4: NO session was admitted to the room. Both the
+        // user-visible room_members list and the SFU member table must be
+        // empty for the room. If any session is admitted on a non-owner
+        // pod, the bot harness's per-pod participant-count gate breaks.
+        let sfu_members = chat_server
+            .send(SnapshotRoomMembers { room: room.clone() })
+            .await
+            .unwrap();
+        assert!(
+            sfu_members.map(|m| m.is_empty()).unwrap_or(true),
+            "SFU member table for redirected room must be empty"
+        );
+        let user_members = chat_server
+            .send(SnapshotRoomMembersList { room: room.clone() })
+            .await
+            .unwrap();
+        assert!(
+            user_members.map(|m| m.is_empty()).unwrap_or(true),
+            "room_members for redirected room must be empty"
+        );
+
+        std::env::remove_var("POD_NAME");
+        std::env::remove_var("STATEFULSET_REPLICAS");
+        std::env::remove_var("SFU_TRANSPORT_KIND");
+    }
+
+    // ==========================================================================
+    // vc-9eve: join-milestone crossing is driven off INTAKE, not room_members
+    // ==========================================================================
+
+    /// Build the three Arc<RwLock<..>> arguments `maybe_emit_join_milestone`
+    /// needs. None of these touch NATS — they're plain in-memory state.
+    type MilestoneArgs = (
+        Arc<RwLock<HashMap<SessionId, Recipient<Message>>>>,
+        Arc<RwLock<RoomState>>,
+        Arc<RwLock<SubscriptionStore>>,
+    );
+
+    fn milestone_args(room: &str) -> MilestoneArgs {
+        (
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(RoomState::new(room.to_string()))),
+            Arc::new(RwLock::new(SubscriptionStore::new())),
+        )
+    }
+
+    /// vc-9eve core invariant: a milestone fires (the watermark advances) when
+    /// the per-room INTAKE count crosses a milestone, even though
+    /// `member_count` stays at 0 — the registration-plateau failure mode that
+    /// the member_count-driven crossing (vc-xow8) could never SEE.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_milestone_fires_off_intake_when_members_plateau() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut chat = ChatServer::new(nats_client).await;
+        chat.sfu_config.milestones = Arc::from(vec![10u64, 50, 100]);
+
+        let room = "intake-plateau-room";
+        let (recv, state, subs) = milestone_args(room);
+
+        // member_count stays 0 throughout (registration is the bottleneck).
+        // join_attempts climbs to 9 — below the first milestone (10): no fire.
+        chat.maybe_emit_join_milestone(room, 1, 9, 0, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            None,
+            "no milestone crossed below the first threshold"
+        );
+
+        // join_attempts crosses 10 while members is still 0 — milestone fires.
+        chat.maybe_emit_join_milestone(room, 1, 10, 0, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10),
+            "watermark must advance off INTAKE even when members==0"
+        );
+
+        // Crossing two milestones in one step advances to the highest crossed.
+        chat.maybe_emit_join_milestone(room, 1, 100, 0, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(100),
+            "watermark advances to the highest milestone crossed"
+        );
+    }
+
+    /// vc-9eve exactly-once: re-invoking with the same (or lower) intake count
+    /// after a crossing must NOT re-fire — the watermark is monotonic.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_milestone_exactly_once_per_room_off_intake() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        let mut chat = ChatServer::new(nats_client).await;
+        chat.sfu_config.milestones = Arc::from(vec![10u64]);
+
+        let room = "exactly-once-room";
+        let (recv, state, subs) = milestone_args(room);
+
+        chat.maybe_emit_join_milestone(room, 1, 10, 5, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10)
+        );
+
+        // Same intake count again (idempotent re-entry) — watermark unchanged.
+        chat.maybe_emit_join_milestone(room, 1, 10, 5, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10),
+            "re-invocation at the same intake count must not re-fire"
+        );
+
+        // A drop in intake (cannot really happen, but the guard must hold).
+        chat.maybe_emit_join_milestone(room, 1, 8, 5, &recv, &state, &subs);
+        assert_eq!(
+            chat.sfu_join_milestone_watermark.get(room).copied(),
+            Some(10),
+            "watermark only moves up"
+        );
     }
 }

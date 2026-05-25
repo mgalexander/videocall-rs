@@ -16,6 +16,9 @@ nats:
       memStore:
         enabled: true
         maxSize: 512Mi
+    # See helm/global/us-east/nats/values.yaml for the rollout sequence.
+    # Both regions MUST be flipped together (NATS supercluster); a one-
+    # sided flip breaks the cross-region gateway in unpredictable ways.
     auth:
       enabled: false
     resources:

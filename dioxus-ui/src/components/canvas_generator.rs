@@ -247,6 +247,8 @@ pub fn generate_for_peer(
         let div_id_mobile = (*peer_video_div_id).clone();
         let pv_canvas_crop = key.clone();
         let key_clone = key.clone();
+        let split_pin_client = client.clone();
+        let split_pin_key = key.clone();
         let peer_display_name_vo = peer_display_name.clone();
         let title_vo = if is_host {
             format!("Host: {peer_user_id}")
@@ -269,7 +271,9 @@ pub fn generate_for_peer(
                     class: "{grid_class}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
-                            toggle_pinned_div(&div_id_mobile);
+                            if let Some(new_state) = toggle_pinned_div(&div_id_mobile) {
+                                split_pin_client.set_peer_pinned(&split_pin_key, new_state);
+                            }
                         }
                     },
                     if is_video_enabled_for_peer {
@@ -316,6 +320,10 @@ pub fn generate_for_peer(
         let div_id_pin = (*peer_video_div_id).clone();
         let canvas_id_crop = key.clone();
         let key_clone = key.clone();
+        let fb_pin_client_mobile = client.clone();
+        let fb_pin_key_mobile = key.clone();
+        let fb_pin_client_btn = client.clone();
+        let fb_pin_key_btn = key.clone();
         let peer_display_name_fb = peer_display_name.clone();
         let title = if is_host {
             format!("Host: {peer_user_id}")
@@ -335,7 +343,10 @@ pub fn generate_for_peer(
                     class: "{full_bleed_class}",
                     onclick: move |_| {
                         if is_mobile_viewport() {
-                            toggle_pinned_div(&div_id_mobile);
+                            if let Some(new_state) = toggle_pinned_div(&div_id_mobile) {
+                                fb_pin_client_mobile
+                                    .set_peer_pinned(&fb_pin_key_mobile, new_state);
+                            }
                         }
                     },
                     if is_video_enabled_for_peer {
@@ -370,7 +381,11 @@ pub fn generate_for_peer(
                         CropIcon {}
                     }
                     button {
-                        onclick: move |_| toggle_pinned_div(&div_id_pin),
+                        onclick: move |_| {
+                            if let Some(new_state) = toggle_pinned_div(&div_id_pin) {
+                                fb_pin_client_btn.set_peer_pinned(&fb_pin_key_btn, new_state);
+                            }
+                        },
                         class: "pin-icon",
                         PushPinIcon {}
                     }
@@ -403,6 +418,17 @@ pub fn generate_for_peer(
     let pv_div_pin = (*peer_video_div_id).clone();
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
+    // Per-callsite clones for the pin-state plumbing. The four buttons
+    // (screen-share mobile/button + peer-video mobile/button) all need their
+    // own move closure capture, so we pre-clone here for readability.
+    let ss_pin_client_mobile = client.clone();
+    let ss_pin_key_mobile = key.clone();
+    let ss_pin_client_btn = client.clone();
+    let ss_pin_key_btn = key.clone();
+    let pv_pin_client_mobile = client.clone();
+    let pv_pin_key_mobile = key.clone();
+    let pv_pin_client_btn = client.clone();
+    let pv_pin_key_btn = key.clone();
     let peer_display_name_grid = peer_display_name.clone();
     let title_grid = if is_host {
         format!("Host: {peer_user_id}")
@@ -420,7 +446,10 @@ pub fn generate_for_peer(
                     class: "canvas-container video-on",
                     onclick: move |_| {
                         if is_mobile_viewport() {
-                            toggle_pinned_div(&ss_div_mobile);
+                            if let Some(new_state) = toggle_pinned_div(&ss_div_mobile) {
+                                ss_pin_client_mobile
+                                    .set_peer_pinned(&ss_pin_key_mobile, new_state);
+                            }
                         }
                     },
                     ScreenCanvas { peer_id: key.clone() }
@@ -436,7 +465,11 @@ pub fn generate_for_peer(
                         CropIcon {}
                     }
                     button {
-                        onclick: move |_| toggle_pinned_div(&ss_div_pin),
+                        onclick: move |_| {
+                            if let Some(new_state) = toggle_pinned_div(&ss_div_pin) {
+                                ss_pin_client_btn.set_peer_pinned(&ss_pin_key_btn, new_state);
+                            }
+                        },
                         class: "pin-icon",
                         PushPinIcon {}
                     }
@@ -460,7 +493,10 @@ pub fn generate_for_peer(
                         class: "{grid_class}",
                         onclick: move |_| {
                             if is_mobile_viewport() {
-                                toggle_pinned_div(&pv_div_mobile);
+                                if let Some(new_state) = toggle_pinned_div(&pv_div_mobile) {
+                                    pv_pin_client_mobile
+                                        .set_peer_pinned(&pv_pin_key_mobile, new_state);
+                                }
                             }
                         },
                         if is_video_enabled_for_peer {
@@ -491,7 +527,11 @@ pub fn generate_for_peer(
                             CropIcon {}
                         }
                         button {
-                            onclick: move |_| toggle_pinned_div(&pv_div_pin),
+                            onclick: move |_| {
+                                if let Some(new_state) = toggle_pinned_div(&pv_div_pin) {
+                                    pv_pin_client_btn.set_peer_pinned(&pv_pin_key_btn, new_state);
+                                }
+                            },
                             class: "pin-icon",
                             PushPinIcon {}
                         }
@@ -652,16 +692,24 @@ fn ScreenCanvas(peer_id: String) -> Element {
     }
 }
 
-fn toggle_pinned_div(div_id: &str) {
-    if let Some(div) = window()
+/// Toggle the pinned CSS class on `div_id` and return the new pinned state.
+/// Returns `None` if the element wasn't found.
+///
+/// The boolean is used to drive the SFU-side `SubscriptionUpdate.pinned_sessions`
+/// list — callers that have a `VideoCallClient` should pair this with
+/// `client.set_peer_pinned(peer_id, new_state)` so the server learns which
+/// peers this receiver wants to prioritize.
+fn toggle_pinned_div(div_id: &str) -> Option<bool> {
+    let div = window()
         .and_then(|w| w.document())
-        .and_then(|doc| doc.get_element_by_id(div_id))
-    {
-        if !div.class_list().contains("grid-item-pinned") {
-            div.class_list().add_1("grid-item-pinned").unwrap();
-        } else {
-            div.class_list().remove_1("grid-item-pinned").unwrap();
-        }
+        .and_then(|doc| doc.get_element_by_id(div_id))?;
+    let was_pinned = div.class_list().contains("grid-item-pinned");
+    if was_pinned {
+        div.class_list().remove_1("grid-item-pinned").ok()?;
+        Some(false)
+    } else {
+        div.class_list().add_1("grid-item-pinned").ok()?;
+        Some(true)
     }
 }
 

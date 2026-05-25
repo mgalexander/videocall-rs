@@ -74,3 +74,11 @@ e2e/playwright-report/**
 e2e/node_modules
 e2e/node_modules/**	
 .claude/worktrees/
+
+# gastown polecat worktrees
+.worktrees/
+
+# gastown materialise state (bead-id map; per-environment)
+sfu-update/.materialize-state.json
+sfu-update/.materialize-state.ops.json
+.claude/scheduled_tasks.lock

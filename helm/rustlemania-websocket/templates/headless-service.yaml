@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: websocket-headless
+  labels:
+    {{- include "rustlemania.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Publish per-pod DNS A records even before the pod is Ready so that
+  # ADMISSION_DECISION{REDIRECT} targets resolve during reconnection/spillover
+  # waves (when the target pod may still be becoming Ready). Without this the
+  # per-pod record is withheld until Ready and the redirect bounces.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "rustlemania.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: websocket
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

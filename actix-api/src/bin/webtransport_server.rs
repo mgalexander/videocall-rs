@@ -18,43 +18,181 @@
 
 use std::net::ToSocketAddrs;
 
-use actix::Actor;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
 
-use sec_api::actors::chat_server::ChatServer;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
+use sec_api::sfu::{SfuConfig, SfuMode};
 use sec_api::version;
 use sec_api::webtransport::{self, Certs};
 
+/// vc-zf8k (Bead B-b) + vc-m7k6: forwarding-liveness + inbound-saturation-aware
+/// health endpoint.
+///
+/// Returns 200 when the SFU is forwarding in steady state OR when it is
+/// idle/empty (nothing to forward). Returns 503 when forwarding SHOULD be
+/// happening (a room with receivers + publishers was observed within the
+/// threshold) AND EITHER no forward has happened within the threshold (the
+/// vc-zf8k "forwarding-dead zombie") OR inbound is being dropped right now (the
+/// vc-m7k6 invisible-saturation case, which the silence path is blind to). The
+/// decision reuses the vc-9eh liveness semantics via
+/// [`sec_api::sfu::forwarding_health::combined_health_decision`].
 async fn health_responder() -> impl Responder {
-    HttpResponse::Ok().body("Ok")
+    use sec_api::sfu::forwarding_health::{
+        combined_health_decision, forwarding_silence_threshold, global,
+        inbound_saturation_threshold, now_millis, HealthStatus,
+    };
+    let snap = global().snapshot();
+    // vc-m7k6: the combined decision reports 503 on EITHER forwarding-silence
+    // (vc-zf8k) OR inbound saturation — a dispatcher whose inbound is being
+    // dropped right now while receivers are present, which the silence path is
+    // structurally blind to (async-nats keeps the subscription open so
+    // `last_forward_ms` keeps advancing). Both arms gate on a recent
+    // should-forward observation, so an idle/quiet pod is never falsely 503'd.
+    let status = combined_health_decision(
+        now_millis(),
+        snap,
+        forwarding_silence_threshold(),
+        inbound_saturation_threshold(),
+    );
+    match status {
+        HealthStatus::Healthy => HttpResponse::Ok().body("Ok"),
+        HealthStatus::ForwardingStalled => {
+            error!(
+                last_forward_ms = snap.last_forward_ms,
+                last_should_forward_ms = snap.last_should_forward_ms,
+                last_inbound_drop_ms = snap.last_inbound_drop_ms,
+                "/healthz: forwarding stalled OR inbound saturated while \
+                 receivers+publishers present — reporting 503 so the liveness \
+                 probe can restart the pod"
+            );
+            HttpResponse::ServiceUnavailable().body("forwarding stalled")
+        }
+    }
+}
+
+/// vc-zf8k (Bead B-a): install the fail-fast panic hook.
+///
+/// Installed FIRST in `main`, before any task is spawned, so a panic on ANY
+/// thread/task (per-session bridge writer, per-room dispatcher, health server,
+/// runtime driver) terminates the WHOLE process. tokio's default behavior only
+/// unwinds the panicking task, which is exactly how the
+/// DEFECT-JOINHANDLE-PANIC zombie arose: forwarding tasks died, but the
+/// process and the health server survived with a static 200 `/healthz` and 0
+/// k8s restarts. We chain to the existing default hook so the panic message,
+/// location, and backtrace are still printed, THEN `std::process::abort()` to
+/// crash non-zero so k8s restarts the pod and forwarding recovers.
+///
+/// We use an explicit hook rather than `panic = "abort"` in the Cargo profile
+/// so unit/integration tests that intentionally panic-and-catch (e.g.
+/// `#[should_panic]`, `catch_unwind`) are unaffected — the hook only runs in
+/// this binary's process.
+fn install_fail_fast_panic_hook() {
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Print the standard panic message/location/backtrace first.
+        default_panic_hook(panic_info);
+        // Also surface via tracing for log aggregation, then crash the process.
+        error!(
+            "FATAL: panic in SFU process — aborting so k8s restarts the pod and \
+             forwarding recovers: {}",
+            panic_info
+        );
+        std::process::abort();
+    }));
 }
 
 #[actix_rt::main]
 async fn main() {
+    install_fail_fast_panic_hook();
+
+    // vc-zf8k (Bead B-a): the panic-hook self-test re-execs THIS binary with
+    // `SFU_PANIC_HOOK_SELFTEST=1` set, expecting the hook to abort the process.
+    // Trigger the panic AFTER the hook is installed and return; the integration
+    // test asserts the abnormal (SIGABRT) exit. No-op in normal operation.
+    if std::env::var_os("SFU_PANIC_HOOK_SELFTEST").is_some() {
+        panic!("forwarding-task panic (panic-hook self-test)");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
         .with_writer(std::io::stderr)
         .init();
 
+    // vc-8wd: arm targeted SFU tracing from SFU_TRACE_ROOM/SESSION (read
+    // once). No-op when unset, which is the default.
+    sec_api::sfu::trace::init();
+
     info!("Starting WebTransport server with actor-based session handling");
 
-    // Connect to NATS
+    // SFU_TRANSPORT_KIND identifies this binary's transport family for the
+    // wave-3 ADMISSION_DECISION{REDIRECT} DNS template (bead vc-8oa / p6-5).
+    // Set unconditionally at startup so the JoinRoom handler doesn't have to
+    // care which binary it's hosted in; the chart can override this for
+    // non-standard deployments.
+    if std::env::var_os("SFU_TRANSPORT_KIND").is_none() {
+        std::env::set_var("SFU_TRANSPORT_KIND", "webtransport");
+    }
+
+    let pod_name = std::env::var("POD_NAME").ok();
+    let self_ordinal = sec_api::sfu::affinity::self_ordinal_from_env();
+    let replicas = sec_api::sfu::affinity::replicas_from_env();
+    info!(
+        pod_name = ?pod_name,
+        replicas,
+        self_ordinal = ?self_ordinal,
+        "affinity init"
+    );
+    // p6-5 follow-up: surface a misconfigured POD_NAME at startup rather
+    // than letting the JoinRoom handler silently skip redirects on every
+    // join. `self_ordinal_from_env()` returns `None` ONLY when POD_NAME
+    // is set but cannot be parsed as `<name>-<u32>`.
+    if pod_name.is_some() && self_ordinal.is_none() {
+        tracing::warn!(
+            pod_name = ?pod_name,
+            "POD_NAME is set but the trailing ordinal could not be parsed; \
+             room→pod affinity redirects will be DISABLED for this pod. \
+             Expected form: <statefulset>-<ordinal>, e.g. \
+             rustlemania-webtransport-0"
+        );
+    }
+
+    let sfu_config = SfuConfig::from_env();
+    info!("sfu mode: {}", sfu_config.mode);
+    if sfu_config.mode == SfuMode::Sfu {
+        info!("sfu mode active (no-op shim)");
+    }
+
+    // Connect to NATS. Auth/TLS posture is driven by the NATS_USER /
+    // NATS_PASSWORD / NATS_TLS / NATS_TLS_CA env vars; see
+    // `nats_connect` module + sfu-update/audits/nats-acl-audit.md.
     let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
-    let nats_client = async_nats::ConnectOptions::new()
-        .require_tls(false)
-        .ping_interval(std::time::Duration::from_secs(10))
-        .connect(&nats_url)
+    let nats_client = sec_api::nats_connect::connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
     info!("Connected to NATS at {}", nats_url);
 
-    // Start ChatServer actor
-    let chat_server = ChatServer::new(nats_client.clone()).await.start();
-    info!("ChatServer actor started");
+    // Start the ChatServer shard pool (bead vc-8txq).
+    //
+    // The pool spawns SFU_CHATSERVER_SHARDS `ChatServer` actors (default:
+    // available_parallelism), each on its own Arbiter thread, and partitions
+    // rooms across them by jump-hash so JoinRoom handling parallelises across
+    // cores. The shared connection-state handle (vc-ud6o E3) is owned by the
+    // pool and threaded through `webtransport::start` so each `SessionLogic`
+    // can read the `Active` gate off-actor.
+    let chat_pool = sec_api::actors::chat_server::ChatServerPool::new(
+        nats_client.clone(),
+        sfu_config.chatserver_shards,
+        sfu_config.fanout_worker_threads,
+    )
+    .await;
+    let connection_states = chat_pool.connection_states_handle();
+    info!(
+        "ChatServerPool started with {} shard(s)",
+        chat_pool.shard_count()
+    );
 
     // Create SessionManager
     let session_manager = SessionManager::new();
@@ -122,10 +260,11 @@ async fn main() {
     let _ = actix_rt::spawn(async move {
         if let Err(e) = webtransport::start(
             opt,
-            chat_server,
+            chat_pool,
             nats_client,
             tracker_sender,
             session_manager,
+            connection_states,
         )
         .await
         {

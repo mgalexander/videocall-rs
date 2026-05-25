@@ -18,6 +18,7 @@ tokio = { version = "1.28.1", features = ["full"] }
 web-transport-quinn = { workspace = true }
 futures = "0.3.16"
 videocall-types = { path= "../videocall-types", version = "5.0.0" }
+videocall-codecs = { path = "../videocall-codecs", features = ["native"] }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"
@@ -34,6 +35,8 @@ env-libvpx-sys = { version = "5.1.3", features = ["generate"] }  # VP9 encoding 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 
 # Logging
 tracing = "0.1.37"
@@ -41,3 +44,27 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1.0"
+
+# Integrity trailer CRC (vc-1re). Already in the workspace lockfile; pinned
+# here as a direct dep so the bot's `--verify-integrity` path can recompute
+# CRC32 over the codec payload without relying on a transitive-only crate.
+crc32fast = "1.5"
+
+[dev-dependencies]
+# vc-k4w: the redirect-follow end-to-end test stands up an in-process
+# `web-transport-quinn` server that needs a TLS certificate. rcgen generates a
+# throwaway self-signed cert at test time; rustls-pki-types names the
+# CertificateDer / PrivateKeyDer the server builder consumes. Both are already
+# in the workspace lockfile (transitive deps of web-transport-quinn / rustls),
+# so this adds no new resolved crates — only makes them nameable from the
+# bot's test code.
+rcgen = "0.13"
+rustls-pki-types = "1"
+# Needed to install a process-default rustls CryptoProvider before standing up
+# the in-process web-transport-quinn server/client in the redirect-follow test
+# (web-transport-quinn does not enable a provider feature itself, so without
+# this the rustls ConfigBuilder panics with "CryptoProvider::set_default() must
+# be called"). Matches actix-api's `rustls = { version = "0.23", features =
+# ["ring"] }`.
+rustls = { version = "0.23", features = ["ring"] }
+web-transport-quinn = { workspace = true }

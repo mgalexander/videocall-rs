@@ -1,0 +1,88 @@
+# Local k3d overlay for helm/rustlemania-websocket.
+#
+# Differences from helm/rustlemania-websocket/values.yaml (production):
+#   - image points at the local k3d registry (localhost:5000) with the
+#     :dev tag built by helm/local/up.sh from Dockerfile.actix.
+#   - pullPolicy: IfNotPresent because images are side-loaded via
+#     `k3d image import`.
+#   - env block overridden in full to point UI_ENDPOINT at the local UI
+#     host. NATS_USER/PASSWORD are wired via secretKeyRef into
+#     nats-credentials WITHOUT `optional: true` (unlike production) —
+#     the local NATS server always has auth enabled, so a missing
+#     Secret must be a hard pod-start failure, not silent no-auth.
+#     See bead vco-757.
+#   - ingress targets ws.videocall.local with local-selfsigned.
+
+image:
+  repository: localhost:5000/videocall-media-server
+  pullPolicy: IfNotPresent
+  tag: dev
+
+env:
+  - name: RUST_LOG
+    value: info
+  # Disable tracing-subscriber ANSI colorization (see meeting-api
+  # values-local.yaml header / bead vco-gek). kubectl logs streams the
+  # raw bytes; color escapes broke validate-app.sh's auth="on" match.
+  - name: NO_COLOR
+    value: "1"
+  # Local stack runs SFU_MODE=sfu to exercise the new forwarder
+  # plumbing (P2 landed pass-through semantics; behavior should be
+  # observationally equivalent to legacy). Production overlays leave
+  # SFU_MODE unset (defaults to legacy). Per PLAN.md operating model:
+  # "the local stack should be the SFU testing ground."
+  - name: SFU_MODE
+    value: sfu
+  - name: ACTIX_PORT
+    value: "8080"
+  - name: UI_ENDPOINT
+    value: https://app.videocall.local
+  - name: NATS_URL
+    value: nats:4222
+  - name: TOKIO_WORKER_THREADS
+    value: "1"
+  - name: JWT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: jwt-secret
+        key: secret
+  # NATS_USER/PASSWORD: NOT optional in the local overlay — the local
+  # NATS server always runs with auth enabled. See header comment.
+  - name: NATS_USER
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: user
+  - name: NATS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: nats-credentials
+        key: password
+  - name: NATS_TLS
+    value: "false"
+  - name: NATS_TLS_CA
+    value: ""
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    # NOTE: cluster-issuer, NOT issuer (see meeting-api values-local.yaml).
+    cert-manager.io/cluster-issuer: local-selfsigned
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Explicitly drop the production annotations (Helm merges maps).
+    cert-manager.io/issuer: null
+    kubernetes.io/tls-acme: null
+  hosts:
+    - host: ws.videocall.local
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: rustlemania-websocket
+            port:
+              number: 8080
+  tls:
+    - secretName: rustlemania-websocket-local-tls
+      hosts:
+        - ws.videocall.local

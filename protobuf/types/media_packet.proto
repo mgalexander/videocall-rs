@@ -19,6 +19,17 @@ message MediaPacket {
   AudioMetadata audio_metadata = 7;
   VideoMetadata video_metadata = 8;
   HeartbeatMetadata heartbeat_metadata = 9;
+  optional RoutingHeader routing_header = 10;
+}
+
+message RoutingHeader {
+  bool is_keyframe = 1;
+  uint32 temporal_layer_id = 2;       // 0=base, 1..N=enhancement
+  uint32 spatial_layer_id = 3;        // 0=base, 1..N=enhancement
+  float audio_level = 4;              // 0..1 RMS, AUDIO only
+  bool is_speaking = 5;               // VAD/threshold hint
+  uint32 frame_marker = 6;            // bitfield: START_OF_FRAME=1, END_OF_FRAME=2, REFERENCES_T0=4
+  uint64 picture_id = 7;              // for SVC dependency tracking
 }
 
 message AudioMetadata {
