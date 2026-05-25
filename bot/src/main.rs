@@ -18,29 +18,275 @@
 
 mod audio_producer;
 mod config;
+mod failover;
+mod integrity;
+mod orchestrate;
+mod stats;
 mod video_encoder; // VP9 encoder from videocall-cli
 mod video_producer;
 mod webtransport_client;
 
-use audio_producer::AudioProducer;
-use config::{BotConfig, ClientConfig};
-// Removed unused Arc import
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
+
+use audio_producer::AudioProducer;
+use clap::Parser;
+use config::{BotConfig, ClientConfig};
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{error, info, warn};
 use video_producer::VideoProducer;
 use webtransport_client::WebTransportClient;
 
+use crate::failover::FailoverConfig;
+use crate::orchestrate::OrchestrationConfig;
+
+/// CLI for the videocall bot.
+///
+/// Two modes are supported:
+///
+/// 1. **Single-bot / config-file mode (default)**: when `--orchestrate` is
+///    not passed, the bot loads its YAML config (via `BOT_CONFIG_PATH`) or
+///    falls back to environment variables, then spawns one or more clients
+///    that publish forever until ctrl-c.
+///
+/// 2. **Load-test orchestration mode**: when `--orchestrate` is passed,
+///    spawns `--senders` publishing bots and `--listeners` subscribe-only
+///    bots in `--room` against `--server-url` for `--duration` seconds,
+///    then emits an aggregate JSON summary on stdout and exits.
+#[derive(Parser, Debug)]
+#[command(name = "bot", author, version, about = "Videocall load-test bot")]
+struct Cli {
+    /// Enable load-test orchestration mode. Requires `--room`, `--senders`,
+    /// `--listeners`, `--duration`, and `--server-url`.
+    #[arg(long)]
+    orchestrate: bool,
+
+    /// Room (meeting id) every spawned bot joins. Orchestration mode only.
+    #[arg(long)]
+    room: Option<String>,
+
+    /// Number of publishing bots (video + audio). Orchestration mode only.
+    #[arg(long)]
+    senders: Option<usize>,
+
+    /// Number of subscribe-only bots. Orchestration mode only.
+    #[arg(long)]
+    listeners: Option<usize>,
+
+    /// Duration of the load test in seconds. Orchestration mode only.
+    #[arg(long)]
+    duration: Option<u64>,
+
+    /// WebTransport server URL (e.g. `https://host:port`). Orchestration mode
+    /// only; the lobby/room path is appended automatically.
+    #[arg(long)]
+    server_url: Option<String>,
+
+    /// Skip TLS certificate verification. Orchestration mode only.
+    #[arg(long, default_value_t = false)]
+    insecure: bool,
+
+    /// Path to the WAV file senders should publish.
+    #[arg(long, default_value = "BundyBests2.wav")]
+    audio_path: String,
+
+    /// Directory containing the JPEG sequence senders should publish.
+    #[arg(long, default_value = ".")]
+    image_dir: String,
+
+    /// Failover-test orchestration mode (bead vc-607 / p6-11). Requires the
+    /// same flags as `--orchestrate` (`--room`, `--senders`, `--listeners`,
+    /// `--duration`, `--server-url`), but additionally wraps each listener
+    /// in a reconnect loop so per-listener downtime can be measured across
+    /// an SFU pod kill. Mutually exclusive with `--orchestrate`.
+    #[arg(long)]
+    failover_test: bool,
+
+    /// Reconnect interval (milliseconds) inside the failover-test listener
+    /// loop. Defaults to 500ms. Tuned to be small enough that the recovery
+    /// window dominates downtime measurement, but not so small that we
+    /// hammer the LB during the kill window.
+    #[arg(long, default_value_t = 500)]
+    reconnect_interval_ms: u64,
+
+    /// String prefix prepended to every generated user_id. Used to shard
+    /// multiple driver invocations against the same room without colliding
+    /// user IDs (e.g. `--user-id-prefix=us-east-`). Applies to both
+    /// `--orchestrate` and `--failover-test` modes; ignored in single-bot
+    /// mode. Default: empty string (unchanged behavior).
+    #[arg(long, default_value = "")]
+    user_id_prefix: String,
+
+    /// Non-negative integer added to the bot index when forming the
+    /// generated user_id. Used together with `--user-id-prefix` to shard
+    /// across drivers (e.g. `--index-offset=100` makes a driver's first
+    /// sender `sender-100`). Applies to both `--orchestrate` and
+    /// `--failover-test` modes; ignored in single-bot mode. Default: 0.
+    #[arg(long, default_value_t = 0)]
+    index_offset: usize,
+
+    /// Enable byte-fidelity integrity verification (vc-1re). When set, sender
+    /// bots append a `[magic][seq][crc32]` trailer to each codec payload and
+    /// listener bots strip + verify it, populating the `crc_mismatches`,
+    /// `media_seq_max`, `media_received_distinct`, and `unexplained_gaps`
+    /// counters. Off by default so ordinary capacity runs stay byte-for-byte
+    /// identical to baseline traffic. Applies to `--orchestrate` and
+    /// `--failover-test`; ignored in single-bot mode.
+    #[arg(long, default_value_t = false)]
+    verify_integrity: bool,
+
+    /// vc-9d2t: make listener bots skip the expensive VP9/Opus codec decode
+    /// while still doing everything else on the receive path — connect,
+    /// subscribe, accept_uni, read_to_end, the media-vs-control packet split,
+    /// integrity trailer CRC strip+verify (with `--verify-integrity`), and the
+    /// per-publisher sequence-gap tracking. Use this for high-scale (10k) SFU
+    /// egress load/soak tests: a 100-listener pod then costs ~0.1-0.3 CPU
+    /// instead of ~2.5, so a single pod can host far more synthetic egress
+    /// receivers. Decode correctness is verified separately by small probe
+    /// cohorts run with this flag OFF. `video_frames_decoded` /
+    /// `audio_frames_decoded` are 0 by design in this mode; all other counters
+    /// (packets_received, media/control split, crc_mismatches,
+    /// unexplained_gaps) still populate. Off by default (listeners decode —
+    /// unchanged baseline). Senders are unaffected. Applies to `--orchestrate`.
+    #[arg(long, default_value_t = false)]
+    listener_no_decode: bool,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    // Initialize logging. The orchestration mode writes its JSON summary to
+    // stdout, so logs are intentionally left on stderr (tracing-subscriber
+    // default).
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
 
-    info!("Starting videocall synthetic client bot");
+    let cli = Cli::parse();
 
+    if cli.orchestrate && cli.failover_test {
+        return Err(anyhow::anyhow!(
+            "--orchestrate and --failover-test are mutually exclusive"
+        ));
+    }
+
+    if cli.failover_test {
+        let cfg = build_failover_config(cli)?;
+        return failover::run(cfg).await;
+    }
+
+    if cli.orchestrate {
+        let cfg = build_orchestration_config(cli)?;
+        return orchestrate::run(cfg).await;
+    }
+
+    if !cli.user_id_prefix.is_empty() || cli.index_offset != 0 {
+        warn!(
+            "--user-id-prefix / --index-offset are ignored in single-bot mode; \
+             they only affect --orchestrate and --failover-test runs"
+        );
+    }
+
+    if cli.listener_no_decode {
+        warn!("--listener-no-decode is ignored in single-bot mode; it only affects --orchestrate");
+    }
+
+    info!("Starting videocall synthetic client bot (single-bot mode)");
+    run_single_bot_mode().await
+}
+
+fn build_failover_config(cli: Cli) -> anyhow::Result<FailoverConfig> {
+    let room = cli
+        .room
+        .ok_or_else(|| anyhow::anyhow!("--room is required in --failover-test mode"))?;
+    let senders = cli
+        .senders
+        .ok_or_else(|| anyhow::anyhow!("--senders is required in --failover-test mode"))?;
+    let listeners = cli
+        .listeners
+        .ok_or_else(|| anyhow::anyhow!("--listeners is required in --failover-test mode"))?;
+    let duration_s = cli
+        .duration
+        .ok_or_else(|| anyhow::anyhow!("--duration is required in --failover-test mode"))?;
+    let server_url = cli
+        .server_url
+        .ok_or_else(|| anyhow::anyhow!("--server-url is required in --failover-test mode"))?;
+
+    if listeners == 0 {
+        return Err(anyhow::anyhow!(
+            "--listeners must be > 0 in --failover-test mode (downtime is measured on listeners)"
+        ));
+    }
+
+    // vc-9d2t: failover-test listeners already run with decode OFF, so
+    // `--listener-no-decode` is a no-op here. Warn rather than silently ignore.
+    if cli.listener_no_decode {
+        warn!(
+            "--listener-no-decode is ignored in --failover-test mode \
+             (those listeners already run without decode); it only affects --orchestrate"
+        );
+    }
+
+    Ok(FailoverConfig {
+        room,
+        senders,
+        listeners,
+        duration: Duration::from_secs(duration_s),
+        server_url: url::Url::parse(&server_url)
+            .map_err(|e| anyhow::anyhow!("Invalid --server-url: {e}"))?,
+        insecure: cli.insecure,
+        audio_path: cli.audio_path,
+        image_dir: cli.image_dir,
+        reconnect_interval: Duration::from_millis(cli.reconnect_interval_ms),
+        user_id_prefix: cli.user_id_prefix,
+        index_offset: cli.index_offset,
+        verify_integrity: cli.verify_integrity,
+    })
+}
+
+fn build_orchestration_config(cli: Cli) -> anyhow::Result<OrchestrationConfig> {
+    let room = cli
+        .room
+        .ok_or_else(|| anyhow::anyhow!("--room is required in --orchestrate mode"))?;
+    let senders = cli
+        .senders
+        .ok_or_else(|| anyhow::anyhow!("--senders is required in --orchestrate mode"))?;
+    let listeners = cli
+        .listeners
+        .ok_or_else(|| anyhow::anyhow!("--listeners is required in --orchestrate mode"))?;
+    let duration_s = cli
+        .duration
+        .ok_or_else(|| anyhow::anyhow!("--duration is required in --orchestrate mode"))?;
+    let server_url = cli
+        .server_url
+        .ok_or_else(|| anyhow::anyhow!("--server-url is required in --orchestrate mode"))?;
+
+    if senders == 0 && listeners == 0 {
+        return Err(anyhow::anyhow!(
+            "--senders and --listeners cannot both be zero"
+        ));
+    }
+
+    Ok(OrchestrationConfig {
+        room,
+        senders,
+        listeners,
+        duration: Duration::from_secs(duration_s),
+        server_url: url::Url::parse(&server_url)
+            .map_err(|e| anyhow::anyhow!("Invalid --server-url: {e}"))?,
+        insecure: cli.insecure,
+        audio_path: cli.audio_path,
+        image_dir: cli.image_dir,
+        user_id_prefix: cli.user_id_prefix,
+        index_offset: cli.index_offset,
+        verify_integrity: cli.verify_integrity,
+        listener_no_decode: cli.listener_no_decode,
+    })
+}
+
+async fn run_single_bot_mode() -> anyhow::Result<()> {
     // Load configuration
     let config = BotConfig::from_env_or_default()?;
     info!("Loaded configuration for {} clients", config.clients.len());
@@ -100,8 +346,14 @@ async fn run_client(
 ) -> anyhow::Result<()> {
     info!("Initializing client: {}", config.user_id);
 
+    // vc-7zjq: shared force-keyframe flag so the always-on inbound consumer
+    // can ask the video producer to emit a keyframe when an inbound
+    // KEYFRAME_REQUEST targets this bot.
+    let force_keyframe = Arc::new(AtomicBool::new(false));
+
     // Create WebTransport client and connect
-    let mut client = WebTransportClient::new(config.clone());
+    let mut client =
+        WebTransportClient::new(config.clone()).with_keyframe_signal(force_keyframe.clone());
     client.connect(&server_url, insecure).await?;
 
     // Create packet channel for media producers
@@ -120,6 +372,8 @@ async fn run_client(
             config.user_id.clone(),
             "BundyBests2.wav",
             packet_tx.clone(),
+            None,
+            false, // single-bot mode does not run integrity (vc-1re)
         ) {
             Ok(producer) => {
                 audio_producer = Some(producer);
@@ -141,6 +395,9 @@ async fn run_client(
             config.user_id.clone(),
             ".", // Images are in current directory (bot working dir)
             packet_tx.clone(),
+            None,
+            false, // single-bot mode does not run integrity (vc-1re)
+            force_keyframe.clone(),
         ) {
             Ok(producer) => {
                 video_producer = Some(producer);

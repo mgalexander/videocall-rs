@@ -21,14 +21,17 @@ use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+use crate::stats::BotStats;
 
 pub struct AudioProducer {
     #[allow(dead_code)]
@@ -42,14 +45,23 @@ impl AudioProducer {
         user_id: String,
         audio_data: Vec<f32>,
         packet_sender: Sender<Vec<u8>>,
+        stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<Self> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_clone = quit.clone();
         let user_id_clone = user_id.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                Self::audio_loop(user_id_clone, audio_data, packet_sender, quit_clone).await
+            if let Err(e) = Self::audio_loop(
+                user_id_clone,
+                audio_data,
+                packet_sender,
+                quit_clone,
+                stats,
+                verify_integrity,
+            )
+            .await
             {
                 error!("Audio producer error: {}", e);
             }
@@ -66,6 +78,8 @@ impl AudioProducer {
         user_id: String,
         wav_path: &str,
         packet_sender: Sender<Vec<u8>>,
+        stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<Self> {
         info!("Loading WAV file for {}: {}", user_id, wav_path);
 
@@ -110,7 +124,7 @@ impl AudioProducer {
             wav_samples.len() as f32 / sample_rate as f32 / channels as f32
         );
 
-        Self::new(user_id, wav_samples, packet_sender)
+        Self::new(user_id, wav_samples, packet_sender, stats, verify_integrity)
     }
 
     async fn audio_loop(
@@ -118,6 +132,8 @@ impl AudioProducer {
         audio_data: Vec<f32>,
         packet_sender: Sender<Vec<u8>>,
         quit: Arc<AtomicBool>,
+        stats: Option<Arc<BotStats>>,
+        verify_integrity: bool,
     ) -> anyhow::Result<()> {
         // Audio configuration - targeting 50fps (20ms packets)
         let sample_rate = 48000u32; // Standard Opus rate
@@ -160,6 +176,14 @@ impl AudioProducer {
                 Ok(bytes_written) => {
                     encoded.truncate(bytes_written);
 
+                    // vc-1re: append the integrity trailer to the codec
+                    // payload when verification is on. No RoutingHeader is
+                    // set (keeps the SFU on legacy passthrough). seq reuses
+                    // AudioMetadata.sequence semantics.
+                    if verify_integrity {
+                        crate::integrity::append_trailer(&mut encoded, sequence);
+                    }
+
                     // Create media packet
                     let media_packet = MediaPacket {
                         user_id: user_id_bytes.clone(),
@@ -183,10 +207,40 @@ impl AudioProducer {
                         ..Default::default()
                     };
 
-                    // Send packet
+                    // Send packet. The producer→sender mpsc channel is
+                    // bounded; the bot intentionally drops on overflow rather
+                    // than blocking the encoder (real-time-client semantics —
+                    // we'd rather skip a frame than build a latency backlog).
+                    // vc-xpf: account for the drop so the staircase test can
+                    // attribute "packets gone" to producer-queue overflow vs.
+                    // wire failure. The channel-full log is downgraded to
+                    // `debug!` because the counter is now the signal and a
+                    // sustained drop storm at 50fps × N bots would otherwise
+                    // flood the logs.
                     let packet_data = packet_wrapper.write_to_bytes()?;
-                    if let Err(e) = packet_sender.try_send(packet_data) {
-                        warn!("Failed to send audio packet for {}: {}", user_id, e);
+                    match packet_sender.try_send(packet_data) {
+                        Ok(()) => {
+                            if let Some(s) = &stats {
+                                s.record_tx_packet_enqueued();
+                            }
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            if let Some(s) = &stats {
+                                s.record_tx_drop_channel_full();
+                            }
+                            debug!(
+                                "audio producer dropped packet (channel full) for {}",
+                                user_id
+                            );
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            // Programming error / shutdown race: the consumer
+                            // is gone. Keep this loud — every subsequent send
+                            // will fail the same way until the producer is
+                            // stopped, so one warn per producer is fine.
+                            warn!("audio producer channel closed for {}; stopping", user_id);
+                            break;
+                        }
                     }
 
                     sequence += 1;
@@ -221,4 +275,62 @@ fn get_timestamp_ms() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::{BotRole, BotStats};
+    use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc;
+    use tokio::time::{sleep, Duration};
+
+    /// vc-xpf: With a tiny (capacity=1) producer→sender channel and no
+    /// drain on the receiving end, the audio producer will fill the queue
+    /// almost immediately and every subsequent `try_send` must increment
+    /// `tx_drops_channel_full`. The first send should succeed and bump
+    /// `tx_packets_enqueued`.
+    ///
+    /// We never `recv()` on the receiver — that's the whole point: we
+    /// simulate a stalled WebTransport writer and assert that the producer
+    /// drops loudly (via the counter) instead of silently.
+    #[tokio::test]
+    async fn audio_producer_records_channel_full_drops() {
+        // Small synthetic PCM buffer; the producer loops it so length only
+        // needs to cover one 20ms packet at 48 kHz mono.
+        let audio_data = vec![0.0f32; 48_000 / 50 * 4];
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        let stats = BotStats::new("sender-test".into(), BotRole::Sender);
+
+        let producer = AudioProducer::new(
+            "sender-test".into(),
+            audio_data,
+            tx,
+            Some(stats.clone()),
+            false,
+        )
+        .expect("construct audio producer");
+
+        // Producer is 50fps -> ~10 ticks in 200ms. Channel capacity is 1 and
+        // nobody is draining, so we expect 1 enqueue and the rest as
+        // channel-full drops. 200ms gives generous CI margin over the
+        // ~20ms tick cadence.
+        sleep(Duration::from_millis(200)).await;
+
+        // Take the counters BEFORE dropping the producer so we don't race
+        // with shutdown.
+        let enqueued = stats.tx_packets_enqueued.load(Ordering::Relaxed);
+        let dropped = stats.tx_drops_channel_full.load(Ordering::Relaxed);
+
+        drop(producer);
+
+        assert!(
+            enqueued >= 1,
+            "expected at least 1 enqueue in 100ms, got {enqueued}"
+        );
+        assert!(
+            dropped > 0,
+            "expected at least 1 channel-full drop with capacity=1 + no drain, got {dropped}"
+        );
+    }
 }

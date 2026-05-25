@@ -1,0 +1,58 @@
+syntax = "proto3";
+package videocall;
+
+// AdmissionDecision is server -> client signaling that conveys the outcome of
+// a room join request. Sent in the `data` field of a PacketWrapper whose
+// `packet_type == ADMISSION_DECISION`.
+//
+// Wave 1 (p3-13): emitted only when the soft cap is reached. Admitted joins
+// below the soft cap do NOT receive this packet (no behavioural change for
+// the common path). The "queued" status today is purely informational — the
+// joiner is still fully admitted to the room. Wave 3 will introduce the
+// actual queue/holding-room semantics.
+//
+// Wave 3 (p6-5): adds the REDIRECT status used when a client connects to the
+// wrong pod under jump-hash room→pod affinity. The owner pod (computed from
+// `STATEFULSET_REPLICAS` + jump_hash(room_id)) emits REDIRECT with a
+// `redirect_to` DNS hint pointing at the owning peer pod's headless service
+// FQDN and closes the connection. The client is expected to reconnect to the
+// hinted address. See sfu-update/PLAN.md wave-3 affinity migration.
+message AdmissionDecision {
+  enum Status {
+    STATUS_UNKNOWN = 0;
+    // Joiner is admitted to the room. Wave 1 only emits this status when the
+    // join occurred above the soft cap but below the hard cap (informational).
+    ADMITTED = 1;
+    // Joiner is admitted but flagged as being in the soft-cap zone. Reserved
+    // for future wave-3 holding-room semantics; in wave 1 the joiner IS in
+    // the room and receives media normally — `position` is informational.
+    QUEUED = 2;
+    // Joiner is rejected because the hard cap has been reached. The server
+    // closes the connection immediately after sending this packet.
+    REJECTED = 3;
+    // Joiner is being redirected to a different pod because this pod is not
+    // the room's jump-hash owner. The server sets `redirect_to` to the
+    // target pod's headless DNS and closes the connection after sending the
+    // packet. The client is expected to reconnect to `redirect_to`. Wave-3
+    // affinity migration (p6-5).
+    REDIRECT = 4;
+  }
+
+  Status status = 1;
+  // 1-based position within the soft-cap overflow zone. Only set for the
+  // QUEUED and REJECTED statuses. position = current_count - SOFT_CAP + 1,
+  // so a joiner attempting to enter a 195-member room gets position=1.
+  uint32 position = 2;
+  // Machine-readable reason code. Examples: "room_full" for REJECTED,
+  // "soft_cap_reached" for QUEUED, "wrong_owner" for REDIRECT. Empty for
+  // ADMITTED.
+  string reason = 3;
+  // Hint to the client for how long to wait before retrying (seconds).
+  // Only set for REJECTED. Zero means "no hint".
+  uint32 retry_after_secs = 4;
+  // Target pod headless DNS name. Set only for REDIRECT — format is
+  // `rustlemania-{transport}-{ordinal}.{transport}-headless.svc.cluster.local`,
+  // no port (the client reuses its current port). Empty for all other
+  // statuses.
+  string redirect_to = 5;
+}

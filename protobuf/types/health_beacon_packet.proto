@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package videocall;
+
+// HealthBeaconPacket — owner-pod liveness signal for the SFU spillover
+// controller (P6 wave-2 bead vc-kol / p6-7).
+//
+// The owner pod for a given room (determined by `affinity::is_owner`)
+// publishes one of these every 5 seconds to `room.{room_id}.system`
+// wrapped in a PacketWrapper with `packet_type = HEALTH_BEACON` and
+// `user_id = SYSTEM_USER_ID`. Spill pods (p6-8) consume the beacon
+// stream to decide whether to accept additional joiners for the room.
+//
+// All fields are small primitives — keep the payload tiny so beacons
+// stay cheap at fleet scale (many rooms × 0.2 Hz cadence).
+message HealthBeaconPacket {
+  // Field 1 previously held a redundant `room_id` string. The room id
+  // is already encoded in the NATS subject (`room.{room_id}.system`),
+  // so embedding a 36-byte UUID per beacon doubled wire size for no
+  // benefit. Reserve to prevent accidental reuse (vc-4le).
+  reserved 1;
+  reserved "room_id";
+
+  // Number of members currently tracked in the owner pod's RoomState
+  // (senders + observers). Drives the participant soft-cap check.
+  uint32 participant_count = 2;
+
+  // Estimated CPU load on the emitting pod, normalised to `[0, 1]`.
+  // Currently sourced from `/proc/loadavg` 1-min average divided by
+  // online CPU count on Linux; falls back to 0.0 if the read fails.
+  // 0..1 is the contract the consumer relies on for the soft-cap check.
+  float cpu_load = 3;
+
+  // Owner pod's wall-clock time at the moment the beacon was assembled,
+  // expressed as UNIX milliseconds. Lets the consumer estimate the age
+  // of a beacon against its own clock (and detect stalled emitters).
+  uint64 reported_at_ms = 4;
+}

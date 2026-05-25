@@ -150,7 +150,21 @@ impl VideoEncoder {
         Ok(())
     }
 
-    pub fn encode(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
+    /// Encode one I420 source frame.
+    ///
+    /// When `force_keyframe` is `true`, `VPX_EFLAG_FORCE_KF` is OR-ed into the
+    /// libvpx encode flags so the next emitted frame is a keyframe regardless
+    /// of the periodic `kf_max_dist` cadence. The bot uses this to honor an
+    /// inbound `KEYFRAME_REQUEST` from a mid-stream-joining listener (vc-7zjq):
+    /// without it, a mid-stream joiner has to wait up to `kf_max_dist` frames
+    /// for the next periodic keyframe, which under backpressure may itself be
+    /// dropped, leaving the joiner with an undecodable GOP indefinitely.
+    pub fn encode(
+        &mut self,
+        pts: i64,
+        data: &[u8],
+        force_keyframe: bool,
+    ) -> anyhow::Result<Frames<'_>> {
         let image = MaybeUninit::zeroed();
         let mut image = unsafe { image.assume_init() };
 
@@ -163,7 +177,15 @@ impl VideoEncoder {
             data.as_ptr() as _,
         ));
 
-        let flags: i64 = 0;
+        // `VPX_EFLAG_FORCE_KF` forces this encode to emit a keyframe. We keep
+        // the periodic `kf_max_dist=150` cadence as the always-on fallback
+        // (vc-7zjq fix spec item 3); this flag is purely additive and only set
+        // when an inbound KEYFRAME_REQUEST targeted at us was observed.
+        let flags: i64 = if force_keyframe {
+            VPX_EFLAG_FORCE_KF as i64
+        } else {
+            0
+        };
 
         vpx!(vpx_codec_encode(
             &mut self.ctx,
@@ -221,3 +243,57 @@ impl<'a> Iterator for Frames<'a> {
 
 unsafe impl Send for VideoEncoder {}
 unsafe impl Sync for VideoEncoder {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a small encoder and feed it solid-grey I420 frames.
+    fn solid_i420(width: u32, height: u32) -> Vec<u8> {
+        // I420: full-res Y plane + quarter-res U/V planes. 0x80 is neutral.
+        vec![0x80u8; (width * height * 3 / 2) as usize]
+    }
+
+    /// vc-7zjq: passing `force_keyframe = true` must cause the next emitted
+    /// frame to be a keyframe even when the periodic cadence would not have
+    /// produced one. We encode one source frame to get the encoder past its
+    /// initial (always-key) frame, then a second delta-eligible frame WITHOUT
+    /// the flag (expected: delta), then a third WITH the flag (expected: key).
+    #[test]
+    fn force_keyframe_flag_emits_keyframe_vc_7zjq() {
+        let (w, h) = (160u32, 120u32);
+        let frame = solid_i420(w, h);
+        let mut enc = VideoEncoderBuilder::new(30, 5)
+            .set_resolution(w, h)
+            .build()
+            .expect("build encoder");
+
+        // Frame 0: the first encoded frame is always a keyframe.
+        let first_was_key = enc
+            .encode(0, &frame, false)
+            .expect("encode 0")
+            .any(|f| f.key);
+        assert!(first_was_key, "first frame should be a keyframe");
+
+        // Frame 1: no force flag. With a static scene and kf_max_dist=150 this
+        // must be a delta frame (NOT a keyframe).
+        let second_was_key = enc
+            .encode(1, &frame, false)
+            .expect("encode 1")
+            .any(|f| f.key);
+        assert!(
+            !second_was_key,
+            "second frame without force flag must be a delta frame"
+        );
+
+        // Frame 2: force the keyframe. The emitted frame MUST be a keyframe.
+        let third_was_key = enc
+            .encode(2, &frame, true)
+            .expect("encode 2")
+            .any(|f| f.key);
+        assert!(
+            third_was_key,
+            "VPX_EFLAG_FORCE_KF must force a keyframe on the next encode"
+        );
+    }
+}

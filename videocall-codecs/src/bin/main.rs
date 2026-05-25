@@ -51,6 +51,8 @@ fn main() {
             batch.push(VideoFrame {
                 sequence_number,
                 frame_type: FrameType::KeyFrame,
+                codec: Default::default(),
+                temporal_layer_id: 0,
                 data: vec![0; 1000],
                 timestamp: 0.0,
             });
@@ -60,6 +62,8 @@ fn main() {
                 batch.push(VideoFrame {
                     sequence_number,
                     frame_type: FrameType::DeltaFrame,
+                    codec: Default::default(),
+                    temporal_layer_id: 0,
                     data: vec![0; 200],
                     timestamp: 0.0,
                 });
