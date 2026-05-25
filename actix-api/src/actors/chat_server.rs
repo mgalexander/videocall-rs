@@ -982,6 +982,77 @@ impl ChatServer {
             }
         }
     }
+
+    /// Reap a single superseded session's membership rows (`room_members` +
+    /// the SFU `room_states` member table) for a room (orphan-leak fix).
+    ///
+    /// # Why this exists
+    ///
+    /// The reconnect-grace departure reaper keys `pending_departures` on
+    /// `(room, user_id)` and only ever tracks the *latest* `old_session`. When
+    /// a user churns through ≥2 sessions inside the `RECONNECT_GRACE_PERIOD`
+    /// (the norm for RTT-election losers under a co-arrival burst on
+    /// high-latency / jittery links), the second-disconnect replace path and
+    /// the stale-`old_session` arm of [`ExecutePendingDeparture`] would
+    /// overwrite / skip without ever cleaning the superseded session — leaving
+    /// it absent from the dispatcher `receivers` (so it never forwards) yet
+    /// counted in `room_members` / `room_states` forever. This permanently
+    /// inflates `member_count` above `receiver_set` and is the residual
+    /// orphan-leak floor.
+    ///
+    /// The superseded session's dispatcher receiver was already removed by its
+    /// own [`Handler<Disconnect>`] via [`ChatServer::drop_room_receiver`]; this
+    /// method removes the membership rows that were intentionally left behind
+    /// for the (now-cancelled) grace window. It mirrors the exact cleanup idiom
+    /// used by the reconnection path (`room_members.retain` + `remove_member`)
+    /// and, for completeness, the room-teardown sequence used by
+    /// [`ExecutePendingDeparture`] should reaping the stale session empty the
+    /// room. It does NOT touch the dispatcher hot path, the priority queue, or
+    /// transport — it runs only on the cold Disconnect / grace-timer path.
+    fn reap_superseded_session(&mut self, room: &str, session: SessionId) {
+        // Mirror the reconnection-path cleanup on the SFU member table — the
+        // superseded SID's subscription was already aborted in Disconnect.
+        if let Some(state) = self.room_states.get(room) {
+            let mut guard = match state.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.remove_member(session);
+        }
+        // Remove the stale `room_members` row. If this empties the room, run
+        // the same teardown sequence ExecutePendingDeparture uses so per-room
+        // SFU state / metrics / background tasks do not leak.
+        if let Some(members) = self.room_members.get_mut(room) {
+            members.retain(|(sid, _, _)| *sid != session);
+            if members.is_empty() {
+                self.room_members.remove(room);
+                // Mirror room_members lifecycle for SFU state.
+                self.forwarders.remove(room);
+                self.room_states.remove(room);
+                self.subscriptions.remove(room);
+                // p3-11: tear down the speaker tick + scorer for the now-empty
+                // room. Dropping the TickHandle aborts the background task.
+                self.speaker_ticks.remove(room);
+                self.speaker_scorers.remove(room);
+                // vc-kol / p6-7 (vc-c6l): drop this room from the shared
+                // owner-pod beacon hub. Non-owner pods never registered;
+                // `unregister` is a no-op.
+                self.beacon_hub.unregister(room);
+                // vc-xow8: drop the join-milestone watermark on drain.
+                self.sfu_join_milestone_watermark.remove(room);
+                // vc-9eve: drop the per-room intake-attempt count too.
+                self.sfu_room_join_attempts.remove(room);
+                // vc-xow8: drop the per-room milestone gauge series so they
+                // don't leak in the Prometheus registry.
+                crate::metrics::SFU_ROOM_MEMBERS
+                    .remove_label_values(&[room])
+                    .ok();
+                crate::metrics::SFU_ROOM_RECEIVER_SET
+                    .remove_label_values(&[room])
+                    .ok();
+            }
+        }
+    }
 }
 
 /// Per-pod pool of `ChatServer` shards (bead vc-8txq).
@@ -1322,8 +1393,16 @@ impl Handler<Disconnect> for ChatServer {
         let key = (room.clone(), user_id.clone());
         if let Some(old) = self.pending_departures.remove(&key) {
             ctx.cancel_future(old.spawn_handle);
+            // Orphan-leak fix: the old timer is now cancelled and the newer
+            // disconnect (staged below) only tracks `session`, so nothing will
+            // ever reap `old.old_session`'s membership rows. Reap them now —
+            // its dispatcher receiver was already dropped on its own Disconnect,
+            // so without this it would remain counted in room_members /
+            // room_states for the room's lifetime while never forwarding.
+            self.reap_superseded_session(&room, old.old_session);
             info!(
-                "Replaced existing pending departure for user {} in room {} (old session {})",
+                "Replaced existing pending departure for user {} in room {} \
+                 (reaped superseded session {})",
                 user_id, room, old.old_session
             );
         }
@@ -1509,11 +1588,18 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
         // cancelled by a reconnection or replaced by a newer disconnect.
         if let Some(pending) = self.pending_departures.remove(&key) {
             if pending.old_session != session {
-                // A newer disconnect replaced this one — do nothing, the newer
-                // timer will handle it.
+                // A newer disconnect replaced this one — the newer timer
+                // (tracking `pending.old_session`) will handle that session.
+                // Orphan-leak fix: this timer's own `session` was superseded
+                // and is tracked by NObody — reap its membership rows now. Its
+                // dispatcher receiver was already dropped on its Disconnect, so
+                // without this it would stay counted in room_members /
+                // room_states for the room's lifetime while never forwarding.
+                self.reap_superseded_session(&room, session);
                 info!(
-                    "Stale pending departure for user {} in room {} (session {} != {}), skipping",
-                    user_id, room, session, pending.old_session
+                    "Stale pending departure for user {} in room {} (session {} != {}), \
+                     reaped superseded session {} and re-armed newer departure",
+                    user_id, room, session, pending.old_session, session
                 );
                 // Re-insert the newer pending state.
                 self.pending_departures.insert(key, pending);
